@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import time
+import uuid
 from collections.abc import Callable
 
 log = logging.getLogger("dfeols")
@@ -92,8 +93,9 @@ class DaskExecutor:
         ordered = _order(tasks)
         futs, fargs = {}, {}
         n = len(ordered)
+        run_id = uuid.uuid4().hex[:8]  # task keys must never repeat across runs (e.g. two preps)
         for i, (tid, _rows, args) in enumerate(ordered):
-            key = f"dfeols-{stage}-{progress.label}-{tid}"
+            key = f"dfeols-{stage}-{progress.label}-{run_id}-{tid}"
             f = self.client.submit(fn, *args, key=key, priority=n - i, retries=self.retries, pure=False)
             futs[f] = tid
             fargs[f] = args

@@ -53,6 +53,14 @@ layout, plus:
   dataset.
 - The ETA no longer crashes with `OverflowError` when no workers are
   connected (an infinite ETA is reported as unknown).
+- Every encode and split task checks that it wrote exactly the rows the scan
+  counted for its input; on a mismatch it deletes its own files and reruns
+  (up to 3 attempts), and otherwise fails naming the task and keeping its
+  files for inspection. (At 1e10 rows one group's 2,000,000 rows were
+  written twice: "encoded 10,002,000,000 rows, expected 10,000,000,000".)
+- Dask task keys include a per-run id; every prep used the same keys
+  (`dfeols-encode-prep-17`), so a second prep in the same job could be handed
+  a result Dask still held for the first.
 - Folder locks also take over immediately when their holder ran on this
   host and is gone, and a release never removes another holder's lock.
 

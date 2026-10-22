@@ -4,6 +4,7 @@ fits."""
 
 import os
 import shutil
+from pathlib import Path
 
 import numpy as np
 import polars as pl
@@ -393,3 +394,51 @@ def test_scan_frames_are_reduced_as_they_arrive():
     for f in range(300):  # nothing overlaps (unit-level frames): still exact
         disjoint.add(pl.DataFrame({"u": np.arange(f * 50, f * 50 + 50)}))
     assert disjoint.result().height == 15_000
+
+
+@pytest.mark.parametrize("opts", [{}, {"max_files": 0}], ids=["direct", "two-level"])
+def test_task_that_writes_extra_rows_is_retried(tmp_path, monkeypatch, opts):
+    """A task whose output has more rows than its input (regression: at 1e10,
+    "encoded 10,002,000,000 rows, expected 10,000,000,000", one group's rows
+    twice) is detected inside the task, its files removed and the task rerun."""
+    import dfeols.prep_dist as pd_
+
+    d = PanelDGP(n_units=2000, units_per_chunk=200, T=10, n_groups=20, balanced=True)
+    raw, truth = _gen(tmp_path, d, "p")
+    src = str(raw / "*.parquet")
+    kw = dict(partition="unit", target_rows=4000, **truth["prep"])
+    ref = dfeols.prep(src, shard_dir=tmp_path / "ref", **kw)
+    orig, calls = pd_._encode_task, {"n": 0}
+
+    def flaky(*a, **k):  # task 3's first attempt writes one piece twice
+        r = orig(*a, **k)
+        if a[1] == 3 and calls["n"] == 0:
+            calls["n"] += 1
+            key, names = next(iter(r["files"].items()))
+            sub = "_buckets" if key < 0 else "shards"
+            src_ = Path(a[2]) / sub / names[0]
+            dup = src_.with_name(src_.stem + "9.parquet")
+            shutil.copy(src_, dup)
+            r["rows"][key] += _nrows(str(dup))
+            r["files"][key].append(dup.name)
+        return r
+
+    monkeypatch.setattr(pd_, "_encode_task", flaky)
+    b = dfeols.prep(
+        src, shard_dir=tmp_path / "b", executor=dfeols.SerialExecutor(), rows_per_task=4000, **opts, **kw
+    )
+    assert calls["n"] == 1 and b.n_rows == ref.n_rows
+    assert sum(_nrows(str(tmp_path / "b" / f)) for s in b.shards for f in s["files"]) == ref.n_rows
+
+    calls["n"] = -100  # now it always over-writes: fail with the task named
+    monkeypatch.setattr(pd_, "_encode_task", lambda *a, **k: (calls.__setitem__("n", 0), flaky(*a, **k))[1])
+    with pytest.raises(RuntimeError, match="encode task 3 .* wrote"):
+        dfeols.prep(
+            src,
+            shard_dir=tmp_path / "c",
+            executor=dfeols.SerialExecutor(),
+            rows_per_task=4000,
+            overwrite=True,
+            **opts,
+            **kw,
+        )

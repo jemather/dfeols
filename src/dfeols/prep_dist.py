@@ -286,6 +286,39 @@ def _encode_task(
     return {"rows": rows, "files": names, "timing": {"total": time.perf_counter() - t}}
 
 
+def _run_checked(fn, expect: int, what: str, root: str, args: tuple, tries: int = 3) -> dict:
+    """Run an encode or split task and check that it wrote exactly the rows
+    it read (`expect`, from the scan). On a mismatch its own files are
+    deleted and it runs again; if it never matches, it fails with the
+    details and leaves the last attempt's files for inspection."""
+    got = None
+    for attempt in range(tries):
+        r = fn(*args)
+        got = sum(r["rows"].values())
+        if got == expect:
+            r["retries"] = attempt
+            return r
+        names = [(k, n) for k, v in r["files"].items() for n in v]
+        log.warning(
+            "prep: %s wrote %s rows, expected %s (attempt %d)", what, f"{got:,}", f"{expect:,}", attempt + 1
+        )
+        if attempt + 1 < tries:
+            for k, n in names:
+                (Path(root) / ("_buckets" if k < 0 else "shards") / n).unlink(missing_ok=True)
+    raise RuntimeError(
+        f"prep: {what} wrote {got:,} rows but its input has {expect:,}, in {tries} attempts; the last "
+        f"attempt's files are kept for inspection: {sorted(n for v in r['files'].values() for n in v)[:12]}"
+    )
+
+
+def _encode_checked(expect, *args):
+    return _run_checked(_encode_task, expect, f"encode task {args[1]} ({len(args[0])} files)", args[2], args)
+
+
+def _split_checked(expect, *args):
+    return _run_checked(_split_task, expect, f"split of bucket {args[0]}", args[1], args)
+
+
 def _split_task(bucket, root, inputs):
     """Second level of the shuffle: read one bucket's files (the accepted
     encode attempts' files, listed by the coordinator) and write each of its
@@ -423,11 +456,13 @@ def prep_distributed(
     }
 
     scanned: set = set()
+    scan_n: dict[int, int] = {}  # rows per input file after dropping null keys
 
     def on_scan(tid, r):
         if tid in scanned:  # a second result for the same task: keep the first
             return
         scanned.add(tid)
+        scan_n[tid] = r["n"]
         acc["n"] += r["n"]
         for k in specs:
             acc["levels"][k].add(r["frames"][f"L:{k}"])
@@ -592,6 +627,8 @@ def prep_distributed(
         if tid in seen:  # a second result for the same task: keep the first
             return
         seen.add(tid)
+        if r.get("retries"):
+            log.warning("prep: task %s needed %d retries to write the right row count", tid, r["retries"])
         for sid, n in r["rows"].items():
             written[sid] = written.get(sid, 0) + n
         for sid, names in r["files"].items():
@@ -600,13 +637,15 @@ def prep_distributed(
     prog.add_stage("encode", {b: max(n, 1) for b, (_, n) in enumerate(batches)})
     prog.start("encode")
     log.info("prep: encoding in %d tasks of ~%s rows", len(batches), f"{int(rows_per_task):,}")
+    file_idx = {f: i for i, f in enumerate(files)}
     executor.run(
-        _encode_task,
+        _encode_checked,
         [
             (
                 b,
                 n,
                 (
+                    sum(scan_n[file_idx[f]] for f in fs),
                     fs,
                     b,
                     str(root),
@@ -637,8 +676,11 @@ def prep_distributed(
         prog.add_stage("split", {b: max(brows.get(b, 1), 1) for b in range(n_buckets)})
         prog.start("split")
         executor.run(
-            _split_task,
-            [(b, brows.get(b, 1), (b, str(root), sorted(binputs.get(b, [])))) for b in range(n_buckets)],
+            _split_checked,
+            [
+                (b, brows.get(b, 1), (brows.get(b, 0), b, str(root), sorted(binputs.get(b, []))))
+                for b in range(n_buckets)
+            ],
             on_encode,
             prog,
             "split",
