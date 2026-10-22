@@ -1,0 +1,50 @@
+# Profile templates for other schedulers. Untested on real sites: run
+# `dfeols jobscript "echo hi" --profile NAME` and `dfeols check --profile NAME`
+# before a real run, and adjust resource_spec / pe / lsf_units for your site.
+
+[profiles.pbs]
+scheduler = "pbs"                   # PBS Pro / OpenPBS; Torque: see resource_spec
+queue = "workq"
+account = ""                        # -A, if required
+scratch = "/scratch/$USER/dfeols"
+prologue = ["module load python", "source $HOME/envs/dfeols/bin/activate"]
+[profiles.pbs.worker]
+cores = 8
+memory = "32GB"
+walltime = "12:00:00"
+max_workers = 20
+# Torque: resource_spec = "nodes=1:ppn={cores},mem={memory}"
+resource_spec = "select=1:ncpus={cores}:mem={memory}"
+
+[profiles.sge]
+scheduler = "sge"                   # SGE / UGE / Son of Grid Engine
+queue = "all.q"
+scratch = "/scratch/$USER/dfeols"
+prologue = ["module load python", "source $HOME/envs/dfeols/bin/activate"]
+[profiles.sge.worker]
+cores = 8
+memory = "32GB"
+walltime = "12:00:00"
+max_workers = 20
+pe = "smp"                          # parallel environment name (`qconf -spl`)
+resource_spec = "h_vmem={per_slot}M"   # memory is per slot on most SGE sites
+
+[profiles.lsf]
+scheduler = "lsf"
+queue = "normal"
+project = ""                        # -P, if required
+scratch = "/scratch/$USER/dfeols"
+prologue = ["module load python", "source $HOME/envs/dfeols/bin/activate"]
+[profiles.lsf.worker]
+cores = 8
+memory = "32GB"
+walltime = "12:00"                  # LSF -W is HH:MM
+max_workers = 20
+lsf_units = "MB"                    # match LSF_UNIT_FOR_LIMITS in lsf.conf
+
+[profiles.local]
+scheduler = "local"
+[profiles.local.worker]
+cores = 1
+max_workers = 4
+memory = "8GB"

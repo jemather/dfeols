@@ -1,0 +1,25 @@
+# OU OSCER (Slurm, configless). Tested 2026-10-21 (1e9-row benchmarks).
+# Copy into ~/.config/dfeols/config.toml (or point $DFEOLS_CONFIG here).
+default = "oscer"
+
+[profiles.oscer]
+scheduler = "slurm"
+queue = "normal"
+scratch = "/scratch/$USER/dfeols"
+prologue = [
+  "module load Python/3.12.3-GCCcore-13.3.0",
+  "source $HOME/envs/dfeols/bin/activate",
+]
+interface = "auto"      # picks the 10.251.x internal network (bond0 / eno1)
+
+[profiles.oscer.worker]
+cores = 4               # small jobs start sooner on a busy partition
+memory = "24GB"         # 2M-row shards peaked at ~15 GB
+walltime = "04:00:00"
+max_workers = 40
+retire_minutes = 30
+
+[profiles.oscer.coordinator]
+cores = 16              # generation runs here; 1e9 needs ~32 GB, 1e10 ~64 GB
+memory = "64GB"
+walltime = "2-00:00:00"
