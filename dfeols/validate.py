@@ -18,13 +18,13 @@ def true_values(res, truth: dict, y: str | None = None) -> tuple[list[int], np.n
     scale = truth.get("outcome_scale", {}).get(y, 1.0)
     ref = {c.split(":")[-1]: tr[c] for c in res.collinear if c in tr}
     idx = [i for i, c in enumerate(res.coefnames) if c in tr]
-    vals = np.array([(tr[res.coefnames[i]] - ref.get(res.coefnames[i].split(":")[-1], 0.0)) * scale
-                     for i in idx])
+    vals = np.array(
+        [(tr[res.coefnames[i]] - ref.get(res.coefnames[i].split(":")[-1], 0.0)) * scale for i in idx]
+    )
     return idx, vals
 
 
-def recovery(res, truth: dict, y: str | None = None, vcov: str | None = None,
-             alpha: float = 0.001) -> dict:
+def recovery(res, truth: dict, y: str | None = None, vcov: str | None = None, alpha: float = 0.001) -> dict:
     """z-statistics of (estimate - truth) and a joint Wald test.
 
     With clustered SEs the Wald statistic uses the small-G correction
@@ -45,5 +45,13 @@ def recovery(res, truth: dict, y: str | None = None, vcov: str | None = None,
         p = float(stats.chi2.sf(W, k))
     zcrit = float(stats.norm.isf(alpha / (2 * k)))
     worst = int(np.abs(z).argmax())
-    return {"max_abs_z": float(np.abs(z).max()), "zcrit": zcrit, "wald": W, "p": p, "k": k,
-            "G": G, "worst": res.coefnames[idx[worst]], "ok": bool(np.abs(z).max() < zcrit)}
+    return {
+        "max_abs_z": float(np.abs(z).max()),
+        "zcrit": zcrit,
+        "wald": W,
+        "p": p,
+        "k": k,
+        "G": G,
+        "worst": res.coefnames[idx[worst]],
+        "ok": bool(np.abs(z).max() < zcrit),
+    }

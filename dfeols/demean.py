@@ -47,8 +47,9 @@ def _one_way(x: np.ndarray, g: np.ndarray, ng: int, w: np.ndarray) -> np.ndarray
     return x - full[g]
 
 
-def exact_two_way(x: np.ndarray, a: np.ndarray, b: np.ndarray, w: np.ndarray,
-                  max_block: int = 20_000) -> np.ndarray:
+def exact_two_way(
+    x: np.ndarray, a: np.ndarray, b: np.ndarray, w: np.ndarray, max_block: int = 20_000
+) -> np.ndarray:
     """Exact residuals of x on two FEs (codes a, b; weights w), no iteration.
 
     Eliminates FE `a` (diagonal) and solves the Schur complement for FE `b`
@@ -96,9 +97,9 @@ def exact_two_way(x: np.ndarray, a: np.ndarray, b: np.ndarray, w: np.ndarray,
     astart = np.searchsorted(compA[orderA], np.arange(ncomp + 1))
     gamma = np.zeros((nB, k))
     for c in np.flatnonzero(sizesB > 1):
-        bl = orderB[bstart[c]:bstart[c + 1]]
-        al = orderA[astart[c]:astart[c + 1]]
-        S = cellT[bl][:, al].toarray().T                 # (nA_c x nB_c) weight sums
+        bl = orderB[bstart[c] : bstart[c + 1]]
+        al = orderA[astart[c] : astart[c + 1]]
+        S = cellT[bl][:, al].toarray().T  # (nA_c x nB_c) weight sums
         M = np.diag(WB[bl]) - S.T @ (S / WA[al, None])
         f = cho_factor(M[1:, 1:], lower=True, check_finite=False)
         gamma[bl[1:]] = cho_solve(f, rhs[bl[1:]], check_finite=False)
@@ -121,8 +122,14 @@ def _map_numpy(x, flist, w, tol, maxiter):
     return x, False
 
 
-def demean(x: np.ndarray, fe_codes: list[np.ndarray], w: np.ndarray,
-           tol: float = 1e-10, maxiter: int = 100_000, method: str = "auto") -> tuple[np.ndarray, bool]:
+def demean(
+    x: np.ndarray,
+    fe_codes: list[np.ndarray],
+    w: np.ndarray,
+    tol: float = 1e-10,
+    maxiter: int = 100_000,
+    method: str = "auto",
+) -> tuple[np.ndarray, bool]:
     """Demean the columns of x by the given FEs.
 
     One FE: exact one pass. Two FEs: exact Schur-complement solve (method
@@ -143,10 +150,16 @@ def demean(x: np.ndarray, fe_codes: list[np.ndarray], w: np.ndarray,
             if method == "exact":
                 raise
             import logging
+
             logging.getLogger("dfeols").debug("exact two-way demeaning fell back to iteration: %s", e)
     flist = np.column_stack([d[0] for d in dense]).astype(np.uint64)
     if _pf_demean is not None:
-        res, ok = _pf_demean(np.ascontiguousarray(x, dtype=np.float64), flist,
-                             np.ascontiguousarray(w, dtype=np.float64), tol, maxiter)
+        res, ok = _pf_demean(
+            np.ascontiguousarray(x, dtype=np.float64),
+            flist,
+            np.ascontiguousarray(w, dtype=np.float64),
+            tol,
+            maxiter,
+        )
         return np.asarray(res), bool(ok)
     return _map_numpy(x, flist.astype(np.int64), w, tol, maxiter)

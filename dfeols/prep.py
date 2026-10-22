@@ -33,9 +33,9 @@ class Dataset:
 
     root: Path
     partition: list[str]
-    shards: list[dict]                 # {"id", "files", "rows"}
-    fes: dict[str, dict]               # name -> {"column", "n_levels", "nested_in_partition"}
-    clusters: dict[str, dict]          # name -> same, used for vcov
+    shards: list[dict]  # {"id", "files", "rows"}
+    fes: dict[str, dict]  # name -> {"column", "n_levels", "nested_in_partition"}
+    clusters: dict[str, dict]  # name -> same, used for vcov
     columns: list[str]
     n_rows: int
     meta: dict = field(default_factory=dict)
@@ -44,9 +44,16 @@ class Dataset:
     def open(cls, root: str | os.PathLike) -> "Dataset":
         root = Path(root)
         m = json.loads((root / META).read_text())
-        return cls(root=root, partition=m["partition"], shards=m["shards"],
-                   fes=m["fes"], clusters=m["clusters"], columns=m["columns"],
-                   n_rows=m["n_rows"], meta=m)
+        return cls(
+            root=root,
+            partition=m["partition"],
+            shards=m["shards"],
+            fes=m["fes"],
+            clusters=m["clusters"],
+            columns=m["columns"],
+            n_rows=m["n_rows"],
+            meta=m,
+        )
 
     def shard_paths(self, shard: dict) -> list[str]:
         return [str(self.root / f) for f in shard["files"]]
@@ -57,8 +64,10 @@ class Dataset:
         return lf.select(columns) if columns else lf
 
     def __repr__(self) -> str:
-        return (f"Dataset({self.root}, rows={self.n_rows:,}, shards={len(self.shards)}, "
-                f"partition={self.partition}, fes={list(self.fes)}, clusters={list(self.clusters)})")
+        return (
+            f"Dataset({self.root}, rows={self.n_rows:,}, shards={len(self.shards)}, "
+            f"partition={self.partition}, fes={list(self.fes)}, clusters={list(self.clusters)})"
+        )
 
 
 def _scan(source) -> pl.LazyFrame:
@@ -68,6 +77,7 @@ def _scan(source) -> pl.LazyFrame:
         return source.lazy()
     try:
         import pandas as pd
+
         if isinstance(source, pd.DataFrame):
             return pl.from_pandas(source).lazy()
     except ImportError:
@@ -94,8 +104,13 @@ def _lpt_bins(sizes: np.ndarray, n_bins: int) -> np.ndarray:
 def _nested(lf: pl.LazyFrame, inner: str, outer: list[str]) -> bool:
     """True if every level of column `inner` maps to one combination of `outer`."""
     outer_key = pl.struct(outer) if len(outer) > 1 else pl.col(outer[0])
-    k = (lf.group_by(inner).agg(outer_key.n_unique().alias("_k"))
-           .select(pl.col("_k").max()).collect(engine="streaming").item())
+    k = (
+        lf.group_by(inner)
+        .agg(outer_key.n_unique().alias("_k"))
+        .select(pl.col("_k").max())
+        .collect(engine="streaming")
+        .item()
+    )
     return k is None or k <= 1
 
 
@@ -130,13 +145,25 @@ def prep(
                    coordinator; output is identical in structure. Extra keyword
                    options (rows_per_task, max_pieces) tune the distributed path.
     """
-    if executor is not None and not isinstance(source, (pl.DataFrame, pl.LazyFrame)) \
-            and not hasattr(source, "to_numpy"):
+    if (
+        executor is not None
+        and not isinstance(source, (pl.DataFrame, pl.LazyFrame))
+        and not hasattr(source, "to_numpy")
+    ):
         from .prep_dist import prep_distributed
-        return prep_distributed(source, shard_dir=shard_dir, partition=partition,
-                                fixed_effects=list(fixed_effects), clusters=list(clusters), keep=keep,
-                                target_rows=target_rows, overwrite=overwrite, executor=executor,
-                                **dist_options)
+
+        return prep_distributed(
+            source,
+            shard_dir=shard_dir,
+            partition=partition,
+            fixed_effects=list(fixed_effects),
+            clusters=list(clusters),
+            keep=keep,
+            target_rows=target_rows,
+            overwrite=overwrite,
+            executor=executor,
+            **dist_options,
+        )
     t_start = time.time()
     root = Path(shard_dir)
     if (root / META).exists() and not overwrite:
@@ -170,8 +197,7 @@ def prep(
     # Global integer codes for each FE / cluster spec (exact; no hashing).
     for name, comps in specs.items():
         col = fe_column(name)
-        codes = (lf.select(comps).unique()
-                   .with_row_index(col).with_columns(pl.col(col).cast(pl.UInt32)))
+        codes = lf.select(comps).unique().with_row_index(col).with_columns(pl.col(col).cast(pl.UInt32))
         lf = lf.join(codes, on=comps, how="inner")
 
     staging = root / "_staging"
@@ -188,13 +214,18 @@ def prep(
     for name in specs:
         col = fe_column(name)
         n_levels = int(st.select(pl.col(col).max()).collect().item()) + 1
-        fe_meta[name] = {"column": col, "components": specs[name], "n_levels": n_levels,
-                         "nested_in_partition": _nested(st, col, partition)}
+        fe_meta[name] = {
+            "column": col,
+            "components": specs[name],
+            "n_levels": n_levels,
+            "nested_in_partition": _nested(st, col, partition),
+        }
     cl_names = ["^".join(fe_components(c)) for c in clusters]
     for cname in cl_names:
         for fname in ["^".join(fe_components(f)) for f in fixed_effects]:
             fe_meta[fname].setdefault("nested_in_cluster", {})[cname] = _nested(
-                st, fe_meta[fname]["column"], [fe_meta[cname]["column"]])
+                st, fe_meta[fname]["column"], [fe_meta[cname]["column"]]
+            )
     log.info("prep: nesting checks done (%.0fs)", time.time() - t_start)
 
     # Assign partition groups to shards (LPT bin packing on row counts).
@@ -207,13 +238,19 @@ def prep(
         log.warning("prep: %d partition groups exceed target_rows on their own", big)
 
     out = root / "shards"
-    (st.join(shard_map.lazy(), on=partition, how="inner")
-       .sink_parquet(pl.PartitionBy(str(out), key="__shard", include_key=False),
-                     mkdir=True, engine="streaming"))
+    (
+        st.join(shard_map.lazy(), on=partition, how="inner").sink_parquet(
+            pl.PartitionBy(str(out), key="__shard", include_key=False), mkdir=True, engine="streaming"
+        )
+    )
 
     # Collect shard files and row counts.
-    shard_rows = (st.join(shard_map.lazy(), on=partition).group_by("__shard")
-                    .agg(pl.len().alias("rows")).collect(engine="streaming"))
+    shard_rows = (
+        st.join(shard_map.lazy(), on=partition)
+        .group_by("__shard")
+        .agg(pl.len().alias("rows"))
+        .collect(engine="streaming")
+    )
     rows_by = dict(zip(shard_rows["__shard"].to_list(), shard_rows["rows"].to_list()))
     shards = []
     for d in sorted(out.iterdir()):

@@ -29,8 +29,8 @@ from .formula import fe_column, fe_components
 
 log = logging.getLogger("dfeols")
 
-SEED_FE = 11          # hash seed for FE/cluster ids of very large nested specs
-SEED_PART = 7         # hash seed for range-based shard assignment
+SEED_FE = 11  # hash seed for FE/cluster ids of very large nested specs
+SEED_PART = 7  # hash seed for range-based shard assignment
 
 
 def _files(source) -> list[str]:
@@ -38,8 +38,11 @@ def _files(source) -> list[str]:
         out = [str(s) for s in source]
     else:
         s = str(source)
-        out = sorted(_glob.glob(s)) if any(ch in s for ch in "*?[") else (
-            sorted(str(p) for p in Path(s).glob("*.parquet")) if Path(s).is_dir() else [s])
+        out = (
+            sorted(_glob.glob(s))
+            if any(ch in s for ch in "*?[")
+            else (sorted(str(p) for p in Path(s).glob("*.parquet")) if Path(s).is_dir() else [s])
+        )
     if not out:
         raise FileNotFoundError(f"no input files match {source!r}")
     bad = [f for f in out if not f.endswith(".parquet")]
@@ -50,6 +53,7 @@ def _files(source) -> list[str]:
 
 def _nrows(f: str) -> int:
     import pyarrow.parquet as pq
+
     return pq.read_metadata(f).num_rows
 
 
@@ -70,8 +74,7 @@ def _scan_task(files, cols, key_cols, specs, partition, checks):
     keys = list(q)
     frames = pl.collect_all([q[k] for k in keys], engine="streaming")
     out = dict(zip(keys, frames))
-    return {"n": int(out.pop("__n").item()), "frames": out,
-            "timing": {"total": time.perf_counter() - t}}
+    return {"n": int(out.pop("__n").item()), "frames": out, "timing": {"total": time.perf_counter() - t}}
 
 
 def _range_key(partition: list[str], schema) -> pl.Expr:
@@ -89,8 +92,19 @@ def _piece_name(sid: int, task_id: int, i: int) -> str:
     return f"s{sid:06d}_t{task_id:05d}_{i}.parquet"
 
 
-def _encode_task(files, task_id, root, cols, key_cols, specs, partition, hashed=(), range_mode=False,
-                 n_buckets=0, schema_key=None):
+def _encode_task(
+    files,
+    task_id,
+    root,
+    cols,
+    key_cols,
+    specs,
+    partition,
+    hashed=(),
+    range_mode=False,
+    n_buckets=0,
+    schema_key=None,
+):
     """Encode a batch of files and write one flat piece file per shard it
     touches: shards/s<shard>_t<task>_<i>.parquet (no per-task directories, so
     nothing slow to delete on a parallel filesystem). Returns rows per shard."""
@@ -98,18 +112,23 @@ def _encode_task(files, task_id, root, cols, key_cols, specs, partition, hashed=
     root = Path(root)
     out = root / "shards"
     out.mkdir(parents=True, exist_ok=True)
-    for old in out.glob(f"s*_t{task_id:05d}_*.parquet"):     # retried task: start clean
+    for old in out.glob(f"s*_t{task_id:05d}_*.parquet"):  # retried task: start clean
         old.unlink(missing_ok=True)
     lf = pl.scan_parquet(files).select(cols).drop_nulls(subset=key_cols)
     for name, comps in specs.items():
-        if name in hashed:      # millions of levels, nested in the partition: hash id, no join
+        if name in hashed:  # millions of levels, nested in the partition: hash id, no join
             lf = lf.with_columns(pl.struct(comps).hash(seed=SEED_FE).alias(fe_column(name)))
         else:
-            lf = lf.join(pl.scan_parquet(str(root / "_codes" / f"{fe_column(name)}.parquet")),
-                         on=comps, how="inner")
-    if range_mode:              # shards are contiguous ranges of the partition key (or its hash)
+            lf = lf.join(
+                pl.scan_parquet(str(root / "_codes" / f"{fe_column(name)}.parquet")), on=comps, how="inner"
+            )
+    if range_mode:  # shards are contiguous ranges of the partition key (or its hash)
         bounds = pl.read_parquet(root / "_codes" / "__shard_bounds.parquet")["b"]
-        key = _range_key(partition, schema_key) if schema_key is not None else pl.struct(partition).hash(seed=SEED_PART)
+        key = (
+            _range_key(partition, schema_key)
+            if schema_key is not None
+            else pl.struct(partition).hash(seed=SEED_PART)
+        )
         lf = lf.with_columns(pl.lit(bounds).search_sorted(key, side="left").cast(pl.UInt32).alias("__shard"))
     else:
         lf = lf.join(pl.scan_parquet(str(root / "_codes" / "__shard_map.parquet")), on=partition, how="inner")
@@ -124,10 +143,16 @@ def _encode_task(files, task_id, root, cols, key_cols, specs, partition, hashed=
         lf = lf.with_columns((pl.col("__shard") % n_buckets).cast(pl.UInt32).alias("__bucket"))
 
         def bprov(a):
-            return str(bdir / f"b{int(a.partition_keys['__bucket'][0]):05d}_t{task_id:05d}_{a.index_in_partition}.parquet")
+            return str(
+                bdir
+                / f"b{int(a.partition_keys['__bucket'][0]):05d}_t{task_id:05d}_{a.index_in_partition}.parquet"
+            )
 
-        lf.sink_parquet(pl.PartitionBy(str(bdir), key="__bucket", include_key=False, file_path_provider=bprov),
-                        mkdir=True, engine="streaming")
+        lf.sink_parquet(
+            pl.PartitionBy(str(bdir), key="__bucket", include_key=False, file_path_provider=bprov),
+            mkdir=True,
+            engine="streaming",
+        )
         rows = {}
         for f in bdir.glob(f"b*_t{task_id:05d}_*.parquet"):
             rows[-1 - int(f.name[1:6])] = rows.get(-1 - int(f.name[1:6]), 0) + _nrows(str(f))
@@ -136,8 +161,11 @@ def _encode_task(files, task_id, root, cols, key_cols, specs, partition, hashed=
     def provider(a):
         return str(out / _piece_name(int(a.partition_keys["__shard"][0]), task_id, a.index_in_partition))
 
-    lf.sink_parquet(pl.PartitionBy(str(out), key="__shard", include_key=False, file_path_provider=provider),
-                    mkdir=True, engine="streaming")
+    lf.sink_parquet(
+        pl.PartitionBy(str(out), key="__shard", include_key=False, file_path_provider=provider),
+        mkdir=True,
+        engine="streaming",
+    )
     rows = {}
     for f in out.glob(f"s*_t{task_id:05d}_*.parquet"):
         sid = int(f.name[1:7])
@@ -157,12 +185,18 @@ def _split_task(bucket, root):
     files = sorted(str(p) for p in (root / "_buckets").glob(f"b{bucket:05d}_t*.parquet"))
     rows = {}
     if files:
+
         def prov(a):
-            return str(out / f"s{int(a.partition_keys['__shard'][0]):06d}_b{bucket:05d}_{a.index_in_partition}.parquet")
+            return str(
+                out
+                / f"s{int(a.partition_keys['__shard'][0]):06d}_b{bucket:05d}_{a.index_in_partition}.parquet"
+            )
 
         pl.scan_parquet(files).sink_parquet(
             pl.PartitionBy(str(out), key="__shard", include_key=False, file_path_provider=prov),
-            mkdir=True, engine="streaming")
+            mkdir=True,
+            engine="streaming",
+        )
         for f in out.glob(f"s*_b{bucket:05d}_*.parquet"):
             sid = int(f.name[1:7])
             rows[sid] = rows.get(sid, 0) + _nrows(str(f))
@@ -191,9 +225,23 @@ def _merge_task(shard_id, root, pieces):
 
 
 # ----------------------------------------------------------------- driver
-def prep_distributed(source, *, shard_dir, partition, fixed_effects, clusters, keep, target_rows,
-                     overwrite, executor, rows_per_task: float | None = None, max_pieces: int = 8,
-                     hash_levels: float = 2e6, range_groups: float = 5e6, max_files: float = 5e4):
+def prep_distributed(
+    source,
+    *,
+    shard_dir,
+    partition,
+    fixed_effects,
+    clusters,
+    keep,
+    target_rows,
+    overwrite,
+    executor,
+    rows_per_task: float | None = None,
+    max_pieces: int = 8,
+    hash_levels: float = 2e6,
+    range_groups: float = 5e6,
+    max_files: float = 5e4,
+):
     """rows_per_task  rows per encode task (default: ~4 tasks per worker, 1M-10M
                    rows each, so the last wave of tasks is short)
     max_pieces     shards made of more piece files than this are merged into one
@@ -266,7 +314,9 @@ def prep_distributed(source, *, shard_dir, partition, fixed_effects, clusters, k
 
     log.info("prep: scanning %d files (%s rows) on workers", len(files), f"{sum(rows_in.values()):,}")
     prog.start("scan")
-    scan_tasks = [(i, rows_in[i], ([f], cols, key_cols, specs, partition, checks)) for i, f in enumerate(files)]
+    scan_tasks = [
+        (i, rows_in[i], ([f], cols, key_cols, specs, partition, checks)) for i, f in enumerate(files)
+    ]
     # the scan is read-only, so the coordinator helps while no workers are up yet
     executor.run(_scan_task, scan_tasks, on_scan, prog, "scan", local_help=True)
     prog.finish("scan")
@@ -279,18 +329,21 @@ def prep_distributed(source, *, shard_dir, partition, fixed_effects, clusters, k
     levels = {}
     for name, comps in specs.items():
         levels[name] = pl.concat(acc["levels"].pop(name)).unique()
-        fe_meta[name] = {"column": fe_column(name), "components": comps, "n_levels": levels[name].height,
-                         "nested_in_partition": True}
+        fe_meta[name] = {
+            "column": fe_column(name),
+            "components": comps,
+            "n_levels": levels[name].height,
+            "nested_in_partition": True,
+        }
     for (name, outer), i in zip(check_keys, range(len(checks))):
         inner = checks[i][0]
-        mm = (pl.concat(acc["C"].pop(i)).group_by(inner)
-                .agg(pl.col("lo").min(), pl.col("hi").max()))
+        mm = pl.concat(acc["C"].pop(i)).group_by(inner).agg(pl.col("lo").min(), pl.col("hi").max())
         ok = bool((mm["lo"] == mm["hi"]).all()) if mm.height else True
         if outer == "__partition__":
             fe_meta[name]["nested_in_partition"] = ok
         else:
             fe_meta[name].setdefault("nested_in_cluster", {})[outer] = ok
-    for f in fe_names:                                  # trivially nested pairs
+    for f in fe_names:  # trivially nested pairs
         for c in cl_names:
             fe_meta[f].setdefault("nested_in_cluster", {}).setdefault(c, True)
 
@@ -304,12 +357,22 @@ def prep_distributed(source, *, shard_dir, partition, fixed_effects, clusters, k
                 hashed.append(name)
                 fe_meta[name]["id"] = "hash"
                 continue
-            log.warning("prep: hash collision among %s levels of %s; using dense codes", f"{lv.height:,}", name)
-        (lv.sort(comps).with_row_index(col).with_columns(pl.col(col).cast(pl.UInt32))
-           .write_parquet(codes_dir / f"{col}.parquet"))
+            log.warning(
+                "prep: hash collision among %s levels of %s; using dense codes", f"{lv.height:,}", name
+            )
+        (
+            lv.sort(comps)
+            .with_row_index(col)
+            .with_columns(pl.col(col).cast(pl.UInt32))
+            .write_parquet(codes_dir / f"{col}.parquet")
+        )
         fe_meta[name]["id"] = "code"
     if hashed:
-        log.info("prep: hash ids for %s (more than %s levels, nested in the partition)", ", ".join(hashed), f"{int(hash_levels):,}")
+        log.info(
+            "prep: hash ids for %s (more than %s levels, nested in the partition)",
+            ", ".join(hashed),
+            f"{int(hash_levels):,}",
+        )
 
     acc["P_files"] = acc.pop("P")
     counts = pl.concat(acc["P_files"]).group_by(partition).agg(pl.col("_n").sum())
@@ -318,16 +381,16 @@ def prep_distributed(source, *, shard_dir, partition, fixed_effects, clusters, k
     if range_mode:
         # contiguous ranges of the partition-key hash, cut by cumulative rows;
         # encode tasks only need the n_bins boundaries
-        counts = (counts.with_columns(_range_key(partition, schema).alias("__h"))
-                        .sort("__h"))
+        counts = counts.with_columns(_range_key(partition, schema).alias("__h")).sort("__h")
         before = counts["_n"].cum_sum() - counts["_n"]
         raw_bin = np.minimum((before.to_numpy() * n_bins) // max(n_rows, 1), n_bins - 1)
         counts = counts.with_columns(pl.Series("__b", raw_bin))
         bounds = counts.group_by("__b").agg(pl.col("__h").max().alias("b")).sort("__b")
         bounds.select("b").write_parquet(codes_dir / "__shard_bounds.parquet")
         # shard id = position of the group's hash among the boundaries
-        counts = counts.with_columns(pl.lit(bounds["b"]).search_sorted(pl.col("__h"), side="left")
-                                     .cast(pl.UInt32).alias("__shard"))
+        counts = counts.with_columns(
+            pl.lit(bounds["b"]).search_sorted(pl.col("__h"), side="left").cast(pl.UInt32).alias("__shard")
+        )
         log.info("prep: %s partition groups -> %d range shards", f"{counts.height:,}", bounds.height)
     else:
         bins = _lpt_bins(counts["_n"].to_numpy(), n_bins)
@@ -337,19 +400,32 @@ def prep_distributed(source, *, shard_dir, partition, fixed_effects, clusters, k
     # which shards each input file touches (for the shuffle plan)
     p_all = pl.concat(acc.pop("P_files"))
     if range_mode:
-        file_shards = (p_all.with_columns(pl.lit(bounds["b"]).search_sorted(_range_key(partition, schema),
-                                                                           side="left").alias("__shard"))
-                           .select("__file", "__shard").unique())
+        file_shards = (
+            p_all.with_columns(
+                pl.lit(bounds["b"]).search_sorted(_range_key(partition, schema), side="left").alias("__shard")
+            )
+            .select("__file", "__shard")
+            .unique()
+        )
     else:
-        file_shards = p_all.join(counts.select(partition + ["__shard"]), on=partition).select("__file", "__shard").unique()
+        file_shards = (
+            p_all.join(counts.select(partition + ["__shard"]), on=partition)
+            .select("__file", "__shard")
+            .unique()
+        )
     del p_all
     rows_by = dict(zip(shard_rows["__shard"].to_list(), shard_rows["_n"].to_list()))
     big = int((counts["_n"] > target_rows).sum())
     if big:
         log.warning("prep: %d partition groups exceed target_rows on their own", big)
     del counts
-    log.info("prep: %s rows, codes for %d specs, %d shards (%.0fs)", f"{n_rows:,}", len(specs),
-             len(rows_by), time.time() - t_start)
+    log.info(
+        "prep: %s rows, codes for %d specs, %d shards (%.0fs)",
+        f"{n_rows:,}",
+        len(specs),
+        len(rows_by),
+        time.time() - t_start,
+    )
 
     # ---------------- encode ----------------
     if rows_per_task is None:
@@ -365,15 +441,23 @@ def prep_distributed(source, *, shard_dir, partition, fixed_effects, clusters, k
     if cur:
         batches.append((cur, cur_n))
     batch_of = {i: b for b, (fs, _) in enumerate(batches) for i in [files.index(f) for f in fs]}
-    pieces_est = (file_shards.with_columns(pl.col("__file").replace_strict(batch_of).alias("__b"))
-                             .select("__b", "__shard").unique().height)
+    pieces_est = (
+        file_shards.with_columns(pl.col("__file").replace_strict(batch_of).alias("__b"))
+        .select("__b", "__shard")
+        .unique()
+        .height
+    )
     n_shards = len(rows_by)
     n_buckets = 0
     if pieces_est > max_files:
         n_buckets = int(min(max(max_files // max(len(batches), 1), 2), n_shards))
-        log.info("prep: one piece per task and shard would be %s files; using a two-level shuffle "
-                 "through %d buckets (%s files)", f"{pieces_est:,}", n_buckets,
-                 f"{len(batches) * n_buckets + n_shards:,}")
+        log.info(
+            "prep: one piece per task and shard would be %s files; using a two-level shuffle "
+            "through %d buckets (%s files)",
+            f"{pieces_est:,}",
+            n_buckets,
+            f"{len(batches) * n_buckets + n_shards:,}",
+        )
     written: dict[int, int] = {}
 
     def on_encode(tid, r):
@@ -383,9 +467,32 @@ def prep_distributed(source, *, shard_dir, partition, fixed_effects, clusters, k
     prog.add_stage("encode", {b: max(n, 1) for b, (_, n) in enumerate(batches)})
     prog.start("encode")
     log.info("prep: encoding in %d tasks of ~%s rows", len(batches), f"{int(rows_per_task):,}")
-    executor.run(_encode_task, [(b, n, (fs, b, str(root), cols, key_cols, specs, partition,
-                                        tuple(hashed), range_mode, n_buckets, schema))
-                                for b, (fs, n) in enumerate(batches)], on_encode, prog, "encode")
+    executor.run(
+        _encode_task,
+        [
+            (
+                b,
+                n,
+                (
+                    fs,
+                    b,
+                    str(root),
+                    cols,
+                    key_cols,
+                    specs,
+                    partition,
+                    tuple(hashed),
+                    range_mode,
+                    n_buckets,
+                    schema,
+                ),
+            )
+            for b, (fs, n) in enumerate(batches)
+        ],
+        on_encode,
+        prog,
+        "encode",
+    )
     prog.finish("encode")
     if sum(written.values()) != n_rows:
         raise RuntimeError(f"prep: encoded {sum(written.values()):,} rows, expected {n_rows:,}")
@@ -394,8 +501,13 @@ def prep_distributed(source, *, shard_dir, partition, fixed_effects, clusters, k
         written = {}
         prog.add_stage("split", {b: max(brows.get(b, 1), 1) for b in range(n_buckets)})
         prog.start("split")
-        executor.run(_split_task, [(b, brows.get(b, 1), (b, str(root))) for b in range(n_buckets)],
-                     on_encode, prog, "split")
+        executor.run(
+            _split_task,
+            [(b, brows.get(b, 1), (b, str(root))) for b in range(n_buckets)],
+            on_encode,
+            prog,
+            "split",
+        )
         prog.finish("split")
         shutil.rmtree(root / "_buckets", ignore_errors=True)
         if sum(written.values()) != n_rows:
@@ -412,28 +524,43 @@ def prep_distributed(source, *, shard_dir, partition, fixed_effects, clusters, k
     if to_merge:
         prog.add_stage("merge", {s_: max(written.get(s_, 1), 1) for s_ in to_merge})
         prog.start("merge")
-        log.info("prep: merging %d of %d shards (more than %d pieces each)", len(to_merge), len(pieces), max_pieces)
+        log.info(
+            "prep: merging %d of %d shards (more than %d pieces each)", len(to_merge), len(pieces), max_pieces
+        )
 
         def on_merge(tid, r):
             pieces[tid] = [r["file"]]
 
-        executor.run(_merge_task, [(s_, written.get(s_, 1), (s_, str(root), pieces[s_])) for s_ in to_merge],
-                     on_merge, prog, "merge")
+        executor.run(
+            _merge_task,
+            [(s_, written.get(s_, 1), (s_, str(root), pieces[s_])) for s_ in to_merge],
+            on_merge,
+            prog,
+            "merge",
+        )
         prog.finish("merge")
     else:
         log.info("prep: no merge needed (at most %d pieces per shard)", max_pieces)
 
     shutil.rmtree(codes_dir, ignore_errors=True)
-    shards = [{"id": int(s_), "files": [f"shards/{p}" for p in pieces[s_]], "rows": int(written[s_])}
-              for s_ in sorted(pieces) if written.get(s_)]
+    shards = [
+        {"id": int(s_), "files": [f"shards/{p}" for p in pieces[s_]], "rows": int(written[s_])}
+        for s_ in sorted(pieces)
+        if written.get(s_)
+    ]
     columns = pl.scan_parquet(str(root / shards[0]["files"][0])).collect_schema().names()
     meta = {
-        "version": 1, "partition": partition, "shards": shards,
+        "version": 1,
+        "partition": partition,
+        "shards": shards,
         "fes": {k: v for k, v in fe_meta.items() if k in set(fe_names)},
         "clusters": {k: fe_meta[k] for k in cl_names},
-        "columns": columns, "n_rows": int(n_rows), "target_rows": target_rows,
+        "columns": columns,
+        "n_rows": int(n_rows),
+        "target_rows": target_rows,
         "created": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "prep_seconds": round(time.time() - t_start, 1), "prep_mode": "distributed",
+        "prep_seconds": round(time.time() - t_start, 1),
+        "prep_mode": "distributed",
         "shard_assignment": "range" if range_mode else "lpt",
         "shuffle": f"two-level ({n_buckets} buckets)" if n_buckets else "direct",
     }

@@ -28,10 +28,10 @@ _NAME_RE = re.compile(r"^[A-Za-z_][\w]*$")
 
 @dataclass(frozen=True)
 class Term:
-    conts: tuple[str, ...]          # continuous factors multiplied together
-    cat: str | None = None          # categorical variable, if any
-    ref: object = None              # level to drop (None = keep all for x:i(c))
-    drop_first: bool = False        # i(c) with no ref: drop the first level
+    conts: tuple[str, ...]  # continuous factors multiplied together
+    cat: str | None = None  # categorical variable, if any
+    ref: object = None  # level to drop (None = keep all for x:i(c))
+    drop_first: bool = False  # i(c) with no ref: drop the first level
 
     @property
     def label(self) -> str:
@@ -46,7 +46,7 @@ class Formula:
     text: str
     depvars: tuple[str, ...]
     terms: tuple[Term, ...]
-    fes: tuple[str, ...]            # FE names, e.g. "spell", "id_a^week"
+    fes: tuple[str, ...]  # FE names, e.g. "spell", "id_a^week"
     intercept: bool = True
 
     @property

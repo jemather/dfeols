@@ -57,12 +57,20 @@ DEFAULTS = {
     "interface": "auto",
     "extra_directives": [],
     "env": {},
-    "worker": {"cores": 8, "memory": "32GB", "walltime": "12:00:00", "max_workers": 20,
-               "min_workers": 1, "retire_minutes": 60, "idle_minutes": 15, "local_directory": None},
+    "worker": {
+        "cores": 8,
+        "memory": "32GB",
+        "walltime": "12:00:00",
+        "max_workers": 20,
+        "min_workers": 1,
+        "retire_minutes": 60,
+        "idle_minutes": 15,
+        "local_directory": None,
+    },
     "coordinator": {"cores": 4, "memory": "16GB", "walltime": "7-00:00:00"},
 }
 
-TEMPLATE = '''# dfeols site configuration. One [profiles.<name>] table per HPC system.
+TEMPLATE = """# dfeols site configuration. One [profiles.<name>] table per HPC system.
 # Select a profile with dfeols.executor("<name>"), --profile <name>,
 # $DFEOLS_PROFILE, or the `default` key below.
 
@@ -101,7 +109,7 @@ idle_minutes = 15              # release a worker only after this long with noth
 cores = 4
 memory = "16GB"
 walltime = "7-00:00:00"
-'''
+"""
 
 
 def config_path() -> Path:
@@ -167,8 +175,10 @@ def profile(name: str | None = None, path=None, **overrides) -> Profile:
         name = "local"
     if name not in profiles and name != "local":
         where = path or config_path()
-        raise KeyError(f"profile {name!r} not found in {where} (have: {sorted(profiles) or 'none'}); "
-                       "run `dfeols config init` to create a config")
+        raise KeyError(
+            f"profile {name!r} not found in {where} (have: {sorted(profiles) or 'none'}); "
+            "run `dfeols config init` to create a config"
+        )
     d = _merge(DEFAULTS, profiles.get(name, {}))
     # flat overrides: worker keys may be given at top level for convenience
     for k, v in overrides.items():
@@ -185,8 +195,7 @@ def profile(name: str | None = None, path=None, **overrides) -> Profile:
         if d.get(k) == "":
             d[k] = None
     known = set(Profile.__dataclass_fields__) - {"name", "source"}
-    return Profile(name=name, source=str(path or config_path()),
-                   **{k: v for k, v in d.items() if k in known})
+    return Profile(name=name, source=str(path or config_path()), **{k: v for k, v in d.items() if k in known})
 
 
 def init_config(path=None, force: bool = False) -> Path:

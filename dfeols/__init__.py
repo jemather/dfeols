@@ -9,8 +9,17 @@ from .executors import DaskExecutor, SerialExecutor
 from .prep import Dataset, prep
 from .results import Result
 
-__all__ = ["prep", "fit", "Dataset", "Result", "SerialExecutor", "DaskExecutor", "build_plan",
-           "executor", "profile"]
+__all__ = [
+    "prep",
+    "fit",
+    "Dataset",
+    "Result",
+    "SerialExecutor",
+    "DaskExecutor",
+    "build_plan",
+    "executor",
+    "profile",
+]
 __version__ = "0.6.1"
 
 _log = _logging.getLogger("dfeols")

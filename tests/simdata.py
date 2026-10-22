@@ -14,10 +14,18 @@ def sim_panel(n_accounts=60, followers_per=40, weeks=30, seed=0, missing=0.01):
         for _ in range(nf):
             f = rng.integers(0, n_accounts * followers_per)
             start = rng.integers(0, weeks - 2)
-            length = rng.integers(1, weeks - start + 1)   # some length-1 spells -> singletons
+            length = rng.integers(1, weeks - start + 1)  # some length-1 spells -> singletons
             wk = np.arange(start, start + length)
-            rows.append((np.full(length, a), np.full(length, f), np.full(length, spell), wk,
-                         wk - start, np.full(length, acc_eff)))
+            rows.append(
+                (
+                    np.full(length, a),
+                    np.full(length, f),
+                    np.full(length, spell),
+                    wk,
+                    wk - start,
+                    np.full(length, acc_eff),
+                )
+            )
             spell += 1
     a, f, s, w, ten, ae = (np.concatenate(x) for x in zip(*rows))
     n = len(a)
@@ -31,6 +39,18 @@ def sim_panel(n_accounts=60, followers_per=40, weeks=30, seed=0, missing=0.01):
     eng2 = 0.5 * eng + rng.normal(size=n)
     wt = rng.uniform(0.5, 2.0, n)
     eng[rng.uniform(size=n) < missing] = np.nan
-    return pl.DataFrame({"id_a": a, "id_f": f, "spell": s, "week": w, "tenure": ten,
-                         "tbin": tbin, "feat": feat, "posts": posts, "eng": eng,
-                         "eng2": eng2, "wt": wt})
+    return pl.DataFrame(
+        {
+            "id_a": a,
+            "id_f": f,
+            "spell": s,
+            "week": w,
+            "tenure": ten,
+            "tbin": tbin,
+            "feat": feat,
+            "posts": posts,
+            "eng": eng,
+            "eng2": eng2,
+            "wt": wt,
+        }
+    )

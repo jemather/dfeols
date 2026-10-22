@@ -48,8 +48,7 @@ class SerialExecutor:
             res = fn(*args)
             secs = time.perf_counter() - t
             on_result(tid, res)
-            progress.task_done(stage, tid, res.get("timing", {}).get("total", secs),
-                               res.get("timing"))
+            progress.task_done(stage, tid, res.get("timing", {}).get("total", secs), res.get("timing"))
 
 
 class DaskExecutor:
@@ -60,8 +59,7 @@ class DaskExecutor:
     the task. That keeps memory per worker predictable: one shard at a time.
     """
 
-    def __init__(self, client, max_workers: int | None = None, tick: float = 5.0,
-                 retries: int = 3):
+    def __init__(self, client, max_workers: int | None = None, tick: float = 5.0, retries: int = 3):
         self.client = client
         self.max_workers = max_workers
         self.tick_s = tick
@@ -88,23 +86,26 @@ class DaskExecutor:
         side effects, since a task a worker had just picked up may then run
         twice (its worker result is discarded)."""
         from distributed import wait
+
         ordered = _order(tasks)
         futs, fargs = {}, {}
         n = len(ordered)
         for i, (tid, rows, args) in enumerate(ordered):
             key = f"dfeols-{stage}-{progress.label}-{tid}"
-            f = self.client.submit(fn, *args, key=key, priority=n - i,
-                                   retries=self.retries, pure=False)
+            f = self.client.submit(fn, *args, key=key, priority=n - i, retries=self.retries, pure=False)
             futs[f] = tid
             fargs[f] = args
-        order = list(futs)                      # submission order = priority order
+        order = list(futs)  # submission order = priority order
         pending = set(futs)
         key_to_tid = {f.key: futs[f] for f in futs}
         while pending:
             if local_help and self.slots()[0] == 0:
                 running = self._running_keys()
-                cand = [f for f in reversed(order) if f in pending and f.key not in running
-                        and f.status == "pending"]
+                cand = [
+                    f
+                    for f in reversed(order)
+                    if f in pending and f.key not in running and f.status == "pending"
+                ]
                 if cand:
                     f = cand[0]
                     f.cancel()
@@ -127,8 +128,7 @@ class DaskExecutor:
                     raise RuntimeError(f"shard {tid} failed in {stage}: {exc!r}") from exc
                 res = f.result()
                 on_result(tid, res)
-                progress.task_done(stage, tid, res.get("timing", {}).get("total", 0.0),
-                                   res.get("timing"))
+                progress.task_done(stage, tid, res.get("timing", {}).get("total", 0.0), res.get("timing"))
                 pending.discard(f)
                 f.release()
             s, mx = self.slots()

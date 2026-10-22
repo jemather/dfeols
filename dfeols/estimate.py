@@ -26,9 +26,20 @@ def _norm(name: str) -> str:
     return "^".join(fe_components(name))
 
 
-def build_plan(ds: Dataset, formula: str, *, cluster=None, vcov=None, weights=None,
-               cache_dir=None, max_dummy_levels: int = 2000, drop_singletons=True,
-               fe_tol: float = 1e-10, fe_method: str = "auto", crossing_fe: str = "auto") -> Plan:
+def build_plan(
+    ds: Dataset,
+    formula: str,
+    *,
+    cluster=None,
+    vcov=None,
+    weights=None,
+    cache_dir=None,
+    max_dummy_levels: int = 2000,
+    drop_singletons=True,
+    fe_tol: float = 1e-10,
+    fe_method: str = "auto",
+    crossing_fe: str = "auto",
+) -> Plan:
     f = parse(formula)
     local, glob = [], []
     for name in f.fes:
@@ -44,7 +55,8 @@ def build_plan(ds: Dataset, formula: str, *, cluster=None, vcov=None, weights=No
             raise NotImplementedError(
                 f"FE {name!r} crosses partitions and has {m['n_levels']:,} levels. "
                 "v0 handles FEs nested in the partition key or with few levels "
-                f"(<= max_dummy_levels={max_dummy_levels}).")
+                f"(<= max_dummy_levels={max_dummy_levels})."
+            )
     cl = None
     cl_local = False
     if cluster:
@@ -74,12 +86,24 @@ def build_plan(ds: Dataset, formula: str, *, cluster=None, vcov=None, weights=No
 
     colnames = plan_columns(f, cat_levels, has_fe=bool(local or glob))
     spec_id = f.fingerprint(cluster=cluster, weights=weights, singletons=drop_singletons)
-    return Plan(formula=f, spec_id=spec_id, local_fes=local, global_fes=glob, cluster=cl,
-                cluster_local=cl_local, weights=weights, cat_levels=cat_levels,
-                colnames=colnames, n_dummy=sum(L - 1 for *_, L in glob) + (1 if glob and not local else 0), vcov_types=vcov,
-                cache_dir=str(cache_dir) if cache_dir else None,
-                drop_singletons=drop_singletons, fe_tol=fe_tol, fe_method=fe_method,
-                sparse_global=_use_sparse(crossing_fe, local, glob))
+    return Plan(
+        formula=f,
+        spec_id=spec_id,
+        local_fes=local,
+        global_fes=glob,
+        cluster=cl,
+        cluster_local=cl_local,
+        weights=weights,
+        cat_levels=cat_levels,
+        colnames=colnames,
+        n_dummy=sum(L - 1 for *_, L in glob) + (1 if glob and not local else 0),
+        vcov_types=vcov,
+        cache_dir=str(cache_dir) if cache_dir else None,
+        drop_singletons=drop_singletons,
+        fe_tol=fe_tol,
+        fe_method=fe_method,
+        sparse_global=_use_sparse(crossing_fe, local, glob),
+    )
 
 
 def estimate_worker_gb(plan: Plan, rows: int, n_cols: int) -> float:
@@ -93,12 +117,12 @@ def estimate_worker_gb(plan: Plan, rows: int, n_cols: int) -> float:
     m = len(plan.formula.depvars)
     k_rep = len(plan.colnames)
     dense = m + k_rep + (0 if plan.sparse_global else plan.n_dummy)
-    gb = 1.5                                           # worker process, Dask, libraries
-    gb += rows * n_cols * 8 * 1.5 / 1e9                # Parquet read and filtered copy
-    gb += rows * dense * 8 * 4 / 1e9                   # design, demeaned copy, products
+    gb = 1.5  # worker process, Dask, libraries
+    gb += rows * n_cols * 8 * 1.5 / 1e9  # Parquet read and filtered copy
+    gb += rows * dense * 8 * 4 / 1e9  # design, demeaned copy, products
     if plan.sparse_global:
         levels = sum(L for *_, L in plan.global_fes)
-        gb += rows * 0.05 * levels * 8 / 1e9 if levels > 200 else 0   # group x level block
+        gb += rows * 0.05 * levels * 8 / 1e9 if levels > 200 else 0  # group x level block
     return gb
 
 
@@ -110,22 +134,38 @@ def _use_sparse(crossing_fe: str, local, glob) -> bool:
     ok = len(local) == 1 and len(glob) > 0
     n_dummy = sum(L - 1 for *_, L in glob)
     if not ok and n_dummy > 300 and crossing_fe != "dense":
-        log.warning("%d crossing-FE dummy columns will be built densely (the sparse path needs "
-                    "exactly one FE nested in the partition); watch worker memory", n_dummy)
+        log.warning(
+            "%d crossing-FE dummy columns will be built densely (the sparse path needs "
+            "exactly one FE nested in the partition); watch worker memory",
+            n_dummy,
+        )
     if crossing_fe == "sparse" and not ok:
-        raise ValueError("crossing_fe='sparse' needs exactly one FE nested in the partition "
-                         "and at least one crossing FE")
+        raise ValueError(
+            "crossing_fe='sparse' needs exactly one FE nested in the partition and at least one crossing FE"
+        )
     return ok and crossing_fe != "dense"
 
 
-def fit(ds: Dataset | str, formula: str, *, cluster: str | None = None,
-        vcov=None, weights: str | None = None, executor=None,
-        workdir: str | None = None, cache: bool | str = "auto", keep_cache: bool = False,
-        max_dummy_levels: int = 2000, drop_singletons: bool = True,
-        fe_tol: float = 1e-10, fe_method: str = "auto", crossing_fe: str = "auto",
-        collin_tol: float = 1e-9,
-        label: str | None = None,
-        log_every: float = 30.0) -> Result:
+def fit(
+    ds: Dataset | str,
+    formula: str,
+    *,
+    cluster: str | None = None,
+    vcov=None,
+    weights: str | None = None,
+    executor=None,
+    workdir: str | None = None,
+    cache: bool | str = "auto",
+    keep_cache: bool = False,
+    max_dummy_levels: int = 2000,
+    drop_singletons: bool = True,
+    fe_tol: float = 1e-10,
+    fe_method: str = "auto",
+    crossing_fe: str = "auto",
+    collin_tol: float = 1e-9,
+    label: str | None = None,
+    log_every: float = 30.0,
+) -> Result:
     """Estimate an HDFE OLS model on a prepared, sharded dataset.
 
     cluster    cluster variable (encoded in prep); default vcov is then CRV1
@@ -145,33 +185,54 @@ def fit(ds: Dataset | str, formula: str, *, cluster: str | None = None,
         # expensive: iterative (3+ local FEs, or 2 with fe_method="iterate"). With one local FE the
         # exact one-pass demean is cheaper than writing and re-reading
         # n x k doubles on shared scratch.
-        n_local = sum(1 for f in probe.fes
-                      if ds.fes.get("^".join(fe_components(f)), {}).get("nested_in_partition"))
+        n_local = sum(
+            1 for f in probe.fes if ds.fes.get("^".join(fe_components(f)), {}).get("nested_in_partition")
+        )
         cache = n_local >= 3 or (n_local == 2 and fe_method == "iterate")
     cache = bool(cache)
     spec_id = probe.fingerprint(cluster=cluster, weights=weights, singletons=drop_singletons)
     wd = Path(workdir) if workdir else ds.root / "runs" / spec_id
     wd.mkdir(parents=True, exist_ok=True)
-    plan = build_plan(ds, formula, cluster=cluster, vcov=vcov, weights=weights,
-                      cache_dir=(wd / "cache") if cache else None,
-                      max_dummy_levels=max_dummy_levels, drop_singletons=drop_singletons,
-                      fe_tol=fe_tol, fe_method=fe_method, crossing_fe=crossing_fe)
+    plan = build_plan(
+        ds,
+        formula,
+        cluster=cluster,
+        vcov=vcov,
+        weights=weights,
+        cache_dir=(wd / "cache") if cache else None,
+        max_dummy_levels=max_dummy_levels,
+        drop_singletons=drop_singletons,
+        fe_tol=fe_tol,
+        fe_method=fe_method,
+        crossing_fe=crossing_fe,
+    )
     if plan.sparse_global and plan.cache_dir:
-        plan.cache_dir = None                       # recomputing is cheap on this path
+        plan.cache_dir = None  # recomputing is cheap on this path
         cache = False
     f = plan.formula
     label = label or spec_id
     m = len(f.depvars)
     k_rep = len(plan.colnames)
     k_tot = k_rep + plan.n_dummy
-    log.info("fit %s: %s | %d regressors + %d FE dummies, %d local FEs, %d shards, %s rows",
-             label, f.text, k_rep, plan.n_dummy, len(plan.local_fes), len(ds.shards), f"{ds.n_rows:,}")
+    log.info(
+        "fit %s: %s | %d regressors + %d FE dummies, %d local FEs, %d shards, %s rows",
+        label,
+        f.text,
+        k_rep,
+        plan.n_dummy,
+        len(plan.local_fes),
+        len(ds.shards),
+        f"{ds.n_rows:,}",
+    )
 
     biggest = max(s["rows"] for s in ds.shards)
-    log.info("fit %s: largest shard %s rows -> peak worker memory roughly %.1f GB; "
-             "cache on disk roughly %.1f GB", label, f"{biggest:,}",
-             estimate_worker_gb(plan, biggest, len(ds.columns)),
-             ds.n_rows * (m + k_tot + 2) * 8 / 1e9 if cache else 0)
+    log.info(
+        "fit %s: largest shard %s rows -> peak worker memory roughly %.1f GB; cache on disk roughly %.1f GB",
+        label,
+        f"{biggest:,}",
+        estimate_worker_gb(plan, biggest, len(ds.columns)),
+        ds.n_rows * (m + k_tot + 2) * 8 / 1e9 if cache else 0,
+    )
 
     prog = Progress(wd, label=label, every=log_every, round2_recomputes=not cache)
     rows = {s["id"]: max(s["rows"], 1) for s in ds.shards}
@@ -179,17 +240,25 @@ def fit(ds: Dataset | str, formula: str, *, cluster: str | None = None,
     prog.add_stage("round2", rows)
 
     # ---------------- round 1 ----------------
-    acc = {"ZtZ": np.zeros((k_tot, k_tot)), "ZtY": np.zeros((k_tot, m)),
-           "YtY": np.zeros(m), "sum_wy": np.zeros(m), "sum_wy2": np.zeros(m),
-           "n": 0, "rows_in": 0, "sumw": 0.0, "converged": True,
-           "fe_levels": np.zeros(len(plan.local_fes), np.int64),
-           "local_nested": np.ones(len(plan.local_fes), bool),
-           "gpresent": [np.zeros(L, bool) for *_, L in plan.global_fes],
-           "glo": [np.full(L, np.iinfo(np.int64).max) for *_, L in plan.global_fes],
-           "ghi": [np.full(L, np.iinfo(np.int64).min, np.int64) for *_, L in plan.global_fes],
-           "cpresent": (np.zeros(plan.cluster[2], bool) if plan.cluster and not plan.cluster_local else None),
-           "G_local": 0,
-           "row_n": {}}
+    acc = {
+        "ZtZ": np.zeros((k_tot, k_tot)),
+        "ZtY": np.zeros((k_tot, m)),
+        "YtY": np.zeros(m),
+        "sum_wy": np.zeros(m),
+        "sum_wy2": np.zeros(m),
+        "n": 0,
+        "rows_in": 0,
+        "sumw": 0.0,
+        "converged": True,
+        "fe_levels": np.zeros(len(plan.local_fes), np.int64),
+        "local_nested": np.ones(len(plan.local_fes), bool),
+        "gpresent": [np.zeros(L, bool) for *_, L in plan.global_fes],
+        "glo": [np.full(L, np.iinfo(np.int64).max) for *_, L in plan.global_fes],
+        "ghi": [np.full(L, np.iinfo(np.int64).min, np.int64) for *_, L in plan.global_fes],
+        "cpresent": (np.zeros(plan.cluster[2], bool) if plan.cluster and not plan.cluster_local else None),
+        "G_local": 0,
+        "row_n": {},
+    }
 
     peak = {"rss": 0.0}
 
@@ -234,12 +303,13 @@ def fit(ds: Dataset | str, formula: str, *, cluster: str | None = None,
 
     # ---------------- round 2 ----------------
     kept = np.flatnonzero(keep)
-    rep_idx = np.flatnonzero(keep[:k_rep])               # reported & kept, in Z order
+    rep_idx = np.flatnonzero(keep[:k_rep])  # reported & kept, in Z order
     pos_in_kept = np.cumsum(keep) - 1
     rep_kept_pos = pos_in_kept[rep_idx]
     fwl = None
     if plan.sparse_global:
         from .worker import _global_layout
+
         _, zpos, P = _global_layout(plan)
         dum_kept_pos = pos_in_kept[kept[kept >= k_rep]]
         dum_z = kept[kept >= k_rep]
@@ -250,23 +320,29 @@ def fit(ds: Dataset | str, formula: str, *, cluster: str | None = None,
         gamma[lv] = beta_k[dum_kept_pos]
         pi = np.zeros((P, len(rep_idx)))
         if len(dum_kept_pos):
-            pi[lv] = np.linalg.solve(A[np.ix_(dum_kept_pos, dum_kept_pos)], A[np.ix_(dum_kept_pos, rep_kept_pos)])
+            pi[lv] = np.linalg.solve(
+                A[np.ix_(dum_kept_pos, dum_kept_pos)], A[np.ix_(dum_kept_pos, rep_kept_pos)]
+            )
         fwl = {"rep": rep_idx, "beta_x": beta_k[rep_kept_pos], "gamma": gamma, "pi": pi}
         bread_use = bread[np.ix_(rep_kept_pos, rep_kept_pos)]
-        meat_idx = np.arange(len(rep_idx))                 # meat is already reported-only
+        meat_idx = np.arange(len(rep_idx))  # meat is already reported-only
     else:
         bread_use = bread
         meat_idx = rep_kept_pos
     kk = len(rep_idx) if plan.sparse_global else int(keep.sum())
-    acc2 = {"rss": np.zeros(m),
-            "hetero": np.zeros((m, kk, kk)) if "hetero" in plan.vcov_types else None,
-            "crv": np.zeros((m, kk, kk)) if ("CRV1" in plan.vcov_types) else None}
+    acc2 = {
+        "rss": np.zeros(m),
+        "hetero": np.zeros((m, kk, kk)) if "hetero" in plan.vcov_types else None,
+        "crv": np.zeros((m, kk, kk)) if ("CRV1" in plan.vcov_types) else None,
+    }
     scores = None
     if "CRV1" in plan.vcov_types and not plan.cluster_local:
         G_tot = plan.cluster[2]
         need = G_tot * kk * m * 8
         if need > 8e9:
-            log.warning("fit %s: cluster-score accumulator needs %.1f GB on the coordinator", label, need / 1e9)
+            log.warning(
+                "fit %s: cluster-score accumulator needs %.1f GB on the coordinator", label, need / 1e9
+            )
         scores = np.zeros((m, G_tot, kk))
 
     def on2(tid, r):
@@ -280,7 +356,9 @@ def fit(ds: Dataset | str, formula: str, *, cluster: str | None = None,
             for j in range(m):
                 np.add.at(scores[j], r["cluster_codes"], r["cluster_scores"][j])
 
-    tasks2 = [(s["id"], rows[s["id"]], (plan, s["id"], ds.shard_paths(s), beta_k, keep, fwl)) for s in ds.shards]
+    tasks2 = [
+        (s["id"], rows[s["id"]], (plan, s["id"], ds.shard_paths(s), beta_k, keep, fwl)) for s in ds.shards
+    ]
     prog.start("round2")
     executor.run(shard_round2, tasks2, on2, prog, "round2")
     if scores is not None:
@@ -313,23 +391,40 @@ def fit(ds: Dataset | str, formula: str, *, cluster: str | None = None,
             V["CRV1"] = (vcov_crv1(bread_use, acc2["crv"][j], N, dfk_cl, G), G - 1)
         V = {t: (v[np.ix_(meat_idx, meat_idx)], df) for t, (v, df) in V.items()}
         tss = acc["YtY"][j] if plan.local_fes else acc["sum_wy2"][j] - acc["sum_wy"][j] ** 2 / acc["sumw"]
-        out[y] = {"coef": b, "vcov": V, "rss": float(acc2["rss"][j]),
-                  "r2_within" if plan.local_fes else "r2": float(1 - acc2["rss"][j] / tss)}
+        out[y] = {
+            "coef": b,
+            "vcov": V,
+            "rss": float(acc2["rss"][j]),
+            "r2_within" if plan.local_fes else "r2": float(1 - acc2["rss"][j] / tss),
+        }
 
     if cache and not keep_cache:
         shutil.rmtree(wd / "cache", ignore_errors=True)
 
     res = Result(
-        formula=f.text, label=label, coefnames=[plan.colnames[i] for i in rep_idx],
-        outcomes=out, N=N, N_dropped=acc["rows_in"] - N, G=G, cluster=plan.cluster[0] if plan.cluster else None,
+        formula=f.text,
+        label=label,
+        coefnames=[plan.colnames[i] for i in rep_idx],
+        outcomes=out,
+        N=N,
+        N_dropped=acc["rows_in"] - N,
+        G=G,
+        cluster=plan.cluster[0] if plan.cluster else None,
         fe=[n for n, _ in plan.local_fes] + [n for n, *_ in plan.global_fes],
-        fe_levels=fe_levels, collinear=dropped, vcov_default=plan.vcov_types[0],
-        seconds=time.time() - t_start, workdir=str(wd),
-        timing={"round1_seconds": prog.stages["round1"].finished - prog.stages["round1"].started,
-                "round2_seconds": prog.stages["round2"].finished - prog.stages["round2"].started,
-                "solve_seconds": prog.stages["round2"].started - prog.stages["round1"].finished,
-                "max_worker_rss_gb": peak["rss"], "n_shards": len(ds.shards),
-                "worker_seconds": sum(sum(st.done.values()) for st in prog.stages.values())})
+        fe_levels=fe_levels,
+        collinear=dropped,
+        vcov_default=plan.vcov_types[0],
+        seconds=time.time() - t_start,
+        workdir=str(wd),
+        timing={
+            "round1_seconds": prog.stages["round1"].finished - prog.stages["round1"].started,
+            "round2_seconds": prog.stages["round2"].finished - prog.stages["round2"].started,
+            "solve_seconds": prog.stages["round2"].started - prog.stages["round1"].finished,
+            "max_worker_rss_gb": peak["rss"],
+            "n_shards": len(ds.shards),
+            "worker_seconds": sum(sum(st.done.values()) for st in prog.stages.values()),
+        },
+    )
     res.save(wd / "result.json")
     log.info("fit %s: done in %s", label, fmt_td(res.seconds))
     return res

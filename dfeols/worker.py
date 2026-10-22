@@ -32,21 +32,21 @@ class Plan:
 
     formula: Formula
     spec_id: str
-    local_fes: list[tuple[str, str]]          # (name, column) nested in partition
-    global_fes: list[tuple[str, str, int]]    # (name, column, n_levels) -> dummies
-    cluster: tuple[str, str, int] | None      # (name, column, n_levels)
-    cluster_local: bool                       # cluster nested in partition key
+    local_fes: list[tuple[str, str]]  # (name, column) nested in partition
+    global_fes: list[tuple[str, str, int]]  # (name, column, n_levels) -> dummies
+    cluster: tuple[str, str, int] | None  # (name, column, n_levels)
+    cluster_local: bool  # cluster nested in partition key
     weights: str | None
-    cat_levels: dict[str, list]               # categorical var -> global sorted levels
-    colnames: list[str]                       # reported regressors (incl. intercept)
-    n_dummy: int                              # global-FE dummy columns appended after
+    cat_levels: dict[str, list]  # categorical var -> global sorted levels
+    colnames: list[str]  # reported regressors (incl. intercept)
+    n_dummy: int  # global-FE dummy columns appended after
     vcov_types: tuple[str, ...]
     cache_dir: str | None
     drop_singletons: bool = True
     fe_tol: float = 1e-10
     fe_maxiter: int = 100_000
-    fe_method: str = "auto"                   # auto | exact | iterate
-    sparse_global: bool = False               # crossing FEs via per-level sums, no dense dummies
+    fe_method: str = "auto"  # auto | exact | iterate
+    sparse_global: bool = False  # crossing FEs via per-level sums, no dense dummies
 
 
 def plan_columns(f: Formula, cat_levels: dict[str, list], has_fe: bool):
@@ -141,11 +141,19 @@ def _global_layout(plan: Plan):
 def _global_matrix(df, plan: Plan, n: int):
     """Sparse n x P indicator matrix of all global FE levels."""
     import scipy.sparse as sp
+
     offs, _, P = _global_layout(plan)
-    cols = np.concatenate([df[c].to_numpy().astype(np.int64) + off
-                           for (_, c, _), off in zip(plan.global_fes, offs)]) if n else np.zeros(0, np.int64)
+    cols = (
+        np.concatenate(
+            [df[c].to_numpy().astype(np.int64) + off for (_, c, _), off in zip(plan.global_fes, offs)]
+        )
+        if n
+        else np.zeros(0, np.int64)
+    )
     rows = np.tile(np.arange(n), len(plan.global_fes))
-    return sp.csr_matrix((np.ones(len(rows)), (rows, cols)), shape=(n, P)), cols.reshape(len(plan.global_fes), n)
+    return sp.csr_matrix((np.ones(len(rows)), (rows, cols)), shape=(n, P)), cols.reshape(
+        len(plan.global_fes), n
+    )
 
 
 def _round1_sparse(plan: Plan, shard_id: int, df, n0: int, local_codes, w, T, t0):
@@ -156,12 +164,17 @@ def _round1_sparse(plan: Plan, shard_id: int, df, n0: int, local_codes, w, T, t0
     where C holds the weight in each (local group, level) cell.
     """
     import scipy.sparse as sp
+
     f = plan.formula
     t = time.perf_counter()
     n = df.height
     a = local_codes[0].astype(np.int64)
     nA = int(a.max()) + 1 if n else 0
-    Y = np.column_stack([df[y].to_numpy().astype(np.float64) for y in f.depvars]) if n else np.zeros((0, len(f.depvars)))
+    Y = (
+        np.column_stack([df[y].to_numpy().astype(np.float64) for y in f.depvars])
+        if n
+        else np.zeros((0, len(f.depvars)))
+    )
     cols = []
     for term in f.terms:
         cols.extend(_term_columns(term, df, plan.cat_levels))
@@ -180,12 +193,17 @@ def _round1_sparse(plan: Plan, shard_id: int, df, n0: int, local_codes, w, T, t0
     offs, zpos, P = _global_layout(plan)
     k_tot = k + plan.n_dummy
     Xw, Yw = Xt * w[:, None], Yt * w[:, None]
-    DX = Dm.T @ Xw                                           # P x k
-    DY = Dm.T @ Yw                                           # P x m
+    DX = Dm.T @ Xw  # P x k
+    DY = Dm.T @ Yw  # P x m
     DWD = (Dm.T @ sp.diags(w) @ Dm).toarray()
     if n:
-        C = sp.csr_matrix((np.tile(w, len(plan.global_fes)), (np.tile(a, len(plan.global_fes)), gcodes.ravel() + np.repeat(offs, n))),
-                          shape=(nA, P))
+        C = sp.csr_matrix(
+            (
+                np.tile(w, len(plan.global_fes)),
+                (np.tile(a, len(plan.global_fes)), gcodes.ravel() + np.repeat(offs, n)),
+            ),
+            shape=(nA, P),
+        )
         C.sum_duplicates()
         WA = np.bincount(a, weights=w, minlength=nA)
         if nA * P <= 50_000_000:
@@ -229,13 +247,14 @@ def _round1(plan: Plan, shard_id: int, files: list[str], write_cache: bool):
             local_codes = [densify(c[keep])[0] for c in local_codes]
     n = df.height
     w = df[plan.weights].to_numpy().astype(np.float64) if plan.weights else np.ones(n)
-    gpresent = [np.bincount(df[c].to_numpy().astype(np.int64), minlength=L) > 0
-                for _, c, L in plan.global_fes]
+    gpresent = [
+        np.bincount(df[c].to_numpy().astype(np.int64), minlength=L) > 0 for _, c, L in plan.global_fes
+    ]
 
     if plan.sparse_global:
         Y, Yt, Zt, ZtZ, ZtY, extra = _round1_sparse(plan, shard_id, df, n0, local_codes, w, T, t0)
         converged = True
-        t = time.perf_counter() - T.pop("crossprod")     # keep timing the cluster bookkeeping
+        t = time.perf_counter() - T.pop("crossprod")  # keep timing the cluster bookkeeping
     else:
         Y, Yt, Zt, ZtZ, ZtY, converged, t = _round1_dense(plan, df, n, local_codes, w, T)
         extra = None
@@ -261,7 +280,11 @@ def _round1(plan: Plan, shard_id: int, files: list[str], write_cache: bool):
 def _round1_dense(plan: Plan, df, n, local_codes, w, T):
     f = plan.formula
     t = time.perf_counter()
-    Y = np.column_stack([df[y].to_numpy().astype(np.float64) for y in f.depvars]) if n else np.zeros((0, len(f.depvars)))
+    Y = (
+        np.column_stack([df[y].to_numpy().astype(np.float64) for y in f.depvars])
+        if n
+        else np.zeros((0, len(f.depvars)))
+    )
     cols: list[np.ndarray] = []
     if "Intercept" in plan.colnames:
         cols.append(np.ones(n))
@@ -275,7 +298,7 @@ def _round1_dense(plan: Plan, df, n, local_codes, w, T):
         D[np.nonzero(m)[0], codes[m] - 1] = 1.0
         cols.append(D)
     if plan.global_fes and not plan.local_fes:
-        cols.append(np.ones(n))        # hidden constant: the dummies' dropped level
+        cols.append(np.ones(n))  # hidden constant: the dummies' dropped level
     Z = np.column_stack([c if c.ndim == 2 else c[:, None] for c in cols]) if cols else np.zeros((n, 0))
     T["build"] = time.perf_counter() - t
 
@@ -339,8 +362,9 @@ def _round1_finish(plan, shard_id, df, local_codes, w, Yt, Zt, out, T, t, t0, wr
     return out, arrays
 
 
-def shard_round2(plan: Plan, shard_id: int, files: list[str], beta: np.ndarray,
-                 keep: np.ndarray, fwl: dict | None = None) -> dict:
+def shard_round2(
+    plan: Plan, shard_id: int, files: list[str], beta: np.ndarray, keep: np.ndarray, fwl: dict | None = None
+) -> dict:
     """beta: (k_kept x m) on the kept columns of Z.
 
     fwl (sparse crossing-FE path): {"rep": kept reported columns, "beta_x",
@@ -369,10 +393,10 @@ def shard_round2(plan: Plan, shard_id: int, files: list[str], beta: np.ndarray,
             V = np.zeros((0, fwl["gamma"].shape[1] + fwl["pi"].shape[1]))
         m_ = fwl["gamma"].shape[1]
         E = Yt - Xr @ fwl["beta_x"] - V[:, :m_]
-        Zk = Xr - V[:, m_:]                              # X with dummies partialled out
+        Zk = Xr - V[:, m_:]  # X with dummies partialled out
     else:
         Zk = Zt[:, keep]
-        E = Yt - Zk @ beta                               # n x m
+        E = Yt - Zk @ beta  # n x m
     m = E.shape[1]
     out = {"shard": shard_id, "n": len(w), "rss": np.einsum("ij,ij,i->j", E, E, w)}
     k = Zk.shape[1]

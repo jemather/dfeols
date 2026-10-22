@@ -85,8 +85,9 @@ def _truth_doc(d) -> dict:
     return {"kind": d.kind, "dgp": asdict(d), **d.truth()}
 
 
-def generate(out, d, chunks: list[int] | None = None, jobs: int = 1, executor=None,
-             verbose: bool = True) -> Path:
+def generate(
+    out, d, chunks: list[int] | None = None, jobs: int = 1, executor=None, verbose: bool = True
+) -> Path:
     """Write the DGP's chunks to `out` (Parquet). Idempotent: existing chunks are
     kept, so an interrupted run resumes. Runs serially, on a local process
     pool (jobs > 1), or on a dfeols/Dask executor (executor=...)."""
@@ -113,17 +114,22 @@ def generate(out, d, chunks: list[int] | None = None, jobs: int = 1, executor=No
         done += 1
         if verbose and (done % max(1, len(args) // 20) == 0 or done == len(args)):
             el = time.time() - t0
-            print(f"synth: {done}/{len(args)} chunks, {rows:,} rows, {el:.0f}s, "
-                  f"ETA {el / done * (len(args) - done):.0f}s", flush=True)
+            print(
+                f"synth: {done}/{len(args)} chunks, {rows:,} rows, {el:.0f}s, "
+                f"ETA {el / done * (len(args) - done):.0f}s",
+                flush=True,
+            )
 
     if executor is not None and hasattr(executor, "client"):
         from distributed import as_completed
+
         futs = [executor.client.submit(_write_chunk, a, pure=False) for a in args]
         for f in as_completed(futs):
             report(f.result()[1])
     elif jobs > 1:
         import multiprocessing as mp
         from concurrent.futures import ProcessPoolExecutor
+
         # spawn, not fork: Polars/numba thread pools in the parent make fork unsafe
         with ProcessPoolExecutor(jobs, mp_context=mp.get_context("spawn")) as ex:
             for _, n, _ in ex.map(_write_chunk, args):
@@ -158,13 +164,21 @@ def _parse_chunks(s: str, n: int) -> list[int]:
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(prog="python -m dfeols.synth", description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(
+        prog="python -m dfeols.synth",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     ap.add_argument("out")
     ap.add_argument("--dgp", default="panel", choices=sorted(DGPS))
     ap.add_argument("--rows", type=float, required=True, help="target total rows")
-    ap.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
-                    help="DGP parameter, e.g. --set T=104 --set n_groups=1000")
+    ap.add_argument(
+        "--set",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="DGP parameter, e.g. --set T=104 --set n_groups=1000",
+    )
     ap.add_argument("--chunks", default=None, help="'i', 'a:b' or 'i::k' (job arrays)")
     ap.add_argument("--jobs", type=int, default=1, help="local processes")
     ap.add_argument("--profile", default=None, help="generate on cluster workers from this profile")
@@ -184,6 +198,7 @@ def main(argv=None):
     ex = None
     if a.profile:
         import dfeols
+
         ex = dfeols.executor(a.profile)
     generate(a.out, d, chunks, a.jobs, executor=ex)
 

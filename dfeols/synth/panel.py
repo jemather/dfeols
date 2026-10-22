@@ -44,9 +44,9 @@ class PanelDGP:
     n_cat: int = 4
     balanced: bool = False
     min_periods: int = 2
-    group_zipf: float = 0.0                   # >0: group sizes ~ rank^-group_zipf (skewed)
+    group_zipf: float = 0.0  # >0: group sizes ~ rank^-group_zipf (skewed)
     # coefficients
-    theta: tuple = (0.5, 0.8, 1.1, 1.4)      # x1 effect by category (length n_cat)
+    theta: tuple = (0.5, 0.8, 1.1, 1.4)  # x1 effect by category (length n_cat)
     beta2: float = -0.3
     beta3: float = 0.2
     # confounding loadings
@@ -54,9 +54,9 @@ class PanelDGP:
     time_conf: float = 1.0
     gt_confound: float = 0.0
     # errors
-    rho: float = 0.5                          # AR(1) within unit
+    rho: float = 0.5  # AR(1) within unit
     noise_sd: float = 1.0
-    gt_sd: float = 1.0                        # group-time shock in y
+    gt_sd: float = 1.0  # group-time shock in y
     hetero: float = 0.5
     seed: int = 20261021
     units_per_chunk: int = 20_000
@@ -81,27 +81,46 @@ class PanelDGP:
         rhs = "x1:i(cat) + x2 + x3"
         twfe_ok = "unbiased" if self.gt_confound == 0 else "biased"
         specs = {
-            "twfe": {"formula": f"y ~ {rhs} | unit + time", "partition": "unit",
-                     "cluster": "group", "expect": twfe_ok},
-            "twfe_by_grp": {"formula": f"y ~ {rhs} | unit + time", "partition": "group",
-                            "cluster": "group", "expect": twfe_ok},
-            "grouptime": {"formula": f"y ~ {rhs} | unit + group^time", "partition": "group",
-                          "cluster": "group", "expect": "unbiased"},
-            "no_unit_fe": {"formula": f"y ~ {rhs} | time", "partition": "unit",
-                           "cluster": "group", "expect": "biased"},
+            "twfe": {
+                "formula": f"y ~ {rhs} | unit + time",
+                "partition": "unit",
+                "cluster": "group",
+                "expect": twfe_ok,
+            },
+            "twfe_by_grp": {
+                "formula": f"y ~ {rhs} | unit + time",
+                "partition": "group",
+                "cluster": "group",
+                "expect": twfe_ok,
+            },
+            "grouptime": {
+                "formula": f"y ~ {rhs} | unit + group^time",
+                "partition": "group",
+                "cluster": "group",
+                "expect": "unbiased",
+            },
+            "no_unit_fe": {
+                "formula": f"y ~ {rhs} | time",
+                "partition": "unit",
+                "cluster": "group",
+                "expect": "biased",
+            },
         }
-        return {"coefs": self.coefs(), "outcome_scale": {"y": 1.0},
-                "prep": {"fixed_effects": ["unit", "time", "group^time"], "clusters": ["unit", "group"]},
-                "specs": specs}
+        return {
+            "coefs": self.coefs(),
+            "outcome_scale": {"y": 1.0},
+            "prep": {"fixed_effects": ["unit", "time", "group^time"], "clusters": ["unit", "group"]},
+            "specs": specs,
+        }
 
     # ---- data ----------------------------------------------------------------
     def _common(self):
         rng = np.random.default_rng([self.seed, 0])
         T, G = self.T, self.n_groups
-        tau = np.cumsum(rng.normal(0, 0.3, T))              # common time path
+        tau = np.cumsum(rng.normal(0, 0.3, T))  # common time path
         tau -= tau.mean()
         gamma = self.time_conf * tau + rng.normal(0, 0.5, T)
-        c_gt = rng.normal(0, 1, (G, T))                     # group-time factor in x
+        c_gt = rng.normal(0, 1, (G, T))  # group-time factor in x
         delta = self.gt_confound * c_gt + rng.normal(0, self.gt_sd, (G, T))
         return tau, gamma, c_gt, delta
 
@@ -119,7 +138,7 @@ class PanelDGP:
             w = np.arange(1, self.n_groups + 1, dtype=float) ** -self.group_zipf
             group = np.random.default_rng([self.seed, 2, chunk]).choice(self.n_groups, size=U, p=w / w.sum())
         else:
-            group = (unit * 2654435761) % self.n_groups      # spread units over groups
+            group = (unit * 2654435761) % self.n_groups  # spread units over groups
         utype = rng.normal(0, 1, U)
         alpha = self.unit_conf * utype + rng.normal(0, 1, U)
 
@@ -142,7 +161,7 @@ class PanelDGP:
 
         # categories: a unit's base class, which may switch once
         base = rng.integers(0, self.n_cat, U)
-        switch = rng.integers(0, 2 * T, U)                   # many never switch
+        switch = rng.integers(0, 2 * T, U)  # many never switch
         cat = np.where(t >= switch[ui], (base[ui] + 1) % self.n_cat, base[ui])
 
         # AR(1) errors within unit: e_t = rho e_{t-1} + sqrt(1-rho^2) z_t
@@ -150,14 +169,28 @@ class PanelDGP:
         e = _ar1(z, length, self.rho)
         scale = 1 + self.hetero * np.abs(x["x1"])
         th = np.asarray(self.theta, float)
-        y = (th[cat] * x["x1"] + self.beta2 * x["x2"] + self.beta3 * x["x3"]
-             + alpha[ui] + gamma[t] + delta[g, t] + self.noise_sd * scale * e)
-        return pl.DataFrame({
-            "unit": unit[ui].astype(np.int64), "group": g.astype(np.int32),
-            "time": t.astype(np.int32), "cat": cat.astype(np.int16),
-            "x1": x["x1"], "x2": x["x2"], "x3": x["x3"], "y": y,
-            "w": rng.uniform(0.5, 2.0, n),
-        })
+        y = (
+            th[cat] * x["x1"]
+            + self.beta2 * x["x2"]
+            + self.beta3 * x["x3"]
+            + alpha[ui]
+            + gamma[t]
+            + delta[g, t]
+            + self.noise_sd * scale * e
+        )
+        return pl.DataFrame(
+            {
+                "unit": unit[ui].astype(np.int64),
+                "group": g.astype(np.int32),
+                "time": t.astype(np.int32),
+                "cat": cat.astype(np.int16),
+                "x1": x["x1"],
+                "x2": x["x2"],
+                "x3": x["x3"],
+                "y": y,
+                "w": rng.uniform(0.5, 2.0, n),
+            }
+        )
 
 
 def _ar1(z: np.ndarray, lengths: np.ndarray, rho: float) -> np.ndarray:
@@ -165,7 +198,7 @@ def _ar1(z: np.ndarray, lengths: np.ndarray, rho: float) -> np.ndarray:
     Vectorised over blocks: iterate over the position within the block."""
     out = np.empty_like(z)
     starts = np.cumsum(lengths) - lengths
-    s = math.sqrt(1 - rho ** 2)
+    s = math.sqrt(1 - rho**2)
     out[starts] = z[starts]
     maxlen = int(lengths.max()) if len(lengths) else 0
     for j in range(1, maxlen):

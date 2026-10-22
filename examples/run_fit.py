@@ -12,10 +12,12 @@ SOURCE = "/path/to/panel/*.parquet"
 # Partition key: groups never split across shards. Choose the key that the
 # most FEs (and ideally the cluster variable) are nested in. `dfeols info`
 # on the prepared data shows what is local and what crosses shards.
-PREP = dict(partition="unit",
-            fixed_effects=["unit", "time"],      # every FE any spec uses
-            clusters=["unit"],                   # every cluster variable any spec uses
-            target_rows=2_000_000)
+PREP = dict(
+    partition="unit",
+    fixed_effects=["unit", "time"],  # every FE any spec uses
+    clusters=["unit"],  # every cluster variable any spec uses
+    target_rows=2_000_000,
+)
 
 SPECS = {
     "main": dict(formula="y ~ x1 + x2 | unit + time", cluster="unit"),
@@ -24,7 +26,7 @@ SPECS = {
 
 
 def main():
-    prof = dfeols.profile()                       # $DFEOLS_PROFILE or the config default
+    prof = dfeols.profile()  # $DFEOLS_PROFILE or the config default
     shard_dir = prof.scratch_dir("shards", "mydata")
     ex = dfeols.executor(prof)
     try:

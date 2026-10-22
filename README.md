@@ -50,12 +50,20 @@ pytest -q tests/
 ```python
 import dfeols
 
-ds = dfeols.prep("/data/panel/*.parquet", shard_dir="/scratch/me/shards/panel",
-                 partition="unit", fixed_effects=["unit", "time"], clusters=["unit", "state"])
+ds = dfeols.prep(
+    "/data/panel/*.parquet",
+    shard_dir="/scratch/me/shards/panel",
+    partition="unit",
+    fixed_effects=["unit", "time"],
+    clusters=["unit", "state"],
+)
 
-ex = dfeols.executor("mycluster")          # or "local", or omit for serial
+ex = dfeols.executor("mycluster")  # or "local", or omit for serial
 res = dfeols.fit(ds, "y ~ x1 + x2:i(size) | unit + time", cluster="state", executor=ex)
-print(res.summary()); res.tidy(); res.coef(); res.vcov()
+print(res.summary())
+res.tidy()
+res.coef()
+res.vcov()
 ```
 
 ### Formula syntax

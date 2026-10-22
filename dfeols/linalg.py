@@ -10,7 +10,7 @@ def collinear_keep(ZtZ: np.ndarray, tol: float = 1e-9) -> np.ndarray:
     Returns a boolean mask of columns to keep."""
     k = ZtZ.shape[0]
     keep = np.zeros(k, dtype=bool)
-    L = np.zeros((k, k))          # lower-triangular factor of kept columns
+    L = np.zeros((k, k))  # lower-triangular factor of kept columns
     m = 0
     kept: list[int] = []
     for j in range(k):

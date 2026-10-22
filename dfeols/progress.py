@@ -45,8 +45,8 @@ def fmt_td(s: float | None) -> str:
 @dataclass
 class StageProgress:
     name: str
-    rows: dict[int, int]                      # task id -> rows
-    done: dict[int, float] = field(default_factory=dict)       # task id -> seconds
+    rows: dict[int, int]  # task id -> rows
+    done: dict[int, float] = field(default_factory=dict)  # task id -> seconds
     started: float | None = None
     finished: float | None = None
 
@@ -73,8 +73,13 @@ class StageProgress:
 
 
 class Progress:
-    def __init__(self, workdir: str | os.PathLike | None, label: str = "",
-                 every: float = 30.0, round2_recomputes: bool = False):
+    def __init__(
+        self,
+        workdir: str | os.PathLike | None,
+        label: str = "",
+        every: float = 30.0,
+        round2_recomputes: bool = False,
+    ):
         self.round2_recomputes = round2_recomputes
         self.workdir = Path(workdir) if workdir else None
         self.label = label
@@ -83,11 +88,11 @@ class Progress:
         self.order: list[str] = []
         self.t0 = time.time()
         self._last = 0.0
-        self.stage2_prior_frac: float | None = None   # round2 secs / round1 secs per row
+        self.stage2_prior_frac: float | None = None  # round2 secs / round1 secs per row
         self.slots = 1
         self.max_slots: int | None = None
         self.running: dict[str, set[int]] = {}
-        self.history: list[dict] = []          # (time, progress, ETA) per tick
+        self.history: list[dict] = []  # (time, progress, ETA) per tick
 
     # --- bookkeeping -----------------------------------------------------
     def add_stage(self, name: str, rows: dict[int, int]):
@@ -164,26 +169,34 @@ class Progress:
                 total_known = False
             else:
                 total_eta += eta
-            stages.append({
-                "stage": name,
-                "tasks_done": len(st.done), "tasks": len(st.rows),
-                "rows_done": st.done_rows, "rows": st.total_rows,
-                "pct_rows": round(100 * st.done_rows / max(st.total_rows, 1), 1),
-                "rows_per_sec_per_worker": (1 / rate) if rate else None,
-                "rate_projected": projected,
-                "eta_seconds": eta, "eta_band_seconds": band,
-                "eta_seconds_at_max_workers": eta_max,
-                "elapsed_seconds": (now - st.started) if st.started else 0,
-                "finished": bool(st.finished),
-            })
+            stages.append(
+                {
+                    "stage": name,
+                    "tasks_done": len(st.done),
+                    "tasks": len(st.rows),
+                    "rows_done": st.done_rows,
+                    "rows": st.total_rows,
+                    "pct_rows": round(100 * st.done_rows / max(st.total_rows, 1), 1),
+                    "rows_per_sec_per_worker": (1 / rate) if rate else None,
+                    "rate_projected": projected,
+                    "eta_seconds": eta,
+                    "eta_band_seconds": band,
+                    "eta_seconds_at_max_workers": eta_max,
+                    "elapsed_seconds": (now - st.started) if st.started else 0,
+                    "finished": bool(st.finished),
+                }
+            )
         return {
             "label": self.label,
             "updated": time.strftime("%Y-%m-%d %H:%M:%S"),
             "elapsed_seconds": now - self.t0,
-            "workers": self.slots, "max_workers": self.max_slots,
+            "workers": self.slots,
+            "max_workers": self.max_slots,
             "stages": stages,
             "eta_total_seconds": total_eta if total_known else None,
-            "finish_time": time.strftime("%a %H:%M", time.localtime(now + total_eta)) if total_known else None,
+            "finish_time": time.strftime("%a %H:%M", time.localtime(now + total_eta))
+            if total_known
+            else None,
         }
 
     def line(self, snap: dict) -> str:
@@ -218,9 +231,14 @@ class Progress:
         log.info(self.line(snap))
         rows_all = sum(st.total_rows for st in self.stages.values())
         done_all = sum(st.done_rows for st in self.stages.values())
-        self.history.append({"t": now - self.t0, "workers": self.slots,
-                             "frac_done": done_all / max(rows_all, 1),
-                             "eta_total": snap["eta_total_seconds"]})
+        self.history.append(
+            {
+                "t": now - self.t0,
+                "workers": self.slots,
+                "frac_done": done_all / max(rows_all, 1),
+                "eta_total": snap["eta_total_seconds"],
+            }
+        )
         if self.workdir:
             self.workdir.mkdir(parents=True, exist_ok=True)
             with open(self.workdir / "history.jsonl", "a") as fh:

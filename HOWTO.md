@@ -44,15 +44,18 @@ Every model on that dataset reuses the shards.
 
 ```python
 import dfeols
+
 prof = dfeols.profile()
 ex = dfeols.executor(prof)
-ds = dfeols.prep("/data/panel/*.parquet",                # Parquet files (or a frame / CSV without executor)
-                 shard_dir=prof.scratch_dir("shards", "panel"),
-                 executor=ex,                               # prep on the workers
-                 partition="unit",                          # groups never split across shards
-                 fixed_effects=["unit", "time", "unit^quarter"],   # every FE any model uses
-                 clusters=["unit", "state"],                # every cluster variable any model uses
-                 target_rows=2_000_000)                     # rows per shard
+ds = dfeols.prep(
+    "/data/panel/*.parquet",  # Parquet files (or a frame / CSV without executor)
+    shard_dir=prof.scratch_dir("shards", "panel"),
+    executor=ex,  # prep on the workers
+    partition="unit",  # groups never split across shards
+    fixed_effects=["unit", "time", "unit^quarter"],  # every FE any model uses
+    clusters=["unit", "state"],  # every cluster variable any model uses
+    target_rows=2_000_000,
+)  # rows per shard
 ```
 
 **Choose the partition key** so that the most FEs are nested in it.
@@ -125,9 +128,10 @@ Copy `examples/run_fit.py`, set `SOURCE`, `PREP` and `SPECS`:
 
 ```python
 SPECS = {
-  "main": dict(formula="y ~ x1 + x2:i(size) | unit + time", cluster="state"),
-  "alt":  dict(formula="y + y2 ~ x1 + x2 | unit + group^time", cluster="unit", weights="w",
-               vcov=["CRV1", "hetero"]),
+    "main": dict(formula="y ~ x1 + x2:i(size) | unit + time", cluster="state"),
+    "alt": dict(
+        formula="y + y2 ~ x1 + x2 | unit + group^time", cluster="unit", weights="w", vcov=["CRV1", "hetero"]
+    ),
 }
 ```
 

@@ -32,8 +32,14 @@ from .site import Profile, profile as load_profile
 
 log = logging.getLogger("dfeols")
 
-THREAD_VARS = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
-               "NUMBA_NUM_THREADS", "RAYON_NUM_THREADS", "POLARS_MAX_THREADS")
+THREAD_VARS = (
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "NUMBA_NUM_THREADS",
+    "RAYON_NUM_THREADS",
+    "POLARS_MAX_THREADS",
+)
 
 
 # --------------------------------------------------------------- utilities
@@ -71,6 +77,7 @@ def native_walltime(s: str, scheduler: str) -> str:
 def private_interface() -> str | None:
     """A network interface with a private IPv4 address, preferring 10.x."""
     import psutil
+
     best = []
     stats = psutil.net_if_stats()
     for name, addrs in psutil.net_if_addrs().items():
@@ -89,6 +96,7 @@ def private_interface() -> str | None:
 
 def _interface_ips(name: str) -> list[str]:
     import psutil
+
     return [a.address for a in psutil.net_if_addrs().get(name, []) if a.family == socket.AF_INET]
 
 
@@ -102,6 +110,7 @@ def fix_scheduler_env(scheduler: str) -> None:
 
 def _memory_bytes(mem: str) -> int:
     from dask.utils import parse_bytes
+
     return int(parse_bytes(mem))
 
 
@@ -122,8 +131,14 @@ def _job_kwargs(p: Profile, cores: int, memory: str, walltime: str, *, worker: b
     """dask-jobqueue keyword arguments that book `cores` CPUs and `memory`
     for one job, with a single Dask task slot (one shard at a time)."""
     s = p.scheduler
-    kw = dict(cores=1, processes=1, memory=memory, walltime=native_walltime(walltime, s), queue=p.queue,
-              job_extra_directives=list(p.extra_directives))
+    kw = dict(
+        cores=1,
+        processes=1,
+        memory=memory,
+        walltime=native_walltime(walltime, s),
+        queue=p.queue,
+        job_extra_directives=list(p.extra_directives),
+    )
     if s in ("slurm", "pbs") and p.account:
         kw["account"] = p.account
     if p.project and s in ("pbs", "sge", "lsf"):
@@ -148,8 +163,12 @@ def _job_kwargs(p: Profile, cores: int, memory: str, walltime: str, *, worker: b
 
 
 _CLASSES = {"slurm": "SLURMCluster", "pbs": "PBSCluster", "sge": "SGECluster", "lsf": "LSFCluster"}
-_JOBS = {"slurm": ("dask_jobqueue.slurm", "SLURMJob"), "pbs": ("dask_jobqueue.pbs", "PBSJob"),
-         "sge": ("dask_jobqueue.sge", "SGEJob"), "lsf": ("dask_jobqueue.lsf", "LSFJob")}
+_JOBS = {
+    "slurm": ("dask_jobqueue.slurm", "SLURMJob"),
+    "pbs": ("dask_jobqueue.pbs", "PBSJob"),
+    "sge": ("dask_jobqueue.sge", "SGEJob"),
+    "lsf": ("dask_jobqueue.lsf", "LSFJob"),
+}
 
 
 # ------------------------------------------------------------- executors
@@ -158,12 +177,13 @@ def make_cluster(p: Profile, log_directory: str | None = None):
     w = p.worker
     if p.scheduler == "local":
         from distributed import LocalCluster
+
         for v in THREAD_VARS:  # workers inherit the parent's environment
             os.environ.setdefault(v, str(w["cores"]))
-        return LocalCluster(n_workers=0, threads_per_worker=1, processes=True,
-                            dashboard_address=None)
+        return LocalCluster(n_workers=0, threads_per_worker=1, processes=True, dashboard_address=None)
 
     import dask_jobqueue
+
     fix_scheduler_env(p.scheduler)
     kw = _job_kwargs(p, w["cores"], w["memory"], w["walltime"], worker=True)
     if p.interface:
@@ -183,11 +203,13 @@ def make_cluster(p: Profile, log_directory: str | None = None):
         local_directory=w.get("local_directory") or "${TMPDIR:-/tmp}",
         job_script_prologue=list(p.prologue) + _env_lines(p, w["cores"], w["memory"]),
         worker_extra_args=["--lifetime", f"{life}s", "--lifetime-stagger", "5m"],
-        **kw)
+        **kw,
+    )
 
 
-def executor(profile: str | Profile | None = None, *, tick: float = 10.0,
-             log_directory: str | None = None, **overrides):
+def executor(
+    profile: str | Profile | None = None, *, tick: float = 10.0, log_directory: str | None = None, **overrides
+):
     """Return a DaskExecutor whose workers come from the profile's scheduler.
 
     Worker settings (cores, memory, walltime, max_workers, min_workers,
@@ -211,25 +233,36 @@ def executor(profile: str | Profile | None = None, *, tick: float = 10.0,
         # the coordinator solves). Release only after `idle_minutes` idle.
         interval = 10.0
         wait = max(int(60 * float(w.get("idle_minutes", 15)) / interval), 1)
-        cl.adapt(minimum_jobs=w["min_workers"], maximum_jobs=w["max_workers"],
-                 interval=f"{interval}s", wait_count=wait)
+        cl.adapt(
+            minimum_jobs=w["min_workers"],
+            maximum_jobs=w["max_workers"],
+            interval=f"{interval}s",
+            wait_count=wait,
+        )
     client = Client(cl)
     ex = DaskExecutor(client, max_workers=w["max_workers"], tick=tick)
     ex.cluster = cl
     ex.profile = p
-    log.info("cluster: profile %r (%s), up to %d workers x %s cores, %s, walltime %s",
-             p.name, p.scheduler, w["max_workers"], w["cores"], w["memory"], w["walltime"])
+    log.info(
+        "cluster: profile %r (%s), up to %d workers x %s cores, %s, walltime %s",
+        p.name,
+        p.scheduler,
+        w["max_workers"],
+        w["cores"],
+        w["memory"],
+        w["walltime"],
+    )
     return ex
 
 
 # ---------------------------------------------------- coordinator scripts
-def coordinator_script(p: Profile, command: str, job_name: str = "dfeols",
-                       output: str | None = None) -> str:
+def coordinator_script(p: Profile, command: str, job_name: str = "dfeols", output: str | None = None) -> str:
     """A batch script that runs `command` as the long-lived coordinator."""
     c = p.coordinator
     lines = ["#!/usr/bin/env bash"]
     if p.scheduler != "local":
         import importlib
+
         mod, name = _JOBS[p.scheduler]
         Job = getattr(importlib.import_module(mod), name)
         kw = _job_kwargs(p, c["cores"], c["memory"], c["walltime"], worker=False)
@@ -239,7 +272,7 @@ def coordinator_script(p: Profile, command: str, job_name: str = "dfeols",
         if p.scheduler == "slurm":
             lines.append(f"#SBATCH -o {out}")
         elif p.scheduler == "pbs":
-            lines.append("#PBS -j oe")       # output: <job_name>.o<jobid> in the submit dir
+            lines.append("#PBS -j oe")  # output: <job_name>.o<jobid> in the submit dir
         elif p.scheduler == "sge":
             lines.append(f"#$ -o {out.replace('%j', '$JOB_ID')}")
         elif p.scheduler == "lsf":
@@ -251,7 +284,7 @@ def coordinator_script(p: Profile, command: str, job_name: str = "dfeols",
     lines += _env_lines(p, c["cores"], c["memory"])
     lines += ["export PYTHONUNBUFFERED=1", f"export DFEOLS_PROFILE={shlex.quote(p.name)}"]
     if p.scheduler == "slurm":
-        lines.append('# configless Slurm: a /proc SLURM_CONF breaks nested sbatch')
+        lines.append("# configless Slurm: a /proc SLURM_CONF breaks nested sbatch")
         lines.append('if [[ "${SLURM_CONF:-}" == /proc/* ]]; then unset SLURM_CONF; fi')
     lines += ["", command, ""]
     return "\n".join(lines)
@@ -263,12 +296,20 @@ def submit(script: str, p: Profile, path: str | os.PathLike | None = None) -> st
     path.write_text(script)
     path.chmod(0o755)
     if p.scheduler == "local":
-        proc = subprocess.Popen(["bash", str(path)], stdout=open(Path(path).with_suffix(".out"), "w"),
-                                stderr=subprocess.STDOUT, start_new_session=True)
+        proc = subprocess.Popen(
+            ["bash", str(path)],
+            stdout=open(Path(path).with_suffix(".out"), "w"),
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
         return f"started local process {proc.pid}, output in {Path(path).with_suffix('.out')}"
     fix_scheduler_env(p.scheduler)
-    cmd = {"slurm": ["sbatch", str(path)], "pbs": ["qsub", str(path)],
-           "sge": ["qsub", str(path)], "lsf": ["bsub"]}[p.scheduler]
+    cmd = {
+        "slurm": ["sbatch", str(path)],
+        "pbs": ["qsub", str(path)],
+        "sge": ["qsub", str(path)],
+        "lsf": ["bsub"],
+    }[p.scheduler]
     stdin = open(path) if p.scheduler == "lsf" else None
     r = subprocess.run(cmd, stdin=stdin, capture_output=True, text=True)
     if r.returncode:
