@@ -53,11 +53,17 @@ layout, plus:
   dataset.
 - The ETA no longer crashes with `OverflowError` when no workers are
   connected (an infinite ETA is reported as unknown).
+- Prep tasks counted their output by listing the folder they had written
+  into. On Lustre, listing a folder that 40 workers are writing into can
+  return an entry twice, so a bucket file was counted twice per repeated
+  entry: "encoded 10,002,000,000 rows, expected 10,000,000,000" at 1e10, with
+  every file on disk correct (10 entries of 200,000 rows; the earlier +2.8M
+  and +400k were the same). Tasks now count exactly the files they handed to
+  Polars, and the input file list is deduplicated.
 - Every encode and split task checks that it wrote exactly the rows the scan
   counted for its input; on a mismatch it deletes its own files and reruns
   (up to 3 attempts), and otherwise fails naming the task and keeping its
-  files for inspection. (At 1e10 rows one group's 2,000,000 rows were
-  written twice: "encoded 10,002,000,000 rows, expected 10,000,000,000".)
+  files for inspection.
 - Dask task keys include a per-run id; every prep used the same keys
   (`dfeols-encode-prep-17`), so a second prep in the same job could be handed
   a result Dask still held for the first.

@@ -442,3 +442,31 @@ def test_task_that_writes_extra_rows_is_retried(tmp_path, monkeypatch, opts):
             **opts,
             **kw,
         )
+
+
+@pytest.mark.parametrize("opts", [{}, {"max_files": 0}], ids=["direct", "two-level"])
+def test_repeated_directory_entries_are_not_counted(tmp_path, monkeypatch, opts):
+    """Listing a folder that many workers write into can return an entry twice
+    on Lustre (regression: every file on disk was correct, yet the tally said
+    "encoded 10,002,000,000 rows, expected 10,000,000,000"). Tasks count the
+    files they wrote, not what a listing shows."""
+    import glob as glob_mod
+    import pathlib
+
+    d = PanelDGP(n_units=2000, units_per_chunk=200, T=10, n_groups=20, balanced=True)
+    raw, truth = _gen(tmp_path, d, "p")
+    src = str(raw / "*.parquet")
+    kw = dict(partition="group", target_rows=4000, **truth["prep"])
+    ref = dfeols.prep(src, shard_dir=tmp_path / "ref", **kw)
+
+    real_glob, real_scandir, real_globg = pathlib.Path.glob, os.scandir, glob_mod.glob
+    monkeypatch.setattr(
+        pathlib.Path, "glob", lambda self, pat: (lambda r: r + r[:3])(list(real_glob(self, pat)))
+    )
+    monkeypatch.setattr(glob_mod, "glob", lambda *a, **k: (lambda r: r + r[:3])(real_globg(*a, **k)))
+    b = dfeols.prep(
+        src, shard_dir=tmp_path / "b", executor=dfeols.SerialExecutor(), rows_per_task=4000, **opts, **kw
+    )
+    monkeypatch.setattr(os, "scandir", real_scandir)
+    assert b.n_rows == ref.n_rows
+    assert sum(_nrows(str(tmp_path / "b" / f)) for s in b.shards for f in s["files"]) == ref.n_rows

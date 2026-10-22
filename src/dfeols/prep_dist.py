@@ -43,9 +43,9 @@ def _files(source) -> list[str]:
     else:
         s = str(source)
         out = (
-            sorted(_glob.glob(s))
+            sorted(set(_glob.glob(s)))  # set: a listing can repeat entries on parallel filesystems
             if any(ch in s for ch in "*?[")
-            else (sorted(str(p) for p in Path(s).glob("*.parquet")) if Path(s).is_dir() else [s])
+            else (sorted({str(p) for p in Path(s).glob("*.parquet")}) if Path(s).is_dir() else [s])
         )
     if not out:
         raise FileNotFoundError(f"no input files match {source!r}")
@@ -175,6 +175,23 @@ def _range_key(partition: list[str], schema) -> pl.Expr:
     return pl.struct(partition).hash(seed=SEED_PART)
 
 
+def _count_written(paths, key_of) -> tuple[dict, dict]:
+    """Rows and file names per key for the files a task wrote. The paths are
+    the ones the task handed to Polars (recorded in its file_path_provider),
+    never a directory listing: listing a folder that 40 workers are writing
+    into can return an entry twice on Lustre, which counted one bucket file
+    twice per duplicate entry ("encoded 10,002,000,000 rows, expected
+    10,000,000,000" at 1e10, with every file on disk correct)."""
+    rows, names = {}, {}
+    for f in sorted({Path(q) for q in paths}):
+        if not f.exists():
+            continue
+        k = key_of(f.name)
+        rows[k] = rows.get(k, 0) + _nrows(str(f))
+        names.setdefault(k, []).append(f.name)
+    return rows, names
+
+
 def _piece_name(sid: int, task_id: int, token: str, i: int) -> str:
     return f"s{sid:06d}_t{task_id:05d}_{token}_{i}.parquet"
 
@@ -252,37 +269,34 @@ def _encode_task(
         bdir.mkdir(exist_ok=True)
         lf = lf.with_columns((pl.col("__shard") % n_buckets).cast(pl.UInt32).alias("__bucket"))
 
+        made: list[str] = []
+
         def bprov(a):
             b = int(a.partition_keys["__bucket"][0])
-            return str(bdir / f"b{b:05d}_t{task_id:05d}_{token}_{a.index_in_partition}.parquet")
+            made.append(str(bdir / f"b{b:05d}_t{task_id:05d}_{token}_{a.index_in_partition}.parquet"))
+            return made[-1]
 
         lf.sink_parquet(
             pl.PartitionBy(str(bdir), key="__bucket", include_key=False, file_path_provider=bprov),
             mkdir=True,
             engine="streaming",
         )
-        rows, names = {}, {}
-        for f in sorted(bdir.glob(f"b*_t{task_id:05d}_{token}_*.parquet")):
-            k = -1 - int(f.name[1:6])
-            rows[k] = rows.get(k, 0) + _nrows(str(f))
-            names.setdefault(k, []).append(f.name)
+        rows, names = _count_written(made, lambda n: -1 - int(n[1:6]))
         return {"rows": rows, "files": names, "timing": {"total": time.perf_counter() - t}}
 
+    made = []
+
     def provider(a):
-        return str(
-            out / _piece_name(int(a.partition_keys["__shard"][0]), task_id, token, a.index_in_partition)
-        )
+        sid = int(a.partition_keys["__shard"][0])
+        made.append(str(out / _piece_name(sid, task_id, token, a.index_in_partition)))
+        return made[-1]
 
     lf.sink_parquet(
         pl.PartitionBy(str(out), key="__shard", include_key=False, file_path_provider=provider),
         mkdir=True,
         engine="streaming",
     )
-    rows, names = {}, {}
-    for f in sorted(out.glob(f"s*_t{task_id:05d}_{token}_*.parquet")):
-        sid = int(f.name[1:7])
-        rows[sid] = rows.get(sid, 0) + _nrows(str(f))
-        names.setdefault(sid, []).append(f.name)
+    rows, names = _count_written(made, lambda n: int(n[1:7]))
     return {"rows": rows, "files": names, "timing": {"total": time.perf_counter() - t}}
 
 
@@ -331,20 +345,19 @@ def _split_task(bucket, root, inputs):
     files = [str(root / "_buckets" / n) for n in inputs]
     rows, names = {}, {}
     if files:
+        made: list[str] = []
 
         def prov(a):
             sid = int(a.partition_keys["__shard"][0])
-            return str(out / f"s{sid:06d}_b{bucket:05d}_{token}_{a.index_in_partition}.parquet")
+            made.append(str(out / f"s{sid:06d}_b{bucket:05d}_{token}_{a.index_in_partition}.parquet"))
+            return made[-1]
 
         pl.scan_parquet(files).sink_parquet(
             pl.PartitionBy(str(out), key="__shard", include_key=False, file_path_provider=prov),
             mkdir=True,
             engine="streaming",
         )
-        for f in sorted(out.glob(f"s*_b{bucket:05d}_{token}_*.parquet")):
-            sid = int(f.name[1:7])
-            rows[sid] = rows.get(sid, 0) + _nrows(str(f))
-            names.setdefault(sid, []).append(f.name)
+        rows, names = _count_written(made, lambda n: int(n[1:7]))
     return {"rows": rows, "files": names, "timing": {"total": time.perf_counter() - t}}
 
 
