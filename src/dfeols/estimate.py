@@ -4,12 +4,15 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import shutil
 import time
 from pathlib import Path
 
 import numpy as np
+import polars as pl
 
 from .executors import SerialExecutor
 from .formula import fe_components, parse
@@ -28,6 +31,76 @@ def _norm(name: str) -> str:
     return "^".join(fe_components(name))
 
 
+def _levels_task(paths: list[str], cols: list[str]) -> dict:
+    t = time.perf_counter()
+    lf = pl.scan_parquet(paths)
+    frames = pl.collect_all([lf.select(c).drop_nulls().unique() for c in cols], engine="streaming")
+    return {
+        "levels": {c: fr[c].to_list() for c, fr in zip(cols, frames)},
+        "timing": {"total": time.perf_counter() - t},
+    }
+
+
+def category_levels(ds: Dataset, cols: list[str], executor=None) -> dict[str, list]:
+    """Sorted levels of each i() variable, read on the executor's workers and
+    cached in <shard_dir>/_levels/ (the dataset never changes after prep).
+
+    Reading one column of every shard on the coordinator took 55 minutes at
+    1e10 rows on Lustre, before any worker started; as tasks over batches of
+    shards it is a short map/reduce, and later fits on the same data reuse it."""
+    out, todo = {}, []
+    cache = ds.root / "_levels"
+    for c in cols:
+        f = cache / f"{c}.json"
+        try:
+            d = json.loads(f.read_text())
+            if d.get("n_rows") == ds.n_rows:
+                out[c] = d["levels"]
+                continue
+        except (FileNotFoundError, ValueError, KeyError):
+            pass
+        todo.append(c)
+    if not todo:
+        return out
+    executor = executor or SerialExecutor()
+    n_tasks = max(1, min(len(ds.shards), 4 * int(getattr(executor, "max_workers", None) or 1)))
+    groups: list[list[dict]] = [[] for _ in range(n_tasks)]
+    for i, s in enumerate(ds.shards):
+        groups[i % n_tasks].append(s)
+    tasks = [
+        (i, max(sum(s["rows"] for s in g), 1), ([p for s in g for p in ds.shard_paths(s)], todo))
+        for i, g in enumerate(groups)
+        if g
+    ]
+    found: dict[str, set] = {c: set() for c in todo}
+    seen: set = set()
+
+    def on_result(tid, r):
+        if tid in seen:
+            return
+        seen.add(tid)
+        for c in todo:
+            found[c].update(r["levels"][c])
+
+    t0 = time.time()
+    prog = Progress(None, label="levels", every=60)
+    prog.add_stage("levels", {tid: rows for tid, rows, _ in tasks})
+    prog.start("levels")
+    executor.run(_levels_task, tasks, on_result, prog, "levels")
+    prog.finish("levels")
+    cache.mkdir(exist_ok=True)
+    for c in todo:
+        out[c] = sorted(found[c])
+        try:
+            tmp = cache / f".{c}.json.tmp"
+            tmp.write_text(json.dumps({"levels": out[c], "n_rows": ds.n_rows}))
+            os.replace(tmp, cache / f"{c}.json")
+        except (TypeError, ValueError, OSError):  # unusual level types: just don't cache
+            pass
+    log.info("fit: levels of %s from %d tasks (%.0fs)", ", ".join(todo), len(tasks), time.time() - t0)
+    return out
+
+
 def build_plan(
     ds: Dataset,
     formula: str,
@@ -41,6 +114,7 @@ def build_plan(
     fe_tol: float = 1e-10,
     fe_method: str = "auto",
     crossing_fe: str = "auto",
+    executor=None,
 ) -> Plan:
     f = parse(formula)
     local, glob = [], []
@@ -78,10 +152,10 @@ def build_plan(
             raise ValueError("CRV1 needs cluster=")
 
     cats = sorted({t.cat for t in f.terms if t.cat})
-    cat_levels = {}
-    for c in cats:
-        lv = ds.scan([c]).drop_nulls().unique().collect(engine="streaming")[c].to_list()
-        cat_levels[c] = sorted(lv)
+    missing_cats = set(cats) - set(ds.columns)
+    if missing_cats:
+        raise KeyError(f"Variables not in the prepared data: {sorted(missing_cats)}")
+    cat_levels = category_levels(ds, cats, executor)
     missing = (f.variables | ({weights} if weights else set())) - set(ds.columns)
     if missing:
         raise KeyError(f"Variables not in the prepared data: {sorted(missing)}")
@@ -234,6 +308,7 @@ def fit(
         fe_tol=fe_tol,
         fe_method=fe_method,
         crossing_fe=crossing_fe,
+        executor=executor,
     )
     if plan.sparse_global and plan.cache_dir:
         plan.cache_dir = None  # recomputing is cheap on this path

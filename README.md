@@ -163,6 +163,12 @@ OSCER) with up to 40 four-core workers (about 36 on average):
 | prep by unit / by group (distributed) | 700 s / 543 s | 524 s / 1300 s |
 | recovers the truth | yes | yes |
 
+At **1e10 rows** (100M units × T=100, 5,000 shards per set, up to 40
+workers), both specs recovered the truth (`unit + time`: max |z| 0.35;
+`unit + group^time`: max |z| 1.79). Rounds 1 and 2 took about an hour per
+fit, peak worker memory was 3.8 GB, and each shard set took 75–90 minutes
+to prepare.
+
 Reproduce with `dfeols bench --profile <name> --preset units10m_t100` (or
 `units1m_t1000`); see [HOWTO.md](https://github.com/jemather/dfeols/blob/main/HOWTO.md#scaling-to-a-billion-rows-and-beyond)
 for resource budgets and the 1e10-row stress presets.

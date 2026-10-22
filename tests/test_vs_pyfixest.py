@@ -259,3 +259,32 @@ def test_status_file_and_result_roundtrip(ds, tmp_path):
     r2 = dfeols.Result.load(tmp_path / "result.json")
     np.testing.assert_allclose(r.coef(), r2.coef())
     np.testing.assert_allclose(r.vcov(), r2.vcov())
+
+
+def test_category_levels_on_workers_and_cached(tmp_path):
+    """i() levels are read by executor tasks and cached in the shard folder
+    (regression: one coordinator process read the column from all 5,000 shards,
+    55 minutes at 1e10 rows before round 1 started)."""
+    import json
+
+    from dfeols.estimate import category_levels
+
+    data = sim_panel(n_accounts=30, followers_per=20, weeks=12, seed=3)
+    ds = dfeols.prep(
+        data, shard_dir=tmp_path / "s", partition="id_a", fixed_effects=["spell", "week"], target_rows=500
+    )
+    calls = []
+
+    class Counting(dfeols.SerialExecutor):
+        def run(self, fn, tasks, on_result, progress, stage, local_help=False):
+            calls.append((stage, len(tasks)))
+            return super().run(fn, tasks, on_result, progress, stage, local_help)
+
+    lv = category_levels(ds, ["tbin"], Counting())
+    assert lv["tbin"] == sorted(data["tbin"].drop_nulls().unique().to_list())
+    assert calls == [("levels", min(len(ds.shards), 4))]
+    assert json.loads((ds.root / "_levels" / "tbin.json").read_text())["levels"] == lv["tbin"]
+    assert category_levels(ds, ["tbin"], Counting()) == lv and len(calls) == 1  # cached
+    r = dfeols.fit(ds, "eng ~ feat:i(tbin) | spell + week", executor=Counting(), log_every=1e9)
+    assert calls[1:] and all(stage != "levels" for stage, _ in calls[1:])  # fit reused the cache
+    assert len(r.coefnames) == len(lv["tbin"])

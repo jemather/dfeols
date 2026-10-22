@@ -104,14 +104,23 @@ class _Compactor:
 
 # ------------------------------------------------------------------ tasks
 def _scan_task(files, cols, key_cols, specs, partition, checks):
+    """Scan a batch of input files. Level sets and nesting checks are reduced
+    over the whole batch here, on the worker: per file, each would repeat the
+    same tables (at 1e10 rows, 5,000 copies of 500k group x time rows shipped
+    to and merged on the coordinator made the scan coordinator-bound). Row
+    counts and partition-group counts stay per file (`__path`)."""
     t = time.perf_counter()
-    lf = pl.scan_parquet(files).select(cols).drop_nulls(subset=key_cols)
-    q = {"__n": lf.select(pl.len())}
+    lf = (
+        pl.scan_parquet(files, include_file_paths="__path")
+        .select([*cols, "__path"])
+        .drop_nulls(subset=key_cols)
+    )
+    q = {}
     for name, comps in specs.items():
         q[f"L:{name}"] = lf.select(comps).unique()
     # Int64, not polars' UInt32 len(): row arithmetic on these counts (cumulative
     # sums, x n_bins) exceeds 2**32 at 1e9 rows and would wrap silently.
-    q["P"] = lf.group_by(partition).agg(pl.len().cast(pl.Int64).alias("_n"))
+    q["P"] = lf.group_by([*partition, "__path"]).agg(pl.len().cast(pl.Int64).alias("_n"))
     # nesting: per inner level, the min and max of a hash of the outer key.
     # Inner is nested in outer iff min == max for every level across all
     # tasks. Size scales with inner levels per file, never with rows.
@@ -121,7 +130,13 @@ def _scan_task(files, cols, key_cols, specs, partition, checks):
     keys = list(q)
     frames = pl.collect_all([q[k] for k in keys], engine="streaming")
     out = dict(zip(keys, frames))
-    return {"n": int(out.pop("__n").item()), "frames": out, "timing": {"total": time.perf_counter() - t}}
+    per_file = out["P"].group_by("__path").agg(pl.col("_n").sum())
+    n_by_file = dict(zip(per_file["__path"].to_list(), per_file["_n"].to_list()))
+    return {
+        "n_by_file": {f: int(n_by_file.get(f, 0)) for f in files},
+        "frames": out,
+        "timing": {"total": time.perf_counter() - t},
+    }
 
 
 def _range_bins(group_rows: np.ndarray, n_rows: int, n_bins: int) -> np.ndarray:
@@ -455,7 +470,12 @@ def prep_distributed(
 
     rows_in = {i: _nrows(f) for i, f in enumerate(files)}
     prog = Progress(root / "_prep_status", label="prep", every=15)
-    prog.add_stage("scan", {i: max(n, 1) for i, n in rows_in.items()})
+    # scan in batches of files (~4 tasks per worker), contiguous in file order
+    file_idx = {f: i for i, f in enumerate(files)}
+    n_scan = max(1, min(len(files), 4 * max(int(getattr(executor, "max_workers", None) or 1), 1)))
+    per = -(-len(files) // n_scan)
+    scan_batches = [list(range(s, min(s + per, len(files)))) for s in range(0, len(files), per)]
+    prog.add_stage("scan", {b: max(sum(rows_in[i] for i in idx), 1) for b, idx in enumerate(scan_batches)})
 
     # ---------------- scan ----------------
     def _minmax(inner):
@@ -475,18 +495,29 @@ def prep_distributed(
         if tid in scanned:  # a second result for the same task: keep the first
             return
         scanned.add(tid)
-        scan_n[tid] = r["n"]
-        acc["n"] += r["n"]
+        for f, n_f in r["n_by_file"].items():
+            scan_n[file_idx[f]] = n_f
+            acc["n"] += n_f
         for k in specs:
             acc["levels"][k].add(r["frames"][f"L:{k}"])
-        acc["P"].append(r["frames"]["P"].with_columns(pl.lit(tid, pl.UInt32).alias("__file")))
+        acc["P"].append(
+            r["frames"]["P"]
+            .with_columns(pl.col("__path").replace_strict(file_idx, return_dtype=pl.UInt32).alias("__file"))
+            .drop("__path")
+        )
         for i in range(len(checks)):
             acc["C"][i].add(r["frames"][f"C:{i}"])
 
-    log.info("prep: scanning %d files (%s rows) on workers", len(files), f"{sum(rows_in.values()):,}")
+    log.info(
+        "prep: scanning %d files (%s rows) on workers, %d tasks",
+        len(files),
+        f"{sum(rows_in.values()):,}",
+        len(scan_batches),
+    )
     prog.start("scan")
     scan_tasks = [
-        (i, rows_in[i], ([f], cols, key_cols, specs, partition, checks)) for i, f in enumerate(files)
+        (b, sum(rows_in[i] for i in idx), ([files[i] for i in idx], cols, key_cols, specs, partition, checks))
+        for b, idx in enumerate(scan_batches)
     ]
     # the scan is read-only, so the coordinator helps while no workers are up yet
     executor.run(_scan_task, scan_tasks, on_scan, prog, "scan", local_help=True)
@@ -650,7 +681,6 @@ def prep_distributed(
     prog.add_stage("encode", {b: max(n, 1) for b, (_, n) in enumerate(batches)})
     prog.start("encode")
     log.info("prep: encoding in %d tasks of ~%s rows", len(batches), f"{int(rows_per_task):,}")
-    file_idx = {f: i for i, f in enumerate(files)}
     executor.run(
         _encode_checked,
         [

@@ -51,6 +51,14 @@ layout, plus:
 - A `shard_dir` left by an interrupted prep (no `dfeols_meta.json`) is
   cleared before prepping again, so its stale pieces cannot join the new
   dataset.
+- `fit` reads the levels of `i()` variables with executor tasks and caches
+  them in `<shard_dir>/_levels/`; it read the column from every shard on
+  the coordinator, 55 minutes before round 1 at 1e10 rows.
+- The prep scan runs over batches of files (about 4 tasks per worker); each
+  task reduces its level sets and nesting checks before returning, so the
+  coordinator receives one copy per batch instead of one per file. At 1e10
+  rows the per-file results made the by-unit scan coordinator-bound
+  (50 minutes, against 16 for the by-group scan).
 - Prep stages are no longer given an ETA projected from the scan rate (the
   split stage showed "8866M rows/s, ETA 0:00:01" while its 200M-row tasks ran
   for ~20 minutes); the round-1-to-round-2 prior now applies to fits only.
