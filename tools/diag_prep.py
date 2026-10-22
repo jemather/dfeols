@@ -29,6 +29,20 @@ def nrows(p):
     return pq.read_metadata(str(p)).num_rows
 
 
+def nrows_many(paths, what):
+    """Footer reads in parallel: one at a time, 50,000 files take over an hour on Lustre."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    paths = list(paths)
+    out = []
+    with ThreadPoolExecutor(64) as pool:
+        for i, n in enumerate(pool.map(nrows, paths), 1):
+            out.append(n)
+            if i % 5000 == 0 or i == len(paths):
+                print(f"  read {i:,}/{len(paths):,} {what}", flush=True)
+    return out
+
+
 print(f"shard folder: {root}")
 # 1. code tables ------------------------------------------------------------
 codes = root / "_codes"
@@ -44,7 +58,7 @@ for f in sorted(codes.glob("*.parquet")) if codes.exists() else []:
 
 # 2. pieces per task and attempt ---------------------------------------------
 files = sorted(str(p) for p in raw.glob("*.parquet"))
-rows_in = [nrows(f) for f in files]
+rows_in = nrows_many(files, "input files")
 batches, cur, n = [], [], 0
 for i, r in enumerate(rows_in):
     cur.append(i)
@@ -58,13 +72,12 @@ print(f"raw: {len(files)} files, {sum(rows_in):,} rows; {len(batches)} encode ta
 
 pat = re.compile(r"^([sb])(\d+)_t(\d+)_([0-9a-f]+)_(\d+)\.parquet$")
 attempts = defaultdict(lambda: defaultdict(list))  # tid -> token -> [(path, rows)]
+found = []
 for d in (root / "shards", root / "_buckets"):
-    if not d.exists():
-        continue
-    for p in d.iterdir():
-        m = pat.match(p.name)
-        if m:
-            attempts[int(m.group(3))][m.group(4)].append((p, nrows(p)))
+    if d.exists():
+        found += [(p, m) for p in d.iterdir() if (m := pat.match(p.name))]
+for (p, m), n in zip(found, nrows_many([p for p, _ in found], "piece files")):
+    attempts[int(m.group(3))][m.group(4)].append((p, n))
 print(f"pieces found for {len(attempts)} tasks")
 
 multi = {t: v for t, v in attempts.items() if len(v) > 1}
