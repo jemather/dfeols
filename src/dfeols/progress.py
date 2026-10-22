@@ -122,7 +122,10 @@ class Progress:
     def task_done(self, stage: str, tid: int, seconds: float, timing: dict | None = None):
         self.stages[stage].done[tid] = seconds
         self.running[stage].discard(tid)
-        if stage == self.order[0] and timing and self.stage2_prior_frac is None:
+        # the prior only describes a fit's round 2 relative to its round 1; prep
+        # stages (scan, encode, split, merge) have unrelated costs and wait for
+        # their own measured rate
+        if stage == "round1" and timing and self.stage2_prior_frac is None:
             tot = timing.get("total", 0) or 1e-9
             # round 2 reads the cache (~ cost of writing it) and forms the
             # meat (~ one to two cross-products per vcov type).
@@ -164,7 +167,7 @@ class Progress:
             st = self.stages[name]
             rate = st.rate()
             projected = False
-            if rate is None and name != self.order[0] and r1 is not None and self.stage2_prior_frac:
+            if rate is None and name == "round2" and r1 is not None and self.stage2_prior_frac:
                 rate, projected = r1 * self.stage2_prior_frac, True
             if st.finished:
                 eta = 0.0

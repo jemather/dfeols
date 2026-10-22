@@ -51,6 +51,9 @@ layout, plus:
 - A `shard_dir` left by an interrupted prep (no `dfeols_meta.json`) is
   cleared before prepping again, so its stale pieces cannot join the new
   dataset.
+- Prep stages are no longer given an ETA projected from the scan rate (the
+  split stage showed "8866M rows/s, ETA 0:00:01" while its 200M-row tasks ran
+  for ~20 minutes); the round-1-to-round-2 prior now applies to fits only.
 - The ETA no longer crashes with `OverflowError` when no workers are
   connected (an infinite ETA is reported as unknown).
 - Prep tasks counted their output by listing the folder they had written
