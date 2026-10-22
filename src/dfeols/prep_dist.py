@@ -315,11 +315,58 @@ def _encode_task(
     return {"rows": rows, "files": names, "timing": {"total": time.perf_counter() - t}}
 
 
+MAX_REJECTED = 5  # rejected attempts kept in <shard_dir>/_rejected/ for diagnosis
+
+
+def _describe_mismatch(r: dict) -> str:
+    """Which output keys (shards or buckets) carry the extra or missing rows.
+
+    One key far off the others means a file was written twice or dropped
+    (write side); every key off by a little means input rows were read twice
+    or skipped (read side)."""
+    rows = r["rows"]
+    if not rows:
+        return "no output"
+    med = float(np.median(list(rows.values())))
+    off = {k: n for k, n in rows.items() if n != med}
+    files = {k: len(v) for k, v in r["files"].items()}
+    parts = [
+        f"{'bucket ' + str(-1 - k) if k < 0 else 'shard ' + str(k)}: {n:,} rows in {files.get(k, 0)} file(s)"
+        for k, n in sorted(off.items(), key=lambda kv: -abs(kv[1] - med))[:8]
+    ]
+    if not off:
+        return f"all {len(rows)} outputs have {med:,.0f} rows (difference spread evenly: read side)"
+    return f"{len(off)} of {len(rows)} outputs differ from the median {med:,.0f}" + (
+        f" ({'; '.join(parts)})" if parts else ""
+    )
+
+
+def _reject(root: Path, r: dict, what: str) -> str:
+    """Move a mismatched attempt's files to _rejected/ (keep the first few)."""
+    rej = root / "_rejected"
+    rej.mkdir(exist_ok=True)
+    keep = sum(1 for _ in rej.iterdir()) < MAX_REJECTED
+    sub = rej / f"{what.split(' (')[0].replace(' ', '_')}_{uuid.uuid4().hex[:6]}"
+    if keep:
+        sub.mkdir()
+    for k, v in r["files"].items():
+        for n in v:
+            src = root / ("_buckets" if k < 0 else "shards") / n
+            try:
+                os.replace(src, sub / n) if keep else src.unlink(missing_ok=True)
+            except FileNotFoundError:
+                pass
+    return str(sub) if keep else "deleted (enough examples kept already)"
+
+
 def _run_checked(fn, expect: int, what: str, root: str, args: tuple, tries: int = 3) -> dict:
     """Run an encode or split task and check that it wrote exactly the rows
-    it read (`expect`, from the scan). On a mismatch its own files are
-    deleted and it runs again; if it never matches, it fails with the
-    details and leaves the last attempt's files for inspection."""
+    it read (`expect`, from the scan). On a mismatch it logs where the rows
+    differ, moves its files to <shard_dir>/_rejected/ and runs again; if it
+    never matches, it fails and leaves the last attempt's files in place.
+
+    At 1e10 rows on OSCER, 4 of 1,000 encode attempts wrote 200k-800k extra
+    rows (whole multiples of one bucket's 200k) and were correct when rerun."""
     got = None
     for attempt in range(tries):
         r = fn(*args)
@@ -327,16 +374,21 @@ def _run_checked(fn, expect: int, what: str, root: str, args: tuple, tries: int 
         if got == expect:
             r["retries"] = attempt
             return r
-        names = [(k, n) for k, v in r["files"].items() for n in v]
-        log.warning(
-            "prep: %s wrote %s rows, expected %s (attempt %d)", what, f"{got:,}", f"{expect:,}", attempt + 1
-        )
+        detail = _describe_mismatch(r)
         if attempt + 1 < tries:
-            for k, n in names:
-                (Path(root) / ("_buckets" if k < 0 else "shards") / n).unlink(missing_ok=True)
+            where = _reject(Path(root), r, what)
+            log.warning(
+                "prep: %s wrote %s rows, expected %s (attempt %d): %s; files: %s",
+                what,
+                f"{got:,}",
+                f"{expect:,}",
+                attempt + 1,
+                detail,
+                where,
+            )
     raise RuntimeError(
-        f"prep: {what} wrote {got:,} rows but its input has {expect:,}, in {tries} attempts; the last "
-        f"attempt's files are kept for inspection: {sorted(n for v in r['files'].values() for n in v)[:12]}"
+        f"prep: {what} wrote {got:,} rows but its input has {expect:,}, in {tries} attempts ({detail}); "
+        f"the last attempt's files are kept: {sorted(n for v in r['files'].values() for n in v)[:12]}"
     )
 
 

@@ -72,9 +72,11 @@ layout, plus:
   and +400k were the same). Tasks now count exactly the files they handed to
   Polars, and the input file list is deduplicated.
 - Every encode and split task checks that it wrote exactly the rows the scan
-  counted for its input; on a mismatch it deletes its own files and reruns
-  (up to 3 attempts), and otherwise fails naming the task and keeping its
-  files for inspection.
+  counted for its input; on a mismatch it logs which shards or buckets carry
+  the difference, moves its files to `<shard_dir>/_rejected/` (the first 5
+  attempts) and reruns, up to 3 attempts, and otherwise fails naming the task.
+  At 1e10 rows on OSCER, 4 of 1,000 encode attempts wrote 200k–800k extra
+  rows (whole multiples of one bucket's share) and were correct when rerun.
 - Dask task keys include a per-run id; every prep used the same keys
   (`dfeols-encode-prep-17`), so a second prep in the same job could be handed
   a result Dask still held for the first.

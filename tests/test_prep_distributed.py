@@ -429,6 +429,8 @@ def test_task_that_writes_extra_rows_is_retried(tmp_path, monkeypatch, opts):
     )
     assert calls["n"] == 1 and b.n_rows == ref.n_rows
     assert sum(_nrows(str(tmp_path / "b" / f)) for s in b.shards for f in s["files"]) == ref.n_rows
+    rejected = list((tmp_path / "b" / "_rejected").iterdir())  # the bad attempt is kept for diagnosis
+    assert len(rejected) == 1 and any(f.name.endswith("9.parquet") for f in rejected[0].iterdir())
 
     calls["n"] = -100  # now it always over-writes: fail with the task named
     monkeypatch.setattr(pd_, "_encode_task", lambda *a, **k: (calls.__setitem__("n", 0), flaky(*a, **k))[1])
@@ -470,3 +472,14 @@ def test_repeated_directory_entries_are_not_counted(tmp_path, monkeypatch, opts)
     monkeypatch.setattr(os, "scandir", real_scandir)
     assert b.n_rows == ref.n_rows
     assert sum(_nrows(str(tmp_path / "b" / f)) for s in b.shards for f in s["files"]) == ref.n_rows
+
+
+def test_mismatch_description_tells_write_side_from_read_side():
+    from dfeols.prep_dist import _describe_mismatch
+
+    write = {"rows": {-1 - b: 200_000 for b in range(50)}, "files": {-1 - b: ["f"] for b in range(50)}}
+    write["rows"][-8] = 400_000  # bucket 7 written twice
+    d = _describe_mismatch(write)
+    assert d.startswith("1 of 50 outputs differ") and "bucket 7: 400,000 rows" in d
+    read = {"rows": {-1 - b: 204_000 for b in range(50)}, "files": {-1 - b: ["f"] for b in range(50)}}
+    assert "spread evenly" in _describe_mismatch(read)
