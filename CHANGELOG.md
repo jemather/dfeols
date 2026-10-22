@@ -46,6 +46,12 @@ First public release.
 - A `shard_dir` left by an interrupted prep (no `dfeols_meta.json`) is
   cleared before prepping again, so its stale pieces cannot join the new
   dataset.
+- Only one prep may write a `shard_dir` at a time. A lock file next to the
+  directory (`.<name>.prep-lock`, created with O_EXCL and refreshed every
+  30 s) makes a second prep, e.g. the same benchmark submitted twice, fail
+  at once with `dfeols.PrepInProgress` instead of clearing or overwriting the
+  running prep's files. A lock whose process is gone, or that has not been
+  refreshed for 10 minutes, is taken over.
 - The ETA no longer crashes with `OverflowError` when no workers are
   connected (an infinite ETA is reported as unknown).
 - Range-based shard assignment (more than `range_groups` partition groups,

@@ -15,7 +15,10 @@ import json
 import logging
 import os
 import shutil
+import socket
+import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -28,6 +31,104 @@ log = logging.getLogger("dfeols")
 
 META = "dfeols_meta.json"
 WORK_DIRS = ("shards", "_staging", "_buckets", "_codes")
+
+
+LOCK_REFRESH_S = 30.0
+LOCK_STALE_S = 600.0
+
+
+class PrepInProgress(RuntimeError):
+    """Another prep is writing the same shard_dir."""
+
+
+def _lock_path(root: Path) -> Path:
+    # next to shard_dir, not inside it, so overwrite=True cannot delete it
+    return root.parent / f".{root.name}.prep-lock"
+
+
+def _job_id() -> str | None:
+    for k in ("SLURM_JOB_ID", "PBS_JOBID", "JOB_ID", "LSB_JOBID"):
+        if os.environ.get(k):
+            return os.environ[k]
+    return None
+
+
+def _lock_is_stale(info: dict, age: float) -> bool:
+    if age > LOCK_STALE_S:  # holder stopped refreshing it: dead, wherever it ran
+        return True
+    if info.get("host") == socket.gethostname() and info.get("pid"):
+        try:
+            os.kill(int(info["pid"]), 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            return False
+    return False
+
+
+@contextmanager
+def prep_lock(root: Path):
+    """Exclusive claim on shard_dir for the duration of a prep.
+
+    Two preps writing one directory corrupt each other (and the second one
+    clears what the first has written so far), e.g. when the same benchmark
+    is submitted twice. The lock file is created atomically (O_EXCL, which
+    works on NFS and Lustre), refreshed every LOCK_REFRESH_S by a background
+    thread, and treated as stale once it is LOCK_STALE_S old or its process
+    is gone, so a prep that was killed does not block the next one."""
+    root = Path(root)
+    lock = _lock_path(root)
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    me = {"host": socket.gethostname(), "pid": os.getpid(), "job": _job_id(), "started": time.time()}
+    for _ in range(2):
+        try:
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            try:
+                info = json.loads(lock.read_text() or "{}")
+                age = time.time() - lock.stat().st_mtime
+            except (FileNotFoundError, json.JSONDecodeError):
+                continue  # released (or half-written) just now: try again
+            if _lock_is_stale(info, age):
+                log.warning("prep: removing a stale lock on %s (%s)", root, info)
+                lock.unlink(missing_ok=True)
+                continue
+            who = f"job {info['job']}" if info.get("job") else f"pid {info.get('pid')}"
+            since = time.strftime("%H:%M", time.localtime(info.get("started", 0)))
+            raise PrepInProgress(
+                f"another prep is writing {root}: {who} on {info.get('host')} since {since} "
+                f"(lock refreshed {age:.0f}s ago). Wait for it to finish or cancel it; if it is "
+                f"dead, delete {lock} (it also expires {LOCK_STALE_S / 60:.0f} min after its last refresh)."
+            ) from None
+        else:
+            with os.fdopen(fd, "w") as fh:
+                json.dump(me, fh)
+            break
+    else:
+        raise PrepInProgress(f"could not acquire {lock}")
+
+    stop = threading.Event()
+
+    def refresh():
+        while not stop.wait(LOCK_REFRESH_S):
+            try:
+                os.utime(lock)
+            except FileNotFoundError:
+                log.warning("prep: lock %s disappeared while prepping %s", lock, root)
+                return
+
+    th = threading.Thread(target=refresh, name="dfeols-prep-lock", daemon=True)
+    th.start()
+    try:
+        yield
+    finally:
+        stop.set()
+        th.join(timeout=5)
+        try:
+            if json.loads(lock.read_text()).get("pid") == me["pid"]:
+                lock.unlink()
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
 
 
 def clear_incomplete(root: Path) -> None:
@@ -161,6 +262,36 @@ def prep(
                    coordinator; output is identical in structure. Extra keyword
                    options (rows_per_task, max_pieces) tune the distributed path.
     """
+    with prep_lock(Path(shard_dir)):
+        return _prep(
+            source,
+            shard_dir=shard_dir,
+            partition=partition,
+            fixed_effects=fixed_effects,
+            clusters=clusters,
+            keep=keep,
+            target_rows=target_rows,
+            overwrite=overwrite,
+            keep_staging=keep_staging,
+            executor=executor,
+            **dist_options,
+        )
+
+
+def _prep(
+    source,
+    *,
+    shard_dir,
+    partition,
+    fixed_effects,
+    clusters,
+    keep,
+    target_rows,
+    overwrite,
+    keep_staging,
+    executor,
+    **dist_options,
+) -> Dataset:
     if (
         executor is not None
         and not isinstance(source, (pl.DataFrame, pl.LazyFrame))
