@@ -16,7 +16,7 @@ import polars as pl
 import pytest
 
 import dfeols
-from dfeols.formula import to_pyfixest
+from dfeols.formula import pyfixest_tol_kwargs, to_pyfixest
 from dfeols.synth import PanelDGP, generate, load_truth
 from dfeols.validate import recovery
 
@@ -150,8 +150,7 @@ def test_matches_pyfixest(panels, executor, tmp_path, request):
                 to_pyfixest(s["formula"]),
                 data=sub.to_pandas(),
                 vcov={"CRV1": "group"} if v == "CRV1" else v,
-                fixef_tol=1e-12,
-                fixef_maxiter=1_000_000,
+                **pyfixest_tol_kwargs(1e-12),
             )
             t = m.tidy().loc[ours.coefnames]
             o = ours.tidy(type=v)

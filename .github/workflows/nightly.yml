@@ -1,0 +1,37 @@
+name: Nightly (latest dependencies)
+
+# dfeols uses two APIs beyond their libraries' stable surface: polars'
+# PartitionBy(file_path_provider=...) sink and pyfixest's compiled demeaner.
+# This job installs the newest releases (including pre-releases, and ignoring
+# the upper bounds in pyproject.toml) so upstream changes show up here before
+# they reach users.
+
+on:
+  schedule:
+    - cron: "17 7 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  latest:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.13", "3.14"]
+    env:
+      POLARS_WARN_UNSTABLE: "1"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - run: pip install -e ".[dask,test]"
+      - run: pip install --upgrade --pre polars pyfixest numpy scipy pandas pyarrow dask distributed dask-jobqueue
+      - run: pip list
+      # Deprecations raised by upstream code that dfeols calls fail the job;
+      # polars' unstable-API warnings are shown in the log.
+      - run: pytest -W 'error::DeprecationWarning:dfeols(\..*)?' -W 'always::polars.exceptions.UnstableWarning'
+      - run: pytest --executor dask:2 tests/test_vs_pyfixest.py tests/test_prep_distributed.py

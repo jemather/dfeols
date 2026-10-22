@@ -64,6 +64,7 @@ def executor(request):
         return
     if spec.startswith("dask"):
         import distributed
+
         import dfeols
 
         n = int(spec.split(":")[1]) if ":" in spec else 2

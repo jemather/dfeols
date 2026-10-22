@@ -1,0 +1,20 @@
+cff-version: 1.2.0
+message: "If you use dfeols in your research, please cite it as below."
+title: "dfeols: sharded, elastic high-dimensional fixed-effects OLS for HPC clusters"
+type: software
+authors:
+  - family-names: Matherly
+    given-names: Ted
+    affiliation: University of Oklahoma
+    orcid: "https://orcid.org/0000-0002-8628-1004"
+version: 0.7.0
+date-released: 2026-10-22
+license: GPL-3.0-or-later
+repository-code: "https://github.com/jemather/dfeols"
+keywords:
+  - econometrics
+  - fixed effects
+  - high-dimensional fixed effects
+  - panel data
+  - high-performance computing
+  - Slurm

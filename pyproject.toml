@@ -1,29 +1,111 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "dfeols"
-version = "0.6.1"
-description = "Sharded, elastic fixed-effects OLS for Slurm clusters"
+dynamic = ["version"]
+description = "Sharded, elastic high-dimensional fixed-effects OLS for HPC clusters (Slurm, PBS, SGE, LSF)"
+readme = "README.md"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
+authors = [{ name = "Ted Matherly" }]
 requires-python = ">=3.10"
+keywords = [
+  "econometrics", "fixed effects", "hdfe", "ols", "panel data", "fixest",
+  "hpc", "slurm", "dask", "polars",
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Science/Research",
+  "Operating System :: POSIX :: Linux",
+  "Operating System :: MacOS",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Scientific/Engineering :: Mathematics",
+  "Topic :: Scientific/Engineering :: Information Analysis",
+  "Topic :: System :: Distributed Computing",
+]
+# Lower bounds are exercised by the "minimum versions" CI job. Upper bounds are
+# set only on the two dependencies whose APIs dfeols uses beyond their stable
+# surface (polars' PartitionBy sink, pyfixest's compiled demeaner); the nightly
+# CI job tests the newest releases so the caps can be lifted deliberately.
 dependencies = [
-  "numpy>=1.24",
+  "numpy>=1.25",
   "scipy>=1.10",
-  "polars>=1.20",
+  "polars>=1.37,<3",
   "pandas>=2.0",
   "pyarrow>=14",
-  "pyfixest>=0.30",
+  "pyfixest>=0.50.1,<1",
   "psutil>=5.9",
   "tomli>=2.0; python_version < '3.11'",
 ]
 
 [project.optional-dependencies]
 dask = ["dask>=2024.1", "distributed>=2024.1", "dask-jobqueue>=0.8"]
-test = ["pytest"]
+test = ["pytest>=7"]
+dev = ["dfeols[dask,test]", "ruff>=0.6", "mypy>=1.10", "build", "twine", "pre-commit"]
+
+[project.urls]
+Homepage = "https://github.com/jemather/dfeols"
+Repository = "https://github.com/jemather/dfeols"
+Issues = "https://github.com/jemather/dfeols/issues"
+Changelog = "https://github.com/jemather/dfeols/blob/main/CHANGELOG.md"
 
 [project.scripts]
 dfeols = "dfeols.cli:main"
 
+[tool.setuptools.dynamic]
+version = { attr = "dfeols.__version__" }
+
 [tool.setuptools.packages.find]
+where = ["src"]
 include = ["dfeols*"]
+
+# ---------------------------------------------------------------- pytest
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+filterwarnings = [
+  # pyfixest reports the singletons it drops; dfeols drops the same ones.
+  "ignore:.*singleton fixed effect.*:UserWarning",
+]
+
+# ---------------------------------------------------------------- ruff
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+src = ["src", "tests"]
+extend-exclude = ["*.md"]  # docs code blocks are hand-formatted
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "NPY", "RUF100"]
+ignore = [
+  "E741",   # ambiguous names (l, I, O) are conventional in the linear algebra
+  "E731",   # small lambdas assigned to names
+  "B905",   # zip() without strict=; lengths are checked where it matters
+  "B028",   # warnings.warn without stacklevel
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E402"]
+"benchmarks/*" = ["E402"]
+"examples/*" = ["E402"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["dfeols"]
+
+# ---------------------------------------------------------------- mypy
+# Advisory for now (CI runs it with continue-on-error): the numerical core is
+# typed loosely. Tighten module by module.
+[tool.mypy]
+python_version = "3.10"
+files = ["src/dfeols"]
+ignore_missing_imports = true
+warn_unused_ignores = true
+check_untyped_defs = false

@@ -1,0 +1,6 @@
+include README.md HOWTO.md CHANGELOG.md CONTRIBUTING.md CITATION.cff LICENSE
+recursive-include tests *.py
+recursive-include examples *.py *.toml
+recursive-include docs *.md
+include ci/min-versions.txt
+global-exclude __pycache__ *.py[cod]

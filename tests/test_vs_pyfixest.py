@@ -11,8 +11,9 @@ import numpy as np
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent))
-import dfeols  # noqa: E402
-from simdata import sim_panel  # noqa: E402
+import dfeols
+from dfeols.formula import pyfixest_tol_kwargs
+from simdata import sim_panel
 
 pf = pytest.importorskip("pyfixest")
 warnings.filterwarnings("ignore")
@@ -53,15 +54,10 @@ def _compare(
     pdf = pdf.dropna(subset=list(r.outcomes))
     for v in [vcov] if isinstance(vcov, str) else vcov:
         m = pf.feols(
-            pf_fml,
-            data=pdf,
-            vcov=_pf_vcov(v, cluster),
-            weights=weights,
-            fixef_tol=1e-13,
-            fixef_maxiter=1_000_000,
+            pf_fml, data=pdf, vcov=_pf_vcov(v, cluster), weights=weights, **pyfixest_tol_kwargs(1e-13)
         )
         mods = m.all_fitted_models if hasattr(m, "all_fitted_models") else {"": m}
-        for key, mod in mods.items():
+        for mod in mods.values():
             yy = mod._depvar
             t = mod.tidy()
             names = [rename.get(c, c) if rename else c for c in r.coefnames]

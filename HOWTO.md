@@ -7,9 +7,12 @@ This is the short version. The README covers the design; `python -m dfeols.bench
 
 ```bash
 python -m venv ~/envs/dfeols && source ~/envs/dfeols/bin/activate
-pip install -e ".[dask,test]"
+pip install "dfeols[dask]"    # or: pip install "dfeols[dask] @ git+https://github.com/jemather/dfeols"
 dfeols config init            # writes ~/.config/dfeols/config.toml
 ```
+
+Create the venv on a filesystem the compute nodes can see (usually your home directory), with
+the same Python module the profile's `prologue` loads.
 
 Edit the profile in that file:
 - `scheduler`, `queue`, `account`
@@ -44,18 +47,15 @@ Every model on that dataset reuses the shards.
 
 ```python
 import dfeols
-
 prof = dfeols.profile()
 ex = dfeols.executor(prof)
-ds = dfeols.prep(
-    "/data/panel/*.parquet",  # Parquet files (or a frame / CSV without executor)
-    shard_dir=prof.scratch_dir("shards", "panel"),
-    executor=ex,  # prep on the workers
-    partition="unit",  # groups never split across shards
-    fixed_effects=["unit", "time", "unit^quarter"],  # every FE any model uses
-    clusters=["unit", "state"],  # every cluster variable any model uses
-    target_rows=2_000_000,
-)  # rows per shard
+ds = dfeols.prep("/data/panel/*.parquet",                # Parquet files (or a frame / CSV without executor)
+                 shard_dir=prof.scratch_dir("shards", "panel"),
+                 executor=ex,                               # prep on the workers
+                 partition="unit",                          # groups never split across shards
+                 fixed_effects=["unit", "time", "unit^quarter"],   # every FE any model uses
+                 clusters=["unit", "state"],                # every cluster variable any model uses
+                 target_rows=2_000_000)                     # rows per shard
 ```
 
 **Choose the partition key** so that the most FEs are nested in it.
@@ -128,10 +128,9 @@ Copy `examples/run_fit.py`, set `SOURCE`, `PREP` and `SPECS`:
 
 ```python
 SPECS = {
-    "main": dict(formula="y ~ x1 + x2:i(size) | unit + time", cluster="state"),
-    "alt": dict(
-        formula="y + y2 ~ x1 + x2 | unit + group^time", cluster="unit", weights="w", vcov=["CRV1", "hetero"]
-    ),
+  "main": dict(formula="y ~ x1 + x2:i(size) | unit + time", cluster="state"),
+  "alt":  dict(formula="y + y2 ~ x1 + x2 | unit + group^time", cluster="unit", weights="w",
+               vcov=["CRV1", "hetero"]),
 }
 ```
 
@@ -154,7 +153,7 @@ SPECS = {
 ## 5. Submit and monitor
 
 ```bash
-dfeols submit run_fit.py --profile oscer    # coordinator as a batch job (default profile if omitted)
+dfeols submit run_fit.py --profile <name>    # coordinator as a batch job (default profile if omitted)
 dfeols status <scratch>/runs --watch 60     # shards done, workers, rows/s, ETA
 ```
 
@@ -222,10 +221,10 @@ Stress tests:
 
 ```bash
 # 1e10 rows, 100M units, 5,000 shards per set: hash ids, range shards, two-level shuffle
-dfeols bench --profile oscer --preset units100m_t100 --rows 2e9   # step up first
-dfeols bench --profile oscer --preset units100m_t100
+dfeols bench --profile <name> --preset units100m_t100 --rows 2e9   # step up first
+dfeols bench --profile <name> --preset units100m_t100
 # skewed group sizes: the largest group (~25M rows) becomes one oversized shard
-dfeols bench --profile oscer --preset skewed_groups
+dfeols bench --profile <name> --preset skewed_groups
 # all of the 1e10 code paths on a tiny panel, on this machine
 python -m dfeols.bench --preset units100m_t100 --rows 2e6 --profile local \
     --prep-opt hash_levels=0 --prep-opt range_groups=0 --prep-opt max_files=0

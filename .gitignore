@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+*.whl
+.venv/
+venv/
+.python-version
+
+# Tooling
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+coverage.xml
+htmlcov/
+.ipynb_checkpoints/
+
+# dfeols outputs: never commit data, shards, or run directories
+*.parquet
+dfeols_meta.json
+status.json
+history.jsonl
+truth.json
+runs/
+shards/
+raw_*/
+dask-worker-space/
+dask-scratch-space/
+slurm-*.out
+*.log
+
+# Local site profiles may contain account names and paths
+config.toml
+!examples/profiles/*.toml
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/

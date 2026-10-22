@@ -24,6 +24,7 @@ import pytest
 from scipy import stats
 
 import dfeols
+from dfeols.formula import pyfixest_tol_kwargs
 
 LEVEL = "eng ~ feat:i(tbin) + posts:i(tbin) | spell + week"
 SHAPE = "eng ~ feat:i(tbin) + posts:i(tbin) | spell + id_a^week"
@@ -194,6 +195,7 @@ def test_matches_pyfixest(synth, executor, request, tmp_path):
     needs the data in memory, so the subset is capped by --pyfixest-rows)."""
     pf = pytest.importorskip("pyfixest")
     import gc
+
     import polars as pl
 
     cap = int(request.config.getoption("--pyfixest-rows"))
@@ -220,8 +222,7 @@ def test_matches_pyfixest(synth, executor, request, tmp_path):
                 "eng ~ i(tbin, feat) + i(tbin, posts) | spell + week",
                 data=pdf,
                 vcov={"CRV1": cl} if v == "CRV1" else v,
-                fixef_tol=1e-12,
-                fixef_maxiter=1_000_000,
+                **pyfixest_tol_kwargs(1e-12),
             )
             t = m.tidy().loc[ours.coefnames]
             o = ours.tidy(type=v)
@@ -236,8 +237,8 @@ def test_matches_pyfixest(synth, executor, request, tmp_path):
 @pytest.mark.slow
 def test_coverage_monte_carlo(request, tmp_path):
     """Repeated small panels: CI coverage of CRV1 should be ~95%."""
+
     from dfeols.synth import DGP, generate_chunk
-    import polars as pl
 
     R = request.config.getoption("--mc-reps")
     pick = ["tbin::2:feat", "tbin::12:feat", "tbin::24:feat", "tbin::5:posts"]
