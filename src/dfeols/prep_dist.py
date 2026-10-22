@@ -22,6 +22,8 @@ import logging
 import os
 import shutil
 import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -90,8 +92,33 @@ def _range_key(partition: list[str], schema) -> pl.Expr:
     return pl.struct(partition).hash(seed=SEED_PART)
 
 
-def _piece_name(sid: int, task_id: int, i: int) -> str:
-    return f"s{sid:06d}_t{task_id:05d}_{i}.parquet"
+def _piece_name(sid: int, task_id: int, token: str, i: int) -> str:
+    return f"s{sid:06d}_t{task_id:05d}_{token}_{i}.parquet"
+
+
+def _attempt_token() -> str:
+    """Unique per task *execution*. A task can run twice at once (a worker the
+    scheduler gave up on keeps writing while the retry runs elsewhere), so
+    file names must never collide between attempts. The coordinator keeps only
+    the files listed by the attempt whose result it accepted."""
+    return uuid.uuid4().hex[:10]
+
+
+def _sweep(directory: Path, keep: set[str], what: str) -> int:
+    """Delete files in `directory` that no accepted task attempt produced."""
+    if not directory.exists():
+        return 0
+    stray = [directory / n for n in os.listdir(directory) if n not in keep]
+    if stray:
+        with ThreadPoolExecutor(32) as pool:
+            list(pool.map(lambda q: q.unlink(missing_ok=True), stray))
+        log.warning("prep: removed %d %s files from duplicate or failed task attempts", len(stray), what)
+    return len(stray)
+
+
+def _remove(paths) -> None:
+    with ThreadPoolExecutor(32) as pool:
+        list(pool.map(lambda q: Path(q).unlink(missing_ok=True), paths))
 
 
 def _encode_task(
@@ -108,14 +135,14 @@ def _encode_task(
     schema_key=None,
 ):
     """Encode a batch of files and write one flat piece file per shard it
-    touches: shards/s<shard>_t<task>_<i>.parquet (no per-task directories, so
-    nothing slow to delete on a parallel filesystem). Returns rows per shard."""
+    touches: shards/s<shard>_t<task>_<attempt>_<i>.parquet (no per-task
+    directories, so nothing slow to delete on a parallel filesystem).
+    Returns rows and file names per shard, for this attempt only."""
     t = time.perf_counter()
+    token = _attempt_token()
     root = Path(root)
     out = root / "shards"
     out.mkdir(parents=True, exist_ok=True)
-    for old in out.glob(f"s*_t{task_id:05d}_*.parquet"):  # retried task: start clean
-        old.unlink(missing_ok=True)
     lf = pl.scan_parquet(files).select(cols).drop_nulls(subset=key_cols)
     for name, comps in specs.items():
         if name in hashed:  # millions of levels, nested in the partition: hash id, no join
@@ -140,89 +167,85 @@ def _encode_task(
         # the split step later turns each bucket into its shards
         bdir = root / "_buckets"
         bdir.mkdir(exist_ok=True)
-        for old in bdir.glob(f"b*_t{task_id:05d}_*.parquet"):
-            old.unlink(missing_ok=True)
         lf = lf.with_columns((pl.col("__shard") % n_buckets).cast(pl.UInt32).alias("__bucket"))
 
         def bprov(a):
-            return str(
-                bdir
-                / f"b{int(a.partition_keys['__bucket'][0]):05d}_t{task_id:05d}_{a.index_in_partition}.parquet"
-            )
+            b = int(a.partition_keys["__bucket"][0])
+            return str(bdir / f"b{b:05d}_t{task_id:05d}_{token}_{a.index_in_partition}.parquet")
 
         lf.sink_parquet(
             pl.PartitionBy(str(bdir), key="__bucket", include_key=False, file_path_provider=bprov),
             mkdir=True,
             engine="streaming",
         )
-        rows = {}
-        for f in bdir.glob(f"b*_t{task_id:05d}_*.parquet"):
-            rows[-1 - int(f.name[1:6])] = rows.get(-1 - int(f.name[1:6]), 0) + _nrows(str(f))
-        return {"rows": rows, "timing": {"total": time.perf_counter() - t}}
+        rows, names = {}, {}
+        for f in sorted(bdir.glob(f"b*_t{task_id:05d}_{token}_*.parquet")):
+            k = -1 - int(f.name[1:6])
+            rows[k] = rows.get(k, 0) + _nrows(str(f))
+            names.setdefault(k, []).append(f.name)
+        return {"rows": rows, "files": names, "timing": {"total": time.perf_counter() - t}}
 
     def provider(a):
-        return str(out / _piece_name(int(a.partition_keys["__shard"][0]), task_id, a.index_in_partition))
+        return str(
+            out / _piece_name(int(a.partition_keys["__shard"][0]), task_id, token, a.index_in_partition)
+        )
 
     lf.sink_parquet(
         pl.PartitionBy(str(out), key="__shard", include_key=False, file_path_provider=provider),
         mkdir=True,
         engine="streaming",
     )
-    rows = {}
-    for f in out.glob(f"s*_t{task_id:05d}_*.parquet"):
+    rows, names = {}, {}
+    for f in sorted(out.glob(f"s*_t{task_id:05d}_{token}_*.parquet")):
         sid = int(f.name[1:7])
         rows[sid] = rows.get(sid, 0) + _nrows(str(f))
-    return {"rows": rows, "timing": {"total": time.perf_counter() - t}}
+        names.setdefault(sid, []).append(f.name)
+    return {"rows": rows, "files": names, "timing": {"total": time.perf_counter() - t}}
 
 
-def _split_task(bucket, root):
-    """Second level of the shuffle: read one bucket's files from every encode
-    task and write each of its shards as a single piece (s<shard>_b<bucket>)."""
+def _split_task(bucket, root, inputs):
+    """Second level of the shuffle: read one bucket's files (the accepted
+    encode attempts' files, listed by the coordinator) and write each of its
+    shards as a single piece (s<shard>_b<bucket>_<attempt>_<i>)."""
     t = time.perf_counter()
+    token = _attempt_token()
     root = Path(root)
     out = root / "shards"
     out.mkdir(parents=True, exist_ok=True)
-    for old in out.glob(f"s*_b{bucket:05d}_*.parquet"):
-        old.unlink(missing_ok=True)
-    files = sorted(str(p) for p in (root / "_buckets").glob(f"b{bucket:05d}_t*.parquet"))
-    rows = {}
+    files = [str(root / "_buckets" / n) for n in inputs]
+    rows, names = {}, {}
     if files:
 
         def prov(a):
-            return str(
-                out
-                / f"s{int(a.partition_keys['__shard'][0]):06d}_b{bucket:05d}_{a.index_in_partition}.parquet"
-            )
+            sid = int(a.partition_keys["__shard"][0])
+            return str(out / f"s{sid:06d}_b{bucket:05d}_{token}_{a.index_in_partition}.parquet")
 
         pl.scan_parquet(files).sink_parquet(
             pl.PartitionBy(str(out), key="__shard", include_key=False, file_path_provider=prov),
             mkdir=True,
             engine="streaming",
         )
-        for f in out.glob(f"s*_b{bucket:05d}_*.parquet"):
+        for f in sorted(out.glob(f"s*_b{bucket:05d}_{token}_*.parquet")):
             sid = int(f.name[1:7])
             rows[sid] = rows.get(sid, 0) + _nrows(str(f))
-        for f in files:
-            os.remove(f)
-    return {"rows": rows, "timing": {"total": time.perf_counter() - t}}
+            names.setdefault(sid, []).append(f.name)
+    return {"rows": rows, "files": names, "timing": {"total": time.perf_counter() - t}}
 
 
 def _merge_task(shard_id, root, pieces):
-    """Concatenate a shard's pieces into one file and delete them."""
+    """Concatenate a shard's pieces into one file. The pieces are left in
+    place: the coordinator deletes them once it accepts this result, so a
+    duplicate attempt of the same merge still finds its inputs."""
     t = time.perf_counter()
+    token = _attempt_token()
     root = Path(root)
     out = root / "shards"
     paths = [str(out / p) for p in pieces]
-    target = out / f"s{shard_id:06d}_merged.parquet"
-    tmp = out / f"s{shard_id:06d}_merged.parquet.tmp"
+    target = out / f"s{shard_id:06d}_merged_{token}.parquet"
+    tmp = out / f"s{shard_id:06d}_merged_{token}.parquet.tmp"
     pl.scan_parquet(paths).sink_parquet(str(tmp), engine="streaming")
     n = _nrows(str(tmp))
     os.replace(tmp, target)
-    for pth in paths:
-        try:
-            os.remove(pth)
-        except FileNotFoundError:
-            pass
     return {"rows": n, "file": target.name, "timing": {"total": time.perf_counter() - t}}
 
 
@@ -259,7 +282,7 @@ def prep_distributed(
                    more files than this (partition groups scattered across the
                    input files), use a two-level shuffle through buckets"""
     from .executors import SerialExecutor
-    from .prep import META, Dataset, _lpt_bins
+    from .prep import META, Dataset, _lpt_bins, clear_incomplete
     from .progress import Progress
 
     t_start = time.time()
@@ -268,6 +291,7 @@ def prep_distributed(
         raise FileExistsError(f"{root} already holds a prepared dataset (overwrite=True to replace)")
     if root.exists() and overwrite:
         shutil.rmtree(root)
+    clear_incomplete(root)
     root.mkdir(parents=True, exist_ok=True)
     executor = executor or SerialExecutor()
 
@@ -460,11 +484,16 @@ def prep_distributed(
             n_buckets,
             f"{len(batches) * n_buckets + n_shards:,}",
         )
+    # Rows and files come only from the result the executor accepted for each
+    # task; files written by any other attempt of the task are swept away.
     written: dict[int, int] = {}
+    accepted: dict[int, list[str]] = {}  # shard id (or -1 - bucket) -> file names
 
     def on_encode(tid, r):
         for sid, n in r["rows"].items():
             written[sid] = written.get(sid, 0) + n
+        for sid, names in r["files"].items():
+            accepted.setdefault(sid, []).extend(names)
 
     prog.add_stage("encode", {b: max(n, 1) for b, (_, n) in enumerate(batches)})
     prog.start("encode")
@@ -500,12 +529,14 @@ def prep_distributed(
         raise RuntimeError(f"prep: encoded {sum(written.values()):,} rows, expected {n_rows:,}")
     if n_buckets:
         brows = {-1 - k: v for k, v in written.items()}
-        written = {}
+        binputs = {-1 - k: v for k, v in accepted.items()}
+        _sweep(root / "_buckets", {n for v in binputs.values() for n in v}, "bucket")
+        written, accepted = {}, {}
         prog.add_stage("split", {b: max(brows.get(b, 1), 1) for b in range(n_buckets)})
         prog.start("split")
         executor.run(
             _split_task,
-            [(b, brows.get(b, 1), (b, str(root))) for b in range(n_buckets)],
+            [(b, brows.get(b, 1), (b, str(root), sorted(binputs.get(b, [])))) for b in range(n_buckets)],
             on_encode,
             prog,
             "split",
@@ -514,14 +545,10 @@ def prep_distributed(
         shutil.rmtree(root / "_buckets", ignore_errors=True)
         if sum(written.values()) != n_rows:
             raise RuntimeError(f"prep: split {sum(written.values()):,} rows, expected {n_rows:,}")
+    _sweep(root / "shards", {n for v in accepted.values() for n in v}, "piece")
 
     # ---------------- merge (only shards split into many pieces) ----------------
-    pieces: dict[int, list[str]] = {}
-    for name in os.listdir(root / "shards"):
-        if name.endswith(".parquet") and name.startswith("s"):
-            pieces.setdefault(int(name[1:7]), []).append(name)
-    for v in pieces.values():
-        v.sort()
+    pieces: dict[int, list[str]] = {sid: sorted(v) for sid, v in accepted.items() if v}
     to_merge = [s_ for s_, v in pieces.items() if len(v) > max_pieces]
     if to_merge:
         prog.add_stage("merge", {s_: max(written.get(s_, 1), 1) for s_ in to_merge})
@@ -530,7 +557,14 @@ def prep_distributed(
             "prep: merging %d of %d shards (more than %d pieces each)", len(to_merge), len(pieces), max_pieces
         )
 
+        merged_from: dict[int, list[str]] = {}
+
         def on_merge(tid, r):
+            if r["rows"] != written.get(tid):
+                raise RuntimeError(
+                    f"prep: merged shard {tid} has {r['rows']:,} rows, expected {written.get(tid):,}"
+                )
+            merged_from[tid] = pieces[tid]
             pieces[tid] = [r["file"]]
 
         executor.run(
@@ -541,6 +575,8 @@ def prep_distributed(
             "merge",
         )
         prog.finish("merge")
+        _remove([root / "shards" / n for v in merged_from.values() for n in v])
+        _sweep(root / "shards", {n for v in pieces.values() for n in v}, "merged")
     else:
         log.info("prep: no merge needed (at most %d pieces per shard)", max_pieces)
 

@@ -35,6 +35,20 @@ First public release.
 - The ETA bootstrap no longer shares one random generator across calls.
 - Code formatted and linted with ruff.
 
+### Fixed
+- Distributed prep could count (and keep) rows twice when a task ran twice
+  at once, e.g. after the scheduler gave up on a busy worker that kept
+  writing ("prep: encoded 2,000,400,000 rows, expected 2,000,000,000"). Each
+  task attempt now writes uniquely named files; the coordinator keeps only
+  the files listed by the attempt it accepted, removes the rest, and passes
+  explicit file lists to the split and merge steps. Merge inputs are deleted
+  by the coordinator after the merge is accepted.
+- A `shard_dir` left by an interrupted prep (no `dfeols_meta.json`) is
+  cleared before prepping again, so its stale pieces cannot join the new
+  dataset.
+- The ETA no longer crashes with `OverflowError` when no workers are
+  connected (an infinite ETA is reported as unknown).
+
 ### Removed
 - `dfeols.slurm` (deprecated shim). Use `dfeols.executor(profile)` with a
   site profile (`dfeols config init`).

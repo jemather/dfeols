@@ -2,11 +2,15 @@
 single-node prep: same rows, FE level counts, nesting flags, and identical
 fits."""
 
+import os
+import shutil
+
 import numpy as np
 import polars as pl
 import pytest
 
 import dfeols
+from dfeols.prep_dist import _nrows
 from dfeols.synth import InfluencerDGP, PanelDGP, generate, load_truth
 
 
@@ -98,7 +102,7 @@ def test_forced_merge_and_flat_layout(tmp_path):
     a = dfeols.prep(src, shard_dir=tmp_path / "pieces", rows_per_task=1e4, **kw)
     b = dfeols.prep(src, shard_dir=tmp_path / "merged", rows_per_task=1e4, max_pieces=0, **kw)
     assert any(len(s["files"]) > 1 for s in a.shards)  # groups span files -> several pieces
-    assert all(len(s["files"]) == 1 and s["files"][0].endswith("_merged.parquet") for s in b.shards)
+    assert all(len(s["files"]) == 1 and "_merged_" in s["files"][0] for s in b.shards)
     import os
 
     assert not [n for n in os.listdir(tmp_path / "merged" / "shards") if "_t" in n]  # pieces removed
@@ -227,3 +231,71 @@ def test_range_shards_on_hashed_multicolumn_key(tmp_path):
     rb = dfeols.fit(b, f, cluster="group", log_every=1e9)
     np.testing.assert_allclose(ra.coef(), rb.coef(), rtol=1e-9)
     np.testing.assert_allclose(ra.vcov(), rb.vcov(), rtol=1e-8)
+
+
+class _ZombieExecutor(dfeols.SerialExecutor):
+    """Every prep task also leaves the files of a second, unaccepted attempt,
+    as when the scheduler gives up on a busy worker and reruns its task
+    elsewhere while the first attempt keeps writing."""
+
+    def __init__(self, root):
+        super().__init__()
+        self.dirs = [root / "shards", root / "_buckets"]
+        self.planted = 0
+
+    def _listing(self):
+        return {d / n for d in self.dirs if d.exists() for n in os.listdir(d)}
+
+    def run(self, fn, tasks, on_result, progress, stage, local_help=False):
+        def twice(*args):
+            before = self._listing()
+            res = fn(*args)
+            for f in self._listing() - before:
+                if f.suffix == ".parquet":
+                    shutil.copy(f, f.with_name(f.stem + "_zombie.parquet"))
+                    self.planted += 1
+            return res
+
+        return super().run(twice, tasks, on_result, progress, stage, local_help)
+
+
+@pytest.mark.parametrize(
+    "opts",
+    [dict(), dict(max_pieces=0), dict(max_files=0)],
+    ids=["direct", "merge", "two-level"],
+)
+def test_duplicate_task_attempts_are_ignored(tmp_path, opts):
+    """Files from task attempts whose result was not accepted never enter the
+    dataset (regression: 'encoded 2,000,400,000 rows, expected 2,000,000,000')."""
+    d = PanelDGP(n_units=3000, units_per_chunk=300, T=20, n_groups=40)
+    raw, truth = _gen(tmp_path, d, "p")
+    src = str(raw / "*.parquet")
+    kw = dict(partition="group", target_rows=6000, **truth["prep"])
+    a = dfeols.prep(src, shard_dir=tmp_path / "single", **kw)
+    ex = _ZombieExecutor(tmp_path / "z")
+    b = dfeols.prep(src, shard_dir=tmp_path / "z", executor=ex, rows_per_task=1e4, **opts, **kw)
+    assert ex.planted > 0
+    on_disk = sum(_nrows(str(tmp_path / "z" / f)) for s in b.shards for f in s["files"])
+    assert on_disk == b.n_rows == a.n_rows
+    assert not [n for n in os.listdir(tmp_path / "z" / "shards") if "zombie" in n]
+    f = "y ~ x1:i(cat) + x2 + x3 | unit + group^time"
+    ra = dfeols.fit(a, f, cluster="group", log_every=1e9)
+    rb = dfeols.fit(b, f, cluster="group", log_every=1e9)
+    assert ra.N == rb.N
+    np.testing.assert_allclose(ra.coef(), rb.coef(), rtol=1e-10)
+
+
+def test_interrupted_prep_is_not_reused(tmp_path):
+    """A shard_dir left by a prep that died (no metadata file) is cleared, so
+    its stale pieces cannot end up in the new dataset."""
+    d = PanelDGP(n_units=1000, units_per_chunk=250, T=10, n_groups=20)
+    raw, truth = _gen(tmp_path, d, "p")
+    src = str(raw / "*.parquet")
+    kw = dict(partition="group", target_rows=4000, executor=dfeols.SerialExecutor(), **truth["prep"])
+    first = dfeols.prep(src, shard_dir=tmp_path / "sd", **kw)
+    (tmp_path / "sd" / "dfeols_meta.json").unlink()  # as if the first prep had crashed
+    stale = tmp_path / "sd" / "shards" / "s000000_t00099_stale_0.parquet"
+    shutil.copy(tmp_path / "sd" / first.shards[0]["files"][0], stale)
+    b = dfeols.prep(src, shard_dir=tmp_path / "sd", **kw)
+    assert not stale.exists()
+    assert sum(_nrows(str(tmp_path / "sd" / f)) for s in b.shards for f in s["files"]) == b.n_rows

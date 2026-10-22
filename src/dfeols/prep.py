@@ -27,6 +27,20 @@ from .formula import fe_column, fe_components
 log = logging.getLogger("dfeols")
 
 META = "dfeols_meta.json"
+WORK_DIRS = ("shards", "_staging", "_buckets", "_codes")
+
+
+def clear_incomplete(root: Path) -> None:
+    """Remove what an interrupted prep left in `root` (shards, staging, code
+    tables). Without the metadata file the directory is not a dataset, and
+    stale piece files would otherwise be picked up as part of the new one."""
+    if (root / META).exists():
+        return
+    stale = [root / d for d in WORK_DIRS if (root / d).exists()]
+    if stale:
+        log.warning("prep: %s has no %s (an earlier prep did not finish); clearing it", root, META)
+        for d in stale:
+            shutil.rmtree(d, ignore_errors=True)
 
 
 @dataclass
@@ -172,6 +186,7 @@ def prep(
         raise FileExistsError(f"{root} already holds a prepared dataset (overwrite=True to replace)")
     if root.exists() and overwrite:
         shutil.rmtree(root)
+    clear_incomplete(root)
     root.mkdir(parents=True, exist_ok=True)
 
     partition = [partition] if isinstance(partition, str) else list(partition)

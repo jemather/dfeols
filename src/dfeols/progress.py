@@ -44,6 +44,14 @@ def fmt_td(s: float | None) -> str:
     return (f"{d}d " if d else "") + f"{h:d}:{m:02d}:{s:02d}"
 
 
+def _clock(ts: float) -> str | None:
+    """Wall-clock time for a finish estimate, or None if it is not representable."""
+    try:
+        return time.strftime("%a %H:%M", time.localtime(ts))
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
 @dataclass
 class StageProgress:
     name: str
@@ -169,7 +177,7 @@ class Progress:
             eta_max = None
             if self.max_slots and self.max_slots > self.slots and rate and not st.finished:
                 eta_max, _ = self._stage_eta(st, rate, self.max_slots)
-            if eta is None:
+            if eta is None or not np.isfinite(eta):  # no rate yet, or no workers connected
                 total_known = False
             else:
                 total_eta += eta
@@ -198,9 +206,7 @@ class Progress:
             "max_workers": self.max_slots,
             "stages": stages,
             "eta_total_seconds": total_eta if total_known else None,
-            "finish_time": time.strftime("%a %H:%M", time.localtime(now + total_eta))
-            if total_known
-            else None,
+            "finish_time": _clock(now + total_eta) if total_known else None,
         }
 
     def line(self, snap: dict) -> str:
