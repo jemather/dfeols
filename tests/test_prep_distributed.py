@@ -299,3 +299,26 @@ def test_interrupted_prep_is_not_reused(tmp_path):
     b = dfeols.prep(src, shard_dir=tmp_path / "sd", **kw)
     assert not stale.exists()
     assert sum(_nrows(str(tmp_path / "sd" / f)) for s in b.shards for f in s["files"]) == b.n_rows
+
+
+def test_range_bins_at_billion_rows():
+    """Range shards at 1e9 rows (regression: uint32 row counts wrapped in
+    rows x n_bins and put 994M of 1e9 rows in one shard of 4)."""
+    from dfeols.prep_dist import _range_bins
+
+    n_units, T = 10_000_000, 100
+    sizes = np.full(n_units, T, dtype=np.uint32)  # polars' len() dtype
+    n_rows, target = n_units * T, 2_000_000
+    n_bins = n_rows // target
+    bins = _range_bins(sizes, n_rows, n_bins)
+    per_bin = np.bincount(bins, weights=sizes.astype(np.int64), minlength=n_bins)
+    assert np.unique(bins).size == n_bins
+    assert per_bin.max() <= target + T and per_bin.min() >= target - T
+
+
+def test_shard_size_guard():
+    from dfeols.prep_dist import _check_shard_sizes
+
+    _check_shard_sizes(np.array([2_000_100, 1_999_900]), np.array([100] * 40_000), 2e6, 2)
+    with pytest.raises(RuntimeError, match="dfeols bug"):
+        _check_shard_sizes(np.array([993_842_500, 6_157_500]), np.array([100] * 10_000_000), 2e6, 500)

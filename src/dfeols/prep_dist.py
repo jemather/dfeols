@@ -68,7 +68,9 @@ def _scan_task(files, cols, key_cols, specs, partition, checks):
     q = {"__n": lf.select(pl.len())}
     for name, comps in specs.items():
         q[f"L:{name}"] = lf.select(comps).unique()
-    q["P"] = lf.group_by(partition).agg(pl.len().alias("_n"))
+    # Int64, not polars' UInt32 len(): row arithmetic on these counts (cumulative
+    # sums, x n_bins) exceeds 2**32 at 1e9 rows and would wrap silently.
+    q["P"] = lf.group_by(partition).agg(pl.len().cast(pl.Int64).alias("_n"))
     # nesting: per inner level, the min and max of a hash of the outer key.
     # Inner is nested in outer iff min == max for every level across all
     # tasks. Size scales with inner levels per file, never with rows.
@@ -79,6 +81,39 @@ def _scan_task(files, cols, key_cols, specs, partition, checks):
     frames = pl.collect_all([q[k] for k in keys], engine="streaming")
     out = dict(zip(keys, frames))
     return {"n": int(out.pop("__n").item()), "frames": out, "timing": {"total": time.perf_counter() - t}}
+
+
+def _range_bins(group_rows: np.ndarray, n_rows: int, n_bins: int) -> np.ndarray:
+    """Bin of each partition group (in key order) for contiguous range shards:
+    a group goes to the bin where its first row falls when rows are cut into
+    n_bins equal parts. Computed in int64: at 1e9 rows, rows x n_bins
+    overflows 32 bits."""
+    sizes = np.asarray(group_rows, dtype=np.int64)
+    before = np.cumsum(sizes) - sizes
+    return np.minimum((before * n_bins) // max(int(n_rows), 1), n_bins - 1)
+
+
+def _check_shard_sizes(shard_rows: np.ndarray, group_rows: np.ndarray, target_rows: float, n_bins: int):
+    """Guard against a broken shard assignment before writing anything.
+
+    Both assignments (LPT and contiguous ranges) keep every shard within
+    target_rows plus one partition group of the target, so a shard far larger
+    than that is a bug, not data skew."""
+    biggest_group = int(group_rows.max()) if len(group_rows) else 0
+    limit = 2 * target_rows + biggest_group
+    if len(shard_rows) and shard_rows.max() > limit:
+        raise RuntimeError(
+            f"prep: shard assignment produced a shard of {int(shard_rows.max()):,} rows "
+            f"({len(shard_rows)} shards for {n_bins} bins; target {int(target_rows):,}, largest "
+            f"partition group {biggest_group:,}). This is a dfeols bug; please report it."
+        )
+    if biggest_group > 4 * target_rows:
+        log.warning(
+            "prep: the largest partition group has %s rows (%.0fx the shard target); it becomes one "
+            "oversized shard, and its worker needs memory for all of it",
+            f"{biggest_group:,}",
+            biggest_group / target_rows,
+        )
 
 
 def _range_key(partition: list[str], schema) -> pl.Expr:
@@ -401,15 +436,14 @@ def prep_distributed(
         )
 
     acc["P_files"] = acc.pop("P")
-    counts = pl.concat(acc["P_files"]).group_by(partition).agg(pl.col("_n").sum())
+    counts = pl.concat(acc["P_files"]).group_by(partition).agg(pl.col("_n").cast(pl.Int64).sum())
     n_bins = max(1, int(np.ceil(n_rows / target_rows)))
     range_mode = counts.height > range_groups
     if range_mode:
         # contiguous ranges of the partition-key hash, cut by cumulative rows;
         # encode tasks only need the n_bins boundaries
         counts = counts.with_columns(_range_key(partition, schema).alias("__h")).sort("__h")
-        before = counts["_n"].cum_sum() - counts["_n"]
-        raw_bin = np.minimum((before.to_numpy() * n_bins) // max(n_rows, 1), n_bins - 1)
+        raw_bin = _range_bins(counts["_n"].to_numpy(), n_rows, n_bins)
         counts = counts.with_columns(pl.Series("__b", raw_bin))
         bounds = counts.group_by("__b").agg(pl.col("__h").max().alias("b")).sort("__b")
         bounds.select("b").write_parquet(codes_dir / "__shard_bounds.parquet")
@@ -423,6 +457,7 @@ def prep_distributed(
         counts = counts.with_columns(pl.Series("__shard", bins, dtype=pl.UInt32))
         counts.select(partition + ["__shard"]).write_parquet(codes_dir / "__shard_map.parquet")
     shard_rows = counts.group_by("__shard").agg(pl.col("_n").sum())
+    _check_shard_sizes(shard_rows["_n"].to_numpy(), counts["_n"].to_numpy(), target_rows, n_bins)
     # which shards each input file touches (for the shuffle plan)
     p_all = pl.concat(acc.pop("P_files"))
     if range_mode:

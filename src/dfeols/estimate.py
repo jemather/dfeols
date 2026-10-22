@@ -128,6 +128,33 @@ def estimate_worker_gb(plan: Plan, rows: int, n_cols: int) -> float:
     return gb
 
 
+def _check_worker_memory(executor, label: str, rows: int, need_gb: float) -> None:
+    """Fail before submitting work that cannot fit on a worker.
+
+    A shard that exceeds worker memory kills every worker that tries it (the
+    scheduler retries it on a fresh worker each time), which wastes the queue
+    wait of each one. The estimate is rough, so warn above the profile's
+    worker memory and refuse only well above it."""
+    prof = getattr(executor, "profile", None)
+    mem = getattr(prof, "worker", {}).get("memory") if prof is not None else None
+    if not mem:
+        return
+    from .cluster import _memory_bytes
+
+    have_gb = _memory_bytes(mem) / 1e9
+    msg = (
+        f"fit {label}: the largest shard ({rows:,} rows) needs roughly {need_gb:.0f} GB, "
+        f"and profile {prof.name!r} gives workers {mem}"
+    )
+    if need_gb > 1.5 * have_gb:
+        raise MemoryError(
+            msg + ". Re-prep with a smaller target_rows or a partition key without one huge "
+            "group (`dfeols info <shard_dir>` shows shard sizes), or raise [worker] memory."
+        )
+    if need_gb > have_gb:
+        log.warning("%s; workers may run out of memory", msg)
+
+
 def _use_sparse(crossing_fe: str, local, glob) -> bool:
     """Crossing (dummy) FEs via per-level sums: needs exactly one local FE,
     whose within-group projection is closed form."""
@@ -228,13 +255,15 @@ def fit(
     )
 
     biggest = max(s["rows"] for s in ds.shards)
+    need_gb = estimate_worker_gb(plan, biggest, len(ds.columns))
     log.info(
         "fit %s: largest shard %s rows -> peak worker memory roughly %.1f GB; cache on disk roughly %.1f GB",
         label,
         f"{biggest:,}",
-        estimate_worker_gb(plan, biggest, len(ds.columns)),
+        need_gb,
         ds.n_rows * (m + k_tot + 2) * 8 / 1e9 if cache else 0,
     )
+    _check_worker_memory(executor, label, biggest, need_gb)
 
     prog = Progress(wd, label=label, every=log_every, round2_recomputes=not cache)
     rows = {s["id"]: max(s["rows"], 1) for s in ds.shards}

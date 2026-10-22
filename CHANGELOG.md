@@ -48,6 +48,17 @@ First public release.
   dataset.
 - The ETA no longer crashes with `OverflowError` when no workers are
   connected (an infinite ETA is reported as unknown).
+- Range-based shard assignment (more than `range_groups` partition groups,
+  new in 0.6.0) computed bins from polars' `UInt32` row counts, which wrap
+  at 2**32: at 1e9 rows, 10M units and 500 bins it produced 4 shards, one
+  with 994M rows. Row counts are now Int64 throughout prep, and prep refuses
+  to write a shard larger than twice the target plus the largest partition
+  group. **Shard sets prepared with range assignment by 0.6.0–0.6.1 should
+  be re-prepped** (`"shard_assignment": "range"` in `dfeols_meta.json`).
+- `fit` checks the largest shard's memory estimate against the profile's
+  worker memory: it warns above it and refuses above 1.5×, instead of
+  letting the scheduler kill worker after worker on the same shard.
+- prep warns when one partition group is more than 4× the shard target.
 
 ### Removed
 - `dfeols.slurm` (deprecated shim). Use `dfeols.executor(profile)` with a

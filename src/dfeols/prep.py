@@ -246,7 +246,7 @@ def prep(
     log.info("prep: nesting checks done (%.0fs)", time.time() - t_start)
 
     # Assign partition groups to shards (LPT bin packing on row counts).
-    counts = st.group_by(partition).agg(pl.len().alias("_n")).collect(engine="streaming")
+    counts = st.group_by(partition).agg(pl.len().cast(pl.Int64).alias("_n")).collect(engine="streaming")
     n_bins = max(1, int(np.ceil(n_rows / target_rows)))
     bins = _lpt_bins(counts["_n"].to_numpy(), n_bins)
     shard_map = counts.select(partition).with_columns(pl.Series("__shard", bins, dtype=pl.UInt32))
