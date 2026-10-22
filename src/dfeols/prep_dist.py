@@ -61,6 +61,47 @@ def _nrows(f: str) -> int:
     return pq.read_metadata(f).num_rows
 
 
+class _Compactor:
+    """Accumulates per-file scan frames and reduces them as they arrive.
+
+    Each file returns, e.g., every group x time level it contains; at 1e10
+    rows that is 5,000 overlapping copies of a 500k-row table (tens of GB
+    held until the scan ended, which got the coordinator killed). Merging
+    whenever the pending rows reach the size of what is already merged (and
+    at least `min_rows`) keeps memory near the number of distinct keys, at
+    O(n log n) total work. Frames whose keys don't overlap across files
+    (unit-level ones) don't shrink when merged, so merging stops for them
+    after a merge of several files' frames that saves less than 10%."""
+
+    def __init__(self, reduce, min_rows: int = 1_000_000):
+        self.reduce, self.min_rows = reduce, min_rows
+        self.merged: pl.DataFrame | None = None
+        self.pending: list[pl.DataFrame] = []
+        self.pending_rows = 0
+        self.worthwhile = True
+
+    def add(self, df: pl.DataFrame) -> None:
+        self.pending.append(df)
+        self.pending_rows += df.height
+        merged = self.merged.height if self.merged is not None else 0
+        if self.worthwhile and self.pending_rows >= max(self.min_rows, merged):
+            self._compact()
+
+    def _compact(self) -> None:
+        parts = ([self.merged] if self.merged is not None else []) + self.pending
+        before = sum(p.height for p in parts)
+        self.merged = self.reduce(pl.concat(parts)) if parts else None
+        self.pending, self.pending_rows = [], 0
+        # judge only merges across several files (one file's rows are unique anyway)
+        if len(parts) >= 8 and self.merged is not None and self.merged.height > 0.9 * before:
+            self.worthwhile = False
+
+    def result(self) -> pl.DataFrame:
+        if self.pending or self.merged is None:
+            self._compact()
+        return self.merged
+
+
 # ------------------------------------------------------------------ tasks
 def _scan_task(files, cols, key_cols, specs, partition, checks):
     t = time.perf_counter()
@@ -90,7 +131,14 @@ def _range_bins(group_rows: np.ndarray, n_rows: int, n_bins: int) -> np.ndarray:
     overflows 32 bits."""
     sizes = np.asarray(group_rows, dtype=np.int64)
     before = np.cumsum(sizes) - sizes
-    return np.minimum((before * n_bins) // max(int(n_rows), 1), n_bins - 1)
+    if int(sizes.sum()) * n_bins < 2**62:
+        out = (before * n_bins) // max(int(n_rows), 1)
+    else:  # beyond int64 range: exact Python integers
+        out = np.array([b * n_bins // int(n_rows) for b in before.tolist()], dtype=np.int64)
+    out = np.minimum(out, n_bins - 1)
+    if np.any(np.diff(out) < 0):
+        raise RuntimeError("prep: internal error, range shard bins are not monotone")
+    return out
 
 
 def _check_shard_sizes(shard_rows: np.ndarray, group_rows: np.ndarray, target_rows: float, n_bins: int):
@@ -316,16 +364,17 @@ def prep_distributed(
     max_files      if writing one piece per (encode task, shard) would create
                    more files than this (partition groups scattered across the
                    input files), use a two-level shuffle through buckets"""
+    from . import __version__
     from .executors import SerialExecutor
-    from .prep import META, Dataset, _lpt_bins, clear_incomplete
+    from .prep import META, Dataset, _lpt_bins, clear_incomplete, remove_dir
     from .progress import Progress
 
     t_start = time.time()
     root = Path(shard_dir)
     if (root / META).exists() and not overwrite:
         raise FileExistsError(f"{root} already holds a prepared dataset (overwrite=True to replace)")
-    if root.exists() and overwrite:
-        shutil.rmtree(root)
+    if overwrite:
+        remove_dir(root)
     clear_incomplete(root)
     root.mkdir(parents=True, exist_ok=True)
     executor = executor or SerialExecutor()
@@ -363,15 +412,28 @@ def prep_distributed(
     prog.add_stage("scan", {i: max(n, 1) for i, n in rows_in.items()})
 
     # ---------------- scan ----------------
-    acc = {"n": 0, "levels": {k: [] for k in specs}, "P": [], "C": {i: [] for i in range(len(checks))}}
+    def _minmax(inner):
+        return lambda df: df.group_by(inner).agg(pl.col("lo").min(), pl.col("hi").max())
+
+    acc = {
+        "n": 0,
+        "levels": {k: _Compactor(lambda df: df.unique()) for k in specs},
+        "P": [],
+        "C": {i: _Compactor(_minmax(checks[i][0])) for i in range(len(checks))},
+    }
+
+    scanned: set = set()
 
     def on_scan(tid, r):
+        if tid in scanned:  # a second result for the same task: keep the first
+            return
+        scanned.add(tid)
         acc["n"] += r["n"]
         for k in specs:
-            acc["levels"][k].append(r["frames"][f"L:{k}"])
+            acc["levels"][k].add(r["frames"][f"L:{k}"])
         acc["P"].append(r["frames"]["P"].with_columns(pl.lit(tid, pl.UInt32).alias("__file")))
         for i in range(len(checks)):
-            acc["C"][i].append(r["frames"][f"C:{i}"])
+            acc["C"][i].add(r["frames"][f"C:{i}"])
 
     log.info("prep: scanning %d files (%s rows) on workers", len(files), f"{sum(rows_in.values()):,}")
     prog.start("scan")
@@ -389,7 +451,7 @@ def prep_distributed(
     fe_meta: dict[str, dict] = {}
     levels = {}
     for name, comps in specs.items():
-        levels[name] = pl.concat(acc["levels"].pop(name)).unique()
+        levels[name] = acc["levels"].pop(name).result()
         fe_meta[name] = {
             "column": fe_column(name),
             "components": comps,
@@ -397,8 +459,7 @@ def prep_distributed(
             "nested_in_partition": True,
         }
     for (name, outer), i in zip(check_keys, range(len(checks))):
-        inner = checks[i][0]
-        mm = pl.concat(acc["C"].pop(i)).group_by(inner).agg(pl.col("lo").min(), pl.col("hi").max())
+        mm = acc["C"].pop(i).result()
         ok = bool((mm["lo"] == mm["hi"]).all()) if mm.height else True
         if outer == "__partition__":
             fe_meta[name]["nested_in_partition"] = ok
@@ -446,6 +507,8 @@ def prep_distributed(
         raw_bin = _range_bins(counts["_n"].to_numpy(), n_rows, n_bins)
         counts = counts.with_columns(pl.Series("__b", raw_bin))
         bounds = counts.group_by("__b").agg(pl.col("__h").max().alias("b")).sort("__b")
+        if bounds.height > 1 and not bool((bounds["b"].diff().drop_nulls() > 0).all()):
+            raise RuntimeError("prep: internal error, range shard boundaries are not increasing")
         bounds.select("b").write_parquet(codes_dir / "__shard_bounds.parquet")
         # shard id = position of the group's hash among the boundaries
         counts = counts.with_columns(
@@ -523,8 +586,12 @@ def prep_distributed(
     # task; files written by any other attempt of the task are swept away.
     written: dict[int, int] = {}
     accepted: dict[int, list[str]] = {}  # shard id (or -1 - bucket) -> file names
+    seen: set = set()
 
     def on_encode(tid, r):
+        if tid in seen:  # a second result for the same task: keep the first
+            return
+        seen.add(tid)
         for sid, n in r["rows"].items():
             written[sid] = written.get(sid, 0) + n
         for sid, names in r["files"].items():
@@ -566,7 +633,7 @@ def prep_distributed(
         brows = {-1 - k: v for k, v in written.items()}
         binputs = {-1 - k: v for k, v in accepted.items()}
         _sweep(root / "_buckets", {n for v in binputs.values() for n in v}, "bucket")
-        written, accepted = {}, {}
+        written, accepted, seen = {}, {}, set()
         prog.add_stage("split", {b: max(brows.get(b, 1), 1) for b in range(n_buckets)})
         prog.start("split")
         executor.run(
@@ -577,7 +644,7 @@ def prep_distributed(
             "split",
         )
         prog.finish("split")
-        shutil.rmtree(root / "_buckets", ignore_errors=True)
+        remove_dir(root / "_buckets")
         if sum(written.values()) != n_rows:
             raise RuntimeError(f"prep: split {sum(written.values()):,} rows, expected {n_rows:,}")
     _sweep(root / "shards", {n for v in accepted.values() for n in v}, "piece")
@@ -595,6 +662,8 @@ def prep_distributed(
         merged_from: dict[int, list[str]] = {}
 
         def on_merge(tid, r):
+            if tid in merged_from:  # a second result for the same task: keep the first
+                return
             if r["rows"] != written.get(tid):
                 raise RuntimeError(
                     f"prep: merged shard {tid} has {r['rows']:,} rows, expected {written.get(tid):,}"
@@ -634,6 +703,7 @@ def prep_distributed(
         "created": time.strftime("%Y-%m-%d %H:%M:%S"),
         "prep_seconds": round(time.time() - t_start, 1),
         "prep_mode": "distributed",
+        "prep_version": __version__,
         "shard_assignment": "range" if range_mode else "lpt",
         "shuffle": f"two-level ({n_buckets} buckets)" if n_buckets else "direct",
     }

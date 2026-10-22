@@ -217,6 +217,12 @@ dfeols bench --profile <name> --preset units10m_t100
 dfeols bench --profile <name> --preset units1m_t1000
 ```
 
+One job per data set at a time: a benchmark locks its data set (`<scratch>/bench/locks/`) while it
+generates and preps, and a second job for the same preset and size stops at once with an error
+naming the job that holds it. Different presets can run side by side. A lock left by a job that
+died is taken over after 5 minutes. Shard sets built by versions before 0.6.2 with range-based
+shards are rebuilt automatically ("re-preparing …").
+
 Stress tests:
 
 ```bash

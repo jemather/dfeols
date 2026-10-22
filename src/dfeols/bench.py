@@ -47,6 +47,7 @@ import polars as pl
 import dfeols
 
 from .formula import pyfixest_tol_kwargs, to_pyfixest
+from .lock import DirLock
 from .synth import generate, load_truth, plan_for_rows
 from .validate import recovery
 
@@ -258,6 +259,20 @@ def write_ledger(root) -> list[dict]:
     return rows
 
 
+def stale_dataset(ds, target_rows) -> str:
+    """Why an existing benchmark shard folder must be rebuilt ("" to reuse it)."""
+    m = ds.meta
+    if sum(s["rows"] for s in ds.shards) != ds.n_rows:
+        return "shard row counts don't add up"
+    if m.get("shard_assignment") == "range" and not m.get("prep_version"):
+        # range shards before 0.6.2 used UInt32 row counts that overflowed
+        return "built by a version with the range-shard overflow bug (before 0.6.2)"
+    biggest = max(s["rows"] for s in ds.shards)
+    if biggest > 10 * target_rows and len(ds.shards) < ds.n_rows / (10 * target_rows):
+        return f"shards are far from the target size (largest {biggest:,} rows)"
+    return ""
+
+
 def run(
     rows_list,
     *,
@@ -292,38 +307,48 @@ def run(
             tag = f"{dgp}_{rows:.0e}".replace("+", "") + _param_suffix(dgp, dgp_kw)
             raw = root / f"raw_{tag}"
             d = plan_for_rows(rows, dgp, **(dgp_kw or {}))
-            t = time.perf_counter()
-            # generate on the coordinator by default: it runs while the first
-            # worker jobs wait in the queue (on workers it would wait for them)
-            generate(
-                raw, d, jobs=gen_jobs, executor=ex if (profile and gen_on_workers) else None, verbose=True
-            )
-            t_gen = time.perf_counter() - t
-            truth = load_truth(raw)
-            todo = specs or list(truth["specs"])
-            missing = set(todo) - set(truth["specs"])
-            if missing:
-                raise KeyError(f"{dgp} DGP has no specs {sorted(missing)}; have {sorted(truth['specs'])}")
-
-            datasets, t_prep = {}, {}
-            for part in sorted({truth["specs"][s]["partition"] for s in todo}):
-                sd = root / f"shards_{tag}_by_{part}_{int(target_rows)}"
+            # One job at a time per data set: a second job would regenerate or
+            # re-prep (deleting) the folders the first one is still writing.
+            # Held for generation and prep only; fits only read the shards.
+            with DirLock(root / "locks" / tag, what=f"benchmark data set {tag}"):
                 t = time.perf_counter()
-                if (sd / "dfeols_meta.json").exists():
-                    datasets[part] = dfeols.Dataset.open(sd)
-                    t_prep[part] = float("nan")
-                else:
-                    datasets[part] = dfeols.prep(
-                        str(raw / "*.parquet"),
-                        shard_dir=sd,
-                        partition=part,
-                        target_rows=int(target_rows),
-                        overwrite=True,
-                        executor=ex if profile else None,
-                        **truth["prep"],
-                        **((prep_opts or {}) if profile else {}),
-                    )
-                    t_prep[part] = time.perf_counter() - t
+                # generate on the coordinator by default: it runs while the first
+                # worker jobs wait in the queue (on workers it would wait for them)
+                generate(
+                    raw, d, jobs=gen_jobs, executor=ex if (profile and gen_on_workers) else None, verbose=True
+                )
+                t_gen = time.perf_counter() - t
+                truth = load_truth(raw)
+                todo = specs or list(truth["specs"])
+                missing = set(todo) - set(truth["specs"])
+                if missing:
+                    raise KeyError(f"{dgp} DGP has no specs {sorted(missing)}; have {sorted(truth['specs'])}")
+
+                datasets, t_prep = {}, {}
+                for part in sorted({truth["specs"][s]["partition"] for s in todo}):
+                    sd = root / f"shards_{tag}_by_{part}_{int(target_rows)}"
+                    t = time.perf_counter()
+                    reuse = (sd / "dfeols_meta.json").exists()
+                    if reuse:
+                        why = stale_dataset(dfeols.Dataset.open(sd), target_rows)
+                        if why:
+                            log(f"re-preparing {sd.name}: {why}")
+                            reuse = False
+                    if reuse:
+                        datasets[part] = dfeols.Dataset.open(sd)
+                        t_prep[part] = float("nan")
+                    else:
+                        datasets[part] = dfeols.prep(
+                            str(raw / "*.parquet"),
+                            shard_dir=sd,
+                            partition=part,
+                            target_rows=int(target_rows),
+                            overwrite=True,
+                            executor=ex if profile else None,
+                            **truth["prep"],
+                            **((prep_opts or {}) if profile else {}),
+                        )
+                        t_prep[part] = time.perf_counter() - t
             n_rows = next(iter(datasets.values())).n_rows
             log(
                 f"\n== {dgp}: {n_rows:,} rows, {d.n_units:,} units (generate {t_gen:.0f}s, prep "

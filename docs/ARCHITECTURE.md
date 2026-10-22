@@ -26,7 +26,9 @@ Prep encodes FEs and clusters as integer codes, checks which FEs are nested in
 the partition key and in each cluster, and writes Parquet shards in which no
 partition group is split. The distributed version runs as
 scan → reduce → encode → (merge | split) rounds on workers; the coordinator
-holds only small tables (level sets and group counts). At scale it switches
+holds only small tables (level sets and group counts), merging the per-file
+scan results as they arrive (`_Compactor`) so overlapping tables such as
+group × time levels never pile up. At scale it switches
 automatically to:
 
 - hash ids for nested FEs with more than 2e6 levels (`hash_levels`; collisions
@@ -62,6 +64,17 @@ Small-sample corrections follow fixest/pyfixest (`vcov.py`).
 | two local FEs | exact Schur-complement solve per connected component (dense Cholesky, LAPACK); 37× faster than alternating projections on the influencer `shape` spec |
 | three or more local FEs | iterated (pyfixest's compiled alternating projections; NumPy fallback) |
 | crossing FEs with ≤ `max_dummy_levels` (2000) levels | dummies. With exactly one local FE they never materialize: cross-products come from per-level sums (`D'W Q D = D'WD − C'diag(1/W_a)C`), and the vcov uses Frisch–Waugh–Lovell on the reported coefficients. This makes T=1000 feasible |
+
+### Robustness
+
+- Every task attempt writes uniquely named files and reports them; the
+  coordinator keeps one attempt per task and sweeps the rest, because a task
+  can run twice at once (a rerun overlapping a worker the scheduler gave up on).
+- Shard folders and benchmark data sets are locked (`lock.DirLock`: a sibling
+  `<folder>.lock`, O_EXCL, heartbeat every 30 s, stale after 5 min).
+- Overwrites rename a folder before deleting it; an interrupted prep's folder
+  (no metadata file) is cleared before reuse.
+- Row counts are Int64 everywhere (polars' `len()` is UInt32 and wraps).
 
 ## Execution
 

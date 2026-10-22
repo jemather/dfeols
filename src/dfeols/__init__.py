@@ -7,7 +7,8 @@ import logging as _logging
 from .cluster import executor
 from .estimate import build_plan, fit
 from .executors import DaskExecutor, SerialExecutor
-from .prep import Dataset, PrepInProgress, prep
+from .lock import LockedError
+from .prep import Dataset, prep
 from .results import Result
 from .site import profile
 
@@ -21,7 +22,7 @@ __all__ = [
     "build_plan",
     "executor",
     "profile",
-    "PrepInProgress",
+    "LockedError",
 ]
 __version__ = "0.7.0"
 

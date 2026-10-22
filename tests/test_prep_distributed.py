@@ -322,3 +322,74 @@ def test_shard_size_guard():
     _check_shard_sizes(np.array([2_000_100, 1_999_900]), np.array([100] * 40_000), 2e6, 2)
     with pytest.raises(RuntimeError, match="dfeols bug"):
         _check_shard_sizes(np.array([993_842_500, 6_157_500]), np.array([100] * 10_000_000), 2e6, 500)
+
+
+class _DuplicatingExecutor(dfeols.SerialExecutor):
+    """Runs every task twice and hands over both results, the way a Dask rerun
+    of a task from a lost worker can overlap its first attempt."""
+
+    def run(self, fn, tasks, on_result, progress, stage, local_help=False):
+        def twice(*args):
+            fn(*args)
+            return fn(*args)
+
+        def both(t, r):
+            on_result(t, r)
+            on_result(t, r)
+
+        return super().run(twice, tasks, both, progress, stage)
+
+
+@pytest.mark.parametrize(
+    "opts",
+    [{}, {"max_files": 0}, {"max_pieces": 0}, {"range_groups": 0}],
+    ids=["direct", "two-level", "merge", "range"],
+)
+def test_task_results_delivered_twice(tmp_path, opts):
+    d = PanelDGP(n_units=2000, units_per_chunk=250, T=15, n_groups=30)
+    raw, truth = _gen(tmp_path, d, "p")
+    src = str(raw / "*.parquet")
+    kw = dict(partition="group", target_rows=5000, **truth["prep"])
+    a = dfeols.prep(src, shard_dir=tmp_path / "single", **kw)
+    b = dfeols.prep(
+        src, shard_dir=tmp_path / "dup", executor=_DuplicatingExecutor(), rows_per_task=1e4, **opts, **kw
+    )
+    assert b.n_rows == a.n_rows == sum(s["rows"] for s in b.shards)
+    on_disk = sum(_nrows(str(tmp_path / "dup" / f)) for s in b.shards for f in s["files"])
+    assert on_disk == a.n_rows
+    listed = {f.split("/")[-1] for s in b.shards for f in s["files"]}
+    assert set(os.listdir(tmp_path / "dup" / "shards")) == listed  # no orphan files
+    f = "y ~ x1:i(cat) + x2 + x3 | unit + group^time"
+    np.testing.assert_allclose(
+        dfeols.fit(a, f, cluster="group", log_every=1e9).coef(),
+        dfeols.fit(b, f, cluster="group", log_every=1e9).coef(),
+        rtol=1e-10,
+    )
+
+
+def test_scan_frames_are_reduced_as_they_arrive():
+    """The coordinator merges per-file scan frames incrementally (regression:
+    at 1e10 rows it held 5,000 copies of the group x time level set and the
+    nesting-check tables, well over 100 GB, and was killed)."""
+    from dfeols.prep_dist import _Compactor
+
+    rng = np.random.default_rng(0)
+    levels = _Compactor(lambda df: df.unique(), min_rows=500)
+    checks = _Compactor(lambda df: df.group_by("g").agg(pl.col("lo").min(), pl.col("hi").max()), min_rows=500)
+    peak = 0
+    for _ in range(2000):  # 2,000 files, each repeating most of 400 distinct keys
+        g = rng.choice(400, 300, replace=False)
+        levels.add(pl.DataFrame({"g": g}))
+        checks.add(pl.DataFrame({"g": g, "lo": rng.integers(0, 9, 300), "hi": rng.integers(9, 99, 300)}))
+        held = sum(x.height for x in levels.pending) + (
+            levels.merged.height if levels.merged is not None else 0
+        )
+        peak = max(peak, held)
+    assert levels.result()["g"].sort().to_list() == list(range(400))
+    assert checks.result().height == 400
+    assert peak < 2_000  # vs 600,000 rows held without merging
+
+    disjoint = _Compactor(lambda df: df.unique(), min_rows=100)
+    for f in range(300):  # nothing overlaps (unit-level frames): still exact
+        disjoint.add(pl.DataFrame({"u": np.arange(f * 50, f * 50 + 50)}))
+    assert disjoint.result().height == 15_000

@@ -21,7 +21,7 @@ First public release.
 - Source moved to a `src/` layout; `examples/` and `tests/` are not installed.
 - Licensed under GPL-3.0-or-later.
 - Dependency ranges are now tested at both ends: `polars>=1.37,<3`,
-  `pyfixest>=0.50.1,<1`, `numpy>=1.25`; Python 3.10–3.13.
+  `pyfixest>=0.50.1,<1`, `numpy>=1.25`; Python 3.10–3.14.
 - Dense FE codes are `int64` (were `uint64`), which fixes `np.bincount`
   failures under NumPy 1.x.
 - pyfixest comparisons (tests, `dfeols.bench` baseline) use the typed
@@ -36,40 +36,59 @@ First public release.
 - Code formatted and linted with ruff.
 
 ### Fixed
-- Distributed prep could count (and keep) rows twice when a task ran twice
-  at once, e.g. after the scheduler gave up on a busy worker that kept
-  writing ("prep: encoded 2,000,400,000 rows, expected 2,000,000,000"). Each
-  task attempt now writes uniquely named files; the coordinator keeps only
-  the files listed by the attempt it accepted, removes the rest, and passes
-  explicit file lists to the split and merge steps. Merge inputs are deleted
-  by the coordinator after the merge is accepted.
-- A `shard_dir` left by an interrupted prep (no `dfeols_meta.json`) is
-  cleared before prepping again, so its stale pieces cannot join the new
-  dataset.
-- Only one prep may write a `shard_dir` at a time. A lock file next to the
-  directory (`.<name>.prep-lock`, created with O_EXCL and refreshed every
-  30 s) makes a second prep, e.g. the same benchmark submitted twice, fail
-  at once with `dfeols.PrepInProgress` instead of clearing or overwriting the
-  running prep's files. A lock whose process is gone, or that has not been
-  refreshed for 10 minutes, is taken over.
-- The ETA no longer crashes with `OverflowError` when no workers are
-  connected (an infinite ETA is reported as unknown).
-- Range-based shard assignment (more than `range_groups` partition groups,
-  new in 0.6.0) computed bins from polars' `UInt32` row counts, which wrap
-  at 2**32: at 1e9 rows, 10M units and 500 bins it produced 4 shards, one
-  with 994M rows. Row counts are now Int64 throughout prep, and prep refuses
-  to write a shard larger than twice the target plus the largest partition
-  group. **Shard sets prepared with range assignment by 0.6.0–0.6.1 should
-  be re-prepped** (`"shard_assignment": "range"` in `dfeols_meta.json`).
+These include the fixes from the 0.6.2 snapshot (below), merged into the new
+layout, plus:
+- The coordinator merges per-file scan results as they arrive instead of
+  holding them until the scan ends. At 1e10 rows it kept 5,000 copies of the
+  group × time level set and its nesting-check tables (well over 100 GB) and
+  was killed; merged, these stay near the number of distinct keys.
 - `fit` checks the largest shard's memory estimate against the profile's
   worker memory: it warns above it and refuses above 1.5×, instead of
   letting the scheduler kill worker after worker on the same shard.
-- prep warns when one partition group is more than 4× the shard target.
+- prep refuses to write a shard larger than twice the target plus the
+  largest partition group (only a bug can produce one), and warns when one
+  partition group is more than 4× the target.
+- A `shard_dir` left by an interrupted prep (no `dfeols_meta.json`) is
+  cleared before prepping again, so its stale pieces cannot join the new
+  dataset.
+- The ETA no longer crashes with `OverflowError` when no workers are
+  connected (an infinite ETA is reported as unknown).
+- Folder locks also take over immediately when their holder ran on this
+  host and is gone, and a release never removes another holder's lock.
 
 ### Removed
 - `dfeols.slurm` (deprecated shim). Use `dfeols.executor(profile)` with a
   site profile (`dfeols config init`).
 - `benchmarks/bench.py` stub; use `python -m dfeols.bench`.
+
+## [0.6.2]
+
+Fixes from the first 1e10 attempts on OSCER (a snapshot, not published).
+
+### Fixed
+- Range-based shard assignment (more than `range_groups` partition groups,
+  new in 0.6.0) used polars' `UInt32` row counts, which wrap at 2**32: at
+  2e9 rows it produced 2 shards instead of 1,000 (at 1e9 rows with 10M units,
+  4 shards). Counts are Int64 and the bins and boundaries are checked to be
+  monotone. **Shard sets prepared with range assignment before 0.6.2 must be
+  rebuilt**; `dfeols bench` detects them (no `prep_version` in their
+  metadata) and re-preps them.
+- A task that ran twice at once (a rerun overlapping its first attempt, or
+  another job writing the same folder) could be counted twice ("encoded
+  2,000,400,000 rows, expected 2,000,000,000"). Every task attempt writes
+  uniquely named files and reports them; the coordinator keeps one attempt
+  per task, ignores duplicate results, sweeps the other files, and gives the
+  split and merge steps explicit file lists. Merge inputs are deleted by the
+  coordinator once the merge is accepted.
+- Two jobs could write the same folder. Shard folders (during prep) and
+  benchmark data sets (during generation and prep) are locked with a sibling
+  `<folder>.lock` (O_EXCL, refreshed every 30 s, stale after 5 min); a
+  second job fails at once with `dfeols.LockedError` naming the holder.
+- Overwrites rename the old folder before deleting it, so a straggling
+  writer cannot make the delete fail ("Directory not empty: '_buckets'").
+
+### Added
+- `prep_version` in `dfeols_meta.json`.
 
 ## [0.6.1]
 
