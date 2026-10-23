@@ -202,7 +202,7 @@ def _round1_sparse(plan: Plan, shard_id: int, df, n0: int, local_codes, w, T, t0
         C = sp.csr_matrix(
             (
                 np.tile(w, len(plan.global_fes)),
-                (np.tile(a, len(plan.global_fes)), gcodes.ravel() + np.repeat(offs, n)),
+                (np.tile(a, len(plan.global_fes)), gcodes.ravel()),  # gcodes carry the offsets
             ),
             shape=(nA, P),
         )

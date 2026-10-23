@@ -122,6 +122,24 @@ def test_sparse_crossing_fe_equals_dense(ds, data, cluster, weights):
         assert abs(a.outcomes[y]["rss"] - b.outcomes[y]["rss"]) < 1e-8 * b.outcomes[y]["rss"]
 
 
+def test_sparse_two_crossing_fes(data, tmp_path):
+    # regression: the second crossing FE's columns were offset twice ("index exceeds matrix
+    # dimension"); the test above has only one crossing FE, whose offset is 0
+    ds = dfeols.prep(data, shard_dir=tmp_path / "s", partition="id_a",
+                     fixed_effects=["spell", "week", "tenure"], clusters=["id_a"], target_rows=3000)
+    f = "eng ~ feat + posts | spell + week + tenure"
+    kw = dict(cluster="id_a", vcov=["CRV1", "hetero"], log_every=1e9)
+    a = dfeols.fit(ds, f, crossing_fe="sparse", **kw)
+    b = dfeols.fit(ds, f, crossing_fe="dense", **kw)
+    assert a.N == b.N and a.fe_levels == b.fe_levels
+    np.testing.assert_allclose(a.coef(), b.coef(), rtol=1e-9, atol=1e-12)
+    for t in ("CRV1", "hetero"):
+        np.testing.assert_allclose(a.vcov(None, t), b.vcov(None, t), rtol=1e-8, atol=1e-15)
+    m = pf.feols("eng ~ feat + posts | spell + week + tenure", data=data.to_pandas(),
+                 vcov={"CRV1": "id_a"}, **pyfixest_tol_kwargs(1e-13))
+    np.testing.assert_allclose(a.coef(), m.coef().to_numpy(), **TOL)
+
+
 def test_exact_two_way_residuals_orthogonal():
     from dfeols.demean import exact_two_way
 
