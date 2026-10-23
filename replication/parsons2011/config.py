@@ -9,10 +9,15 @@ race/ethnicity match (UPM), count/inning/score controls, and absorbed pitcher,
 umpire and batter effects (with QuesTec interactions in some tables).
 Heteroskedasticity-robust SEs.
 
-What to edit here:
-  1. VARMAP: the authors' column names (run `harness.py inspect` first).
-  2. SPECS: check each regressor list and FE set against 20081366_statacode.do.
-  3. PUBLISHED: replace the working-paper values with the AER tables.
+Variables and specs follow 20081366_statacode.do (openICPSR 112434); notes and line cites in
+docs/parsons2011.md. PUBLISHED is empty until the AER tables are entered.
+
+Most published estimates do not use exact fixed effects. Table 3 cols. 8-9 demean once by
+umpire (then batter) and absorb the pitcher; Tables 4-5 demean once each by the QuesTec-specific
+batter, umpire and pitcher ids, in that order, then run OLS. Both demean on the full file,
+Asian pitchers included, and then regress on non-Asian pitchers. AUTHORS reproduces that
+procedure (`harness.py authors`), so the data can be checked against the published tables;
+dfeols, pyfixest and reghdfe all fit the exact FE model, which differs in the 4th decimal.
 """
 
 from __future__ import annotations
@@ -30,35 +35,43 @@ TITLE = "Parsons et al. (2011), Strike Three: dfeols replication"
 # the harness derives it where it can (see DERIVED) or leaves it out.
 VARMAP: dict[str, str | None] = {
     # outcome
-    "strike": None,        # 1 = called strike, 0 = called ball (called pitches only)
+    "strike": "callstrike",  # 1 = called strike, 0 = called ball (called pitches only)
     # identifiers (any type; strings are factorized)
-    "umpire": None,        # home-plate umpire
-    "pitcher": None,
-    "batter": None,
-    "catcher": None,       # optional
-    "game": None,          # optional: enables the CRV1-by-game check
-    "year": None,          # optional: enables `build --years`
+    "umpire": "uid",         # home-plate umpire
+    "pitcher": "pid",
+    "batter": "bid",
+    "catcher": None,         # not in the file (only ucm, the umpire-catcher match)
+    "game": None,            # not in the file
+    "year": None,            # not in the file
     # treatment and moderators
-    "upm": None,           # umpire-pitcher match; or set ump_race + pitcher_race
-    "ump_race": None,
-    "pitcher_race": None,
-    "questec": None,       # 1 = QuesTec park
-    "well_att": None,      # 1 = well-attended game; or set attendance + capacity
+    "upm": "upm",            # == (u0race == prace) on every row
+    "ump_race": "u0race",
+    "pitcher_race": "prace", # 1 White, 2 Black, 3 Hispanic, 4 Asian
+    "questec": "questec",
+    "well_att": "att_dummy", # attendance > 69% of capacity (ReadMe); built by the authors
     "attendance": None,
     "capacity": None,
-    "terminal": None,      # 1 = two strikes or three balls; derived from balls/strikes if None
+    "terminal": "term",      # == (3 balls or 2 strikes) on every row
     # controls
     "balls": None,
     "strikes": None,
-    "count": None,         # categorical count; derived as 10*balls + strikes if None
-    "inning": None,
-    "top": None,           # 1 = top of the inning
-    "score_adv": None,     # pitching team's score advantage
+    "count": None,           # from the cd* dummies, see DUMMY_SETS
+    "inning": None,          # from the id* dummies, see DUMMY_SETS
+    "top": "top",            # 1 = top of the inning
+    "score_adv": "score",    # pitcher's score advantage
 }
 
-# Threshold for the well-attended indicator when it is built from attendance /
-# capacity. The working paper splits at roughly 69-70% of capacity; use the
-# authors' definition from the do-file.
+# Categorical controls rebuilt from the authors' dummy sets: {name: (base level, {column: level})}.
+# count = 10*balls + strikes, base 0-0; inning base 1, 9 = ninth or later.
+DUMMY_SETS = {
+    "count": (0, {f"cd{b}{s}": 10 * b + s for b in range(4) for s in range(3) if (b, s) != (0, 0)}),
+    "inning": (1, {f"id{i}": i for i in range(2, 10)}),
+}
+
+# Every pooled regression in the do-file is on non-Asian pitchers (prace<4 / prace~=4).
+SAMPLE = "pitcher_race < 4"
+
+# Only used when well_att is built from attendance / capacity, which this file doesn't need.
 WELL_ATTENDED_SHARE = 0.70
 
 REQUIRED = ["strike", "umpire", "pitcher", "batter", "upm", "questec", "count", "inning", "top",
@@ -67,54 +80,58 @@ IDS = ["umpire", "pitcher", "batter", "catcher", "game"]
 
 # --------------------------------------------------------------------------- 2. models
 CONTROLS = "i(count) + i(inning) + top + score_adv"
+QFE = "pitcher^questec + umpire^questec + batter^questec"  # the authors' qpid, quid, qbid
 
 # Partition keys. dfeols handles an FE locally when it is nested in the key and
-# as (sparse) dummies when it crosses shards; crossing FEs need <= max_dummy_levels
-# levels. Batters have the most levels, so they are the default key. Sharding the
-# same data two ways and getting the same answer is itself one of the checks.
+# as (sparse) dummies when it crosses shards. Sharding the same data two ways and
+# getting the same answer is itself one of the checks.
 DATASETS = [
     DatasetSpec("by_batter", "batter",
-                ("batter", "pitcher", "umpire", "pitcher^questec", "umpire^questec"), ("game",)),
-    DatasetSpec("by_pitcher", "pitcher", ("pitcher", "umpire", "batter"), ("game",)),
-    DatasetSpec("by_batter_qt", ("batter", "questec"),
-                ("batter^questec", "pitcher^questec", "umpire^questec"), ("game",)),
+                ("batter", "pitcher", "umpire", "pitcher^questec", "umpire^questec", "batter^questec"),
+                ("pitcher",)),
+    DatasetSpec("by_pitcher", "pitcher", ("pitcher", "umpire", "batter")),
 ]
 
+# Pooled columns only; the subsample columns (by race, QuesTec, attendance, count) are left out.
 SPECS = [
     Spec("T3c7", f"strike ~ upm + {CONTROLS} | pitcher", ("by_pitcher",),
-         paper="Table 3, col. 7"),
+         paper="Table 3, col. 7", note="do-file line 37; areg, so exact"),
     Spec("T3c8", f"strike ~ upm + {CONTROLS} | pitcher + umpire", ("by_pitcher",),
-         paper="Table 3, col. 8"),
+         paper="Table 3, col. 8", note="lines 41-48; paper demeans once by umpire"),
     Spec("T3c9", f"strike ~ upm + {CONTROLS} | pitcher + umpire + batter", ("by_batter", "by_pitcher"),
-         paper="Table 3, col. 9", note="run on two partitions: invariance check"),
-    Spec("T4", f"strike ~ upm + upm:questec + {CONTROLS} | pitcher^questec + umpire^questec + batter",
-         ("by_batter",), paper="Table 4, pooled"),
-    Spec("T5A", f"strike ~ upm + well_att + upm:well_att + {CONTROLS} | pitcher + umpire + batter",
-         ("by_batter",), paper="Table 5A, pooled"),
-    Spec("T5B", f"strike ~ upm + upm:terminal + {CONTROLS} | pitcher + umpire + batter",
-         ("by_batter",), paper="Table 5B, pooled",
-         note="terminal itself is a function of the count dummies, so it is absorbed by i(count)"),
-    Spec("T7", f"strike ~ upm + upm:questec + upm:well_att + upm:terminal + well_att + {CONTROLS}"
-               " | pitcher^questec + umpire^questec + batter^questec",
-         ("by_batter_qt",), paper="Table 7", note="check the exact regressor list in the do-file"),
-    # Not in the paper: exercises CRV1 with clusters (games) that cross shards.
-    Spec("T3c9_game", f"strike ~ upm + {CONTROLS} | pitcher + umpire + batter", ("by_batter",),
-         vcov=("CRV1", "hetero"), cluster="game", paper="(extra check)"),
+         paper="Table 3, col. 9", note="lines 51-59; run on two partitions: invariance check"),
+    Spec("T4c3", f"strike ~ upm + upm:questec + {CONTROLS} | {QFE}", ("by_batter",),
+         paper="Table 4, col. 3", note="lines 67-93"),
+    Spec("T5c3", f"strike ~ upm + well_att + upm:well_att + {CONTROLS} | {QFE}", ("by_batter",),
+         paper="Table 5A, col. 3", note="line 108"),
+    Spec("T5c6", f"strike ~ upm + upm:terminal + {CONTROLS} | {QFE}", ("by_batter",),
+         paper="Table 5B, col. 3", note="line 120; terminal itself is absorbed by i(count)"),
+    Spec("T5c9", f"strike ~ upm + upm:questec + well_att + upm:well_att + upm:terminal + {CONTROLS}"
+                 f" | {QFE}", ("by_batter",), paper="Table 5C", note="line 132"),
+    # Not in the paper: CRV1 with clusters (pitchers) that cross the batter shards.
+    Spec("T3c9_crv", f"strike ~ upm + {CONTROLS} | pitcher + umpire + batter", ("by_batter",),
+         vcov=("CRV1", "hetero"), cluster="pitcher", paper="(extra check)"),
 ]
 
-# --------------------------------------------------------------------------- 3. published
-# {spec: {term: (coef, se, decimals)}}. The values below are from the NBER
-# working paper (w13665: seasons 2004-06, N = 1,132,145 called pitches), read
-# from the PDF; the AER version uses a different sample, so these are for
-# orientation only. Replace them with the AER tables and set PUBLISHED_N.
-PUBLISHED: dict[str, dict[str, tuple[float, float | None, int]]] = {
-    "T3c7": {"upm": (0.0034, 0.0017, 4)},
-    "T3c8": {"upm": (0.0028, 0.0023, 4)},
-    "T3c9": {"upm": (0.0027, 0.0023, 4)},
-    "T4": {"upm": (0.0064, 0.0029, 4), "upm:questec": (-0.0098, 0.0047, 4)},
-    "T5A": {"upm": (0.0052, 0.0025, 4), "well_att": (0.0062, 0.0016, 4),
-            "upm:well_att": (-0.0050, 0.0019, 4)},
-    "T5B": {"upm": (0.0042, 0.0024, 4), "upm:terminal": (-0.0073, 0.0018, 4)},
+# The authors' procedure, on calledpitch.dta's own columns (see the module docstring).
+# demean: one pass each, in order, on the full file; absorb: areg FE on the sample; sample: Stata if.
+# terms maps the authors' regressor names to ours.
+_T45 = dict(demean=("qbid", "quid", "qpid"), absorb=None, sample="prace != 4")
+AUTHORS = {
+    "T3c7": dict(x=["upm"], demean=(), absorb="pid", sample="prace < 4"),
+    "T3c8": dict(x=["upm"], demean=("uid",), absorb="pid", sample="prace < 4"),
+    "T3c9": dict(x=["upm"], demean=("uid", "bid"), absorb="pid", sample="prace < 4"),
+    "T4c3": dict(x=["upm", "q_upm"], **_T45),
+    "T5c3": dict(x=["upm", "att_dummy", "att_dummy_upm"], **_T45),
+    "T5c6": dict(x=["upm", "term_upm"], **_T45),
+    "T5c9": dict(x=["upm", "q_upm", "att_dummy", "att_dummy_upm", "term_upm"], **_T45),
 }
-PUBLISHED_SOURCE = "NBER WP w13665 (orientation only; replace with the AER tables)"
-PUBLISHED_N: dict[str, int] = {k: 1_132_145 for k in PUBLISHED}
+AUTHORS_CONTROLS = ["score", *DUMMY_SETS["count"][1], *DUMMY_SETS["inning"][1], "top"]
+AUTHORS_TERMS = {"q_upm": "upm:questec", "att_dummy": "well_att", "att_dummy_upm": "upm:well_att",
+                 "term_upm": "upm:terminal"}
+
+# --------------------------------------------------------------------------- 3. published
+# {spec: {term: (coef, se, decimals)}}, from the AER tables (not yet entered).
+PUBLISHED: dict[str, dict[str, tuple[float, float | None, int]]] = {}
+PUBLISHED_SOURCE = "not yet entered (needs the AER 101(4) tables)"
+PUBLISHED_N: dict[str, int] = {}

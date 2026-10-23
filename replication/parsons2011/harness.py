@@ -8,6 +8,8 @@ reghdfe and the published tables.
     python harness.py run      --data WORK [--executor serial|dask:4|<profile>] [--specs T3c9 T4]
     python harness.py stata-do --data WORK      # then run WORK/reference_reghdfe.do in Stata
     python harness.py report   --data WORK      # exit code 1 if any check FAILs
+    python harness.py authors  --dta calledpitch.dta --data WORK
+    #   -> the authors' approximate demeaning, to check the data against the published tables
 
 WORK holds everything: analysis.parquet/.dta, shards/<dataset>, runs/<label>,
 results/*.json, reghdfe_results.csv, comparison.csv and report.md.
@@ -67,6 +69,15 @@ def cmd_inspect(a):
 
 
 # --------------------------------------------------------------------------- build
+def _from_dummies(raw: pd.DataFrame, base: int, levels: dict[str, int]) -> pd.Series:
+    """Categorical from a set of mutually exclusive dummies; rows with none get `base`."""
+    d = raw[list(levels)]
+    if (d.sum(axis=1) > 1).any():
+        sys.exit(f"dummies {list(levels)} are not mutually exclusive")
+    return pd.Series(np.select([d[c].eq(1) for c in levels], list(levels.values()), base),
+                     index=raw.index, dtype=np.int64)
+
+
 def _derive(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     notes = []
     if "upm" not in df and {"ump_race", "pitcher_race"} <= set(df):
@@ -91,9 +102,20 @@ def cmd_build(a):
     mapped = {k: v for k, v in config.VARMAP.items() if v}
     if not mapped:
         sys.exit("VARMAP in config.py is empty: run `inspect` and fill it in first.")
-    raw = pd.read_stata(a.dta, convert_categoricals=False, columns=sorted(set(mapped.values())))
+    dummy_sets = getattr(config, "DUMMY_SETS", {})
+    cols = set(mapped.values()) | {c for _, lv in dummy_sets.values() for c in lv}
+    raw = pd.read_stata(a.dta, convert_categoricals=False, columns=sorted(cols))
     df = pd.DataFrame({k: raw[v] for k, v in mapped.items()})
+    for name, (base, levels) in dummy_sets.items():
+        df[name] = _from_dummies(raw, base, levels)
+    del raw
     df, notes = _derive(df)
+    notes += [f"{name} from dummies {', '.join(lv)} (base {base})" for name, (base, lv) in dummy_sets.items()]
+    sample = getattr(config, "SAMPLE", None)
+    if sample:
+        n0 = len(df)
+        df = df.query(sample)
+        notes.append(f"sample {sample}: kept {len(df):,} of {n0:,}")
     missing = [c for c in config.REQUIRED if c not in df]
     if missing:
         sys.exit(f"Missing after mapping and derivation: {missing}. Map them in VARMAP.")
@@ -117,7 +139,7 @@ def cmd_build(a):
     df = df.reset_index(drop=True)
     df.to_parquet(out / "analysis.parquet", index=False)
     df.to_stata(out / "analysis.dta", write_index=False, version=118)
-    info = {"source": str(Path(a.dta).resolve()), "rows": len(df), "columns": list(df.columns),
+    info = {"source": str(a.dta), "rows": len(df), "columns": list(df.columns),
             "levels": {c: int(df[c].nunique()) for c in keyed}, "notes": notes}
     (out / "build.json").write_text(json.dumps(info, indent=1))
     print(json.dumps(info, indent=1))
@@ -218,6 +240,61 @@ def cmd_report(a):
     sys.exit(1 if out["verdict"] == "FAIL" else 0)
 
 
+# --------------------------------------------------------------------------- authors
+def _hc1(y: np.ndarray, X: np.ndarray, absorbed: int) -> tuple[np.ndarray, np.ndarray]:
+    """OLS on demeaned data with Stata's robust SEs, scaled by (N-1)/(N-p-a): a is areg's absorbed
+    levels, or 1 for reg's constant. Data demeaned in one pass are not exactly mean zero, so
+    reg gets its constant."""
+    if not absorbed:
+        X = np.column_stack([X, np.ones(len(X))])
+    p = X.shape[1] - (0 if absorbed else 1)
+    xtx_inv = np.linalg.inv(X.T @ X)
+    b = xtx_inv @ (X.T @ y)
+    e = y - X @ b
+    n = len(y)
+    V = xtx_inv @ ((X.T * e**2) @ X) @ xtx_inv * (n - 1) / (n - p - max(absorbed, 1))
+    return b[:p], np.sqrt(np.diag(V))[:p]
+
+
+def authors_procedure(dta: str) -> dict:
+    """config.AUTHORS fit the way the do-file does: one-pass group demeaning on the full file,
+    then areg (one absorbed FE) or reg on the sample. Returns {spec: {term: (b, se)}, "N": ...}."""
+    ctrl = config.AUTHORS_CONTROLS
+    out = {}
+    raw = pd.read_stata(dta, convert_categoricals=False)
+    for label, m in config.AUTHORS.items():
+        cols = ["callstrike", *m["x"], *ctrl]
+        d = raw[cols].astype(np.float64)
+        for g in m["demean"]:
+            d = d - d.groupby(raw[g]).transform("mean")
+        keep = raw.eval(m["sample"]).to_numpy()
+        d = d[keep]
+        absorbed = 0
+        if m["absorb"]:
+            g = raw.loc[keep, m["absorb"]]
+            d = d - d.groupby(g).transform("mean")
+            absorbed = int(g.nunique())
+        b, se = _hc1(d["callstrike"].to_numpy(), d[[*m["x"], *ctrl]].to_numpy(), absorbed)
+        terms = {config.AUTHORS_TERMS.get(x, x): (float(b[i]), float(se[i])) for i, x in enumerate(m["x"])}
+        out[label] = {"N": int(keep.sum()), "coefs": terms}
+        log.info("authors %s: %s", label, {t: round(v[0], 5) for t, v in terms.items()})
+    return out
+
+
+def cmd_authors(a):
+    res = authors_procedure(a.dta)
+    data = Path(a.data)
+    (data / "results").mkdir(parents=True, exist_ok=True)
+    (data / "results" / "authors.json").write_text(json.dumps(res, indent=1))
+    print(f"{'spec':<6} {'term':<14} {'authors b':>10} {'se':>8} {'published':>18}")
+    for label, r in res.items():
+        pub = config.PUBLISHED.get(label, {})
+        for t, (b, se) in r["coefs"].items():
+            p = pub.get(t)
+            ps = f"{p[0]} ({p[1]})" if p else ""
+            print(f"{label:<6} {t:<14} {b:>10.4f} {se:>8.4f} {ps:>18}")
+
+
 # --------------------------------------------------------------------------- main
 def main(argv=None):
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
@@ -248,6 +325,10 @@ def main(argv=None):
     s = sub.add_parser("report", help="compare all results and write report.md")
     s.add_argument("--data", required=True)
     s.set_defaults(fn=cmd_report)
+    s = sub.add_parser("authors", help="the authors' approximate procedure, vs the published values")
+    s.add_argument("--dta", required=True)
+    s.add_argument("--data", required=True)
+    s.set_defaults(fn=cmd_authors)
     a = p.parse_args(argv)
     a.fn(a)
 
