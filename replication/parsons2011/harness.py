@@ -259,10 +259,10 @@ def _hc1(y: np.ndarray, X: np.ndarray, absorbed: int) -> tuple[np.ndarray, np.nd
 def authors_procedure(dta: str) -> dict:
     """config.AUTHORS fit the way the do-file does: one-pass group demeaning on the full file,
     then areg (one absorbed FE) or reg on the sample. Returns {spec: {term: (b, se)}, "N": ...}."""
-    ctrl = config.AUTHORS_CONTROLS
     out = {}
     raw = pd.read_stata(dta, convert_categoricals=False)
     for label, m in config.AUTHORS.items():
+        ctrl = m.get("controls", config.AUTHORS_CONTROLS)
         cols = ["callstrike", *m["x"], *ctrl]
         d = raw[cols].astype(np.float64)
         for g in m["demean"]:
@@ -286,13 +286,22 @@ def cmd_authors(a):
     data = Path(a.data)
     (data / "results").mkdir(parents=True, exist_ok=True)
     (data / "results" / "authors.json").write_text(json.dumps(res, indent=1))
-    print(f"{'spec':<6} {'term':<14} {'authors b':>10} {'se':>8} {'published':>18}")
+    # the published tables mix rounding and truncation, so allow one unit in the last digit
+    print(f"{'spec':<6} {'term':<14} {'authors b':>10} {'se':>8} {'published':>18}  within 1 unit")
+    bad = 0
     for label, r in res.items():
         pub = config.PUBLISHED.get(label, {})
         for t, (b, se) in r["coefs"].items():
             p = pub.get(t)
+            ok = ""
+            if p:
+                unit = 10.0 ** -p[2] + 1e-12
+                good = abs(b - p[0]) <= unit and (p[1] is None or abs(se - p[1]) <= unit)
+                ok, bad = ("yes" if good else "NO"), bad + (not good)
             ps = f"{p[0]} ({p[1]})" if p else ""
-            print(f"{label:<6} {t:<14} {b:>10.4f} {se:>8.4f} {ps:>18}")
+            print(f"{label:<6} {t:<14} {b:>10.6f} {se:>8.6f} {ps:>18}  {ok}")
+    print("all published values reproduced" if not bad else f"{bad} published values not reproduced")
+    sys.exit(1 if bad else 0)
 
 
 # --------------------------------------------------------------------------- main

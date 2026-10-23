@@ -94,8 +94,10 @@ DATASETS = [
 
 # Pooled columns only; the subsample columns (by race, QuesTec, attendance, count) are left out.
 SPECS = [
-    Spec("T3c7", f"strike ~ upm + {CONTROLS} | pitcher", ("by_pitcher",),
-         paper="Table 3, col. 7", note="do-file line 37; areg, so exact"),
+    # `score- top` (line 37) is a range in the file's column order, which in the deposited file is
+    # score term term_upm top: no count or inning dummies. Published R2 0.031 confirms it.
+    Spec("T3c7", "strike ~ upm + score_adv + terminal + upm:terminal + top | pitcher", ("by_pitcher",),
+         paper="Table 3, col. 7", note="line 37; areg, so exact: compare with the paper directly"),
     Spec("T3c8", f"strike ~ upm + {CONTROLS} | pitcher + umpire", ("by_pitcher",),
          paper="Table 3, col. 8", note="lines 41-48; paper demeans once by umpire"),
     Spec("T3c9", f"strike ~ upm + {CONTROLS} | pitcher + umpire + batter", ("by_batter", "by_pitcher"),
@@ -103,11 +105,11 @@ SPECS = [
     Spec("T4c3", f"strike ~ upm + upm:questec + {CONTROLS} | {QFE}", ("by_batter",),
          paper="Table 4, col. 3", note="lines 67-93"),
     Spec("T5c3", f"strike ~ upm + well_att + upm:well_att + {CONTROLS} | {QFE}", ("by_batter",),
-         paper="Table 5A, col. 3", note="line 108"),
+         paper="Table 5, col. 3 (panel A)", note="line 108"),
     Spec("T5c6", f"strike ~ upm + upm:terminal + {CONTROLS} | {QFE}", ("by_batter",),
-         paper="Table 5B, col. 3", note="line 120; terminal itself is absorbed by i(count)"),
+         paper="Table 5, col. 6 (panel B)", note="line 120; terminal itself is absorbed by i(count)"),
     Spec("T5c9", f"strike ~ upm + upm:questec + well_att + upm:well_att + upm:terminal + {CONTROLS}"
-                 f" | {QFE}", ("by_batter",), paper="Table 5C", note="line 132"),
+                 f" | {QFE}", ("by_batter",), paper="Table 5, col. 9 (panel C)", note="line 132"),
     # Not in the paper: CRV1 with clusters (pitchers) that cross the batter shards.
     Spec("T3c9_crv", f"strike ~ upm + {CONTROLS} | pitcher + umpire + batter", ("by_batter",),
          vcov=("CRV1", "hetero"), cluster="pitcher", paper="(extra check)"),
@@ -118,7 +120,8 @@ SPECS = [
 # terms maps the authors' regressor names to ours.
 _T45 = dict(demean=("qbid", "quid", "qpid"), absorb=None, sample="prace != 4")
 AUTHORS = {
-    "T3c7": dict(x=["upm"], demean=(), absorb="pid", sample="prace < 4"),
+    "T3c7": dict(x=["upm"], demean=(), absorb="pid", sample="prace < 4",
+                 controls=["score", "term", "term_upm", "top"]),
     "T3c8": dict(x=["upm"], demean=("uid",), absorb="pid", sample="prace < 4"),
     "T3c9": dict(x=["upm"], demean=("uid", "bid"), absorb="pid", sample="prace < 4"),
     "T4c3": dict(x=["upm", "q_upm"], **_T45),
@@ -131,7 +134,20 @@ AUTHORS_TERMS = {"q_upm": "upm:questec", "att_dummy": "well_att", "att_dummy_upm
                  "term_upm": "upm:terminal"}
 
 # --------------------------------------------------------------------------- 3. published
-# {spec: {term: (coef, se, decimals)}}, from the AER tables (not yet entered).
-PUBLISHED: dict[str, dict[str, tuple[float, float | None, int]]] = {}
-PUBLISHED_SOURCE = "not yet entered (needs the AER 101(4) tables)"
-PUBLISHED_N: dict[str, int] = {}
+# {spec: {term: (coef, se, decimals)}}, AER 101(4) Tables 3-5. The target is the authors' code
+# (AUTHORS); every published number is within 0.0001 of it, but the tables mix rounding and
+# truncation, so expect last-digit INFO flags. Only T3c7 is an exact FE model; for the rest,
+# dfeols (exact) and the paper (one-pass demeaning) differ by design.
+PUBLISHED: dict[str, dict[str, tuple[float, float | None, int]]] = {
+    "T3c7": {"upm": (0.0024, 0.0013, 4)},
+    "T3c8": {"upm": (0.0021, 0.0017, 4)},
+    "T3c9": {"upm": (0.0016, 0.0017, 4)},
+    "T4c3": {"upm": (0.0059, 0.0022, 4), "upm:questec": (-0.0107, 0.0035, 4)},
+    "T5c3": {"upm": (0.0036, 0.0019, 4), "well_att": (0.0059, 0.0012, 4),
+             "upm:well_att": (-0.0037, 0.0015, 4)},
+    "T5c6": {"upm": (0.0031, 0.0018, 4), "upm:terminal": (-0.0058, 0.0014, 4)},
+    "T5c9": {"upm": (0.0089, 0.0024, 4), "upm:questec": (-0.0102, 0.0036, 4),
+             "upm:well_att": (-0.0035, 0.0015, 4), "upm:terminal": (-0.0058, 0.0014, 4)},
+}
+PUBLISHED_SOURCE = "AER 101(4): 1410-35, Tables 3-5"
+PUBLISHED_N: dict[str, int] = {k: 1_838_676 for k in PUBLISHED}
