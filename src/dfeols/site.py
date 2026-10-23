@@ -39,7 +39,7 @@ from __future__ import annotations
 
 import copy
 import os
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 try:
@@ -129,6 +129,18 @@ def _expand(v):
     return v
 
 
+def _apply_overrides(d: dict, overrides: dict) -> dict:
+    # flat overrides: worker keys may be given at top level for convenience
+    for k, v in overrides.items():
+        if v is None:
+            continue
+        if k in DEFAULTS["worker"]:
+            d["worker"][k] = v
+        else:
+            d[k] = v
+    return d
+
+
 def _merge(base: dict, over: dict) -> dict:
     out = copy.deepcopy(base)
     for k, v in over.items():
@@ -159,6 +171,15 @@ class Profile:
         base = Path(self.scratch) if self.scratch else Path.cwd() / "dfeols-scratch"
         return base.joinpath(*parts)
 
+    def with_overrides(self, **overrides) -> Profile:
+        """Copy of this profile with the same flat overrides profile() accepts."""
+        if not any(v is not None for v in overrides.values()):
+            return self
+        d = asdict(self)
+        name, source = d.pop("name"), d.pop("source")
+        d = _expand(_apply_overrides(d, overrides))
+        return Profile(name=name, source=source, **d)
+
 
 def load_config(path: str | os.PathLike | None = None) -> dict:
     p = Path(path) if path else config_path()
@@ -181,16 +202,7 @@ def profile(name: str | None = None, path=None, **overrides) -> Profile:
             f"profile {name!r} not found in {where} (have: {sorted(profiles) or 'none'}); "
             "run `dfeols config init` to create a config"
         )
-    d = _merge(DEFAULTS, profiles.get(name, {}))
-    # flat overrides: worker keys may be given at top level for convenience
-    for k, v in overrides.items():
-        if v is None:
-            continue
-        if k in DEFAULTS["worker"]:
-            d["worker"][k] = v
-        else:
-            d[k] = v
-    d = _expand(d)
+    d = _expand(_apply_overrides(_merge(DEFAULTS, profiles.get(name, {})), overrides))
     if d["scheduler"] not in SCHEDULERS:
         raise ValueError(f"scheduler must be one of {SCHEDULERS}, got {d['scheduler']!r}")
     for k in ("account", "queue", "project"):
