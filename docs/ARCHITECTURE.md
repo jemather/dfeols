@@ -45,6 +45,13 @@ same dataset as single-node prep.
 
 `estimate.py` (coordinator) and `worker.py` (shard tasks).
 
+0. **Singletons** (only when an FE crosses the partition): passes over the
+   shards drop singletons in every FE, iterating, as fixest and reghdfe do.
+   Pass 1 drops local-FE singletons and counts each crossing FE's levels; each
+   later pass drops rows whose level count from the previous pass is 1 (an upper
+   bound, since shards only drop rows), until a pass drops nothing. Keep masks
+   go to `<workdir>/singletons/`, so the workdir must be on shared scratch.
+   With only local FEs, each shard finds its singletons in round 1.
 1. **Round 1** (per shard): build the design, drop singletons, demean, return
    `X'WX` and `X'Wy`.
 2. **Solve** (coordinator): reduce the cross-products and solve, with

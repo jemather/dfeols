@@ -140,6 +140,37 @@ def test_sparse_two_crossing_fes(data, tmp_path):
     np.testing.assert_allclose(a.coef(), m.coef().to_numpy(), **TOL)
 
 
+@pytest.fixture(scope="module")
+def singleton_data(data):
+    # a crossing FE with many one-row levels; dropping those rows leaves new singletons in
+    # spell (local) and tenure, so finding them all takes several passes across shards
+    import polars as pl
+
+    rng = np.random.default_rng(7)
+    n = data.height
+    rare = np.where(rng.random(n) < 0.03, np.arange(n) + 1000, rng.integers(0, 40, n))
+    return data.with_columns(rare=pl.Series(rare))
+
+
+# sparse needs exactly one FE nested in the partition; by week, none is
+@pytest.mark.parametrize("partition,crossing_fe", [("id_a", "sparse"), ("id_a", "dense"), ("week", "dense")])
+def test_singletons_over_all_fes_match_fixest(singleton_data, tmp_path, partition, crossing_fe):
+    # fixest/reghdfe drop singletons in every FE, iterating; dfeols must too, whatever the
+    # partition (it used to drop only the local FE's singletons, so N depended on the key)
+    ds = dfeols.prep(singleton_data, shard_dir=tmp_path / "s", partition=partition,
+                     fixed_effects=["spell", "week", "tenure", "rare"], clusters=["id_a"], target_rows=3000)
+    f = "eng ~ feat + posts | spell + tenure + rare"
+    r = dfeols.fit(ds, f, cluster="id_a", vcov=["CRV1", "hetero"], crossing_fe=crossing_fe,
+                   max_dummy_levels=10_000, log_every=1e9)
+    pdf = singleton_data.to_pandas()
+    for v in ("CRV1", "hetero"):
+        m = pf.feols(f, data=pdf, vcov=_pf_vcov(v, "id_a"), fixef_rm="singleton", **pyfixest_tol_kwargs(1e-13))
+        assert r.N == m._N
+        np.testing.assert_allclose(r.coef(), m.coef().to_numpy(), **TOL)
+        np.testing.assert_allclose(np.sqrt(np.diag(r.vcov(None, v))), m.se().to_numpy(), rtol=1e-7)
+    assert r.timing["singleton_passes"] >= 2
+
+
 def test_exact_two_way_residuals_orthogonal():
     from dfeols.demean import exact_two_way
 

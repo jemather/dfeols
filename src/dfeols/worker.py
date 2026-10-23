@@ -2,6 +2,10 @@
 # Copyright (C) 2026 Ted Matherly
 """Shard-level work. These functions run on workers and must stay picklable.
 
+Singletons (`shard_singletons`): with FEs that cross the partition, singletons
+are found over all FEs at once in passes over the shards (see
+estimate._drop_singletons); each shard's keep mask goes to plan.keep_dir.
+
 Round 1 (`shard_round1`): build the design for one shard, drop singletons,
 demean by FEs nested in the partition key, and return cross-products.
 The demeaned arrays are cached to disk for round 2.
@@ -49,6 +53,7 @@ class Plan:
     fe_maxiter: int = 100_000
     fe_method: str = "auto"  # auto | exact | iterate
     sparse_global: bool = False  # crossing FEs via per-level sums, no dense dummies
+    keep_dir: str | None = None  # per-shard singleton keep masks (when FEs cross the partition)
 
 
 def plan_columns(f: Formula, cat_levels: dict[str, list], has_fe: bool):
@@ -120,6 +125,57 @@ def _maxrss_gb() -> float:
 
 def _cache_path(plan: Plan, shard_id: int) -> Path:
     return Path(plan.cache_dir) / plan.spec_id / f"shard_{shard_id:06d}.npz"
+
+
+def _keep_path(plan: Plan, shard_id: int) -> Path:
+    return Path(plan.keep_dir) / f"shard_{shard_id:06d}.npy"
+
+
+def shard_singletons(plan: Plan, shard_id: int, files: list[str], gcount, first: bool) -> dict:
+    """One pass of singleton removal over every FE, as fixest and reghdfe do.
+
+    gcount: per crossing FE, the count of kept rows in each level over all shards
+    after the previous pass (None on the first pass, which drops local-FE
+    singletons only). Other shards only drop rows, so gcount minus this shard's
+    own rows plus its current rows is an upper bound on a level's true count: a
+    row is dropped only if it is truly alone, and anything missed is caught on a
+    later pass. Writes the keep mask and returns this shard's level counts."""
+    t0 = time.perf_counter()
+    df = _load(plan, files)  # the same rows round 1 sees (listwise deletion included)
+    n0 = df.height
+    keep = np.ones(n0, bool) if first else np.load(_keep_path(plan, shard_id))
+    local = [densify(df[c].to_numpy())[0] for _, c in plan.local_fes]
+    glob = [(df[c].to_numpy().astype(np.int64), L) for _, c, L in plan.global_fes]
+    before = int(keep.sum())
+    others = (
+        [gc - np.bincount(g[keep], minlength=L) for gc, (g, L) in zip(gcount, glob)] if gcount is not None else None
+    )
+    changed = n0 > 0
+    while changed:
+        changed = False
+        for c in local:
+            cnt = np.bincount(c[keep], minlength=int(c.max()) + 1)
+            bad = keep & (cnt[c] <= 1)
+            if bad.any():
+                keep &= ~bad
+                changed = True
+        for i, (g, L) in enumerate(glob if others is not None else ()):
+            cnt = others[i] + np.bincount(g[keep], minlength=L)
+            bad = keep & (cnt[g] <= 1)
+            if bad.any():
+                keep &= ~bad
+                changed = True
+    p = _keep_path(plan, shard_id)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(p.stem + ".tmp.npy")
+    np.save(tmp, keep)
+    os.replace(tmp, p)
+    return {
+        "shard": shard_id,
+        "dropped": before - int(keep.sum()),
+        "gcount": [np.bincount(g[keep], minlength=L) for g, L in glob],
+        "timing": {"total": time.perf_counter() - t0, "maxrss_gb": _maxrss_gb()},
+    }
 
 
 def shard_round1(plan: Plan, shard_id: int, files: list[str]) -> dict:
@@ -240,8 +296,12 @@ def _round1(plan: Plan, shard_id: int, files: list[str], write_cache: bool):
 
     t = time.perf_counter()
     n0 = df.height
+    if plan.keep_dir:  # singletons over all FEs, found in the passes before round 1
+        keep = np.load(_keep_path(plan, shard_id))
+        if not keep.all():
+            df = df.filter(pl.Series(keep))
     local_codes = [densify(df[c].to_numpy())[0] for _, c in plan.local_fes]
-    if plan.drop_singletons and local_codes:
+    if plan.drop_singletons and local_codes and not plan.keep_dir:
         keep = drop_singletons(local_codes)
         if not keep.all():
             df = df.filter(pl.Series(keep))

@@ -22,7 +22,7 @@ from .progress import Progress, fmt_td
 from .results import Result
 from .vcov import df_k as _df_k
 from .vcov import vcov_crv1, vcov_hetero, vcov_iid
-from .worker import Plan, plan_columns, shard_round1, shard_round2
+from .worker import Plan, plan_columns, shard_round1, shard_round2, shard_singletons
 
 log = logging.getLogger("dfeols")
 
@@ -249,6 +249,38 @@ def _use_sparse(crossing_fe: str, local, glob) -> bool:
     return ok and crossing_fe != "dense"
 
 
+def _drop_singletons(plan: Plan, ds: Dataset, executor, prog: Progress, rows: dict, label: str) -> dict:
+    """Singletons over all FEs, as fixest and reghdfe do, when some FE crosses the
+    partition (a shard can't see a crossing FE's other rows). Pass 1 drops singletons
+    of the local FEs and counts the crossing FEs' levels; each later pass drops rows
+    whose level count (from the previous pass) is 1, within shards iterating to a
+    fixed point, until a pass drops nothing. Usually two or three passes."""
+    t0 = time.time()
+    gcount, p, total = None, 0, 0
+    while True:
+        p += 1
+        name = f"singletons{p}"
+        acc = {"g": [np.zeros(L, np.int64) for *_, L in plan.global_fes], "dropped": 0}
+
+        def on(tid, r):
+            acc["dropped"] += r["dropped"]
+            for i, c in enumerate(r["gcount"]):
+                acc["g"][i] += c
+
+        tasks = [(s["id"], rows[s["id"]], (plan, s["id"], ds.shard_paths(s), gcount, p == 1)) for s in ds.shards]
+        prog.add_stage(name, rows)
+        prog.start(name)
+        executor.run(shard_singletons, tasks, on, prog, name)
+        prog.finish(name)
+        total += acc["dropped"]
+        if p > 1 and acc["dropped"] == 0:
+            break
+        gcount = acc["g"]
+    log.info("fit %s: dropped %s singleton rows over all FEs in %d passes (%s)",
+             label, f"{total:,}", p, fmt_td(time.time() - t0))
+    return {"passes": p, "seconds": time.time() - t0}
+
+
 def fit(
     ds: Dataset | str,
     formula: str,
@@ -342,6 +374,10 @@ def fit(
 
     prog = Progress(wd, label=label, every=log_every, round2_recomputes=not cache)
     rows = {s["id"]: max(s["rows"], 1) for s in ds.shards}
+    sing = {"passes": 0, "seconds": 0.0}
+    if plan.drop_singletons and plan.global_fes:
+        plan.keep_dir = str(wd / "singletons")
+        sing = _drop_singletons(plan, ds, executor, prog, rows, label)
     prog.add_stage("round1", rows)
     prog.add_stage("round2", rows)
 
@@ -506,6 +542,8 @@ def fit(
 
     if cache and not keep_cache:
         shutil.rmtree(wd / "cache", ignore_errors=True)
+    if plan.keep_dir:
+        shutil.rmtree(plan.keep_dir, ignore_errors=True)
 
     res = Result(
         formula=f.text,
@@ -526,6 +564,8 @@ def fit(
             "round1_seconds": prog.stages["round1"].finished - prog.stages["round1"].started,
             "round2_seconds": prog.stages["round2"].finished - prog.stages["round2"].started,
             "solve_seconds": prog.stages["round2"].started - prog.stages["round1"].finished,
+            "singleton_passes": sing["passes"],
+            "singleton_seconds": sing["seconds"],
             "max_worker_rss_gb": peak["rss"],
             "n_shards": len(ds.shards),
             "worker_seconds": sum(sum(st.done.values()) for st in prog.stages.values()),
