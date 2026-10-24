@@ -1016,9 +1016,13 @@ other tools, by issue first; start with pyfixest, then fixest, then reghdfe):
    on real output and give each tool's authors code to adapt.
 7. **Own repository**: under a GitHub organisation; clean specification (this document
    without its decision history); the CC0 schemas, catalog and examples; a standalone
-   validator package (permissive license) that dfeols depends on. Open: organisation and
-   name ("estimation" is generic; check PyPI and GitHub), validator license (MIT or
-   Apache-2.0).
+   validator package (permissive license) that dfeols depends on. Decided (Ted, 2026-10-24,
+   after a name check the same day): organisation `estimation-format` (repo
+   `estimation-format/estimation`), PyPI package `estimation-format` (`import
+   estimation_format`), validator MIT. The check: `github.com/estimation` is an unrelated
+   personal account; `estimation`, `estimation-format`, `estrec` were free on PyPI
+   (`estimates` is taken); `estimation-format`, `estimation-records`, `open-estimation` were
+   free on github.com. The format's own name stays `estimation`.
 8. **Feedback, then a version**: share 0.1 as a draft for comments; publish a version
    before asking anyone to merge a writer.
 
