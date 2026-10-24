@@ -9,6 +9,7 @@ import logging
 import os
 import shutil
 import time
+import uuid
 from pathlib import Path
 
 import numpy as np
@@ -307,6 +308,9 @@ def fit(
     collin_tol: float = 1e-9,
     label: str | None = None,
     log_every: float = 30.0,
+    record: bool | str | os.PathLike = True,
+    publication: dict | None = None,
+    redact: bool = False,
 ) -> Result:
     """Estimate an HDFE OLS model on a prepared, sharded dataset.
 
@@ -315,11 +319,17 @@ def fit(
     executor   SerialExecutor() (default) or DaskExecutor(client)
     workdir    where status.json and the demeaned cache go; defaults to
                <shard_dir>/runs/<spec id>. Put it on shared scratch.
+    record     write `estimation` records, one per response: True puts them at
+               <workdir>/result.estimation.json (result.<y>.estimation.json with
+               several responses), a path puts them there, False skips them
+    publication  `publication` block for the record (citation, locator, links)
+    redact     leave identifying details (user, host, paths, job ids) out of the record
     """
     if not isinstance(ds, Dataset):
         ds = Dataset.open(ds)
     executor = executor or SerialExecutor()
     t_start = time.time()
+    cpu_start = time.process_time()
 
     probe = parse(formula)
     if cache == "auto":
@@ -407,6 +417,7 @@ def fit(
         "cpresent": (np.zeros(plan.cluster[2], bool) if plan.cluster and not plan.cluster_local else None),
         "G_local": 0,
         "row_n": {},
+        "load": {"rows": 0, "missing": 0, "non_finite": 0, "zero_weights": 0},
     }
 
     peak = {"rss": 0.0}
@@ -417,6 +428,8 @@ def fit(
             acc[key] += r[key]
         acc["n"] += r["n"]
         acc["rows_in"] += r["rows_in"]
+        for key, v in r.get("load", {}).items():
+            acc["load"][key] += v
         acc["sumw"] += r["sumw"]
         acc["row_n"][tid] = r["n"]
         acc["converged"] &= r["converged"]
@@ -544,6 +557,7 @@ def fit(
             "coef": b,
             "vcov": V,
             "rss": float(acc2["rss"][j]),
+            "tss": float(tss),
             "r2_within" if plan.local_fes else "r2": float(1 - acc2["rss"][j] / tss),
         }
 
@@ -552,6 +566,50 @@ def fit(
     if plan.keep_dir:
         shutil.rmtree(plan.keep_dir, ignore_errors=True)
 
+    from . import record as _record
+
+    t_end = time.time()
+    options = {
+        "cluster": cluster,
+        "vcov": list(plan.vcov_types),
+        "weights": weights,
+        "drop_singletons": bool(drop_singletons),
+        "fe_tol": fe_tol,
+        "fe_maxiter": plan.fe_maxiter,
+        "fe_method": fe_method,
+        "crossing_fe": "sparse" if plan.sparse_global else ("dense" if plan.global_fes else None),
+        "max_dummy_levels": max_dummy_levels,
+        "collin_tol": collin_tol,
+        "cache": cache,
+    }
+    run = _record.run_info(
+        ds,
+        executor,
+        started=t_start,
+        finished=t_end,
+        cpu_seconds=(time.process_time() - cpu_start) if isinstance(executor, SerialExecutor) else None,
+    )
+    run["sample"] = {
+        "rows_input": acc["load"]["rows"],
+        "dropped": {k: acc["load"][k] for k in ("missing", "non_finite", "zero_weights")},
+    }
+    run["fit_id"] = str(uuid.uuid4())
+    run["converged"] = bool(acc["converged"])
+    run["fe_nested_in_cluster"] = nested
+    run["n_local_fes"] = len(plan.local_fes)
+    run["absorption"] = {
+        **{n: {"method": "local", "nested_in_partition": True} for n, _ in plan.local_fes},
+        **{
+            n: {
+                "method": "crossing_sparse" if plan.sparse_global else "crossing_dense",
+                "nested_in_partition": False,
+            }
+            for n, *_ in plan.global_fes
+        },
+    }
+    run["factor_terms"] = _record.factor_terms(f, plan.cat_levels)
+    if weights:
+        run["sum_weights"] = float(acc["sumw"])
     res = Result(
         formula=f.text,
         label=label,
@@ -577,7 +635,17 @@ def fit(
             "n_shards": len(ds.shards),
             "worker_seconds": sum(sum(st.done.values()) for st in prog.stages.values()),
         },
+        options=options,
+        terms=_record.term_rows(f, plan.cat_levels, has_fe=bool(plan.local_fes or plan.global_fes)),
+        run=run,
     )
     res.save(wd / "result.json")
+    if record:
+        rpath = wd / "result.estimation.json" if record is True else Path(record)
+        try:
+            res.write_estimation(rpath, publication=publication, redact=redact)
+            log.info("fit %s: record %s", label, rpath)
+        except Exception:  # the fit is done and saved; a record can be rewritten from result.json
+            log.exception("fit %s: writing the estimation record failed", label)
     log.info("fit %s: done in %s", label, fmt_td(res.seconds))
     return res

@@ -98,7 +98,9 @@ def _term_columns(t: Term, df: pl.DataFrame, cat_levels: dict[str, list]) -> lis
     return out
 
 
-def _load(plan: Plan, files: list[str]):
+def _load(plan: Plan, files: list[str], dropped: dict | None = None):
+    """The shard's rows for this spec. `dropped`, if given, gets the rows removed by
+    reason (missing, non_finite, zero_weights), for the record's sample counts."""
     f = plan.formula
     cols = set(f.variables)
     cols.update(c for _, c in plan.local_fes)
@@ -110,11 +112,19 @@ def _load(plan: Plan, files: list[str]):
     df = pl.read_parquet(files, columns=sorted(cols))
     # listwise deletion on the variables of this spec
     num = [c for c in f.variables if df.schema[c].is_float()]
+    n = [df.height]
     df = df.drop_nulls()
+    n.append(df.height)
     if num:
         df = df.filter(pl.all_horizontal([pl.col(c).is_finite() for c in num]))
+    n.append(df.height)
     if plan.weights:
         df = df.filter(pl.col(plan.weights) > 0)
+    n.append(df.height)
+    if dropped is not None:
+        dropped.update(
+            {"rows": n[0], "missing": n[0] - n[1], "non_finite": n[1] - n[2], "zero_weights": n[2] - n[3]}
+        )
     return df
 
 
@@ -291,7 +301,8 @@ def _round1_sparse(plan: Plan, shard_id: int, df, n0: int, local_codes, w, T, t0
 def _round1(plan: Plan, shard_id: int, files: list[str], write_cache: bool):
     t0 = time.perf_counter()
     T = {}
-    df = _load(plan, files)
+    loaded: dict = {}
+    df = _load(plan, files, loaded)
     T["read"] = time.perf_counter() - t0
 
     t = time.perf_counter()
@@ -322,6 +333,7 @@ def _round1(plan: Plan, shard_id: int, files: list[str], write_cache: bool):
     out = {
         "shard": shard_id,
         "rows_in": n0,
+        "load": loaded,
         "n": n,
         "sumw": float(w.sum()),
         "ZtZ": ZtZ,

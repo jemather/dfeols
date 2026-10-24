@@ -32,6 +32,9 @@ class Result:
     seconds: float
     workdir: str = ""
     timing: dict = field(default_factory=dict)
+    options: dict = field(default_factory=dict)  # fit() arguments, resolved
+    terms: list = field(default_factory=list)  # every regressor, collinear ones too: {term, canonical}
+    run: dict = field(default_factory=dict)  # sample counts, provenance, dfeols facts (record.run_info)
 
     def coef(self, y: str | None = None) -> np.ndarray:
         return self.outcomes[y or next(iter(self.outcomes))]["coef"]
@@ -83,6 +86,23 @@ class Result:
 
     def __repr__(self):
         return self.summary()
+
+    # ---- estimation records ---------------------------------------------------
+    def to_estimation(self, y: str | None = None, **kwargs) -> dict:
+        """Response `y` as an `estimation` record (dict); see dfeols.record.to_estimation.
+        `y` may be left out when the fit has one response."""
+        from .record import to_estimation
+
+        return to_estimation(self, y, **kwargs)
+
+    def write_estimation(self, path, **kwargs) -> dict:
+        """Write one record per response: at `path` (`<name>.estimation.json`) for one
+        response, else `<name>.<response>.estimation.json`. `redact=True` removes
+        identifying fields, `publication={...}` adds a publication block. Returns the
+        records as written, by response."""
+        from .record import write_estimations
+
+        return write_estimations(self, path, **kwargs)
 
     # ---- persistence --------------------------------------------------------
     def to_dict(self) -> dict:

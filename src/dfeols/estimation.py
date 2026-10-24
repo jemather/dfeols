@@ -85,6 +85,12 @@ DEFAULT_IDENTIFYING = (
     "provenance.software[*].container.path",
     "extensions.dfeols.shards.folder",
     "extensions.dfeols.dask.scheduler_address",
+    "extensions.dfeols.dask.profile.account",
+    "extensions.dfeols.dask.profile.project",
+    "extensions.dfeols.dask.profile.scratch",
+    "extensions.dfeols.dask.profile.source",
+    "extensions.dfeols.dask.profile.prologue",
+    "extensions.dfeols.dask.profile.env",
 )
 
 

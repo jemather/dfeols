@@ -8,6 +8,13 @@ break the API).
 ## [Unreleased]
 
 ### Added
+- dfeols writes its own `estimation` records: `fit(..., record=True)` (the default) writes
+  `<workdir>/result.estimation.json` (one record per response) with provenance (software and
+  git commit, environment, invocation, SLURM job fields, Dask workers), the sample by drop
+  reason, canonical term names, each vcov's small-sample correction and the `dfeols/0.1`
+  extension; `publication=` and `redact=` options. `Result.to_estimation(y)` and
+  `Result.write_estimation(path)` build them later. Every record is validated against the
+  packaged schemas in `tests/test_record.py`.
 - `dfeols.estimation`: writer, reader, validator and redactor for `estimation/0.1` records
   (docs/design/estimation-format.md), with the RFC 8785 core digest and automatic spilling of
   large structures to attachments; `dfeols estimation {validate,redact,digest}`. Validation uses

@@ -78,8 +78,19 @@
           "type": "object",
           "properties": {
             "scheduler_address": {"x-identifying": true, "type": "string"},
-            "workers": {"type": ["array", "object"]},
-            "profile": {"description": "Resolved dfeols profile.", "type": "object"}
+            "workers": {"description": "Worker specs; per-worker hosts go in provenance.execution.workers, where they are marked identifying.", "type": ["array", "object"]},
+            "profile": {
+              "description": "Resolved dfeols profile (site.Profile).",
+              "type": "object",
+              "properties": {
+                "account": {"x-identifying": true, "type": ["string", "null"]},
+                "project": {"x-identifying": true, "type": ["string", "null"]},
+                "scratch": {"x-identifying": true, "type": ["string", "null"]},
+                "source": {"x-identifying": true, "type": "string"},
+                "prologue": {"x-identifying": true, "type": "array"},
+                "env": {"x-identifying": true, "type": "object"}
+              }
+            }
           }
         },
         "estimate": {"description": "The time estimate shown at submission.", "type": "object"},

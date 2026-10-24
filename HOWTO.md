@@ -190,6 +190,10 @@ Each spec writes to `<scratch>/runs/<label>/`:
 - `result.json`: coefficients, full vcov for every requested type, N, singletons dropped,
   cluster and FE level counts, collinear terms, timings. Load it with
   `dfeols.Result.load(path)`, then use `.tidy()`, `.summary()`, `.coef()` and `.vcov()`.
+- `result.estimation.json` (`result.<y>.estimation.json` for each outcome of a multi-outcome
+  fit): the same result as an `estimation` record, with where and how it ran. Check it with
+  `dfeols estimation validate <file>`; pass `redact=True` to `fit` (or run `dfeols estimation
+  redact`) before sharing it.
 - `coefs.csv`: the tidy table.
 - `status.json` and `history.jsonl`: progress and ETA history.
 

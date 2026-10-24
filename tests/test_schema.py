@@ -146,6 +146,14 @@ def test_core_required_and_encodings():
     assert errors(CORE, ok)
 
 
+def test_core_canonical_constant():
+    """The constant's canonical form has no factors; every other term needs one (Ted, 2026-10-24)."""
+    assert not errors(CORE, {"name": "(Intercept)", "factors": []}, "canonical_term")
+    assert errors(CORE, {"name": "x", "factors": []}, "canonical_term")
+    assert errors(CORE, {"name": "(Intercept)", "factors": [{"variable": "x"}]}, "canonical_term")
+    assert not errors(CORE, {"name": "x", "factors": [{"variable": "x"}]}, "canonical_term")
+
+
 def test_core_checksum_in_memory_needs_method():
     c = {"algorithm": "xxhash64", "value": "ab12", "of": "in-memory"}
     assert errors(CORE, c, "checksum")

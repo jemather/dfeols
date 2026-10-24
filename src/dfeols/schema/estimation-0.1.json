@@ -156,14 +156,16 @@
       }
     },
     "canonical_term": {
-      "description": "Standard form for matching across tools. `factors` is the definition; `name` is an R-style rendering (Stata form for factor x continuous). Matching on factors is order-insensitive.",
+      "description": "Standard form for matching across tools. `factors` is the definition; `name` is an R-style rendering (Stata form for factor x continuous). Matching on factors is order-insensitive. The constant is {name: \"(Intercept)\", factors: []}; every other term has at least one factor.",
       "type": "object",
       "required": ["name", "factors"],
+      "if": {"properties": {"name": {"const": "(Intercept)"}}},
+      "then": {"properties": {"factors": {"maxItems": 0}}},
+      "else": {"properties": {"factors": {"minItems": 1}}},
       "properties": {
         "name": {"type": "string"},
         "factors": {
           "type": "array",
-          "minItems": 1,
           "items": {
             "type": "object",
             "required": ["variable"],

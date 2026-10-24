@@ -194,7 +194,11 @@ A list of rows, as in the sketch. `term` is required; other columns depend on th
   `conf_high` (from the default vcov; `conf_level` in `metrics`).
 - ML: `importance`, `rank`, and so on.
 - Multi-part models: `response` (which outcome), `component` (e.g. `first_stage`,
-  `zero_inflation`, `random`), `group` for random-effect terms.
+  `zero_inflation`, `random`), `group` for random-effect terms. A fit of several outcomes
+  on the same right-hand side (fixest `c(y1, y2) ~ x`, dfeols `y1 + y2 ~ x`) gives **one
+  record per outcome** (Ted, 2026-10-24), as fixest and pyfixest return one model per
+  outcome; `response` is for models whose outcomes are estimated jointly (e.g. with a
+  cross-equation vcov).
 - `dropped`: `null`, `"collinear"`, `"reference"`, kept as rows so the term list is complete.
 
 Rows are the model's reported parameters. Per-level estimates (FE coefficients, BLUPs) are not
@@ -223,6 +227,8 @@ writers do.
 
 - `factors` is the definition, and matching across tools uses it. `name` is a readable
   rendering.
+- **The constant** is `{"name": "(Intercept)", "factors": []}`, the only canonical form
+  without factors (Ted, 2026-10-24), so `_cons`, `Intercept` and `(Intercept)` match.
 - **Rendering follows R** (`model.matrix` naming): `(Intercept)`, variable name followed by
   level (`year2005`), `:` between interacted terms. R's concatenation can be ambiguous
   (`year2005` could be variable `year2`, level `005`); `factors` resolves that.
@@ -1010,7 +1016,40 @@ Toward other packages (Ted, 2026-10-24: the format gets its own repository and i
 other tools, by issue first; start with pyfixest, then fixest, then reghdfe):
 
 5. **dfeols writes records**: `Result` → record with full provenance and the dfeols
-   extension; every record dfeols writes is validated in the tests.
+   extension; every record dfeols writes is validated in the tests. **Done**
+   (`src/dfeols/record.py`, `tests/test_record.py`):
+   - `fit(..., record=True)` (default) writes `<workdir>/result.estimation.json` next to
+     `result.json`; `record=PATH` puts it elsewhere, `record=False` skips it;
+     `publication={...}` and `redact=True` pass through. A failed record write is logged
+     and doesn't fail the fit (the record can be rebuilt from `result.json`).
+     `Result.to_estimation(y)` and `Result.write_estimation(path, ...)` do the same later.
+   - One record per response (Ted, 2026-10-24): `result.<y>.estimation.json`; the records
+     share `extensions.dfeols.fit` (`id`, `label`, `responses`).
+   - Claims `inference/0.1`, `linear-fe/0.1`, `dfeols/0.1`; a fit without FEs claims
+     `inference/0.1` only (linear-fe needs at least one FE) and keeps the dfeols block.
+   - What `fit` now keeps on `Result` for this (`options`, `terms`, `run`; old
+     `result.json` files still load and give a record without provenance): rows by drop
+     reason (`missing`, `non_finite`, `zero_weights` from the workers, then `singletons`),
+     so `rows_input` minus the drops is `nobs`; canonical term names (dfeols `x::2005:z` →
+     `2005.x#c.z`; `x::2005` → `x2005`, with the reference level); TSS; FE nesting in the
+     cluster; absorption per FE; a fit id.
+   - vcov: `hetero` is written as `HC1` (N/(N−K)); each vcov's `ssc` gives the fixest
+     convention with the factors, K and what K counted. `df_residual` = N − K − absorbed
+     (the iid df); `df_absorbed_nested` when an FE is nested in the cluster.
+   - Provenance is captured on the coordinator at the end of the fit: dfeols version and
+     git commit + dirty flag (from the checkout, else pip's `direct_url.json`), Python and
+     imported packages with purls, OS, CPU model and float-relevant flags, memory, BLAS,
+     allowlisted thread variables, invocation (argv, script sha256, cwd, mode), SLURM fields
+     **from the job's environment variables** (no `sacct` call, so End/Elapsed/MaxRSS/State
+     are absent), Dask workers, the shard folder. `processor_seconds` only for the serial
+     executor (with Dask the workers' CPU time isn't collected).
+   - The dfeols profile now marks the resolved site profile's `account`, `project`,
+     `scratch`, `source`, `prologue` and `env` as identifying (kept by default, removed by
+     `redact=True`); Dask worker hosts are only in `provenance.execution.workers`.
+   - Not yet: `row_key` (needs a per-shard hash of row indices from the workers), demeaning
+     iteration counts (the compiled demeaner returns only a converged flag), a data checksum
+     for the input (the shard folder has no content hash; `meta_sha256` hashes its layout
+     file), group sizes per FE.
 6. **Worked converters**: pyfixest (Python), fixest (R) and reghdfe `e()` (Stata), each
    producing records that validate against `linear-fe/0.1`. They test the profile mappings
    on real output and give each tool's authors code to adapt.
