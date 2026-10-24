@@ -235,9 +235,6 @@ def test_linear_fe_requires():
         ("metrics", "n_singletons"),
         ("specification", "options", "drop_singletons"),
         ("structures", "fixed_effects", 0, "levels"),
-        ("structures", "numerics", "iterative"),
-        ("structures", "numerics", "converged"),
-        ("structures", "numerics", "iterations"),
     ):
         bad = copy.deepcopy(rec)
         node = bad
@@ -245,24 +242,33 @@ def test_linear_fe_requires():
             node = node[k]
         del node[path[-1]]
         assert errors(p, bad), path
-    # A tool that doesn't report a count (pyfixest, Stata areg/xtreg) records null
-    unknown = copy.deepcopy(rec)
-    unknown["structures"]["numerics"].update(iterations=None, converged=None)
-    assert errors(p, unknown) == []
-    exact = copy.deepcopy(rec)
-    exact["structures"]["numerics"] = {"kind": "object", "iterative": False}
-    assert errors(p, exact) == []
+    # Convergence is vocabulary, not required (pyfixest, Stata areg/xtreg don't report it)
+    no_count = copy.deepcopy(rec)
+    del no_count["structures"]["numerics"]["iterations"]
+    del no_count["structures"]["numerics"]["converged"]
+    assert errors(p, no_count) == []
+    no_numerics = copy.deepcopy(rec)
+    del no_numerics["structures"]["numerics"]
+    assert errors(p, no_numerics) == []
 
 
 def test_iv_and_dfeols_require():
     iv = example("iv.estimation.json")
+    p = PROFILES["iv/0.1"]
     for key in ("endogenous", "instruments"):
         bad = copy.deepcopy(iv)
         del bad["specification"][key]
-        assert errors(PROFILES["iv/0.1"], bad), key
+        assert errors(p, bad), key
+    # first_stage is expected, not required: most tools compute it only on request
+    no_first = copy.deepcopy(iv)
+    del no_first["structures"]["first_stage"]
+    assert errors(p, no_first) == []
     bad = copy.deepcopy(iv)
-    del bad["structures"]["first_stage"]
-    assert errors(PROFILES["iv/0.1"], bad)
+    del bad["structures"]["first_stage"]["per_endogenous"][0]["endogenous"]
+    assert errors(p, bad)
+    bad = copy.deepcopy(iv)
+    bad["structures"]["first_stage"]["endogeneity"][0] = {"name": "wu_hausman"}  # no statistic
+    assert errors(p, bad)
 
     rec = example("dfeols-linear-fe.estimation.json")
     p = PROFILES["dfeols/0.1"]

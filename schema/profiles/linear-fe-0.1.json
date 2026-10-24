@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://raw.githubusercontent.com/jemather/dfeols/main/schema/profiles/linear-fe-0.1.json",
   "title": "linear-fe/0.1",
-  "description": "Profile for linear models with absorbed fixed effects (fixest, lfe; pyfixest, linearmodels; reghdfe, areg, xtreg; FixedEffectModels.jl). Requires inference/0.1 plus metrics.n_singletons, specification.options.drop_singletons, one structures.fixed_effects entry per FE with name and levels, and structures.numerics.iterative; when iterative is true, iterations and converged (null when the tool doesn't report them). x-tools maps each name to the tools' own, as checked on 2026-10-24 (docs/design/estimation-format.md).",
+  "description": "Profile for linear models with absorbed fixed effects (fixest, lfe; pyfixest, linearmodels; reghdfe, areg, xtreg; FixedEffectModels.jl). Requires inference/0.1 plus metrics.n_singletons, specification.options.drop_singletons, and one structures.fixed_effects entry per FE with name and levels. Convergence (structures.numerics) is vocabulary, not required. x-tools maps each name to the tools' own, as checked on 2026-10-24 (docs/design/estimation-format.md).",
   "allOf": [
     {"$ref": "../estimation-0.1.json"},
     {"$ref": "#/$defs/rules"}
@@ -83,7 +83,7 @@
           }
         },
         "structures": {
-          "required": ["fixed_effects", "numerics"],
+          "required": ["fixed_effects"],
           "properties": {
             "fixed_effects": {
               "minItems": 1,
@@ -93,7 +93,7 @@
               }
             },
             "numerics": {
-              "required": ["iterative"],
+              "description": "Vocabulary only: convergence is not required (Ted, 2026-10-24), since pyfixest and Stata areg/xtreg don't report an iteration count by default.",
               "x-tools": {
                 "algorithm": {"reghdfe": "technique()", "fixest": "fixef.algo", "areg/xtreg": "e(apm)", "pyfixest": "demeaner"},
                 "tolerance": {"fixest": "fixef.tol", "reghdfe": "tolerance()", "pyfixest": "fixef_tol", "FixedEffectModels.jl": "tol", "areg/xtreg": "tolerance()"},
@@ -103,9 +103,7 @@
                 "collinearity_tolerance": {"fixest": "collin.tol", "pyfixest": "collin_tol"},
                 "collinear_terms": {"fixest": "collin.var"},
                 "collinearity_min_norm": {"fixest": "collin.min_norm"}
-              },
-              "if": {"required": ["iterative"], "properties": {"iterative": {"const": true}}},
-              "then": {"required": ["iterations", "converged"]}
+              }
             }
           }
         }

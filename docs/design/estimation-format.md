@@ -532,7 +532,7 @@ Proposed first profiles:
 |---|---|---|
 | `inference/0.1` | R `lm`/estimatr, statsmodels, Stata `regress` | `parameters` with estimate, std_error, p_value; a default `vcov` with `type` and `ssc`; `metrics.nobs`, `df_residual` |
 | `linear-fe/0.1` | fixest, lfe (R); pyfixest, linearmodels (Python); reghdfe, areg, xtreg (Stata); FixedEffectModels.jl | `inference` + below |
-| `iv/0.1` | fixest, ivreg (R); pyfixest, linearmodels IV (Python); ivreghdfe, ivreg2, ivregress (Stata) | `inference` + endogenous/instruments in `specification`; `structures.first_stage` |
+| `iv/0.1` | fixest, ivreg, estimatr `iv_robust`, lfe (R); pyfixest, linearmodels IV (Python); ivregress, ivreg2, ivreghdfe (Stata); FixedEffectModels.jl | `inference` + `endogenous` and `instruments` in `specification`; `structures.first_stage` expected, not required (see the IV survey) |
 | `dfeols/0.1` | dfeols | `linear-fe` + `extensions.dfeols` |
 
 Later, as needed: `glm/0.1` (deviance, log-likelihood, family/link; fixest `feglm`/`fepois`,
@@ -597,13 +597,13 @@ result object (`R/fixest_env.R`) but not in the documented Value list.
 5. **`ssc`** is required for inference records, with at least `convention` (e.g. `"fixest"`,
    `"reghdfe"`, `"linearmodels debiased=True"`) and the individual factors (what K counted,
    G/(G−1), (N−1)/(N−K)) when the producer has them.
-6. **Convergence** (`iterations`, `converged`) is required when the algorithm is iterative
-   (reghdfe, fixest, pyfixest, dfeols, FEM.jl; StataNow 19 `areg`/`xtreg` with more than one
-   absorbed variable, which use alternating projections and store `e(converged)`), and absent
-   for exact methods (`areg`/`xtreg` with one absorbed variable, one-FE linearmodels). Not every
-   iterative tool stores the count: fixest has an undocumented `$iterations` slot, pyfixest and
-   Stata `areg`/`xtreg` store none, and Stata stores `e(converged)` only. The schema expresses
-   this as `structures.numerics.iterative`; see the schema notes.
+6. **Convergence** (`iterations`, `converged`) is **not required** (Ted, 2026-10-24, revising
+   draft 6): a quantity that the surveyed tools don't report by default is not a requirement.
+   Iterative tools differ: reghdfe (`e(ic)`, `e(converged)`) and FEM.jl report both; StataNow 19
+   `areg`/`xtreg` with several absorbed variables report `e(converged)` only; fixest has an
+   undocumented `$iterations` slot; pyfixest reports neither. Both stay in the vocabulary
+   (`structures.numerics`), with `iterative` to say whether the algorithm iterates, and writers
+   that have them include them.
 
 **`structures.fixed_effects`**, one entry per FE: `name`, `components` (for interactions and
 slopes, as reghdfe `e(extended_absvars)`), `levels` (fixest `fixef_sizes`), `redundant`
@@ -648,6 +648,61 @@ it reproduces (`fixest`, `reghdfe`, `stata`, `linearmodels`).
 **Sample**: reghdfe `e(sample)` and fixest `obs_selection` mark the rows used. The profile
 records the counts (above) and, as an attachment or a hash (dfeols `row_key`), the rows
 themselves.
+
+### Worked example: `iv/0.1` (survey 2026-10-24)
+
+Sources: StataNow 19 `ivregress` and `ivregress postestimation` help; ivreghdfe 1.1.4 source
+(`src/ivreghdfe.ado`, a fork of ivreg2 4.1.11 that keeps ivreg2's `e()` names; the ivreg2 help
+server couldn't be reached from here, so ivreg2 is read through this fork); fixest 0.14.2
+`fitstat` reference and `R/estimation.R`; R `ivreg` (`ivreg`, `summary.ivreg`,
+`R/summary.ivreg.R`); estimatr `iv_robust`; lfe `R/felm.R` and `condfstat`; linearmodels 7.1
+`IVResults`, `FirstStageResults` and `iv/results.py`; pyfixest 0.60.0 `feiv_.py`;
+FixedEffectModels.jl `FixedEffectModel.jl`.
+
+**What each tool stores by default, and what only on request.** This decides what is required.
+
+| Tool | Endogenous / instruments | First-stage statistics by default | On request |
+|---|---|---|---|
+| Stata `ivregress` | `e(endog)`, `e(exog)` | none (`e(k_endog)`, `e(kappa)` for LIML, `e(J)` for GMM) | `estat firststage`: `r(singleresults)` (R², partial R², F per endogenous), `r(multiresults)` (Shea), `r(mineig)`; `estat endogenous`: `r(durbin)`, `r(wu)`, `r(r_score)`; `estat overid`: `r(sargan)`, `r(basmann)`, `r(score)`, LIML `r(ar)`, GMM `r(HansenJ)` |
+| ivreg2 / ivreghdfe | `e(instd)`, `e(insts)`, `e(exexog)`, `e(endog_ct)`, `e(exexog_ct)` | `e(idstat)`, `e(idp)`, `e(iddf)` (underidentification); `e(widstat)`, `e(cdf)`, `e(rkf)` (weak ID); `e(j)`, `e(jp)`, `e(jdf)`; `e(sargan)` when not robust | `first`/`ffirst`/`savefirst`: matrix `e(first)` per endogenous (`F`, `df`, `df_r`, `pvalue`, `pr2`, `sheapr2`, `SWF`, `SWr2`, `APF`, ...) and `e(arf)`, `e(archi2)`, `e(sstat)`; `endog()`: `e(estat)`; `orthog()`: `e(cstat)`; `redundant()`: `e(redstat)` |
+| fixest `feols` IV | `iv_endo_names`, `iv_inst_names_xpd`, `iv_first_stage` | `iv_wh` (Wu-Hausman), `iv_sargan` (when overidentified) | `fitstat`: `ivf`/`ivf1` (first-stage F), `ivwald`/`ivwald1` (Wald, = Kleibergen-Paap with robust vcov and one endogenous), `cd`, `kpr`, `wh`, `sargan` |
+| R `ivreg` | `endogenous`, `instruments` | `summary()` (diagnostics on by default): "Weak instruments" F per endogenous, "Wu-Hausman", "Sargan", each `df1`, `df2`, `statistic`, `p-value` | — |
+| estimatr `iv_robust` | `terms_regressors` | none | `diagnostics = TRUE` (not with fixed effects): `diagnostic_first_stage_fstatistic`, `diagnostic_endogeneity_test`, `diagnostic_overid_test` |
+| lfe `felm` IV | `endovars`, `stage1$instruments` | `stage1$iv1fstat`, `stage1$rob.iv1fstat` | `condfstat()` (Sanderson-Windmeijer conditional F) |
+| linearmodels `IV2SLS`/`IVLIML`/`IVGMM` | model `endog`, `instruments` | none (all properties computed on access) | `first_stage.diagnostics` (`rsquared`, `partial.rsquared`, `shea.rsquared`, `f.stat`, `f.pval`, `f.dist`), `cragg_donald(_f)`, `kleibergen_paap(_f)`; `sargan`, `basmann`, `basmann_f`, `wooldridge_overid`, `wooldridge_score`, `wooldridge_regression`, `anderson_rubin`, `wu_hausman()`, `durbin()`; `kappa` |
+| pyfixest IV | `_endogvar`, `_non_exo_instruments` | `_f_stat_1st_stage` (first-stage F, vcov-adjusted) | `IV_Diag()`: `_eff_F` (Montiel Olea-Pflueger effective F) |
+| FixedEffectModels.jl | formula | `F_kp`, `p_kp` (Kleibergen-Paap first-stage F) | — |
+
+**Required set** (applying the decision 6 rule: not stored by default in most tools → not
+required): `specification.endogenous` and `specification.instruments` (excluded instruments),
+plus everything `inference/0.1` requires. `structures.first_stage` is **expected**: writers
+include it when the tool computed it, and validators warn when it is missing.
+
+**Vocabulary.** `structures.first_stage` is a `kind: "object"` structure with a
+`per_endogenous` list (one entry per endogenous regressor) and joint tests; every test is
+`{name, statistic, p_value, df, df1, df2, distribution}`, and `overid` and `endogeneity` are
+lists, since tools report several versions:
+
+| Profile name | Meaning | Stata `ivregress` | ivreg2 / ivreghdfe | fixest | R `ivreg` / estimatr / lfe | linearmodels | pyfixest / FEM.jl |
+|---|---|---|---|---|---|---|---|
+| `per_endogenous[].f_stat` | first-stage F of the excluded instruments, one endogenous at a time | `r(singleresults)` F | `e(first)` `F` | `ivf1`; `ivwald1` (robust) | "Weak instruments"; `diagnostic_first_stage_fstatistic`; `iv1fstat` / `rob.iv1fstat` | `diagnostics` `f.stat` | `_f_stat_1st_stage` |
+| `per_endogenous[].r2`, `partial_r2`, `shea_partial_r2` | first-stage R²s | `r(singleresults)`, `r(multiresults)` | `e(first)` `pr2`, `sheapr2` | | | `rsquared`, `partial.rsquared`, `shea.rsquared` | |
+| `per_endogenous[].sw_f`, `ap_f` | Sanderson-Windmeijer, Angrist-Pischke conditional F | | `e(first)` `SWF`, `APF` | | lfe `condfstat` | | |
+| `per_endogenous[].effective_f` | Montiel Olea-Pflueger effective F | | | | | | pyfixest `_eff_F` |
+| `underidentification` | Anderson LM or Kleibergen-Paap rk LM | | `e(idstat)`, `e(idp)`, `e(iddf)` | | | | |
+| `weak_id_cd_f` | Cragg-Donald Wald F | `r(mineig)` (minimum eigenvalue statistic) | `e(cdf)` | `cd` | | `cragg_donald_f` | |
+| `weak_id_kp_f` | Kleibergen-Paap rk Wald F | | `e(rkf)` | `kpr` | | `kleibergen_paap_f` | FEM.jl `F_kp`, `p_kp` |
+| `weak_id_robust_ar` | Anderson-Rubin test of the endogenous coefficients | | `e(arf)`, `e(archi2)` | | | | |
+| `weak_id_robust_sw` | Stock-Wright LM S | | `e(sstat)` | | | | |
+| `overid` | Sargan, Basmann, score or Hansen J (`name` says which) | `estat overid` | `e(j)`, `e(sargan)` | `iv_sargan` | "Sargan"; `diagnostic_overid_test` | `sargan`, `basmann`, `wooldridge_overid` | |
+| `endogeneity` | Durbin, Wu-Hausman, score or C test (`name` says which) | `estat endogenous` | `e(estat)` | `iv_wh` | "Wu-Hausman"; `diagnostic_endogeneity_test` | `wu_hausman()`, `durbin()`, `wooldridge_score` | |
+
+`ivreg2`'s `e(widstat)` is the weak-ID statistic it reports in the header: Cragg-Donald under
+iid, Kleibergen-Paap otherwise; writers map it to whichever of the two it is. Estimator settings
+go in `metrics`: `kappa` (`ivregress` `e(kappa)`, ivreg2 `e(lambda)`, linearmodels `kappa`)
+and `fuller` (ivreg2 `e(fuller)`); `meta.estimator.method` uses `2sls`, `liml`, `gmm`, `cue`,
+`kclass`, `fuller`. The fitted endogenous term is spelled `fit_x` in fixest and `x` elsewhere;
+`canonical` matches them.
 
 ## The dfeols extension (`dfeols/0.1`)
 
@@ -824,21 +879,24 @@ None open on the design. Raised by the verification and the schema, to confirm o
    stands on `areg` alone.
 3. **`nobs_full` for fixest.** `nobs_origin` is not `nobs_full`, so fixest has no direct
    `nobs_full`; mapped to `specification.sample.rows_input` instead.
-4. **Convergence (decision 6), two points.** (a) "Required when iterative" needs the record to
-   say it was iterative: the schema adds `structures.numerics.iterative` (boolean), requires
-   it (so `structures.numerics`) in `linear-fe`, and when it is `true` requires `iterations`
-   and `converged`. (b) **Disagreement:** pyfixest and Stata
-   `areg`/`xtreg` don't report an iteration count, and pyfixest no convergence flag either, so
-   their records can't meet decision 6 unless `null` is allowed ("applies but wasn't
-   computed"). The schema follows the decision as written and accepts `null` for both, so
-   those tools pass with `"iterations": null` while the key is still required. Ted to confirm
-   or tighten.
+4. ~~Convergence (decision 6).~~ **Settled by Ted (2026-10-24):** not required, since several
+   tools don't report it by default. `structures.numerics.iterative`, `iterations` and
+   `converged` are vocabulary only.
 5. **CSL `id`.** CSL requires `id` and `type`; the schema requires only `type`, so a hand-written
    citation without an `id` is still valid.
 6. **`df_residual` vs FEM.jl and pyfixest.** Their stored "residual" df is min(G) − 1 under
    clustering. Writers for those tools must compute N − K − absorbed for `df_residual` and put
-   the tool's value in `vcov.df_t`. No design change; noted for converters. Still to revisit: interaction order ("as specified" for now; revisit if matching
-across tools needs a normalised order in `name` as well).
+   the tool's value in `vcov.df_t`. No design change; noted for converters.
+7. **`iv/0.1`: `structures.first_stage` from required to expected.** See the IV survey below.
+   Applying the decision 6 rule: of the 10 tools, only ivreg2/ivreghdfe (joint weak-ID
+   statistics), R `ivreg` (in `summary`), lfe, pyfixest and FEM.jl compute a first-stage
+   statistic by default; Stata `ivregress`, fixest, linearmodels and estimatr compute them on
+   request. The profile now requires only `endogenous` and `instruments` (every tool stores
+   them) and marks `first_stage` as expected (validators warn when it's missing). Ted to
+   confirm.
+
+Still to revisit: interaction order ("as specified" for now; revisit if matching across tools
+needs a normalised order in `name` as well).
 
 ## Next
 

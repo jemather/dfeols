@@ -100,7 +100,7 @@
           "type": "object",
           "properties": {
             "family": {"type": "string", "x-vocabulary": ["linear", "glm", "mixed", "ensemble", "tree", "kernel", "neural", "other"]},
-            "method": {"type": "string", "x-vocabulary": ["ols", "wls", "2sls", "liml", "gmm", "mle", "qmle", "random_forest", "gradient_boosting"]},
+            "method": {"type": "string", "x-vocabulary": ["ols", "wls", "2sls", "liml", "gmm", "cue", "kclass", "fuller", "mle", "qmle", "random_forest", "gradient_boosting"]},
             "distribution": {"type": "string"},
             "link": {"type": "string"}
           }
@@ -421,7 +421,7 @@
       "allOf": [{"$ref": "#/$defs/structure"}],
       "properties": {
         "kind": {"const": "object"},
-        "iterative": {"description": "Whether the algorithm is iterative; profiles then require convergence detail.", "type": "boolean"},
+        "iterative": {"description": "Whether the algorithm is iterative.", "type": "boolean"},
         "algorithm": {"type": "string"},
         "acceleration": {"type": "string"},
         "transform": {"type": "string"},
