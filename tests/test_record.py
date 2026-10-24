@@ -293,3 +293,143 @@ def test_dask_executor_and_profile(ds, tmp_path):
     text = json.dumps(red)
     assert "secret" not in text and "tcp://" not in text and "127.0.0.1" not in text
     assert red["extensions"]["dfeols"]["dask"]["profile"]["worker"] == {"cores": 1, "memory": "4GB"}
+
+
+# ---------------------------------------------------------------- row_key and source checksums
+
+
+def test_rowset_hash_properties():
+    import polars as pl
+
+    from dfeols import rowhash
+
+    df = pl.DataFrame({"x": [1.5, -0.0, float("nan"), 2.0], "g": ["a", "b", None, "a"], "k": [1, 2, 3, 4]})
+    full = rowhash.rowset(df, ["x", "g", "k"])
+    # order- and split-invariant; column order doesn't matter
+    parts = [rowhash.rowset(df[2:], ["k", "g", "x"]), rowhash.rowset(df[:2].reverse(), ["x", "g", "k"])]
+    assert rowhash.combine(parts) == full and full["rows"] == 4
+    # -0.0 == 0.0 and every NaN alike; a changed value or a dropped row changes it
+    same = df.with_columns(x=pl.Series([1.5, 0.0, float("nan"), 2.0]))
+    assert rowhash.rowset(same, ["x", "g", "k"]) == full
+    assert rowhash.rowset(df.with_columns(k=pl.Series([1, 2, 3, 5])), ["x", "g", "k"]) != full
+    assert rowhash.rowset(df[:3], ["x", "g", "k"]) != full
+    # pinned: a change of algorithm must change its name (dfeols-rowset-v1)
+    assert rowhash.hexdigest(full) == PINNED_ROWSET == _rowset_reference(df.to_dicts())
+
+
+PINNED_ROWSET = "23d77b231955dab9fc3757c5a2c33543"
+
+
+def _rowset_reference(rows: list[dict]) -> str:
+    """dfeols-rowset-v1 in plain Python (no numpy), to check the vectorised one."""
+    import hashlib
+    import math
+    import struct
+
+    M = (1 << 64) - 1
+
+    def mix(x):
+        x ^= x >> 30
+        x = (x * 0xBF58476D1CE4E5B9) & M
+        x ^= x >> 27
+        x = (x * 0x94D049BB133111EB) & M
+        return x ^ (x >> 31)
+
+    def h8(b):
+        return int.from_bytes(hashlib.sha256(b).digest()[:8], "little")
+
+    def bits(v):
+        if v is None:
+            return 0x6A09E667F3BCC908
+        if isinstance(v, float):
+            v = math.nan if math.isnan(v) else v + 0.0
+            return struct.unpack("<Q", struct.pack("<d", v))[0]
+        if isinstance(v, str):
+            return h8(v.encode())
+        return v & M
+
+    lanes = []
+    for seed in (0x9E3779B97F4A7C15, 0xD1B54A32D192ED03):
+        total = 0
+        for row in rows:
+            h = seed
+            for c in sorted(row):
+                h = mix(h ^ mix(bits(row[c]) ^ h8(c.encode())))
+            total = (total + h) & M
+        lanes.append(total)
+    return "".join(f"{v:016x}" for v in lanes)
+
+
+def test_row_key_same_sample_across_partitions(data, ds, tmp_path):
+    other = dfeols.prep(
+        data,
+        shard_dir=tmp_path / "s2",
+        partition="spell",
+        fixed_effects=["spell", "week", "id_a"],
+        clusters=["id_a", "week"],
+        target_rows=5000,
+    )
+    f = "eng ~ feat + posts | spell"
+    _, a = _fit(ds, tmp_path / "a", f, cluster="id_a")
+    _, b = _fit(other, tmp_path / "b", f, cluster="id_a")
+    _, c = _fit(ds, tmp_path / "c", "eng ~ feat + posts | spell", cluster="id_a", drop_singletons=False)
+    ka, kb, kc = (r["extensions"]["dfeols"]["row_key"] for r in (a, b, c))
+    assert ka == kb and ka["rows"] == a["metrics"]["nobs"]
+    assert ka["columns"] == ["eng", "feat", "id_a", "posts", "spell"]
+    assert kc["value"] != ka["value"]  # singletons kept: another sample
+
+
+def test_source_checksum_frame(ds, data, tmp_path):
+    src = ds.meta["source"]
+    assert src["kind"] == "frame" and src["rows"] == data.height
+    assert src["checksum"]["of"] == "in-memory" and src["checksum"]["method"] == "dfeols-rowset-v1"
+    _, rec = _fit(ds, tmp_path, "eng ~ feat | spell")
+    inp = rec["provenance"]["data"]
+    assert [d["role"] for d in inp] == ["source", "estimation"]
+    assert inp[0]["checksum"] == src["checksum"]
+
+
+def test_source_checksum_files_and_prep_drops(data, tmp_path):
+    import hashlib
+
+    import polars as pl
+
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    d = data.with_columns(spell=pl.when(pl.int_range(pl.len()) < 7).then(None).otherwise(pl.col("spell")))
+    d[: d.height // 2].write_parquet(raw / "part-0.parquet")
+    d[d.height // 2 :].write_parquet(raw / "part-1.parquet")
+    ds2 = dfeols.prep(
+        raw, shard_dir=tmp_path / "s", partition="id_a", fixed_effects=["spell"], target_rows=5000
+    )
+    src = ds2.meta["source"]
+    shas = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in raw.iterdir()}
+    assert {f["name"]: f["sha256"] for f in src["files"]} == shas
+    lines = "".join(f"{shas[n]}  {n}\n" for n in sorted(shas))
+    assert src["checksum"] == {
+        **src["checksum"],
+        "of": "manifest",
+        "value": hashlib.sha256(lines.encode()).hexdigest(),
+    }
+    assert src["rows"] == data.height and ds2.n_rows == data.height - 7
+    _, rec = _fit(ds2, tmp_path / "wd", "eng ~ feat | spell")
+    smp = rec["specification"]["sample"]
+    assert smp["rows_input"] == data.height and smp["dropped"]["missing_keys"] == 7
+    assert smp["rows_input"] - sum(smp["dropped"].values()) == rec["metrics"]["nobs"]
+    assert rec["provenance"]["data"][0]["location"] == str(raw.resolve())
+    one = dfeols.prep(
+        raw / "part-0.parquet",
+        shard_dir=tmp_path / "s1",
+        partition="id_a",
+        fixed_effects=["spell"],
+        target_rows=5000,
+    )
+    assert one.meta["source"]["checksum"] == {
+        "algorithm": "sha256",
+        "value": shas["part-0.parquet"],
+        "of": "file",
+    }
+    off = dfeols.prep(
+        raw, shard_dir=tmp_path / "s0", partition="id_a", fixed_effects=["spell"], checksum=False
+    )
+    assert "checksum" not in off.meta["source"] and "sha256" not in off.meta["source"]["files"][0]

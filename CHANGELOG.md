@@ -15,6 +15,10 @@ break the API).
   extension; `publication=` and `redact=` options. `Result.to_estimation(y)` and
   `Result.write_estimation(path)` build them later. Every record is validated against the
   packaged schemas in `tests/test_record.py`.
+- `prep` records the source's sha256 (per file, plus a manifest hash for several files) or, for
+  an in-memory frame, a content hash, and its row count, in `dfeols_meta.json` (`checksum=False`
+  skips it). Records carry it, and `extensions.dfeols.row_key` identifies the exact sample with
+  a partition-independent hash of the rows used (`dfeols.rowhash`).
 - `dfeols.estimation`: writer, reader, validator and redactor for `estimation/0.1` records
   (docs/design/estimation-format.md), with the RFC 8785 core digest and automatic spilling of
   large structures to attachments; `dfeols estimation {validate,redact,digest}`. Validation uses

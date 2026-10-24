@@ -10,6 +10,7 @@ filesystem every worker can read (e.g. a shared scratch/temp filesystem).
 
 from __future__ import annotations
 
+import hashlib
 import heapq
 import json
 import logging
@@ -24,6 +25,8 @@ import numpy as np
 import polars as pl
 
 from .formula import fe_column, fe_components
+from .rowhash import ALGORITHM as ROWSET
+from .rowhash import column_bits, hexdigest, rowset
 
 log = logging.getLogger("dfeols")
 
@@ -144,6 +147,78 @@ def _nested(lf: pl.LazyFrame, inner: str, outer: list[str]) -> bool:
     return k is None or k <= 1
 
 
+def _sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for block in iter(lambda: fh.read(1 << 22), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def source_info(source, checksum: bool = True) -> dict:
+    """What prep read, for dfeols_meta.json and the records' provenance.data: the files
+    (name, path, bytes, sha256, Parquet row count) and one checksum: the file's sha256,
+    for several files the sha256 of their `sha256sum` lines (sorted by name), or, for an
+    in-memory frame, a dfeols-rowset-v1 content hash. A LazyFrame gets no checksum."""
+    if isinstance(source, pl.LazyFrame):
+        return {"kind": "lazyframe"}
+    if isinstance(source, pl.DataFrame) or hasattr(source, "to_numpy"):
+        df = source if isinstance(source, pl.DataFrame) else pl.from_pandas(source)
+        info: dict = {"kind": "frame", "rows": df.height, "columns": len(df.columns)}
+        if checksum:
+            cols = []
+            for c in df.columns:
+                try:
+                    column_bits(df[c].head(1))
+                    cols.append(c)
+                except TypeError:
+                    pass
+            info["checksum"] = {
+                "algorithm": ROWSET,
+                "value": hexdigest(rowset(df, cols)),
+                "of": "in-memory",
+                "method": ROWSET,
+            }
+            if len(cols) < len(df.columns):
+                info["checksum"]["columns"] = cols
+        return info
+    from .prep_dist import _files
+
+    try:
+        files = _files(source)
+    except ValueError:  # not Parquet: a single CSV file
+        files = [str(source)]
+    t0 = time.time()
+    entries = []
+    for f in files:
+        p = Path(f).resolve()
+        e: dict = {"name": p.name, "path": str(p), "bytes": p.stat().st_size}
+        if checksum:
+            e["sha256"] = _sha256_file(str(p))
+        if p.suffix == ".parquet":
+            import pyarrow.parquet as pq
+
+            e["rows"] = pq.read_metadata(str(p)).num_rows
+        entries.append(e)
+    info = {"kind": "files", "files": entries}
+    if all("rows" in e for e in entries):
+        info["rows"] = sum(e["rows"] for e in entries)
+    if checksum:
+        if len(entries) == 1:
+            info["checksum"] = {"algorithm": "sha256", "value": entries[0]["sha256"], "of": "file"}
+        else:
+            lines = "".join(f"{e['sha256']}  {e['name']}\n" for e in sorted(entries, key=lambda e: e["name"]))
+            info["checksum"] = {
+                "algorithm": "sha256",
+                "value": hashlib.sha256(lines.encode()).hexdigest(),
+                "of": "manifest",
+                "method": "sha256 of the files' sha256sum lines (hash, two spaces, base name), "
+                "sorted by name",
+            }
+        log.info("prep: sha256 of %d source file(s) in %.0fs", len(entries), time.time() - t0)
+    return info
+
+
 def prep(
     source,
     *,
@@ -156,6 +231,7 @@ def prep(
     overwrite: bool = False,
     keep_staging: bool = False,
     executor=None,
+    checksum: bool = True,
     **dist_options,
 ) -> Dataset:
     """Encode FEs and clusters and write sharded Parquet.
@@ -170,6 +246,8 @@ def prep(
     keep           Data columns to keep (default: all).
     target_rows    Approximate rows per shard. Peak worker memory is about
                    rows x (outcomes + regressors + dummies) x 8 bytes x 3.
+    checksum       record the source's sha256 (files) or content hash (frames) in
+                   dfeols_meta.json; estimation records carry it
     executor       run prep as map/reduce rounds on this executor's workers
                    (Parquet input). Use it for data too large to stream on the
                    coordinator; output is identical in structure. Extra keyword
@@ -189,6 +267,7 @@ def prep(
             overwrite=overwrite,
             keep_staging=keep_staging,
             executor=executor,
+            checksum=checksum,
             **dist_options,
         )
 
@@ -205,6 +284,7 @@ def _prep(
     overwrite,
     keep_staging,
     executor,
+    checksum=True,
     **dist_options,
 ) -> Dataset:
     if (
@@ -224,9 +304,11 @@ def _prep(
             target_rows=target_rows,
             overwrite=overwrite,
             executor=executor,
+            source_meta=source_info(source, checksum),
             **dist_options,
         )
     t_start = time.time()
+    source_meta = source_info(source, checksum)
     root = Path(shard_dir)
     if (root / META).exists() and not overwrite:
         raise FileExistsError(f"{root} already holds a prepared dataset (overwrite=True to replace)")
@@ -342,6 +424,7 @@ def _prep(
         "target_rows": target_rows,
         "created": time.strftime("%Y-%m-%d %H:%M:%S"),
         "prep_seconds": round(time.time() - t_start, 1),
+        "source": source_meta,
     }
     (root / META).write_text(json.dumps(meta, indent=1))
     log.info("prep: wrote %d shards in %.0fs", len(shards), time.time() - t_start)

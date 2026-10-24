@@ -30,6 +30,7 @@ import polars as pl
 
 from .demean import demean, densify, drop_singletons
 from .formula import Formula, Term
+from .rowhash import rowset
 
 
 @dataclass
@@ -54,6 +55,7 @@ class Plan:
     fe_method: str = "auto"  # auto | exact | iterate
     sparse_global: bool = False  # crossing FEs via per-level sums, no dense dummies
     keep_dir: str | None = None  # per-shard singleton keep masks (when FEs cross the partition)
+    row_key_cols: tuple[str, ...] = ()  # raw columns hashed into the record's row_key
 
 
 def plan_columns(f: Formula, cat_levels: dict[str, list], has_fe: bool):
@@ -109,6 +111,7 @@ def _load(plan: Plan, files: list[str], dropped: dict | None = None):
         cols.add(plan.cluster[1])
     if plan.weights:
         cols.add(plan.weights)
+    cols.update(plan.row_key_cols)
     df = pl.read_parquet(files, columns=sorted(cols))
     # listwise deletion on the variables of this spec
     num = [c for c in f.variables if df.schema[c].is_float()]
@@ -334,6 +337,7 @@ def _round1(plan: Plan, shard_id: int, files: list[str], write_cache: bool):
         "shard": shard_id,
         "rows_in": n0,
         "load": loaded,
+        "row_key": rowset(df, list(plan.row_key_cols)) if plan.row_key_cols else None,
         "n": n,
         "sumw": float(w.sum()),
         "ZtZ": ZtZ,

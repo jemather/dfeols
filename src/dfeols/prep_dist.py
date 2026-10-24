@@ -462,6 +462,7 @@ def prep_distributed(
     hash_levels: float = 2e6,
     range_groups: float = 5e6,
     max_files: float = 5e4,
+    source_meta: dict | None = None,
 ):
     """rows_per_task  rows per encode task (default: ~4 tasks per worker, 1M-10M
                    rows each, so the last wave of tasks is short)
@@ -843,6 +844,7 @@ def prep_distributed(
         "prep_version": __version__,
         "shard_assignment": "range" if range_mode else "lpt",
         "shuffle": f"two-level ({n_buckets} buckets)" if n_buckets else "direct",
+        "source": source_meta if source_meta is not None else {"kind": "files"},
     }
     (root / META).write_text(json.dumps(meta, indent=1))
     log.info("prep: wrote %d shards in %.0fs (distributed)", len(shards), time.time() - t_start)

@@ -15,6 +15,7 @@ from pathlib import Path
 import numpy as np
 import polars as pl
 
+from . import rowhash
 from .executors import SerialExecutor
 from .formula import fe_components, parse
 from .linalg import collinear_keep, solve_spd
@@ -162,6 +163,11 @@ def build_plan(
         raise KeyError(f"Variables not in the prepared data: {sorted(missing)}")
 
     colnames = plan_columns(f, cat_levels, has_fe=bool(local or glob))
+    # the spec's raw columns (FE and cluster components, not their codes) identify its rows
+    key = set(f.variables) | ({weights} if weights else set())
+    for name in [*f.fes, *([cluster] if cluster else [])]:
+        key.update(fe_components(name))
+    row_key_cols = tuple(sorted(c for c in key if c in ds.columns))
     spec_id = f.fingerprint(cluster=cluster, weights=weights, singletons=drop_singletons)
     return Plan(
         formula=f,
@@ -180,6 +186,7 @@ def build_plan(
         fe_tol=fe_tol,
         fe_method=fe_method,
         sparse_global=_use_sparse(crossing_fe, local, glob),
+        row_key_cols=row_key_cols,
     )
 
 
@@ -418,6 +425,7 @@ def fit(
         "G_local": 0,
         "row_n": {},
         "load": {"rows": 0, "missing": 0, "non_finite": 0, "zero_weights": 0},
+        "row_key": [],
     }
 
     peak = {"rss": 0.0}
@@ -430,6 +438,8 @@ def fit(
         acc["rows_in"] += r["rows_in"]
         for key, v in r.get("load", {}).items():
             acc["load"][key] += v
+        if r.get("row_key"):
+            acc["row_key"].append(r["row_key"])
         acc["sumw"] += r["sumw"]
         acc["row_n"][tid] = r["n"]
         acc["converged"] &= r["converged"]
@@ -593,7 +603,20 @@ def fit(
         "rows_input": acc["load"]["rows"],
         "dropped": {k: acc["load"][k] for k in ("missing", "non_finite", "zero_weights")},
     }
+    src_rows = (ds.meta.get("source") or {}).get("rows")
+    if src_rows is not None and src_rows >= ds.n_rows:
+        # prep drops rows with a missing partition, FE or cluster key
+        run["sample"]["rows_input"] = int(src_rows)
+        run["sample"]["dropped"] = {"missing_keys": int(src_rows - ds.n_rows), **run["sample"]["dropped"]}
     run["fit_id"] = str(uuid.uuid4())
+    if plan.row_key_cols:
+        rk = rowhash.combine(acc["row_key"])
+        run["row_key"] = {
+            "algorithm": rowhash.ALGORITHM,
+            "value": rowhash.hexdigest(rk),
+            "rows": rk["rows"],
+            "columns": list(plan.row_key_cols),
+        }
     run["converged"] = bool(acc["converged"])
     run["fe_nested_in_cluster"] = nested
     run["n_local_fes"] = len(plan.local_fes)

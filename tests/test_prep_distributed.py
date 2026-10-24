@@ -85,6 +85,10 @@ def test_distributed_prep_matches(tmp_path, name, d, fits, execname):
             ra = dfeols.fit(a, fml, cluster=cl, vcov=["CRV1", "hetero"], log_every=1e9)
             rb = dfeols.fit(b, fml, cluster=cl, vcov=["CRV1", "hetero"], executor=ex, log_every=1e9)
             assert ra.N == rb.N and ra.coefnames == rb.coefnames and ra.fe_levels == rb.fe_levels
+            # same source checksum and same sample, however the shards were made
+            assert a.meta["source"]["checksum"] == b.meta["source"]["checksum"]
+            assert a.meta["source"]["checksum"]["of"] == "manifest"
+            assert ra.run["row_key"] == rb.run["row_key"]
             np.testing.assert_allclose(ra.coef(), rb.coef(), rtol=1e-9, atol=1e-12)
             for t in ("CRV1", "hetero"):
                 np.testing.assert_allclose(ra.vcov(type=t), rb.vcov(type=t), rtol=1e-8, atol=1e-15)

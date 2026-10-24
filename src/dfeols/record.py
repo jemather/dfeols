@@ -322,6 +322,30 @@ def _dask(executor) -> tuple[dict | None, list[dict]]:
     return out, workers
 
 
+def _source_input(src: dict | None) -> list[dict]:
+    """provenance.data entry for what prep read (dfeols_meta.json `source`): name, location
+    (identifying), checksum, rows; per-file names, sizes and sha256 without their paths."""
+    if not src or src.get("kind") == "lazyframe":
+        return []
+    entry: dict[str, Any] = {"role": "source"}
+    files = src.get("files") or []
+    if src.get("kind") == "frame":
+        entry["name"] = "in-memory frame"
+    elif len(files) == 1:
+        entry.update(name=files[0]["name"], location=files[0]["path"])
+    elif files:
+        parent = os.path.commonpath([str(Path(f["path"]).parent) for f in files])
+        entry.update(name=Path(parent).name, location=parent)
+        entry["files"] = [{k: f[k] for k in ("name", "bytes", "sha256", "rows") if k in f} for f in files]
+    if "checksum" in src:
+        entry["checksum"] = src["checksum"]
+    if "rows" in src:
+        entry["rows"] = src["rows"]
+    if "columns" in src:
+        entry["columns"] = src["columns"]
+    return [entry]
+
+
 def run_info(ds, executor, *, started: float, finished: float, cpu_seconds: float | None) -> dict:
     """What fit() records about where and how it ran: `provenance` (core sections) and
     `dfeols` (dataset and executor facts for the extension). JSON-ready."""
@@ -351,13 +375,14 @@ def run_info(ds, executor, *, started: float, finished: float, cpu_seconds: floa
         "execution": execution,
         "agent": {k: v for k, v in {"user": user, "host": socket.gethostname()}.items() if v},
         "data": [
+            *_source_input(ds.meta.get("source")),
             {
                 "role": "estimation",
                 "name": Path(ds.root).name,
                 "location": str(Path(ds.root).resolve()),
                 "rows": int(ds.n_rows),
                 "columns": list(ds.columns),
-            }
+            },
         ],
     }
     shards: dict[str, Any] = {
@@ -667,6 +692,8 @@ def to_estimation(
     }
     dfe = run.get("dfeols") or {}
     ext.update({k_: v for k_, v in dfe.items() if k_ in ("shards", "dask", "executor")})
+    if run.get("row_key"):
+        ext["row_key"] = run["row_key"]
     if absorption:
         ext["absorption"] = absorption
     if r.timing:

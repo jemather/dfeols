@@ -761,8 +761,12 @@ What only dfeols has (most of it from draft 1):
 - `shards`: shard folder, prep version, partition key, target rows, shard count, a hash of
   `dfeols_meta.json`. Results must not depend on the partition, but it is the first thing to
   check when they do.
-- `row_key`: a hash of the indices of the rows used, combined shard by shard, so two runs can
-  be checked for an identical sample without storing rows.
+- `row_key`: a hash of the rows used, combined shard by shard, so two runs can be checked for
+  an identical sample without storing rows. The shards have no row ids, so it hashes each
+  row's values in the spec's raw columns (outcomes, regressors, FE and cluster components,
+  weights): `dfeols-rowset-v1` (`src/dfeols/rowhash.py`), splitmix64 over the values' bits,
+  summed mod 2^64 in two lanes, so it doesn't depend on row order or partition. Polars' hash
+  isn't used (unstable across versions). Identical rows are a multiset, as in estimation.
 - `absorption`: per FE, `local` / `crossing_dense` / `crossing_sparse`, `nested_in_partition`.
 - `demeaning`: per-shard iterations (max, median), the worst shard's final change, round 1/2
   timing; the persisted demeaned-data key if from a session.
@@ -1046,10 +1050,19 @@ other tools, by issue first; start with pyfixest, then fixest, then reghdfe):
    - The dfeols profile now marks the resolved site profile's `account`, `project`,
      `scratch`, `source`, `prologue` and `env` as identifying (kept by default, removed by
      `redact=True`); Dask worker hosts are only in `provenance.execution.workers`.
-   - Not yet: `row_key` (needs a per-shard hash of row indices from the workers), demeaning
-     iteration counts (the compiled demeaner returns only a converged flag), a data checksum
-     for the input (the shard folder has no content hash; `meta_sha256` hashes its layout
-     file), group sizes per FE.
+   - Confirmed by Ted (2026-10-24): record on by default; fits without FEs claim
+     `inference/0.1` only; `hetero` written as `HC1`; SLURM fields from environment
+     variables.
+   - `row_key` (see the dfeols extension) and the source checksum (Ted, 2026-10-24): `prep`
+     records what it read in `dfeols_meta.json` `source`: per file name, path, bytes, sha256
+     and Parquet row count, and one checksum: the file's sha256 (`of: "file"`), for several
+     files the sha256 of their `sha256sum` lines sorted by name (`of: "manifest"`), for an
+     in-memory frame a `dfeols-rowset-v1` content hash (`of: "in-memory"`); none for a
+     LazyFrame; `prep(..., checksum=False)` skips hashing. Records list it as a `source`
+     input before the shards, and `rows_input` becomes the source's row count, with rows
+     prep dropped for a missing partition/FE/cluster key as `dropped.missing_keys`.
+   - Not done: demeaning iteration counts (the compiled demeaner returns only a converged
+     flag; left out, Ted 2026-10-24), group sizes per FE.
 6. **Worked converters**: pyfixest (Python), fixest (R) and reghdfe `e()` (Stata), each
    producing records that validate against `linear-fe/0.1`. They test the profile mappings
    on real output and give each tool's authors code to adapt.
