@@ -1,6 +1,7 @@
 # Design: the `estimation` format (`estimation/0.1`)
 
-Status: draft 4 (2026-10-24), for discussion. Draft 1 was the dfeols-only `dfeols-result/1`
+Status: draft 5 (2026-10-24), for discussion. Draft 5 adds canonical term names, flagged
+disagreements (term spelling, profile requirements), and the two kinds of collections. Draft 1 was the dfeols-only `dfeols-result/1`
 (b903bc1); draft 2 made it general (faddceb, as `result-format.md`); draft 3 (463110d) settled
 naming, validation, attachments, identifying details and chained extensions. Draft 4 adds what
 other tools record (SPSS, Stata, R, Python, lock files, SBOMs, SLURM), the `publication` block
@@ -189,8 +190,51 @@ A list of rows, as in the sketch. `term` is required; other columns depend on th
 Rows are the model's reported parameters. Per-level estimates (FE coefficients, BLUPs) are not
 parameters for this purpose; they go in an attachment.
 
-Because `term` names differ by tool (fixest `x::2`, Stata `2.x`), the record keeps the producer's
-own name. Validation records how names were matched (below).
+#### Term names: the tool's own and a canonical one (Ted, 2026-10-24)
+
+Each row keeps the producer's own name in `term` and adds `canonical`, a structured name that
+is the same in every tool:
+
+```json
+{"term": "i(year, ref = 2000)::2005", "canonical": {"name": "year[2005]",
+   "factors": [{"variable": "year", "level": "2005", "reference": "2000"}]}, ...}
+{"term": "c.price#c.weight", "canonical": {"name": "price:weight",
+   "factors": [{"variable": "price"}, {"variable": "weight"}]}, ...}
+```
+
+The structured `factors` list is the definition; `name` is a readable rendering of it
+(`variable[level]`, with `:` between interacted factors, `(Intercept)` for the constant).
+Comparisons across tools match on `factors`, not on strings.
+
+Tools spell the same term in different ways:
+
+| Term | R `lm` | fixest | Stata | patsy (statsmodels, pyfixest) | canonical |
+|---|---|---|---|---|---|
+| constant | `(Intercept)` | `(Intercept)` | `_cons` | `Intercept` (statsmodels `const`) | `(Intercept)` |
+| factor level | `factor(year)2005` | `year::2005` | `2005.year` | `C(year)[T.2005]` | `year[2005]` |
+| base level | (not shown) | (not shown) | `2000b.year` | (not shown) | row with `dropped: "reference"` |
+| interaction | `price:weight` | `price:weight` | `c.price#c.weight` | `price:weight` | `price:weight` |
+| omitted (collinear) | `NA` estimate | dropped, in `collin.var` | `o.x` | dropped | row with `dropped: "collinear"` |
+
+**Flagged for discussion.** Points where tools disagree and the canonical form makes a choice
+that needs a decision:
+
+1. **Level spelling**: codes or labels? Stata reports value-label codes (`2.region`), and R
+   reports factor labels (`regionSouth`). The canonical form needs one, with the other kept.
+   Proposal: the level as stored in the data, with the label as `level_label`.
+2. **Transformations in the formula** (`log(x)`, `I(x^2)`, `poly(x, 2)`, Stata `c.x#c.x`):
+   canonicalise the expression, or keep it verbatim as the variable name? Proposal: verbatim
+   expression, plus `transform` when the tool reports one.
+3. **Constant in FE models**: reghdfe reports `_cons` (`e(report_constant)`); fixest and
+   pyfixest absorb it and report no constant. Should a canonical record include a constant row
+   the tool didn't estimate? Proposal: no; `structures.fixed_effects.constant_reported` says
+   which convention applied.
+4. **Order of factors in an interaction** (`a:b` vs `b:a`): order-insensitive matching
+   (proposal), or the order as specified?
+5. **Factor-by-continuous interactions** (fixest `i(year, x)`, Stata `i.year#c.x`): one
+   factor with a level and one without (proposal), or a special form?
+
+These are listed again under Questions.
 
 ### `structures` (optional)
 
@@ -265,8 +309,8 @@ deliberately open-ended.
 - `data`: list of inputs, each `{role, name, version, location, checksum, rows, columns,
   source, license, publication}`.
   - `checksum` is `{algorithm, value, of, method}`. `of` says what was hashed (a file, a
-    manifest such as `MANIFEST.sha256`, in-memory content). For in-memory content, `method` names
-    the procedure (`stata-datasignature`, `R digest::digest(df, "xxhash64")`,
+    manifest such as `MANIFEST.sha256`, in-memory content). For in-memory content, the format
+    defines no single hash (Ted, 2026-10-24); `method` is required and names the procedure (`stata-datasignature`, `R digest::digest(df, "xxhash64")`,
     `pandas.util.hash_pandas_object`). Two checksums are comparable only if `method` matches.
   - `publication`: where the data is published (same block as below: DOI, AsCollected or
     ResearchBox link, openICPSR project).
@@ -435,9 +479,13 @@ Rules:
 - Each tool appends to `history`: `{when, by: {name, version}, action: "created" | "extended" |
   "redacted" | "validated", sections: [...]}`. The chain of tools that touched a record is
   therefore explicit and in order.
-- Optional integrity check: `meta.core_digest` is the sha256 of the canonical JSON (RFC 8785)
-  of the core sections, written at creation. Any later tool can verify that the results it is
-  annotating haven't changed.
+- Optional integrity check (`meta.core_digest`): when the record is created, the writer
+  computes one sha256 fingerprint over the result sections (`meta` except the digest itself,
+  `specification`, `metrics`, `parameters`, `structures`), serialised in a fixed canonical way
+  (RFC 8785) so the same content always gives the same hash. Later tools only add blocks, so
+  the fingerprint should never change. Any tool, or a reader, can recompute it and see whether
+  someone edited the results after the run (by hand or by a buggy tool), as opposed to only
+  annotating them. Without it, an edited coefficient is indistinguishable from the original.
 - The core validator ignores block content; each block's `schema` names the schema that
   validates it, and readers skip blocks they don't know.
 
@@ -457,7 +505,8 @@ saves and every option it takes. Then:
   definition, and a mapping to each tool's own name. A writer that has the quantity uses the
   profile name. One that doesn't omits it.
 - **Requirements = what (nearly) all of them save.** Only those are required for a record to
-  claim the profile.
+  claim the profile. Where tools disagree on whether a quantity exists or what it means, the
+  profile flags it for discussion instead of deciding silently (see `linear-fe` below).
 - **Options = the union of options**, with each tool's default. A record lists the effective
   value of every option the producer has. The mapping shows which options in another tool
   correspond, which is most of what explains a discrepancy between tools.
@@ -513,6 +562,33 @@ schema is written.
 \* method or derived (`r2()`, `fitstat()`, `sigma()`), not a stored element. † not in the
 documented Value list; from memory, to check.
 
+**Flagged for discussion: the required set.** ✓ marks a proposal. Where the tools disagree on
+whether a quantity exists or what it means, the profile can't just require it (Ted,
+2026-10-24: flag these and discuss):
+
+1. **`nobs` means different samples.** reghdfe drops singletons by default; fixest
+   (`fixef.rm`) and pyfixest keep them unless asked. Two correct tools can report different
+   `nobs` for the same command. Proposal: `nobs` stays required, and so do `n_singletons` and
+   `specification.options.drop_singletons`, so the difference is visible.
+2. **`df_residual` has several definitions.** With clustering, reghdfe's `e(df_r)` and fixest's
+   default `t.df = "min"` use G − 1; linearmodels' `df_resid` is N − K; others subtract the
+   absorbed FE levels as well. Proposal: `df_residual` = N − K − absorbed levels (the model's
+   residual df), always; the df used for t tests and CIs goes in `vcov.df_t`, which carries
+   the tool's convention.
+3. **`r2_within` isn't universal.** areg reports the R² of the dummy-variable regression, not a
+   within R²; lfe's projected R² is defined differently. Proposal: required only when the
+   producer computes it, with `definition` when it isn't the standard within R². This would make
+   it vocabulary, not a requirement.
+4. **FE level counts** (`fixed_effects[].levels`): every surveyed tool knows them (fixest
+   `fixef_sizes`, reghdfe `dof_table`, xtreg `e(N_g)`, linearmodels `entity_info`).
+   Proposal: required.
+5. **The `ssc` breakdown**: fixest and reghdfe can say exactly which factors were applied;
+   linearmodels exposes only `debiased`, statsmodels only `use_correction`. Proposal: `ssc`
+   required with at least `convention`; the full factors when the producer has them.
+6. **Convergence** (`iterations`, `converged`): only iterative demeaners (reghdfe, fixest,
+   pyfixest, dfeols, FEM.jl) have it. xtreg, areg and linearmodels with one FE are exact.
+   Proposal: optional, but required when `numerics.algorithm` is iterative.
+
 **`structures.fixed_effects`**, one entry per FE: `name`, `components` (for interactions and
 slopes, as reghdfe `e(extended_absvars)`), `levels` (fixest `fixef_sizes`), `redundant`
 and `redundant_method` (reghdfe `e(dof_table)` and `dofadjustments()`: exact for nested FEs,
@@ -566,14 +642,26 @@ What only dfeols has (most of it from draft 1):
 
 ## Collections ("all results")
 
-`estimation-collection/0.1`: the records of one session (or another grouping, such as a paper's
-tables), plus what is true of the session as a whole. It is an export, built from records and
+`estimation-collection/0.1`: a set of records plus what is true of the set as a whole. There are
+two main uses, and each leans on a different part (Ted, 2026-10-24):
+
+- **A paper's results** (`kind: "paper"`) is organised by `members`. They are ordered by
+  locator (Table 1 col. 1, col. 2, ...), with the paper's citation in `publication`. It answers
+  "which record is behind each number?".
+- **Replicating results** (`kind: "session"` or `"replication"`) is organised by `events`: the
+  timeline of what was done, in order, including the fits (each fit event points to its member).
+  It answers "what exactly happened, so that I can do it again?".
+
+Both parts are always allowed, and a collection can have both. The `kind` sets which one a
+validator expects.
+
+The details: It is an export, built from records and
 never edited by itself. Each member record stays self-contained: it can be pulled out and
 read alone.
 
 ```text
 schema         "estimation-collection/0.1"
-meta           id, created, title, tags, notes, kind ("session" | "paper" | "batch" | "other")
+meta           id, created, title, tags, notes, kind ("paper" | "session" | "replication" | "batch" | "other")
 session        what the session was and how it ran (kind "session")
 provenance     the session's own software, environment, execution, agent, data
 publication    optional: the paper a "paper" collection belongs to (citation; members carry locators)
@@ -598,9 +686,10 @@ history        as for records
 - `members`: each `{id, sha256, path or embedded record, created, order, label}`, in the order
   run. Embedded whole, or as a JSON Lines file (one record per line) linked like an attachment.
   A member's `sha256` lets the collection prove which version of each record it holds.
-- `events`: `{when, type, detail}` for what isn't a fit: variables created, demeaned data
-  persisted or reloaded, workers lost and replaced, client connects and disconnects, errors.
-  Together with `members`, this is a timeline of the session.
+- `events`: `{when, type, detail, member}` in order: fits (`type: "fit"`, with `member` set to
+  the record id), variables created, data loaded, demeaned data persisted or reloaded, settings
+  changed, workers lost and replaced, client connects and disconnects, errors. Replaying the
+  events in order should reproduce the members.
 - Redaction and size rules are the same as for records. Since a collection can embed many
   records, the 16 MB limit applies to the collection file; a larger one keeps its members as a
   linked JSON Lines file instead of embedding them.
@@ -666,14 +755,11 @@ filled, plus `extensions.dfeols` and `history`.
 
 ## Questions for Ted
 
-1. **Term names across tools.** Keep each tool's own names and match them in validation (as
-   drafted), or also store a canonical name per term? Profiles' mapping tables could define a
-   canonical form for factor and interaction terms.
-2. **In-memory data checksums.** Draft 4 proposes leaving the procedure to the producer but
-   requiring it to be named (`method`), so checksums are compared only when the method
-   matches. Enough, or should the format define one canonical content hash?
-3. **Core digest**: worth having from the start, or later?
-4. **Profiles' required set**: is "what nearly all surveyed tools save" the right bar? For
-   `linear-fe` that makes `nobs`, `df_residual` and `r2_within` required, and the rest
-   vocabulary.
-5. **Collections**: is a session's `events` timeline wanted, or is `members` enough?
+1. **Core digest** (explained under `extensions`): include `meta.core_digest` from the start, or
+   leave it out until someone needs it?
+2. **Canonical term names: the five flagged points** under `parameters` (level codes vs
+   labels, transformations, the constant in FE models, interaction order,
+   factor-by-continuous terms).
+3. **`linear-fe` required set: the six flagged points** under Profiles (`nobs` and singletons,
+   the `df_residual` definition, `r2_within`, FE level counts, the `ssc` breakdown,
+   convergence).
