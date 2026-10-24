@@ -1,8 +1,11 @@
 # Design: the `estimation` format (`estimation/0.1`)
 
-Status: draft 3 (2026-10-24), for discussion. Draft 1 was the dfeols-only `dfeols-result/1`
-(b903bc1); draft 2 made it general (faddceb, as `result-format.md`). Draft 3 follows Ted's
-answers on naming, validation, attachments, identifying details and chained extensions.
+Status: draft 4 (2026-10-24), for discussion. Draft 1 was the dfeols-only `dfeols-result/1`
+(b903bc1); draft 2 made it general (faddceb, as `result-format.md`); draft 3 (463110d) settled
+naming, validation, attachments, identifying details and chained extensions. Draft 4 adds what
+other tools record (SPSS, Stata, R, Python, lock files, SBOMs, SLURM), the `publication` block
+(citations, table/column locators, AsCollected/ResearchBox links), profiles built from the union
+of what popular tools save, and session metadata for collections.
 
 ## Purpose
 
@@ -30,10 +33,27 @@ No existing format covers this. The nearest pieces:
 | PMML (XML, DMG) | scoring a fitted model in another system | inference (SEs, vcov, tests), provenance; dated, XML-heavy |
 | R `sessionInfo()`, `pip freeze`, conda env | software environment | nothing about the model |
 | W3C PROV, RO-Crate, CodeMeta | generic provenance and software metadata | nothing statistical |
-| Stata `e()`/`r()`, fixest objects | full detail, one tool | tool-specific, binary or in-memory |
+| Stata `e()`/`r()`/`c()`, `estimates save` (`.ster`), `collect` | full detail of one run; `c()` holds the environment; `collect` groups results with tags | Stata-only, binary `.ster`; nothing outside Stata reads it |
+| SPSS OMS (OXML), the "Notes" table, `OUTFILE=COVB` | OMS routes any output table to XML/SAV; every procedure's Notes table records time created, input file, active filter/weight/split, rows, missing-value handling, the syntax and processor/elapsed time | OXML describes *display tables* (pivot dimensions and cells), not a model; the vcov goes to a separate `.sav`; no software or hardware detail |
+| fixest / pyfixest / linearmodels result objects | full detail, one tool | in-memory, tool-specific |
+| MLflow run records | params, metrics, tags, artifacts by link, source commit | ML-oriented; no inference, vcov or data identity |
+| renv.lock, pylock.toml (PEP 751), conda lock, `pip freeze` | exact package sets with sources and hashes | nothing about the model or run |
+| CycloneDX / SPDX SBOMs, Package URLs (purl) | software components with a universal identifier (`pkg:cran/fixest@0.12.1`, `pkg:pypi/numpy@2.1.0`) and hashes | supply-chain focus; heavy |
+| RO-Crate Process Run Crate | one execution of a tool: inputs, outputs, start/end, agent, instrument | generic; nothing statistical |
+| SLURM `sacct`/`scontrol` | job id, partition, account, nodes, allocated TRES, submit line, elapsed, MaxRSS, exit state | scheduler only |
+| AsCollected, ResearchBox, AsPredicted (Wharton CredLab) | provenance of a paper's data; data/code boxes with file ids; pre-registrations; each with a stable short URL | the estimation results themselves |
 
-So the format borrows names where they exist (broom for parameters and metrics, CodeMeta-like
-fields for software, PROV's idea of entity/activity/agent for provenance) and defines the rest.
+So the format borrows names and identifiers where they exist and defines the rest:
+
+- broom for parameters and metrics;
+- purl to identify software;
+- lock-file hashes for package sets;
+- CSL-JSON (the citation format used by Zotero, pandoc and CrossRef) for citations;
+- SLURM's own field names for scheduler data;
+- SPSS's Notes table as a checklist of run state worth recording (active filter, weight, split,
+  missing-value handling, processor vs elapsed time);
+- PROV and RO-Crate for the run as an activity with inputs, outputs and an agent;
+- Stata `collect` and MLflow for collections and tags.
 
 ## Decisions (Ted, 2026-10-24)
 
@@ -55,6 +75,15 @@ fields for software, PROV's idea of entity/activity/agent for provenance) and de
   (expected for a custom or untested estimator, unusual otherwise), in open-ended styles.
 - **Extensions can be chained**: each tool that handles a record can add its own diagnostic
   block.
+- **Size thresholds**: warn above 1 MB per record or 10,000 elements in one array; fail above
+  16 MB.
+- **Publication links**: a record can say where its result appears ("Study 1, Table 2, Column
+  1" plus a citation) and link to AsCollected, ResearchBox and similar records. No author-role
+  detail: that belongs in AsCollected itself.
+- **Profiles** are the way to get model-specific rules. Each is built from the union of what the
+  most popular Stata, R and Python tools for that task save.
+- **Collections record the session**: duration, environment and system details, like a record
+  does for a run.
 
 ## Format: JSON, with JSON Schema
 
@@ -90,6 +119,7 @@ metrics        expected   flat dict of scalar results           (sketch: metrics
 specification  expected   what was asked for: call, formula, options, sample
 provenance     expected   software, environment, execution, data
 structures     optional   named complex objects: vcov, FEs, ... (sketch: structures)
+publication    optional   where the result appears: citation, table/column, links
 validation     optional   other software's version of this model; comparisons
 attachments    optional   links to large side files
 extensions     optional   blocks added by tools, one per namespace
@@ -127,6 +157,10 @@ What was asked for, in the estimating software's own terms, fully resolved:
 - `fixed_effects`, `instruments`, `clusters` as specified.
 - `sample`: the restriction as written, plus `rows_input` and the drop counts by reason
   (missing per variable, singletons, zero weights, other). `nobs` lives in `metrics`.
+- `state`: settings in force from *outside* the call, which change results without appearing
+  in it. SPSS's Notes table and Stata's settings are the model here: active filter, weight and
+  split file (SPSS); `xtset`/`tsset`, `if`/`in`, `set seed` (Stata); `options()` that change
+  estimates (R); user-defined missing-value codes and how they were treated.
 - `options`: every option with its effective value (tolerances, algorithms, seeds,
   hyperparameters for ML).
 
@@ -191,22 +225,61 @@ Everything about how and where the run happened. Each sub-block is a list or dic
 producer fills as far as it can. **This is where a discrepancy is traced**, so it is
 deliberately open-ended.
 
-- `software`: list of components, each `{name, version, role, source, attributes}`.
-  `role` is `estimator` (dfeols, fixest), `language` (R, Python), `dependency` (numpy, polars) or
-  `system` (BLAS). `source` is CRAN, PyPI, conda, or a git commit with a dirty flag. For base R:
-  R plus attached packages from `sessionInfo()`. For dfeols: dfeols at commit X, Python,
-  numpy, scipy, polars, pyarrow, dask, distributed, dask-jobqueue and BLAS.
-- `environment`: OS, kernel, CPU model and cores, memory, locale, timezone, thread settings,
-  and **an allowlist of environment variables** (`OMP_NUM_THREADS`, `POLARS_MAX_THREADS`, ...).
-  Never a full dump: environments carry tokens.
-- `execution`: `started`, `finished`, duration and timing by stage; `invocation` (command
-  line, script path and sha256, working directory); `scheduler` (`{type: "slurm", job_id,
-  submit_command, partition, account, resources, nodes}`); `workers` (count, cores, memory, peak
-  use); launch parameters (the dfeols profile, fully resolved); `session` id if from a session.
+- `software`: list of components, each `{name, version, purl, role, source, hash, attributes}`.
+  - `purl` (Package URL) identifies a component the same way across ecosystems:
+    `pkg:cran/fixest@0.12.1`, `pkg:pypi/numpy@2.1.0`, `pkg:github/jemather/dfeols@ce05eec`,
+    `pkg:conda/...`. Stata and SPSS have no purl type, so they use `pkg:generic/stata@19.5`
+    plus `attributes`.
+  - `role`: `estimator` (dfeols, fixest), `language` (R, Python, Stata), `dependency` (numpy,
+    polars), `system` (BLAS, OpenMP, MPI), `container`.
+  - `source`: CRAN, PyPI, conda, SSC, or a git commit with a dirty flag.
+  - `lock`: optional pointer to a full lock file (`renv.lock`, `pylock.toml`, `conda-lock.yml`,
+    CycloneDX SBOM), linked like an attachment by path + sha256. The record lists only the
+    components that matter; the lock file has the rest.
+  - `container`: image reference and digest (Docker/OCI, Apptainer `.sif` sha256) when the run
+    was containerised.
+- `environment`: OS, kernel, locale, timezone, and the details below.
+  - **Hardware**: CPU model, sockets, cores, threads, instruction-set flags that change
+    floating-point results (AVX2, AVX-512, FMA), memory, GPU model and driver.
+  - **Numerical libraries and threads**: the BLAS/LAPACK in use, its version, threading layer
+    and thread count (Python `threadpoolctl.threadpool_info()`; R `sessionInfo()` BLAS/LAPACK
+    and `La_version()`; `numpy.show_config()`).
+  - **Random numbers**: generator type, seed, state (R `RNGkind()`, Stata `c(rngtype)`,
+    `c(rngstate)`, numpy's bit generator).
+  - **Environment variables**: an allowlist only (`OMP_NUM_THREADS`, `MKL_NUM_THREADS`,
+    `POLARS_MAX_THREADS`, ...). Never a full dump: environments carry tokens.
+- `execution`:
+  - Times: `started`, `finished`, elapsed and **processor time** (SPSS reports both; a large gap
+    between them means waiting or contention), timing by stage, peak memory.
+  - `invocation`: command line, script path and sha256, working directory, interactive or
+    batch (Stata `c(mode)`).
+  - `scheduler`: `{type: "slurm", ...}`, using SLURM's own field names: `JobID`, `JobName`,
+    `Partition`, `Account`, `QOS`, `NodeList`, `AllocCPUS`, `AllocTRES`, `ReqMem`, `Submit`,
+    `Start`, `End`, `Elapsed`, `MaxRSS`, `State`, `ExitCode`, `SubmitLine`, `WorkDir`. Other
+    schedulers (PBS, LSF, SGE) use their own names under their own `type`.
+  - `workers`: count, cores, memory, peak use.
+  - `launch`: launch parameters, fully resolved (the dfeols profile, `dfeols submit`
+    arguments).
+  - `session`: session id if the run came from a session (see Collections).
 - `agent`: user and host.
 - `data`: list of inputs, each `{role, name, version, location, checksum, rows, columns,
-  source, license}`. `checksum` is `{algorithm, value, of}`, where `of` says what was hashed (a
-  file, a manifest such as `MANIFEST.sha256`, a data frame's content).
+  source, license, publication}`.
+  - `checksum` is `{algorithm, value, of, method}`. `of` says what was hashed (a file, a
+    manifest such as `MANIFEST.sha256`, in-memory content). For in-memory content, `method` names
+    the procedure (`stata-datasignature`, `R digest::digest(df, "xxhash64")`,
+    `pandas.util.hash_pandas_object`). Two checksums are comparable only if `method` matches.
+  - `publication`: where the data is published (same block as below: DOI, AsCollected or
+    ResearchBox link, openICPSR project).
+
+What each kind of producer can usually fill, as a guide for writers:
+
+| Producer | Software | Environment | Execution |
+|---|---|---|---|
+| base R | `R.version`, attached and loaded packages (`sessionInfo()`), optionally `renv.lock` | `platform`, `running`, BLAS/LAPACK, `La_version()`, locale, `tzone`, `RNGkind()` | `Sys.time()` around the call, `proc.time()`, `commandArgs()` |
+| Stata | `c(stata_version)`, `c(version)`, `c(born_date)`, edition (BE/SE/MP), ado versions (`which`), SSC packages | `c(os)`, `c(osdtl)`, `c(machine_type)`, `c(byteorder)`, `c(processors)`, `c(rngtype)`, `c(rngstate)` | `c(current_date)`, `c(current_time)`, `timer`, `c(mode)`, `c(pwd)`; `e(cmdline)` |
+| SPSS | version, edition, fix pack, extension bundles | OS, `SHOW` settings (e.g. `MXCELLS`, `RNG`, `SEED`) | Notes table: Output Created, Syntax, Input data, Filter/Weight/Split, Processor/Elapsed Time |
+| Python | interpreter, packages (`importlib.metadata`), optionally `pylock.toml`/conda lock | `platform`, `threadpoolctl`, `os.cpu_count()`, allowlisted variables | `time`, `resource.getrusage`, `sys.argv` |
+| dfeols | all of the Python row, plus dfeols commit and dirty flag, Dask stack | per worker as well as the coordinator | SLURM fields, launch profile, workers, per-stage timing |
 
 ### Identifying details
 
@@ -226,6 +299,58 @@ them by default, because they matter for tracing a discrepancy, and make them ea
 - The redactor appends a `history` entry (`action: "redacted"`, method, fields changed), so a
   reader knows what is missing and why.
 
+### `publication` (optional)
+
+Where this result appears, so a number in a paper can be traced to the record that produced it,
+and the record back to the paper and its materials. The same block describes published
+reference values (validation style `published`) and published data (`provenance.data`).
+
+```json
+"publication": {
+  "citation": {"type": "article-journal", "title": "Strike Three: Discrimination, Incentives, and Evaluation",
+               "author": [{"family": "Parsons", "given": "Christopher A."}, "..."],
+               "issued": {"date-parts": [[2011]]}, "container-title": "American Economic Review",
+               "volume": "101", "issue": "4", "page": "1410-1435",
+               "DOI": "10.1257/aer.101.4.1410"},
+  "locator": {"study": "1", "table": "3", "panel": "A", "column": "9", "row": null,
+              "label": "Table 3, column 9"},
+  "status": "published",
+  "ascollected_url": "https://ascollected.org/ZJ6_Z47",
+  "researchbox_url": "https://researchbox.org/15",
+  "researchbox_files": [7, 12],
+  "aspredicted_url": null,
+  "replication_package": {"doi": "10.3886/E112434V1", "url": "https://www.openicpsr.org/openicpsr/project/112434"},
+  "links": [{"rel": "preregistration", "url": "..."}, {"rel": "osf", "url": "..."}]
+}
+```
+
+(The citation is Parsons et al.'s; the AsCollected and ResearchBox URLs are the public examples
+and belong to other papers. They only illustrate the fields.)
+
+- `citation`: **CSL-JSON**, the citation format Zotero, pandoc, Mendeley and CrossRef use, so
+  a citation can be pasted in from a reference manager or fetched from a DOI. Common fields:
+  `type`, `title`, `author`, `issued`, `container-title`, `volume`, `issue`, `page`, `DOI`,
+  `URL`, `version`. Working papers and preprints use `type: "report"` or `"article"` with
+  `number` and `publisher`.
+- `locator`: where in the work, as structured fields **plus** a `label` as printed. Fields:
+  `study`, `table`, `panel`, `column`, `row`, `figure`, `equation`, `page`, `appendix`,
+  `section`. Any can be absent. Structured fields make "every record for Table 3" a simple
+  query; `label` keeps the paper's own wording ("Table A4, col. (3)"). One record has one
+  locator. A result that appears twice (main text and appendix) lists `locators` instead.
+- `status`: `published`, `accepted`, `submitted`, `working-paper`, `preprint`, `unpublished`.
+  `version` in `citation` says which version of the paper the locator refers to, since table
+  numbers move between drafts.
+- **Named links** for the services the format wants to encourage, so writers see them and
+  readers can rely on them: `ascollected_url`, `researchbox_url` (with `researchbox_files`:
+  file ids in the box's bingo table), `aspredicted_url`, `replication_package` (DOI and URL:
+  openICPSR, Dataverse, Zenodo). Use the URL of the specific version cited: AsCollected and
+  ResearchBox give each public version its own URL.
+- `links`: anything else, as `{rel, url}` (OSF, GitHub release, Code Ocean capsule).
+
+Writers can fill `publication` from options (`dfeols.fit(..., publication={...})`, or a
+project-level default plus a per-model locator), so a paper's records all carry the citation
+and each its table and column.
+
 ### `validation` (optional)
 
 Most records won't have one: re-running an `lm` in Stata is not the norm. It is for when the
@@ -239,7 +364,7 @@ It has two parts.
 | `code` | `{software, language, code}`: e.g. `reghdfe y x, absorb(fe) vce(cluster c)` |
 | `description` | prose: how the reference was produced |
 | `record` | another `estimation` record (by path + sha256 + id, or embedded whole) |
-| `published` | `{citation, table, column, values}`: numbers from a paper |
+| `published` | `{publication, values}`: numbers from a paper, with a `publication` block (citation + locator) as above |
 
 The style list is open: a writer can use a new style (e.g. `notebook`, `container`), and
 readers skip styles they don't know. A `record` reference carries its own provenance, so a
@@ -281,7 +406,7 @@ To keep records small, the format **encourages links in three ways**:
    `parameters` and `structures` definitions exclude it.
 2. **Validators warn**: above 1 MB for a whole record, or 10,000 elements in a single
    array, the validator warns and names the section to move to an attachment. Records above
-   16 MB fail validation.
+   16 MB fail validation. (Thresholds agreed by Ted, 2026-10-24.)
 3. **Reference writers spill automatically**: the dfeols writer, and any helper library, move
    a structure above the threshold into an attachment and leave a `link`. The easy path is the
    small one.
@@ -323,17 +448,103 @@ columns and `structures` a record of that kind must have, and their shapes. A re
 profiles it follows in `meta.profiles`; a validator checks the core schema plus each profile.
 This gives model-specific requirements without a new format per model.
 
+### How a profile is built (Ted, 2026-10-24)
+
+For each task, take the most popular tools in Stata, R and Python and list everything each one
+saves and every option it takes. Then:
+
+- **Vocabulary = the union.** Every quantity any of them saves gets one profile name, a
+  definition, and a mapping to each tool's own name. A writer that has the quantity uses the
+  profile name. One that doesn't omits it.
+- **Requirements = what (nearly) all of them save.** Only those are required for a record to
+  claim the profile.
+- **Options = the union of options**, with each tool's default. A record lists the effective
+  value of every option the producer has. The mapping shows which options in another tool
+  correspond, which is most of what explains a discrepancy between tools.
+- The mapping table ships with the profile (`schema/profiles/linear-fe.md`), so it also serves
+  as a cross-tool reference, and converters (Stata `e()` → record, fixest → record) are
+  written from it.
+
 Proposed first profiles:
 
-| Profile | Requires |
-|---|---|
-| `inference/0.1` | `parameters` with estimate, std_error, p_value; a default `vcov` with `type` and `ssc`; `metrics.nobs`, `df_residual` |
-| `linear-fe/0.1` | `inference` + `structures.fixed_effects`; `r2_within`; singleton handling in `specification.sample` |
-| `iv/0.1` | `inference` + endogenous/instruments in `specification`; `structures.first_stage` |
-| `dfeols/0.1` | `linear-fe` + `extensions.dfeols` |
+| Profile | Tools surveyed | Requires |
+|---|---|---|
+| `inference/0.1` | R `lm`/estimatr, statsmodels, Stata `regress` | `parameters` with estimate, std_error, p_value; a default `vcov` with `type` and `ssc`; `metrics.nobs`, `df_residual` |
+| `linear-fe/0.1` | fixest, lfe (R); pyfixest, linearmodels (Python); reghdfe, areg, xtreg (Stata); FixedEffectModels.jl | `inference` + below |
+| `iv/0.1` | fixest, ivreg (R); pyfixest, linearmodels IV (Python); ivreghdfe, ivreg2, ivregress (Stata) | `inference` + endogenous/instruments in `specification`; `structures.first_stage` |
+| `dfeols/0.1` | dfeols | `linear-fe` + `extensions.dfeols` |
 
-Later, as needed: `glm/0.1` (deviance, log-likelihood, family/link), `mixed/0.1` (random
-effects), `ml/0.1` (hyperparameters, importance, CV metrics).
+Later, as needed: `glm/0.1` (deviance, log-likelihood, family/link; fixest `feglm`/`fepois`,
+`glm`, statsmodels, ppmlhdfe, Stata `glm`), `mixed/0.1` (lme4, Stata `mixed`, statsmodels
+MixedLM), `ml/0.1` (scikit-learn, tidymodels/parsnip, xgboost).
+
+### Worked example: `linear-fe/0.1`
+
+Sources: fixest `feols` value and arguments, reghdfe stored results and options, linearmodels
+`PanelEffectsResults` (all checked against current documentation, 2026-10-24). pyfixest, lfe,
+Stata `areg`/`xtreg` and FixedEffectModels.jl are from memory and must be checked before the
+schema is written.
+
+**Metrics** (✓ = required):
+
+| Profile name | Meaning | fixest | reghdfe | linearmodels | others |
+|---|---|---|---|---|---|
+| ✓ `nobs` | rows used | `nobs` | `e(N)` | `nobs` | pyfixest `_N`; FEM.jl `nobs` |
+| `nobs_full` | rows before singleton removal | `nobs_origin`† | `e(N_full)` | — | |
+| `n_singletons` | singleton rows dropped | (`obs_selection`) | `e(num_singletons)` | — | |
+| ✓ `df_residual` | residual df | `df.residual`* | `e(df_r)` | `df_resid` | FEM.jl `dof_residual` |
+| `df_model` | model df | | `e(df_m)` | `df_model` | |
+| `df_absorbed` | df lost to the FEs | | `e(df_a)` | | FEM.jl `dof_fes` |
+| `df_absorbed_nested` | FE df redundant because nested in a cluster | | `e(df_a_nested)` | | |
+| `rss`, `tss`, `tss_within` | sums of squares | `ssr`*, `ssr_null`, `ssr_fe_only` | `e(rss)`, `e(tss)`, within tss | `resid_ss`, `total_ss`, `model_ss` | |
+| `r2`, `adj_r2` | R² | `r2()` | `e(r2)`, `e(r2_a)` | `rsquared` | |
+| ✓ `r2_within`, `adj_r2_within` | within R² | `r2(, "wr2")` | `e(r2_within)`, `e(r2_a_within)` | `rsquared_within` | xtreg `e(r2_w)` |
+| `r2_between`, `r2_overall` | panel R²s | | | `rsquared_between`, `rsquared_overall` | xtreg `e(r2_b)`, `e(r2_o)` |
+| `r2_inclusive` | R² including the fit of the FEs | | | `rsquared_inclusive` | |
+| `sq_corr_fitted` | squared corr(y, ŷ) | `sq.cor` | | `corr_squared_*` | |
+| `sigma` | RMSE | `sigma()` | `e(rmse)` | `s2` (variance) | xtreg `e(sigma_e)` |
+| `sigma_fe`, `rho` | FE standard deviation; share of variance due to the FEs | | | `variance_decomposition` | xtreg `e(sigma_u)`, `e(rho)` |
+| `log_lik`, `log_lik_fe_only`, `log_lik_null` | log-likelihoods | `loglik`, `ll_fe_only`, `ll_null` | `e(ll)`, `e(ll_0)` | `loglik` | |
+| `f_stat`, `f_stat_robust` | joint test of regressors | `fitstat` | `e(F)` | `f_statistic`, `f_statistic_robust` | |
+| `f_fe` | test that the FEs are jointly zero | | | `f_pooled` | xtreg `e(F_f)` |
+| `sum_weights` | | | `e(sumweights)` | | |
+| `rank` | rank of the vcov | | `e(rank)` | | |
+
+\* method or derived (`r2()`, `fitstat()`, `sigma()`), not a stored element. † not in the
+documented Value list; from memory, to check.
+
+**`structures.fixed_effects`**, one entry per FE: `name`, `components` (for interactions and
+slopes, as reghdfe `e(extended_absvars)`), `levels` (fixest `fixef_sizes`), `redundant`
+and `redundant_method` (reghdfe `e(dof_table)` and `dofadjustments()`: exact for nested FEs,
+`pairwise`, `firstpair`, `clusters`, `continuous`), `nested_in` (clusters, other FEs),
+`group_size` `{min, mean, max}` (linearmodels `entity_info`/`time_info`, xtreg `e(g_min)`,
+`e(g_avg)`, `e(g_max)`), `constant_reported` (reghdfe `e(report_constant)`).
+
+**`structures.numerics`**: `algorithm` (reghdfe `technique()`: map, lsmr, lsqr;
+fixest `fixef.algo`), `acceleration` (reghdfe: cg, sd, aitken, none), `transform` (reghdfe:
+symmetric_kaczmarz, kaczmarz, cimmino), `preconditioner`, `tolerance` (fixest `fixef.tol`,
+reghdfe `tolerance()`), `max_iterations` (fixest `fixef.iter`, reghdfe `iterations()`),
+`iterations` (reghdfe `e(ic)`, FEM.jl `iterations`), `converged` (reghdfe `e(converged)`,
+FEM.jl `converged`), `collinearity_tolerance` (fixest `collin.tol`), `collinear_terms`
+(fixest `collin.var`), `collinearity_min_norm` (fixest `collin.min_norm`).
+
+**`structures.vcov`**: `type` (vocabulary: `iid`, `HC0`-`HC3`, `CRV1`, `CRV3`,
+`twoway`/`multiway`, `HAC`, `DK`; mapped to fixest `vcov=`, reghdfe `vce()`, linearmodels
+`cov_type`), `cluster`, `n_clusters` per variable (reghdfe `e(clust#)`) and the minimum
+(`e(N_clust)`), and `ssc` written out with every factor: fixest `ssc()` (`K.adj`, `K.fixef`,
+`G.adj`, `G.df`, `t.df`, `K.exact`), pyfixest `ssc()`, reghdfe `e(dofmethod)`. These factors
+are the most common source of SE differences between tools, so `ssc` must name the convention
+it reproduces (`fixest`, `reghdfe`, `stata`, `linearmodels`).
+
+**`specification.options`**, the union with each tool's default (reghdfe tolerance `1e-8` and
+16,000 iterations; fixest `fixef.tol` `1e-6`, `fixef.iter` 10,000, `collin.tol` `1e-9`,
+`fixef.rm` `"perfect_fit"`): `drop_singletons` (reghdfe `keepsingletons` off), `fixef_rm`
+(fixest), `threads` (fixest `nthreads`, reghdfe `parallel()`), weights type (frequency,
+analytic, probability).
+
+**Sample**: reghdfe `e(sample)` and fixest `obs_selection` mark the rows used. The profile
+records the counts (above) and, as an attachment or a hash (dfeols `row_key`), the rows
+themselves.
 
 ## The dfeols extension (`dfeols/0.1`)
 
@@ -355,11 +566,47 @@ What only dfeols has (most of it from draft 1):
 
 ## Collections ("all results")
 
-`estimation-collection/0.1`: a header (`id`, `created`, `title`, members) and the member records,
-embedded whole or as JSON Lines with one record per line. It is an export (e.g. at the end of a
-session, or for a paper's tables), built from records and never edited by itself. A flat
-`parameters` table across records (Parquet/CSV, with record id, response and term) is a
-convenience export.
+`estimation-collection/0.1`: the records of one session (or another grouping, such as a paper's
+tables), plus what is true of the session as a whole. It is an export, built from records and
+never edited by itself. Each member record stays self-contained: it can be pulled out and
+read alone.
+
+```text
+schema         "estimation-collection/0.1"
+meta           id, created, title, tags, notes, kind ("session" | "paper" | "batch" | "other")
+session        what the session was and how it ran (kind "session")
+provenance     the session's own software, environment, execution, agent, data
+publication    optional: the paper a "paper" collection belongs to (citation; members carry locators)
+members        the records, in order
+events         what happened in the session besides fits
+extensions     chained blocks, as for records
+history        as for records
+```
+
+- `session`: `id` (the session id that member records carry in
+  `provenance.execution.session`), `started`, `ended`, `duration`, `status` (`closed`,
+  `crashed`, `timed_out`), clients that connected (`{language, version, host, connected,
+  disconnected}`, e.g. a Python and an R client), and what was fixed for the session (FE
+  structure, weights, sample definition, declared variables).
+- `provenance`: the same structure as a record's, describing the **session process**, not one
+  fit. Software, environment and hardware of the manager and workers. Execution: the
+  scheduler job that held the session (SLURM fields), launch parameters, total wall time and
+  worker-seconds, peak memory, idle time. Data: the dataset and its checksum, and persisted
+  demeaned data (key, size, sha256). Members repeat what applies to them, so a member read alone
+  loses nothing, while the session-level block shows whether the environment changed *during*
+  the session (e.g. workers replaced after a failure).
+- `members`: each `{id, sha256, path or embedded record, created, order, label}`, in the order
+  run. Embedded whole, or as a JSON Lines file (one record per line) linked like an attachment.
+  A member's `sha256` lets the collection prove which version of each record it holds.
+- `events`: `{when, type, detail}` for what isn't a fit: variables created, demeaned data
+  persisted or reloaded, workers lost and replaced, client connects and disconnects, errors.
+  Together with `members`, this is a timeline of the session.
+- Redaction and size rules are the same as for records. Since a collection can embed many
+  records, the 16 MB limit applies to the collection file; a larger one keeps its members as a
+  linked JSON Lines file instead of embedding them.
+
+A flat `parameters` table across members (Parquet/CSV, with record id, response, term and
+locator) is a convenience export for tables and plots.
 
 ## Example: base R `lm`, minimal
 
@@ -398,14 +645,35 @@ filled, plus `extensions.dfeols` and `history`.
 - Later, if the format proves useful beyond dfeols: its own repository and package (the
   `estimation` CLI), plus small writers for R (from `lm`/fixest objects) and Stata (from `e()`).
 
+## Sources consulted (2026-10-24)
+
+- fixest `feols` reference: https://lrberge.github.io/fixest/reference/feols.html
+- reghdfe help (stored results, options): https://scorreia.com/help/reghdfe.html
+- linearmodels `PanelEffectsResults`:
+  https://bashtage.github.io/linearmodels/panel/panel/linearmodels.panel.results.PanelEffectsResults.html
+- SPSS OMS overview and syntax: https://ibm.com/support/knowledgecenter/SSLVMB_24.0.0/spss/base/syn_oms_overview.html,
+  https://www.ibm.com/support/knowledgecenter/SSLVMB_24.0.0/spss/base/syn_oms.html;
+  REGRESSION `OUTFILE=COVB`: https://stats.oarc.ucla.edu/spss/faq/how-can-i-output-the-results-of-my-regression-to-an-spss-data-file/;
+  CSLOGISTIC `OUTFILE` (XML model): https://www.ibm.com/docs/en/SSLVMB_sub/statistics_reference_project_ddita/spss/complex_samples/syn_cslogistic_outfile.html
+- Stata `creturn`: https://www.stata.com/manuals/pcreturn.pdf
+- renv lockfile: https://rstudio.github.io/renv/articles/lockfile.html
+- AsCollected: https://ascollected.org/, https://ascollected.org/help, examples
+  https://ascollected.org/ZJ6_Z47 and https://ascollected.org/G2Q_W7V; ResearchBox example
+  https://researchbox.org/15
+- From memory, to verify before the schema: pyfixest, lfe, Stata `areg`/`xtreg` stored
+  results, FixedEffectModels.jl, `threadpoolctl`, R `sessionInfo()` fields, SLURM `sacct`
+  fields, CSL-JSON, purl, PEP 751.
+
 ## Questions for Ted
 
-1. **Profiles.** Is the profile mechanism the right way to get model-specific rules, and are
-   the first four the right set?
-2. **Term names across tools.** Keep each tool's own names and match them in validation (as
-   drafted), or also store a canonical name per term?
-3. **Data checksums for in-memory data** (an R data frame): hash the content, or leave it to
-   the producer?
-4. **Size thresholds**: 1 MB warning, 10,000-element arrays, 16 MB hard limit. Right order of
-   magnitude?
-5. **Core digest**: worth having from the start, or later?
+1. **Term names across tools.** Keep each tool's own names and match them in validation (as
+   drafted), or also store a canonical name per term? Profiles' mapping tables could define a
+   canonical form for factor and interaction terms.
+2. **In-memory data checksums.** Draft 4 proposes leaving the procedure to the producer but
+   requiring it to be named (`method`), so checksums are compared only when the method
+   matches. Enough, or should the format define one canonical content hash?
+3. **Core digest**: worth having from the start, or later?
+4. **Profiles' required set**: is "what nearly all surveyed tools save" the right bar? For
+   `linear-fe` that makes `nobs`, `df_residual` and `r2_within` required, and the rest
+   vocabulary.
+5. **Collections**: is a session's `events` timeline wanted, or is `members` enough?
