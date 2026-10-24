@@ -315,9 +315,14 @@ def main(argv=None):
     r.add_argument("--profile")
     r.add_argument("-n", type=int, default=20)
     r.add_argument("--run", default=None, help="only this run id (prefix)")
+    sub.add_parser("estimation", help="validate, redact or digest estimation records", add_help=False)
     args, rest = ap.parse_known_args(argv)
     if args.cmd == "bench":
         return bench_cmd(args, rest)
+    if args.cmd == "estimation":
+        from .estimation import main as estimation_main
+
+        sys.exit(estimation_main(rest))
     if rest:
         ap.error(f"unrecognized arguments: {' '.join(rest)}")
     {

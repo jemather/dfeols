@@ -7,6 +7,11 @@ break the API).
 
 ## [Unreleased]
 
+### Added
+- `dfeols.estimation`: writer, reader, validator and redactor for `estimation/0.1` records
+  (docs/design/estimation-format.md), with the RFC 8785 core digest and automatic spilling of
+  large structures to attachments; `dfeols estimation {validate,redact,digest}`.
+
 ### Changed
 - Singletons are dropped over all fixed effects, iterating across shards, as fixest and reghdfe
   do (previously only in the FE local to the partition, so N could depend on the partition).

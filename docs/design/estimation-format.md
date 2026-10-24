@@ -761,4 +761,19 @@ across tools needs a normalised order in `name` as well).
 2. JSON Schema: `schema/estimation-0.1.json`, `schema/profiles/{inference,linear-fe,iv,dfeols}-0.1.json`,
    with `x-identifying` marks.
 3. `src/dfeols/estimation.py`: writer, reader, validator, redactor, core digest, attachment
-   spilling; tests.
+   spilling; tests. **Done** (`tests/test_estimation.py`), written against this document
+   because the schema files weren't committed yet: profile checks and the identifying-field
+   list are hand-written stand-ins, and `validate(schema=...)` / `redact(schema=...)` take the
+   JSON Schema once it exists. Choices the schema should confirm or change:
+   - `meta.core_digest` is `{algorithm: "sha256", canonicalization: "RFC8785", value}`, over
+     the sections as written (after spilling, non-finite values as strings).
+   - The 10,000-element limit counts list items, with nested lists counted by their leaves (a
+     100 x 100 matrix is 10,000; a 10,000-row `parameters` is 10,000). MB = 10^6 bytes.
+   - A spilled structure keeps its non-data fields (vcov `type`, `ssc`, `cluster`, `default`)
+     and becomes `{kind: "link", attachment, spilled_kind, ...}`. Matrices and tables go to
+     Parquet, other kinds to JSON; files are `<record stem>.<attachment id>.<ext>`.
+   - `--hash` redaction is HMAC-SHA256 with a user salt (`$ESTIMATION_REDACT_SALT` or a file);
+     the history entry carries a `salt_id` so readers know which records compare.
+   - `structures.fixed_effects` is a list, one `{kind: "object", name, levels, ...}` per FE.
+   - Not done here: collections, the `iv` profile, convergence checks (the record doesn't say
+     whether its algorithm was iterative), and the dfeols `Result` → record converter.
