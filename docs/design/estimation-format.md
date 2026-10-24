@@ -1,7 +1,8 @@
 # Design: the `estimation` format (`estimation/0.1`)
 
-Status: draft 5 (2026-10-24), for discussion. Draft 5 adds canonical term names, flagged
-disagreements (term spelling, profile requirements), and the two kinds of collections. Draft 1 was the dfeols-only `dfeols-result/1`
+Status: draft 6 (2026-10-24), for discussion. Draft 6 settles term names (verbatim, plus an
+optional R-style canonical form), the `linear-fe` required set (except `ssc`) and the core
+digest (on by default). Draft 5 added canonical names, flagged disagreements and collection kinds. Draft 1 was the dfeols-only `dfeols-result/1`
 (b903bc1); draft 2 made it general (faddceb, as `result-format.md`); draft 3 (463110d) settled
 naming, validation, attachments, identifying details and chained extensions. Draft 4 adds what
 other tools record (SPSS, Stata, R, Python, lock files, SBOMs, SLURM), the `publication` block
@@ -190,51 +191,51 @@ A list of rows, as in the sketch. `term` is required; other columns depend on th
 Rows are the model's reported parameters. Per-level estimates (FE coefficients, BLUPs) are not
 parameters for this purpose; they go in an attachment.
 
-#### Term names: the tool's own and a canonical one (Ted, 2026-10-24)
+#### Term names: as the tool reports them, plus an optional canonical form (Ted, 2026-10-24)
 
-Each row keeps the producer's own name in `term` and adds `canonical`, a structured name that
-is the same in every tool:
+`term` is **verbatim**: the name exactly as the producing software reports it, transformations
+and all (`log(price)`, `i(year, ref = 2000)::2005`, `2005.year`). That is enough to replicate
+the result in that software, so it is the required name, and nothing is reinterpreted.
+
+`canonical` is **optional but encouraged**: a standard form that lets records from different
+tools be matched and tabulated together. Writers are encouraged to fill it, and reference
+writers do.
 
 ```json
-{"term": "i(year, ref = 2000)::2005", "canonical": {"name": "year[2005]",
-   "factors": [{"variable": "year", "level": "2005", "reference": "2000"}]}, ...}
-{"term": "c.price#c.weight", "canonical": {"name": "price:weight",
-   "factors": [{"variable": "price"}, {"variable": "weight"}]}, ...}
+{"term": "i(year, ref = 2000)::2005",
+ "canonical": {"name": "year2005",
+               "factors": [{"variable": "year", "level": "2005", "reference": "2000"}]}}
+{"term": "c.price#c.weight",
+ "canonical": {"name": "price:weight", "factors": [{"variable": "price"}, {"variable": "weight"}]}}
+{"term": "2005.year#c.x",
+ "canonical": {"name": "2005.year#c.x",
+               "factors": [{"variable": "year", "level": "2005"}, {"variable": "x"}]}}
 ```
 
-The structured `factors` list is the definition; `name` is a readable rendering of it
-(`variable[level]`, with `:` between interacted factors, `(Intercept)` for the constant).
-Comparisons across tools match on `factors`, not on strings.
+- `factors` is the definition, and matching across tools uses it. `name` is a readable
+  rendering.
+- **Rendering follows R** (`model.matrix` naming): `(Intercept)`, variable name followed by
+  level (`year2005`), `:` between interacted terms. R's concatenation can be ambiguous
+  (`year2005` could be variable `year2`, level `005`); `factors` resolves that.
+- **Exception: factor × continuous interactions use Stata's form** (`2005.year#c.x`), which is
+  clearer than R's (`factor(year)2005:x`).
+- Levels and transformations stay as the tool reports them (codes or labels, `log(x)` as
+  written). `canonical` may add `level_label` or `transform` when the producer knows them.
+- Interaction order is kept as specified in both `term` and `name`; matching on `factors` is
+  order-insensitive.
+- FE models: no constant row is required. A tool that reports one (reghdfe `_cons`) includes
+  it, and `structures.fixed_effects.constant_reported` flags the convention.
 
-Tools spell the same term in different ways:
+How tools spell the same term:
 
-| Term | R `lm` | fixest | Stata | patsy (statsmodels, pyfixest) | canonical |
+| Term | R `lm` | fixest | Stata | patsy (statsmodels, pyfixest) | canonical `name` |
 |---|---|---|---|---|---|
 | constant | `(Intercept)` | `(Intercept)` | `_cons` | `Intercept` (statsmodels `const`) | `(Intercept)` |
-| factor level | `factor(year)2005` | `year::2005` | `2005.year` | `C(year)[T.2005]` | `year[2005]` |
+| factor level | `factor(year)2005` | `year::2005` | `2005.year` | `C(year)[T.2005]` | `year2005` |
 | base level | (not shown) | (not shown) | `2000b.year` | (not shown) | row with `dropped: "reference"` |
 | interaction | `price:weight` | `price:weight` | `c.price#c.weight` | `price:weight` | `price:weight` |
+| factor × continuous | `factor(year)2005:x` | `year::2005:x` | `2005.year#c.x` | `C(year)[T.2005]:x` | `2005.year#c.x` |
 | omitted (collinear) | `NA` estimate | dropped, in `collin.var` | `o.x` | dropped | row with `dropped: "collinear"` |
-
-**Flagged for discussion.** Points where tools disagree and the canonical form makes a choice
-that needs a decision:
-
-1. **Level spelling**: codes or labels? Stata reports value-label codes (`2.region`), and R
-   reports factor labels (`regionSouth`). The canonical form needs one, with the other kept.
-   Proposal: the level as stored in the data, with the label as `level_label`.
-2. **Transformations in the formula** (`log(x)`, `I(x^2)`, `poly(x, 2)`, Stata `c.x#c.x`):
-   canonicalise the expression, or keep it verbatim as the variable name? Proposal: verbatim
-   expression, plus `transform` when the tool reports one.
-3. **Constant in FE models**: reghdfe reports `_cons` (`e(report_constant)`); fixest and
-   pyfixest absorb it and report no constant. Should a canonical record include a constant row
-   the tool didn't estimate? Proposal: no; `structures.fixed_effects.constant_reported` says
-   which convention applied.
-4. **Order of factors in an interaction** (`a:b` vs `b:a`): order-insensitive matching
-   (proposal), or the order as specified?
-5. **Factor-by-continuous interactions** (fixest `i(year, x)`, Stata `i.year#c.x`): one
-   factor with a level and one without (proposal), or a special form?
-
-These are listed again under Questions.
 
 ### `structures` (optional)
 
@@ -479,13 +480,16 @@ Rules:
 - Each tool appends to `history`: `{when, by: {name, version}, action: "created" | "extended" |
   "redacted" | "validated", sections: [...]}`. The chain of tools that touched a record is
   therefore explicit and in order.
-- Optional integrity check (`meta.core_digest`): when the record is created, the writer
-  computes one sha256 fingerprint over the result sections (`meta` except the digest itself,
-  `specification`, `metrics`, `parameters`, `structures`), serialised in a fixed canonical way
-  (RFC 8785) so the same content always gives the same hash. Later tools only add blocks, so
-  the fingerprint should never change. Any tool, or a reader, can recompute it and see whether
-  someone edited the results after the run (by hand or by a buggy tool), as opposed to only
-  annotating them. Without it, an edited coefficient is indistinguishable from the original.
+- Integrity check (`meta.core_digest`), **on by default in writers** (Ted, 2026-10-24): when
+  the record is created, the writer computes one sha256 fingerprint over the result sections
+  (`meta` except the digest itself, `specification`, `metrics`, `parameters`, `structures`),
+  serialised in a fixed canonical way (RFC 8785), so the same content always gives the same hash.
+  Later tools only add blocks, so the fingerprint should never change. Any tool, or a reader,
+  can recompute it to check whether someone edited the results after the run (by hand or by a
+  buggy tool), as opposed to only annotating them.
+  The field is optional in the format. Writers include it by default and may let users turn it
+  off, and a producer may leave it out entirely (e.g. a Stata converter). A validator reports
+  "no digest" as information, not a warning. A digest that doesn't match is a warning.
 - The core validator ignores block content; each block's `schema` names the schema that
   validates it, and readers skip blocks they don't know.
 
@@ -562,32 +566,21 @@ schema is written.
 \* method or derived (`r2()`, `fitstat()`, `sigma()`), not a stored element. † not in the
 documented Value list; from memory, to check.
 
-**Flagged for discussion: the required set.** ✓ marks a proposal. Where the tools disagree on
-whether a quantity exists or what it means, the profile can't just require it (Ted,
-2026-10-24: flag these and discuss):
+**Required set: decided (Ted, 2026-10-24)**, except `ssc`:
 
-1. **`nobs` means different samples.** reghdfe drops singletons by default; fixest
-   (`fixef.rm`) and pyfixest keep them unless asked. Two correct tools can report different
-   `nobs` for the same command. Proposal: `nobs` stays required, and so do `n_singletons` and
-   `specification.options.drop_singletons`, so the difference is visible.
-2. **`df_residual` has several definitions.** With clustering, reghdfe's `e(df_r)` and fixest's
-   default `t.df = "min"` use G − 1; linearmodels' `df_resid` is N − K; others subtract the
-   absorbed FE levels as well. Proposal: `df_residual` = N − K − absorbed levels (the model's
-   residual df), always; the df used for t tests and CIs goes in `vcov.df_t`, which carries
-   the tool's convention.
-3. **`r2_within` isn't universal.** areg reports the R² of the dummy-variable regression, not a
-   within R²; lfe's projected R² is defined differently. Proposal: required only when the
-   producer computes it, with `definition` when it isn't the standard within R². This would make
-   it vocabulary, not a requirement.
-4. **FE level counts** (`fixed_effects[].levels`): every surveyed tool knows them (fixest
-   `fixef_sizes`, reghdfe `dof_table`, xtreg `e(N_g)`, linearmodels `entity_info`).
-   Proposal: required.
-5. **The `ssc` breakdown**: fixest and reghdfe can say exactly which factors were applied;
-   linearmodels exposes only `debiased`, statsmodels only `use_correction`. Proposal: `ssc`
-   required with at least `convention`; the full factors when the producer has them.
-6. **Convergence** (`iterations`, `converged`): only iterative demeaners (reghdfe, fixest,
-   pyfixest, dfeols, FEM.jl) have it. xtreg, areg and linearmodels with one FE are exact.
-   Proposal: optional, but required when `numerics.algorithm` is iterative.
+1. **`nobs` means different samples** across tools: reghdfe drops singletons by default, while
+   fixest (`fixef.rm`) and pyfixest keep them unless asked. `nobs`, `n_singletons` and
+   `specification.options.drop_singletons` are all required, so the difference is visible.
+2. **`df_residual`** = N − K − absorbed levels (the model's residual df), always. The df used
+   for t tests and CIs goes in `vcov.df_t`, with the tool's convention (reghdfe and fixest
+   use G − 1 under clustering).
+3. **`r2_within`** is not required (areg has none, lfe defines it differently). It is
+   vocabulary, with `definition` when it isn't the standard within R².
+4. **FE level counts** (`fixed_effects[].levels`) are required for FE models.
+5. **`ssc`**: open (see Questions).
+6. **Convergence** (`iterations`, `converged`) is required when the algorithm is iterative
+   (reghdfe, fixest, pyfixest, dfeols, FEM.jl), and absent for exact methods (xtreg, areg,
+   one-FE linearmodels).
 
 **`structures.fixed_effects`**, one entry per FE: `name`, `components` (for interactions and
 slopes, as reghdfe `e(extended_absvars)`), `levels` (fixest `fixef_sizes`), `redundant`
@@ -755,11 +748,13 @@ filled, plus `extensions.dfeols` and `history`.
 
 ## Questions for Ted
 
-1. **Core digest** (explained under `extensions`): include `meta.core_digest` from the start, or
-   leave it out until someone needs it?
-2. **Canonical term names: the five flagged points** under `parameters` (level codes vs
-   labels, transformations, the constant in FE models, interaction order,
-   factor-by-continuous terms).
-3. **`linear-fe` required set: the six flagged points** under Profiles (`nobs` and singletons,
-   the `df_residual` definition, `r2_within`, FE level counts, the `ssc` breakdown,
-   convergence).
+1. **`ssc`, the small-sample correction.** Cluster-robust (and HC1) vcovs are multiplied by a
+   correction factor, usually G/(G−1) × (N−1)/(N−K). Tools differ in what they count in K
+   (absorbed FE levels or not; FE levels nested in a cluster or not) and in whether they apply
+   each factor, so two tools can agree on every coefficient and still differ in SEs by a few
+   percent. fixest and reghdfe can say exactly what they applied; linearmodels exposes only a
+   `debiased` flag, statsmodels only `use_correction`. Proposal: `vcov.ssc` is required for
+   inference records, with at least `convention` (e.g. `"fixest"`, `"reghdfe"`,
+   `"linearmodels debiased=True"`) and the full factors when the producer has them.
+2. **Interaction order**: settled as "as specified" for now (Ted unsure); revisit if matching
+   across tools turns out to need a normalised order in `name` as well.
