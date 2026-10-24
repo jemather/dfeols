@@ -70,6 +70,8 @@ To add a profile, open a pull request with:
   in this repository. Its rules go in `$defs/rules`, and the file is
   `allOf: [core, #/$defs/rules]`, like the existing profiles.
 - At least one example record in `examples/` that claims the profile.
+- `"x-license": "CC0-1.0"` in the profile file: everything in the catalog
+  is public domain, so any tool can copy or embed it.
 - An entry in `catalog.json`: `name`, `file`, `kind` (`tool` for one
   program's records, `standard` for a model type shared across tools),
   `status: "draft"`, `maintainer` (your GitHub handle), `description`,
@@ -106,4 +108,7 @@ it; a local profile can't replace one in the catalog.
 ## License
 
 By contributing you agree that your contributions are licensed under the
-project's license, GPL-3.0-or-later.
+project's license, GPL-3.0-or-later, except contributions to
+`src/dfeols/schema/` (the estimation format's schemas, catalog and example
+records), which are dedicated to the public domain under CC0 1.0
+(`src/dfeols/schema/LICENSE`), so any tool can use the format freely.

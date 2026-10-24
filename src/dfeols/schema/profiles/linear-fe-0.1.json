@@ -2,6 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://raw.githubusercontent.com/jemather/dfeols/main/src/dfeols/schema/profiles/linear-fe-0.1.json",
   "title": "linear-fe/0.1",
+  "x-license": "CC0-1.0",
   "description": "Profile for linear models with absorbed fixed effects (fixest, lfe; pyfixest, linearmodels; reghdfe, areg, xtreg; FixedEffectModels.jl). Requires inference/0.1 plus metrics.n_singletons, specification.options.drop_singletons, and one structures.fixed_effects entry per FE with name and levels. Convergence (structures.numerics) is vocabulary, not required. x-tools maps each name to the tools' own, as checked on 2026-10-24 (docs/design/estimation-format.md).",
   "x-extends": ["inference/0.1"],
   "x-deviations": [],

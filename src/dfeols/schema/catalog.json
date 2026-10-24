@@ -1,6 +1,7 @@
 {
   "catalog": "estimation-catalog/0.1",
-  "description": "The estimation format's registered schemas. Add a profile by pull request: its file under profiles/, at least one example record under examples/, and an entry here (see CONTRIBUTING.md). A published entry carries the sha256 of its file and never changes; a fix is a new version.",
+  "license": "CC0-1.0",
+  "description": "The estimation format's registered schemas. Add a profile by pull request: its file under profiles/, at least one example record under examples/, and an entry here (see CONTRIBUTING.md). Everything listed here is CC0-1.0 (LICENSE); contributions must be too. A published entry carries the sha256 of its file and never changes; a fix is a new version.",
   "core": {
     "name": "estimation/0.1",
     "file": "estimation-0.1.json",

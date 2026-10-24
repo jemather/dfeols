@@ -26,6 +26,11 @@ def ids(entries):
     return [e["name"] for e in entries]
 
 
+def test_license():
+    assert CATALOG["license"] == "CC0-1.0"
+    assert "CC0" in (ROOT / "LICENSE").read_text(encoding="utf-8")
+
+
 def test_entries_are_complete_and_unique():
     names = ids(ENTRIES)
     assert len(names) == len(set(names)), "duplicate names"
@@ -53,6 +58,7 @@ def test_schema_file(entry):
     doc = load(entry["file"])
     jsonschema.Draft202012Validator.check_schema(doc)
     assert doc["title"] == entry["name"]
+    assert doc.get("x-license") == "CC0-1.0", "schemas in the catalog are CC0 (see LICENSE)"
     assert doc["$id"] == ID_BASE + entry["file"], "$id must match the file's place in the repository"
     if entry is not CATALOG["core"]:
         assert "rules" in doc.get("$defs", {}), "a profile keeps its own rules in $defs/rules"
@@ -99,5 +105,6 @@ def test_published_files_never_change(entry):
 def test_package_includes_the_schemas():
     """pyproject.toml's package-data must cover every catalog file."""
     text = (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text(encoding="utf-8")
-    for pattern in ("schema/*.json", "schema/profiles/*.json", "schema/examples/*.json"):
+    for pattern in ("schema/*.json", "schema/profiles/*.json", "schema/examples/*.json", "schema/LICENSE"):
         assert f'"{pattern}"' in text
+    assert '"src/dfeols/schema/LICENSE"' in text  # license-files

@@ -7,8 +7,8 @@ name = "dfeols"
 dynamic = ["version"]
 description = "Sharded, elastic high-dimensional fixed-effects OLS for HPC clusters (Slurm, PBS, SGE, LSF)"
 readme = "README.md"
-license = "GPL-3.0-or-later"
-license-files = ["LICENSE"]
+license = "GPL-3.0-or-later AND CC0-1.0"  # CC0: the estimation schemas in src/dfeols/schema/
+license-files = ["LICENSE", "src/dfeols/schema/LICENSE"]
 authors = [{ name = "Ted Matherly" }]
 requires-python = ">=3.10"
 keywords = [
@@ -71,7 +71,7 @@ include = ["dfeols*"]
 
 [tool.setuptools.package-data]
 # the estimation format's catalog, core schema, profiles and example records
-dfeols = ["schema/*.json", "schema/profiles/*.json", "schema/examples/*.json"]
+dfeols = ["schema/*.json", "schema/profiles/*.json", "schema/examples/*.json", "schema/LICENSE"]
 
 # ---------------------------------------------------------------- pytest
 [tool.pytest.ini_options]

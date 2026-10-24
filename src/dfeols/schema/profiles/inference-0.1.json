@@ -2,6 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://raw.githubusercontent.com/jemather/dfeols/main/src/dfeols/schema/profiles/inference-0.1.json",
   "title": "inference/0.1",
+  "x-license": "CC0-1.0",
   "description": "Profile for records with classical inference (R lm/estimatr, statsmodels, Stata regress). Requires, on top of the core: estimate, std_error and p_value on every row that isn't dropped; metrics.nobs and df_residual; a default vcov (the one marked default, or the only one) with type and ssc.convention.",
   "allOf": [
     {"$ref": "../estimation-0.1.json"},

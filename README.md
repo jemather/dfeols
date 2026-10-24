@@ -262,3 +262,6 @@ Tested site profiles for new clusters are especially useful.
 
 dfeols is free software, licensed under the
 [GNU General Public License v3.0 or later](https://github.com/jemather/dfeols/blob/main/LICENSE).
+The `estimation` result format's schemas (`src/dfeols/schema/`) are in the public domain
+([CC0 1.0](https://github.com/jemather/dfeols/blob/main/src/dfeols/schema/LICENSE)), so any
+software can use them.

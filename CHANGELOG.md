@@ -17,7 +17,8 @@ break the API).
   Tool profiles declare their base (`x-extends`) and departures (`x-deviations`); the validator
   reports whether a record also meets the base, and warns on undeclared departures. Draft
   profiles load from `$ESTIMATION_SCHEMA_PATH` or `--schema-path`. `tests/test_catalog.py`
-  checks contributed profiles.
+  checks contributed profiles. The schemas, catalog and example records are CC0 1.0 (public
+  domain; `src/dfeols/schema/LICENSE`); the package license is now `GPL-3.0-or-later AND CC0-1.0`.
 - JSON Schemas for `estimation/0.1` (`src/dfeols/schema/estimation-0.1.json`) and the `inference`,
   `linear-fe`, `iv` and `dfeols` profiles (`src/dfeols/schema/profiles/`), with `x-identifying` marks,
   example records and `tests/test_schema.py`.

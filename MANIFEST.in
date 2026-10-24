@@ -3,5 +3,5 @@ recursive-include tests *.py
 recursive-include examples *.py *.toml
 recursive-include docs *.md
 include ci/min-versions.txt
-recursive-include src/dfeols/schema *.json
+recursive-include src/dfeols/schema *.json LICENSE
 global-exclude __pycache__ *.py[cod]

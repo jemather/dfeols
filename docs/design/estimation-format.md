@@ -91,6 +91,10 @@ So the format borrows names and identifiers where they exist and defines the res
 - **Schemas ship in the package, profiles come by pull request** (Ted, 2026-10-24): the core
   and the standard profiles are part of dfeols; tools may have their own profiles and may
   depart from a standard one, but must declare where. See "The catalog and tool profiles".
+- **The schemas are public domain: CC0 1.0** (Ted, 2026-10-24), "very permissive, that's the
+  point": the schemas, catalog and example records in `src/dfeols/schema/` (its `LICENSE`;
+  `x-license: "CC0-1.0"` in each schema file and the catalog). The rest of dfeols stays
+  GPL-3.0-or-later. Contributed profiles must be CC0 too (checked by `tests/test_catalog.py`).
 
 ## Format: JSON, with JSON Schema
 
@@ -571,6 +575,8 @@ staying close is the easy and the rewarded choice.
 - **Local drafts.** Folders in `$ESTIMATION_SCHEMA_PATH` (or `--schema-path`) add profiles
   that aren't in the catalog yet, for trying one before the pull request. They can't replace
   a catalog name (ignored with a warning), and records claiming them get an info note.
+- **License.** Everything in the catalog is CC0 1.0, so any tool can copy, embed or adapt
+  a profile under its own license. A contributed profile must carry `"x-license": "CC0-1.0"`.
 - **No plug-in mechanism** (Python entry points): it would only serve Python tools and would
   bypass the review the catalog gives.
 
@@ -910,12 +916,7 @@ or source. Corrections are made in place above; this list says what was found.
 
 ## Questions for Ted
 
-Open:
-
-- **License of the schema files.** They ship in dfeols, which is GPL-3.0-or-later. Other
-  tools (an R writer, a reghdfe profile, a Stata converter) will copy or embed the schemas;
-  GPL on the schema files may deter that. Common choices for formats: CC0 or MIT for the
-  schema files only, stated in `src/dfeols/schema/` and the catalog. Not decided.
+None open. The schema-file license is decided: CC0 (below).
 
 Earlier, all answered. Ted's answers (2026-10-24) to the points raised by the verification and the schema:
 
@@ -1003,4 +1004,4 @@ Interaction order: kept as specified (final, no longer to revisit).
    `$ESTIMATION_SCHEMA_PATH` drafts; `validate` reports "also meets" / declared (info) /
    undeclared (warning) against unclaimed bases; `tests/test_catalog.py` as the PR check;
    CONTRIBUTING.md section; `dfeols[estimation]` extra; CI checks the wheel holds the schemas.
-   Open: the license of the schema files (Questions for Ted).
+   The schema files are CC0 (decided after this step; see Decisions).

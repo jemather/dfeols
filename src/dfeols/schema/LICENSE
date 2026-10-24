@@ -1,0 +1,12 @@
+The estimation format's schemas, catalog and example records (this folder and
+its subfolders) are dedicated to the public domain under CC0 1.0 Universal.
+
+To the extent possible under law, Ted Matherly and the contributors have
+waived all copyright and related or neighboring rights to the files in this
+folder. You can copy, modify, distribute and embed them, including in other
+software and under any license, without asking permission or giving credit.
+
+Full legal code: https://creativecommons.org/publicdomain/zero/1.0/legalcode
+SPDX-License-Identifier: CC0-1.0
+
+The rest of dfeols is licensed under GPL-3.0-or-later (../../../LICENSE).
