@@ -105,7 +105,7 @@ The files are plain Parquet, so any tool can read them; correct SEs need the dof
 
 ## Results file
 
-Superseded by `result-format.md` (the full format); the sketch below is the earlier broom-only version.
+Superseded by `estimation-format.md` (the full format); the sketch below is the earlier broom-only version.
 
 There is no standard JSON format for regression results. The closest shared convention is R's
 broom (`tidy`: term, estimate, std.error, statistic, p.value, conf.low, conf.high; `glance`: one
@@ -164,7 +164,7 @@ small extractor for dfeols results); R through modelsummary, since the file alre
 
 1. DirLock race fix (prerequisite).
 2. Session core: start/attach/stop, demean once, OLS with iid/hetero/CRV1, request files,
-   estimates, `dfeols-result/1` files. Python client and CLI.
+   estimates, `estimation` records. Python client and CLI.
 3. Persisted demeaned data: write, find by key, reuse; size warning.
 4. Created variables; vcov changes on an existing model.
 5. Exports (maketables extractor); R client.
