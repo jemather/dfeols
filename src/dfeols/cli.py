@@ -136,7 +136,7 @@ def _submit_options(args):
     words = list(args.args)
     if "--" in words:
         i = words.index("--")
-        own, rest = words[:i], words[i + 1:]
+        own, rest = words[:i], words[i + 1 :]
     else:
         own, rest = words, []
     op = argparse.ArgumentParser(prog="dfeols submit", add_help=False)

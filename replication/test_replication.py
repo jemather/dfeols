@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Published-data replications as a pytest suite. Skipped unless the data is built.
 
-    export DFEOLS_PARSONS_DIR=/scratch/$USER/parsons2011     # output of `harness.py build`
-    pytest replication/ -q                                     # serial, all specs
-    DFEOLS_REPLICATION_EXECUTOR=dask:4 pytest replication/ -q
+export DFEOLS_PARSONS_DIR=/scratch/$USER/parsons2011     # output of `harness.py build`
+pytest replication/ -q                                     # serial, all specs
+DFEOLS_REPLICATION_EXECUTOR=dask:4 pytest replication/ -q
 """
 
 import os

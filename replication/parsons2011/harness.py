@@ -40,8 +40,11 @@ import config  # noqa: E402
 
 log = logging.getLogger("dfeols.replication")
 
-_EST = re.compile(r"^(?!\s*\*).*\b(reg|regress|areg|reghdfe|xtreg|felsdvreg|a2reg|probit|logit|dprobit|"
-                  r"xtlogit)\b", re.I)
+_EST = re.compile(
+    r"^(?!\s*\*).*\b(reg|regress|areg|reghdfe|xtreg|felsdvreg|a2reg|probit|logit|dprobit|"
+    r"xtlogit)\b",
+    re.I,
+)
 _PREP = re.compile(r"^\s*(gen|generate|egen|replace|keep|drop|xi|recode)\b", re.I)
 
 
@@ -74,8 +77,9 @@ def _from_dummies(raw: pd.DataFrame, base: int, levels: dict[str, int]) -> pd.Se
     d = raw[list(levels)]
     if (d.sum(axis=1) > 1).any():
         sys.exit(f"dummies {list(levels)} are not mutually exclusive")
-    return pd.Series(np.select([d[c].eq(1) for c in levels], list(levels.values()), base),
-                     index=raw.index, dtype=np.int64)
+    return pd.Series(
+        np.select([d[c].eq(1) for c in levels], list(levels.values()), base), index=raw.index, dtype=np.int64
+    )
 
 
 def _derive(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
@@ -139,8 +143,13 @@ def cmd_build(a):
     df = df.reset_index(drop=True)
     df.to_parquet(out / "analysis.parquet", index=False)
     df.to_stata(out / "analysis.dta", write_index=False, version=118)
-    info = {"source": str(a.dta), "rows": len(df), "columns": list(df.columns),
-            "levels": {c: int(df[c].nunique()) for c in keyed}, "notes": notes}
+    info = {
+        "source": str(a.dta),
+        "rows": len(df),
+        "columns": list(df.columns),
+        "levels": {c: int(df[c].nunique()) for c in keyed},
+        "notes": notes,
+    }
     (out / "build.json").write_text(json.dumps(info, indent=1))
     print(json.dumps(info, indent=1))
 
@@ -170,8 +179,14 @@ def _plan(data: Path, only: list[str] | None):
     return specs, datasets
 
 
-def run(data: Path, only=None, executor: str = "serial", target_rows: int = 150_000,
-        pyfixest: bool = True, max_dummy_levels: int = 2000) -> dict:
+def run(
+    data: Path,
+    only=None,
+    executor: str = "serial",
+    target_rows: int = 150_000,
+    pyfixest: bool = True,
+    max_dummy_levels: int = 2000,
+) -> dict:
     data = Path(data)
     specs, datasets = _plan(data, only)
     src = data / "analysis.parquet"
@@ -210,8 +225,13 @@ def cmd_run(a):
 def cmd_stata_do(a):
     data = Path(a.data).resolve()
     specs, _ = _plan(data, a.specs)
-    p = common.write_reghdfe_do(specs, data / "analysis.dta", data / "reghdfe_results.csv",
-                                data / "reference_reghdfe.do", config.TITLE)
+    p = common.write_reghdfe_do(
+        specs,
+        data / "analysis.dta",
+        data / "reghdfe_results.csv",
+        data / "reference_reghdfe.do",
+        config.TITLE,
+    )
     print(f"wrote {p}\nRun it in Stata (it writes {data / 'reghdfe_results.csv'}), then `report`.")
 
 
@@ -226,9 +246,11 @@ def check(data: Path) -> dict:
     cmp = common.compare(specs, ours, pyf, stata, config.PUBLISHED, config.PUBLISHED_N)
     cmp.to_csv(data / "comparison.csv", index=False)
     build = json.loads((data / "build.json").read_text())
-    notes = [f"Data: {build['rows']:,} called pitches; levels {build['levels']}; "
-             f"{'; '.join(build['notes']) or 'no derived variables'}.",
-             f"Published values: {config.PUBLISHED_SOURCE}."]
+    notes = [
+        f"Data: {build['rows']:,} called pitches; levels {build['levels']}; "
+        f"{'; '.join(build['notes']) or 'no derived variables'}.",
+        f"Published values: {config.PUBLISHED_SOURCE}.",
+    ]
     if not stata:
         notes.append("No reghdfe results yet: run `stata-do`, then the do-file in Stata.")
     return common.write_report(data / "report.md", config.TITLE, specs, cmp, ours, pyf, stata, notes)
@@ -322,8 +344,12 @@ def main(argv=None):
     s.add_argument("--data", required=True)
     s.add_argument("--specs", nargs="*")
     s.add_argument("--executor", default="serial", help="serial | dask:N | <site profile>")
-    s.add_argument("--target-rows", type=int, default=150_000,
-                   help="rows per shard; small, so the ~1M-row file spans several shards")
+    s.add_argument(
+        "--target-rows",
+        type=int,
+        default=150_000,
+        help="rows per shard; small, so the ~1M-row file spans several shards",
+    )
     s.add_argument("--max-dummy-levels", type=int, default=2000)
     s.add_argument("--no-pyfixest", action="store_true")
     s.set_defaults(fn=cmd_run)

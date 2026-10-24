@@ -278,8 +278,13 @@ def _drop_singletons(plan: Plan, ds: Dataset, executor, prog: Progress, rows: di
         if p > 1 and acc["dropped"] == 0:
             break
         gcount = acc["g"]
-    log.info("fit %s: dropped %s singleton rows over all FEs in %d passes (%s)",
-             label, f"{total:,}", p, fmt_td(time.time() - t0))
+    log.info(
+        "fit %s: dropped %s singleton rows over all FEs in %d passes (%s)",
+        label,
+        f"{total:,}",
+        p,
+        fmt_td(time.time() - t0),
+    )
     return {"passes": p, "seconds": time.time() - t0}
 
 

@@ -125,8 +125,14 @@ def test_sparse_crossing_fe_equals_dense(ds, data, cluster, weights):
 def test_sparse_two_crossing_fes(data, tmp_path):
     # regression: the second crossing FE's columns were offset twice ("index exceeds matrix
     # dimension"); the test above has only one crossing FE, whose offset is 0
-    ds = dfeols.prep(data, shard_dir=tmp_path / "s", partition="id_a",
-                     fixed_effects=["spell", "week", "tenure"], clusters=["id_a"], target_rows=3000)
+    ds = dfeols.prep(
+        data,
+        shard_dir=tmp_path / "s",
+        partition="id_a",
+        fixed_effects=["spell", "week", "tenure"],
+        clusters=["id_a"],
+        target_rows=3000,
+    )
     f = "eng ~ feat + posts | spell + week + tenure"
     kw = dict(cluster="id_a", vcov=["CRV1", "hetero"], log_every=1e9)
     a = dfeols.fit(ds, f, crossing_fe="sparse", **kw)
@@ -135,8 +141,12 @@ def test_sparse_two_crossing_fes(data, tmp_path):
     np.testing.assert_allclose(a.coef(), b.coef(), rtol=1e-9, atol=1e-12)
     for t in ("CRV1", "hetero"):
         np.testing.assert_allclose(a.vcov(None, t), b.vcov(None, t), rtol=1e-8, atol=1e-15)
-    m = pf.feols("eng ~ feat + posts | spell + week + tenure", data=data.to_pandas(),
-                 vcov={"CRV1": "id_a"}, **pyfixest_tol_kwargs(1e-13))
+    m = pf.feols(
+        "eng ~ feat + posts | spell + week + tenure",
+        data=data.to_pandas(),
+        vcov={"CRV1": "id_a"},
+        **pyfixest_tol_kwargs(1e-13),
+    )
     np.testing.assert_allclose(a.coef(), m.coef().to_numpy(), **TOL)
 
 
@@ -157,11 +167,24 @@ def singleton_data(data):
 def test_singletons_over_all_fes_match_fixest(singleton_data, tmp_path, partition, crossing_fe):
     # fixest/reghdfe drop singletons in every FE, iterating; dfeols must too, whatever the
     # partition (it used to drop only the local FE's singletons, so N depended on the key)
-    ds = dfeols.prep(singleton_data, shard_dir=tmp_path / "s", partition=partition,
-                     fixed_effects=["spell", "week", "tenure", "rare"], clusters=["id_a"], target_rows=3000)
+    ds = dfeols.prep(
+        singleton_data,
+        shard_dir=tmp_path / "s",
+        partition=partition,
+        fixed_effects=["spell", "week", "tenure", "rare"],
+        clusters=["id_a"],
+        target_rows=3000,
+    )
     f = "eng ~ feat + posts | spell + tenure + rare"
-    r = dfeols.fit(ds, f, cluster="id_a", vcov=["CRV1", "hetero"], crossing_fe=crossing_fe,
-                   max_dummy_levels=10_000, log_every=1e9)
+    r = dfeols.fit(
+        ds,
+        f,
+        cluster="id_a",
+        vcov=["CRV1", "hetero"],
+        crossing_fe=crossing_fe,
+        max_dummy_levels=10_000,
+        log_every=1e9,
+    )
     pdf = singleton_data.to_pandas()
     for v in ("CRV1", "hetero"):
         vc = _pf_vcov(v, "id_a")
