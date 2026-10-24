@@ -544,14 +544,14 @@ schema is written.
 |---|---|---|---|---|---|
 | ✓ `nobs` | rows used | `nobs` | `e(N)` | `nobs` | pyfixest `_N`; FEM.jl `nobs` |
 | `nobs_full` | rows before singleton removal | `nobs_origin`† | `e(N_full)` | — | |
-| `n_singletons` | singleton rows dropped | (`obs_selection`) | `e(num_singletons)` | — | |
+| ✓ `n_singletons` | singleton rows dropped | (`obs_selection`) | `e(num_singletons)` | — | |
 | ✓ `df_residual` | residual df | `df.residual`* | `e(df_r)` | `df_resid` | FEM.jl `dof_residual` |
 | `df_model` | model df | | `e(df_m)` | `df_model` | |
 | `df_absorbed` | df lost to the FEs | | `e(df_a)` | | FEM.jl `dof_fes` |
 | `df_absorbed_nested` | FE df redundant because nested in a cluster | | `e(df_a_nested)` | | |
 | `rss`, `tss`, `tss_within` | sums of squares | `ssr`*, `ssr_null`, `ssr_fe_only` | `e(rss)`, `e(tss)`, within tss | `resid_ss`, `total_ss`, `model_ss` | |
 | `r2`, `adj_r2` | R² | `r2()` | `e(r2)`, `e(r2_a)` | `rsquared` | |
-| ✓ `r2_within`, `adj_r2_within` | within R² | `r2(, "wr2")` | `e(r2_within)`, `e(r2_a_within)` | `rsquared_within` | xtreg `e(r2_w)` |
+| `r2_within`, `adj_r2_within` | within R² | `r2(, "wr2")` | `e(r2_within)`, `e(r2_a_within)` | `rsquared_within` | xtreg `e(r2_w)` |
 | `r2_between`, `r2_overall` | panel R²s | | | `rsquared_between`, `rsquared_overall` | xtreg `e(r2_b)`, `e(r2_o)` |
 | `r2_inclusive` | R² including the fit of the FEs | | | `rsquared_inclusive` | |
 | `sq_corr_fitted` | squared corr(y, ŷ) | `sq.cor` | | `corr_squared_*` | |
