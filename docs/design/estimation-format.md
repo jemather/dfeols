@@ -1,8 +1,8 @@
 # Design: the `estimation` format (`estimation/0.1`)
 
-Status: draft 6 (2026-10-24), for discussion. Draft 6 settles term names (verbatim, plus an
-optional R-style canonical form), the `linear-fe` required set (except `ssc`) and the core
-digest (on by default). Draft 5 added canonical names, flagged disagreements and collection kinds. Draft 1 was the dfeols-only `dfeols-result/1`
+Status: draft 6 (2026-10-24), all questions settled (`ssc` last); ready for the schema. Draft 6
+settles term names (verbatim, plus an optional R-style canonical form), the `linear-fe`
+required set and the core digest (on by default). Draft 5 added canonical names, flagged disagreements and collection kinds. Draft 1 was the dfeols-only `dfeols-result/1`
 (b903bc1); draft 2 made it general (faddceb, as `result-format.md`); draft 3 (463110d) settled
 naming, validation, attachments, identifying details and chained extensions. Draft 4 adds what
 other tools record (SPSS, Stata, R, Python, lock files, SBOMs, SLURM), the `publication` block
@@ -566,7 +566,7 @@ schema is written.
 \* method or derived (`r2()`, `fitstat()`, `sigma()`), not a stored element. † not in the
 documented Value list; from memory, to check.
 
-**Required set: decided (Ted, 2026-10-24)**, except `ssc`:
+**Required set: decided (Ted, 2026-10-24):**
 
 1. **`nobs` means different samples** across tools: reghdfe drops singletons by default, while
    fixest (`fixef.rm`) and pyfixest keep them unless asked. `nobs`, `n_singletons` and
@@ -577,7 +577,9 @@ documented Value list; from memory, to check.
 3. **`r2_within`** is not required (areg has none, lfe defines it differently). It is
    vocabulary, with `definition` when it isn't the standard within R².
 4. **FE level counts** (`fixed_effects[].levels`) are required for FE models.
-5. **`ssc`**: open (see Questions).
+5. **`ssc`** is required for inference records, with at least `convention` (e.g. `"fixest"`,
+   `"reghdfe"`, `"linearmodels debiased=True"`) and the individual factors (what K counted,
+   G/(G−1), (N−1)/(N−K)) when the producer has them.
 6. **Convergence** (`iterations`, `converged`) is required when the algorithm is iterative
    (reghdfe, fixest, pyfixest, dfeols, FEM.jl), and absent for exact methods (xtreg, areg,
    one-FE linearmodels).
@@ -748,13 +750,15 @@ filled, plus `extensions.dfeols` and `history`.
 
 ## Questions for Ted
 
-1. **`ssc`, the small-sample correction.** Cluster-robust (and HC1) vcovs are multiplied by a
-   correction factor, usually G/(G−1) × (N−1)/(N−K). Tools differ in what they count in K
-   (absorbed FE levels or not; FE levels nested in a cluster or not) and in whether they apply
-   each factor, so two tools can agree on every coefficient and still differ in SEs by a few
-   percent. fixest and reghdfe can say exactly what they applied; linearmodels exposes only a
-   `debiased` flag, statsmodels only `use_correction`. Proposal: `vcov.ssc` is required for
-   inference records, with at least `convention` (e.g. `"fixest"`, `"reghdfe"`,
-   `"linearmodels debiased=True"`) and the full factors when the producer has them.
-2. **Interaction order**: settled as "as specified" for now (Ted unsure); revisit if matching
-   across tools turns out to need a normalised order in `name` as well.
+None open. Still to revisit: interaction order ("as specified" for now; revisit if matching
+across tools needs a normalised order in `name` as well).
+
+## Next
+
+1. Verify the tool fields marked "from memory" (pyfixest, lfe, Stata `areg`/`xtreg`,
+   FixedEffectModels.jl, `threadpoolctl`, `sessionInfo()`, SLURM `sacct`, CSL-JSON, purl,
+   PEP 751).
+2. JSON Schema: `schema/estimation-0.1.json`, `schema/profiles/{inference,linear-fe,iv,dfeols}-0.1.json`,
+   with `x-identifying` marks.
+3. `src/dfeols/estimation.py`: writer, reader, validator, redactor, core digest, attachment
+   spilling; tests.
