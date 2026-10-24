@@ -105,6 +105,8 @@ The files are plain Parquet, so any tool can read them; correct SEs need the dof
 
 ## Results file
 
+Superseded by `result-format.md` (the full format); the sketch below is the earlier broom-only version.
+
 There is no standard JSON format for regression results. The closest shared convention is R's
 broom (`tidy`: term, estimate, std.error, statistic, p.value, conf.low, conf.high; `glance`: one
 row of model statistics), which modelsummary and others consume. Each model is one
