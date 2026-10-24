@@ -99,6 +99,9 @@ jobs:
           bad = [n for n in names if not (n.startswith("dfeols/") or ".dist-info/" in n)]
           assert not bad, bad
           print(len(names), "files, all under dfeols/")
+          catalog = [n for n in names if n.startswith("dfeols/schema/")]
+          assert "dfeols/schema/catalog.json" in catalog, "estimation schemas missing from the wheel"
+          print(len(catalog), "estimation schema files")
           EOF
       - uses: actions/upload-artifact@v4
         with:

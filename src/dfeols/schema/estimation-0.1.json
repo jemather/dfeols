@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://raw.githubusercontent.com/jemather/dfeols/main/schema/estimation-0.1.json",
+  "$id": "https://raw.githubusercontent.com/jemather/dfeols/main/src/dfeols/schema/estimation-0.1.json",
   "title": "estimation/0.1",
   "description": "One estimation run: what was estimated, what came out, and how and where it ran. Specification: docs/design/estimation-format.md. Absent key = not recorded by this producer; null = applies but wasn't computed. Non-finite numbers are the strings \"NaN\", \"Inf\", \"-Inf\". Times are UTC, ISO 8601. Fields marked \"x-identifying\": true identify people, hosts, paths or jobs; none is required and a redactor removes or hashes them. \"x-expected\" lists keys a validator warns about when absent; \"x-vocabulary\" lists recommended values of an open string field.",
   "type": "object",

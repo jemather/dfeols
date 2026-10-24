@@ -1,4 +1,4 @@
-"""The `estimation` JSON Schemas in schema/: the design doc's examples validate, the profiles
+"""The `estimation` JSON Schemas in src/dfeols/schema/: the design doc's examples validate, the profiles
 enforce the decided required sets, and the `x-identifying` marks match what the library
 redacts."""
 
@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-SCHEMA_DIR = ROOT / "schema"
+SCHEMA_DIR = ROOT / "src" / "dfeols" / "schema"
 DOC = ROOT / "docs" / "design" / "estimation-format.md"
 CORE = "estimation-0.1.json"
 PROFILES = {

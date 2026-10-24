@@ -88,6 +88,9 @@ So the format borrows names and identifiers where they exist and defines the res
   most popular Stata, R and Python tools for that task save.
 - **Collections record the session**: duration, environment and system details, like a record
   does for a run.
+- **Schemas ship in the package, profiles come by pull request** (Ted, 2026-10-24): the core
+  and the standard profiles are part of dfeols; tools may have their own profiles and may
+  depart from a standard one, but must declare where. See "The catalog and tool profiles".
 
 ## Format: JSON, with JSON Schema
 
@@ -522,9 +525,9 @@ saves and every option it takes. Then:
 - **Options = the union of options**, with each tool's default. A record lists the effective
   value of every option the producer has. The mapping shows which options in another tool
   correspond, which is most of what explains a discrepancy between tools.
-- The mapping table ships with the profile (`schema/profiles/linear-fe.md`), so it also serves
-  as a cross-tool reference, and converters (Stata `e()` → record, fixest → record) are
-  written from it.
+- The mapping ships with the profile (`x-tools` on each field of
+  `src/dfeols/schema/profiles/linear-fe-0.1.json`), so it also serves as a cross-tool
+  reference, and converters (Stata `e()` → record, fixest → record) are written from it.
 
 Proposed first profiles:
 
@@ -538,6 +541,38 @@ Proposed first profiles:
 Later, as needed: `glm/0.1` (deviance, log-likelihood, family/link; fixest `feglm`/`fepois`,
 `glm`, statsmodels, ppmlhdfe, Stata `glm`), `mixed/0.1` (lme4, Stata `mixed`, statsmodels
 MixedLM), `ml/0.1` (scikit-learn, tidymodels/parsnip, xgboost).
+
+### The catalog and tool profiles (Ted, 2026-10-24)
+
+The standard profiles are the defaults, not a constraint. A tool can have its own profile
+(`reghdfe/0.1`, as dfeols has `dfeols/0.1`), and it is that tool's prerogative to depart from
+the standard where it must. The format makes the distance from the standard visible, so that
+staying close is the easy and the rewarded choice.
+
+- **The catalog.** `src/dfeols/schema/catalog.json` lists the core and every profile: `name`,
+  `file`, `kind` (`standard` for a model type shared across tools, `tool` for one program's
+  records), `status` (`draft`, `published`), `maintainer` (GitHub handle), `description`,
+  `examples`. The schemas and the catalog ship in the dfeols package. Profiles are added by
+  pull request (CONTRIBUTING.md, "Estimation profiles"); `tests/test_catalog.py` is the
+  check CI applies. The catalog stays in the dfeols repository until a second tool
+  contributes; the library reads profiles only through it, so moving it later is cheap.
+- **Declaring the base.** A profile names what it builds on in `x-extends`
+  (`["linear-fe/0.1"]`) and lists departures in `x-deviations`, each `{path, reason}`
+  (`path` in the redaction syntax, covering its sub-paths). A profile that includes its
+  base's rules in `$defs/rules` has no departures (`dfeols/0.1` does this). Standard profiles
+  don't deviate from each other.
+- **What a validator reports** for a record claiming a tool profile, against each base the
+  record doesn't also claim: info "also meets linear-fe/0.1" when it does; info for a
+  departure the profile declares; a **warning** for one it doesn't. The record stays valid
+  either way: it is judged by the profile it claims.
+- **Published versions never change.** A published catalog entry carries the sha256 of its
+  file, and CI fails if the file changes. A fix is a new version (`/0.2`). All of 0.1 is
+  still `draft`.
+- **Local drafts.** Folders in `$ESTIMATION_SCHEMA_PATH` (or `--schema-path`) add profiles
+  that aren't in the catalog yet, for trying one before the pull request. They can't replace
+  a catalog name (ignored with a warning), and records claiming them get an info note.
+- **No plug-in mechanism** (Python entry points): it would only serve Python tools and would
+  bypass the review the catalog gives.
 
 ### Worked example: `linear-fe/0.1`
 
@@ -809,11 +844,14 @@ locator) is a convenience export for tables and plots.
 (Numbers illustrative.) A dfeols record has the same top level with every expected block
 filled, plus `extensions.dfeols` and `history`.
 
-## Repository layout (proposed)
+## Repository layout
 
 - `docs/spec/estimation.md`: the specification (this document, once settled).
-- `schema/estimation-0.1.json` and `schema/profiles/*.json`: JSON Schemas, with
-  `x-identifying` annotations.
+- `src/dfeols/schema/`: `catalog.json`, `estimation-0.1.json`, `profiles/*.json` (JSON
+  Schemas with `x-identifying`, `x-extends`, `x-deviations`) and `examples/`, shipped as
+  package data. `$id`s are `https://raw.githubusercontent.com/jemather/dfeols/main/src/dfeols/schema/<file>`:
+  file names carry the version and published files never change, so `main` is stable.
+- `jsonschema` is the optional extra `dfeols[estimation]` (and part of `test`).
 - `src/dfeols/estimation.py`: writer, reader, redactor, validator, attachment spilling.
 - Tests validate every record dfeols writes, round-trip a hand-written base R example, and
   check that redaction removes every marked field.
@@ -872,7 +910,14 @@ or source. Corrections are made in place above; this list says what was found.
 
 ## Questions for Ted
 
-None open. Ted's answers (2026-10-24) to the points raised by the verification and the schema:
+Open:
+
+- **License of the schema files.** They ship in dfeols, which is GPL-3.0-or-later. Other
+  tools (an R writer, a reghdfe profile, a Stata converter) will copy or embed the schemas;
+  GPL on the schema files may deter that. Common choices for formats: CC0 or MIT for the
+  schema files only, stated in `src/dfeols/schema/` and the catalog. Not decided.
+
+Earlier, all answered. Ted's answers (2026-10-24) to the points raised by the verification and the schema:
 
 1. **Singleton rationale (decision 1):** the required set stays; the corrected reason stands.
 2. **lfe within R² (decision 3):** the decision stands on `areg` alone.
@@ -896,7 +941,7 @@ Interaction order: kept as specified (final, no longer to revisit).
    FixedEffectModels.jl, `threadpoolctl`, `sessionInfo()`, SLURM `sacct`, CSL-JSON, purl,
    PEP 751). **Done** (see Verification; questions 1–6 above).
 2. JSON Schema: `schema/estimation-0.1.json`, `schema/profiles/{inference,linear-fe,iv,dfeols}-0.1.json`,
-   with `x-identifying` marks. **Done**, with example records in `schema/examples/` and
+   with `x-identifying` marks (now in `src/dfeols/schema/`, step 4). **Done**, with example records in `schema/examples/` and
    `tests/test_schema.py` (every JSON block in this document, the examples against their
    profiles, failure cases per required field, and the marks against the library's list).
    Schema notes:
@@ -913,7 +958,8 @@ Interaction order: kept as specified (final, no longer to revisit).
      structure keeps `type`/`ssc`/`default`, so a spilled default vcov still meets
      `inference`; `fixed_effects` a list of `{kind: "object", name, levels, ...}`;
      `constant_reported` sits on each FE entry.
-   - `$id`s are `https://raw.githubusercontent.com/jemather/dfeols/main/schema/...` and the
+   - `$id`s were `https://raw.githubusercontent.com/jemather/dfeols/main/schema/...` (now
+     `.../main/src/dfeols/schema/...`, step 4) and the
      profiles refer to the core relatively; they resolve once the repo is pushed. Validators
      load them locally (`tests/test_schema.py` shows how).
    - For step 3: `jsonschema_check` builds a validator with no registry, so a profile file
@@ -933,11 +979,10 @@ Interaction order: kept as specified (final, no longer to revisit).
    - `redact` takes the `x-identifying` marks of the core plus each claimed profile
      (`identifying_paths` now follows `$ref`s across files). A record that has an
      `extensions.dfeols` block but doesn't claim `dfeols/0.1` keeps that block's marked fields.
-   - `schema/` is found as `$ESTIMATION_SCHEMA_DIR` or the repository checkout. Without it,
-     or without `jsonschema`, both fall back to the built-in checks and `DEFAULT_IDENTIFYING`,
-     and `validate` reports the fallback as info. A wheel doesn't include `schema/` yet:
-     shipping it as package data is a packaging decision for later.
-   - CLI: `--schema-dir DIR`, `--no-schema` (validate), `--schema FILE` (one extra schema).
+   - The schemas are package data (step 4). Without `jsonschema`, both fall back to the
+     built-in checks and `DEFAULT_IDENTIFYING`, and `validate` reports the fallback as info.
+   - CLI: `--schema-path DIR` (draft profiles, repeatable), `--no-schema` (validate),
+     `--schema FILE` (one extra schema).
 
    Choices made in the library before the schema (the schema confirmed them):
    - `meta.core_digest` is `{algorithm: "sha256", canonicalization: "RFC8785", value}`, over
@@ -952,3 +997,10 @@ Interaction order: kept as specified (final, no longer to revisit).
    - `structures.fixed_effects` is a list, one `{kind: "object", name, levels, ...}` per FE.
    - Not done here: collections, the `iv` profile, convergence checks (the record doesn't say
      whether its algorithm was iterative), and the dfeols `Result` → record converter.
+4. Catalog and tool profiles (Ted, 2026-10-24; see "The catalog and tool profiles"). **Done**:
+   schemas moved to `src/dfeols/schema/` as package data with `$id`s updated; `catalog.json`;
+   `x-extends`/`x-deviations` on the profiles; `load_schemas` reads the catalog plus
+   `$ESTIMATION_SCHEMA_PATH` drafts; `validate` reports "also meets" / declared (info) /
+   undeclared (warning) against unclaimed bases; `tests/test_catalog.py` as the PR check;
+   CONTRIBUTING.md section; `dfeols[estimation]` extra; CI checks the wheel holds the schemas.
+   Open: the license of the schema files (Questions for Ted).

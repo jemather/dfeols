@@ -10,3 +10,4 @@ psutil==5.9.0
 dask==2024.1.0
 distributed==2024.1.0
 dask-jobqueue==0.8.0
+jsonschema==4.18.0

@@ -56,10 +56,50 @@ If you run dfeols on a new cluster, a tested profile in
 comment) is a very useful contribution. PBS, SGE and LSF are currently
 untested on real systems.
 
+## Estimation profiles
+
+The `estimation` result format (`docs/design/estimation-format.md`) is meant
+for any software. Its schemas live in `src/dfeols/schema/`, listed in
+`catalog.json`, and ship with the package. A *profile* adds rules for one kind
+of model (`linear-fe/0.1`, `iv/0.1`) or one tool (`dfeols/0.1`).
+
+To add a profile, open a pull request with:
+
+- `profiles/<name>-<version>.json`: a JSON Schema (Draft 2020-12) whose
+  `title` is the profile name (`reghdfe/0.1`) and whose `$id` matches its path
+  in this repository. Its rules go in `$defs/rules`, and the file is
+  `allOf: [core, #/$defs/rules]`, like the existing profiles.
+- At least one example record in `examples/` that claims the profile.
+- An entry in `catalog.json`: `name`, `file`, `kind` (`tool` for one
+  program's records, `standard` for a model type shared across tools),
+  `status: "draft"`, `maintainer` (your GitHub handle), `description`,
+  `examples`.
+
+Tool profiles are encouraged to stay close to a standard one:
+
+- Name the profiles you build on in `x-extends` (e.g. `["linear-fe/0.1"]`).
+  The validator checks records against them too, and reports "also meets
+  linear-fe/0.1" when they do.
+- Including the base's rules (`allOf: [{"$ref": ".../linear-fe-0.1.json#/$defs/rules"}]`)
+  keeps your records fully conforming, which is the simplest choice.
+- Where your tool can't or won't follow the base, list each departure in
+  `x-deviations` as `{"path": "metrics.n_singletons", "reason": "..."}`.
+  Declared departures are reported as information; undeclared ones as
+  warnings.
+
+`pytest tests/test_catalog.py tests/test_schema.py` runs the checks CI
+applies: the schema is valid, names and files match, examples validate, every
+departure from a base is declared, and published files are unchanged. A
+published version never changes; a fix is a new version (`/0.2`). To try a
+profile before submitting it, put it in a folder and point
+`ESTIMATION_SCHEMA_PATH` (or `dfeols estimation validate --schema-path`) at
+it; a local profile can't replace one in the catalog.
+
 ## Releasing (maintainers)
 
 1. Update the version in `src/dfeols/__init__.py`, `CITATION.cff` and the
-   changelog.
+   changelog. To publish a draft profile, set its catalog entry's `status` to
+   `published` and add the file's `sha256`.
 2. Tag `vX.Y.Z` and push the tag. The release workflow builds the sdist and
    wheel, publishes to TestPyPI, then to PyPI (trusted publishing).
 

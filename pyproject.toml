@@ -48,7 +48,9 @@ dependencies = [
 
 [project.optional-dependencies]
 dask = ["dask>=2024.1", "distributed>=2024.1", "dask-jobqueue>=0.8"]
-test = ["pytest>=7"]
+# JSON Schema validation of estimation records; without it dfeols.estimation uses built-in checks
+estimation = ["jsonschema>=4.18"]
+test = ["pytest>=7", "jsonschema>=4.18"]
 dev = ["dfeols[dask,test]", "ruff>=0.6", "mypy>=1.10", "build", "twine", "pre-commit"]
 
 [project.urls]
@@ -66,6 +68,10 @@ version = { attr = "dfeols.__version__" }
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["dfeols*"]
+
+[tool.setuptools.package-data]
+# the estimation format's catalog, core schema, profiles and example records
+dfeols = ["schema/*.json", "schema/profiles/*.json", "schema/examples/*.json"]
 
 # ---------------------------------------------------------------- pytest
 [tool.pytest.ini_options]

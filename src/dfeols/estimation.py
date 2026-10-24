@@ -12,11 +12,13 @@ arrays) and pyarrow (for spilled attachments), both imported lazily.
     redact(record)            remove or HMAC the identifying fields
     core_digest(record)       sha256 over the RFC 8785 canonical form of the result sections
 
-The JSON Schemas are in the repository's schema/ folder (or $ESTIMATION_SCHEMA_DIR):
-`validate` checks the core schema plus each profile the record claims, and `redact`
-takes the fields marked `x-identifying` in the core and each claimed profile. Where
-the schemas or the `jsonschema` package are missing, both fall back to built-in
-checks and DEFAULT_IDENTIFYING, and `validate` says so.
+The JSON Schemas ship in the package (dfeols/schema/: catalog.json, the core, the
+profiles), and draft profiles can be added from local folders ($ESTIMATION_SCHEMA_PATH).
+`validate` checks the core schema plus each profile the record claims, and compares the
+record with the profiles those build on; `redact` takes the fields marked
+`x-identifying` in the core and each claimed profile. Without the `jsonschema` package
+(`pip install 'dfeols[estimation]'`), both fall back to built-in checks and
+DEFAULT_IDENTIFYING, and `validate` says so.
 
 Command line: `python -m dfeols.estimation {validate,redact,digest} ...`
 (also `dfeols estimation ...`).
@@ -59,7 +61,7 @@ NONFINITE = {"NaN": math.nan, "Inf": math.inf, "-Inf": -math.inf}
 # parameters columns that hold text; every other column is numeric for decoding
 TEXT_COLUMNS = {"term", "canonical", "response", "component", "group", "dropped", "label"}
 
-# Identifying fields when the schemas aren't available: what schema/ marks "x-identifying"
+# Identifying fields when the schemas aren't used: what dfeols/schema marks "x-identifying"
 # in the core and the dfeols profile (tests/test_schema.py keeps the two equal). `*` matches
 # any key of a dict, `[*]` any item of a list. Content hashes are not identifying and stay.
 DEFAULT_IDENTIFYING = (
@@ -790,7 +792,7 @@ def _profile_dfeols(rec: dict) -> list[Issue]:
     return issues
 
 
-# Built-in checks of the decided required sets, used only when schema/ or jsonschema is
+# Built-in checks of the decided required sets, used only when the schemas or jsonschema are
 # missing. The schemas are the reference; these cover the main required fields.
 PROFILES: dict[str, Callable[[dict], list[Issue]]] = {
     "inference/0.1": _profile_inference,
@@ -799,45 +801,99 @@ PROFILES: dict[str, Callable[[dict], list[Issue]]] = {
 }
 
 
-@dataclass(frozen=True)
-class Schemas:
-    """The core schema and the profiles, by profile name (each file's `title`)."""
+PACKAGED_SCHEMAS = Path(__file__).with_name("schema")
 
-    directory: Path
-    core: dict
-    profiles: dict[str, dict]
+
+class Schemas:
+    """The core schema and the profiles by name: the packaged catalog's, plus drafts found
+    in local folders. Build it with `load_schemas`; treat it as read-only."""
+
+    def __init__(self, catalog: dict, core: dict, profiles: dict[str, dict], local: Iterable[str] = ()):
+        self.catalog = catalog
+        self.core = core
+        self.profiles = profiles
+        self.local = frozenset(local)  # names from local folders, not the catalog
+        self._checks: dict[str | None, Callable[[dict], list[Issue]]] = {}
 
     def documents(self) -> list[dict]:
         return [self.core, *self.profiles.values()]
 
+    def extends(self, name: str) -> list[str]:
+        """The profiles `name` declares it builds on (`x-extends`)."""
+        return list(self.profiles.get(name, {}).get("x-extends") or [])
 
-def find_schema_dir() -> Path | None:
-    """$ESTIMATION_SCHEMA_DIR, else schema/ in the repository checkout this module is in."""
-    env = os.environ.get("ESTIMATION_SCHEMA_DIR")
-    for d in [Path(env)] if env else [Path(__file__).resolve().parents[2] / "schema"]:
-        if (d / "estimation-0.1.json").is_file():
-            return d
-    return None
+    def deviations(self, name: str) -> list[dict]:
+        """The departures from its bases that `name` declares (`x-deviations`)."""
+        return list(self.profiles.get(name, {}).get("x-deviations") or [])
+
+    def check(self, profile: str | None = None) -> Callable[[dict], list[Issue]]:
+        """The core check (None), or a profile's own rules (`$defs/rules`) without the core
+        again; built once."""
+        if profile not in self._checks:
+            if profile is None:
+                target = self.core
+            else:
+                doc = self.profiles[profile]
+                target = {"$ref": f"{doc['$id']}#/$defs/rules"} if "rules" in doc.get("$defs", {}) else doc
+            self._checks[profile] = jsonschema_check(target, self.documents())
+        return self._checks[profile]
+
+
+def _read_json(path: Path) -> Any:
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 @functools.lru_cache(maxsize=8)
-def _load_schemas(directory: str) -> Schemas:
-    d = Path(directory)
-    load = lambda p: json.loads(p.read_text(encoding="utf-8"))
-    profiles = {}
-    for f in sorted((d / "profiles").glob("*.json")):
-        doc = load(f)
-        profiles[doc.get("title") or f.stem] = doc
-    return Schemas(d, load(d / "estimation-0.1.json"), profiles)
-
-
-def load_schemas(directory: str | os.PathLike | None = None) -> Schemas | None:
-    """The schemas in `directory` (default `find_schema_dir()`), or None if there are none.
-    Loaded once per folder; treat the result as read-only."""
-    d = Path(directory) if directory is not None else find_schema_dir()
-    if d is None or not (d / "estimation-0.1.json").is_file():
+def _load_schemas(packaged: str, folders: tuple[str, ...]) -> Schemas | None:
+    root = Path(packaged)
+    if not (root / "catalog.json").is_file():
         return None
-    return _load_schemas(str(d.resolve()))
+    catalog = _read_json(root / "catalog.json")
+    core = _read_json(root / catalog["core"]["file"])
+    profiles: dict[str, dict] = {}
+    for entry in catalog["profiles"]:
+        doc = _read_json(root / entry["file"])
+        if doc.get("title") != entry["name"]:
+            raise EstimationError(f"{entry['file']}: title {doc.get('title')!r} is not {entry['name']!r}")
+        profiles[entry["name"]] = doc
+    local: list[str] = []
+    for folder in map(Path, folders):
+        for f in sorted([*folder.glob("*.json"), *folder.glob("profiles/*.json")]):
+            try:
+                doc = _read_json(f)
+            except (OSError, ValueError):
+                continue
+            name = doc.get("title") if isinstance(doc, dict) else None
+            if not name or "$id" not in doc or "estimation/" in name or "catalog" in doc:
+                continue  # not a profile (the core, a catalog, an example record)
+            if name in profiles:
+                which = "the catalog's" if name not in local else "one found earlier"
+                warnings.warn(f"{f}: profile {name!r} is ignored; {which} takes precedence")
+                continue
+            profiles[name] = doc
+            local.append(name)
+    return Schemas(catalog, core, profiles, local)
+
+
+def load_schemas(
+    folders: Iterable[str | os.PathLike] = (), *, packaged: str | os.PathLike | None = None
+) -> Schemas | None:
+    """The packaged catalog's schemas, plus draft profiles in `folders` and in the folders
+    listed in $ESTIMATION_SCHEMA_PATH (a profile is any JSON Schema with a `title` and an
+    `$id`, in a folder or its profiles/ subfolder). A local profile can't replace a catalog
+    one: it is ignored with a warning. None if the packaged schemas are missing."""
+    env = [d for d in os.environ.get("ESTIMATION_SCHEMA_PATH", "").split(os.pathsep) if d]
+    dirs = tuple(str(Path(d).resolve()) for d in [*folders, *env])
+    return _load_schemas(str(Path(packaged or PACKAGED_SCHEMAS).resolve()), dirs)
+
+
+def _deviation(declared: list[dict], path: str) -> dict | None:
+    """The declared deviation covering `path` (a pattern covers its sub-paths)."""
+    for d in declared:
+        pat = re.escape(str(d.get("path", ""))).replace(r"\[\*\]", r"\[\d+\]").replace(r"\*", r"[^.\[]+")
+        if pat and re.match(rf"{pat}(?:$|[.\[])", path):
+            return d
+    return None
 
 
 def _have_jsonschema() -> bool:
@@ -857,21 +913,17 @@ def jsonschema_check(
     try:
         import jsonschema
     except ImportError as e:  # pragma: no cover - depends on the environment
-        raise ImportError("JSON Schema validation needs the 'jsonschema' package") from e
+        raise ImportError("JSON Schema validation needs jsonschema: pip install 'dfeols[estimation]'") from e
     root: dict = schema if isinstance(schema, dict) else json.loads(Path(schema).read_text(encoding="utf-8"))
     docs = [d for d in [root, *documents] if "$id" in d]
     cls = jsonschema.validators.validator_for(root, default=jsonschema.Draft202012Validator)
-    try:
-        from referencing import Registry, Resource
-        from referencing.jsonschema import DRAFT202012
+    from referencing import Registry, Resource  # jsonschema >= 4.18 depends on it
+    from referencing.jsonschema import DRAFT202012
 
-        registry = Registry().with_resources(
-            (d["$id"], Resource.from_contents(d, default_specification=DRAFT202012)) for d in docs
-        )
-        v = cls(root, registry=registry)
-    except ImportError:  # jsonschema < 4.18
-        store = {d["$id"]: d for d in docs}
-        v = cls(root, resolver=jsonschema.RefResolver.from_schema(root, store=store))
+    registry = Registry().with_resources(
+        (d["$id"], Resource.from_contents(d, default_specification=DRAFT202012)) for d in docs
+    )
+    v = cls(root, registry=registry)
 
     def check(rec: dict) -> list[Issue]:
         out = []
@@ -906,17 +958,6 @@ def _message(e: Any) -> str:
     return msg
 
 
-@functools.lru_cache(maxsize=32)
-def _schema_checks(directory: str, profile: str | None) -> Callable[[dict], list[Issue]]:
-    """The core check (profile None) or a profile's own rules, without the core again."""
-    sc = _load_schemas(directory)
-    if profile is None:
-        return jsonschema_check(sc.core, sc.documents())
-    doc = sc.profiles[profile]
-    target = {"$ref": f"{doc['$id']}#/$defs/rules"} if "rules" in doc.get("$defs", {}) else doc
-    return jsonschema_check(target, sc.documents())
-
-
 def validate(
     record: dict,
     *,
@@ -930,13 +971,16 @@ def validate(
     digest that doesn't match, or attachment files that don't match their hash; info
     notes what couldn't be checked.
 
-    `schema="auto"` (default) validates against schema/ (`find_schema_dir`): the core
-    plus the rules of each profile in `meta.profiles`; without the schemas or the
-    `jsonschema` package it falls back to the built-in checks. A `Schemas` uses those
-    files; None uses the built-in checks only; any other value (a JSON Schema as dict or
-    path, or a callable returning issues) is checked in addition to the built-in ones.
-    `profiles` adds or replaces profile checks by name. With `base_dir` (the record's
-    folder), attachment files found there are hashed."""
+    `schema="auto"` (default) validates against `load_schemas()`: the core plus the rules
+    of each profile in `meta.profiles`. For a claimed profile that builds on others
+    (`x-extends`), the record is also checked against each base it doesn't claim: info
+    when it meets the base or differs where the profile declares it (`x-deviations`), a
+    warning where it differs without a declaration. Without the `jsonschema` package it
+    falls back to the built-in checks. A `Schemas` is used as given; None uses the
+    built-in checks only; any other value (a JSON Schema as dict or path, or a callable
+    returning issues) is checked in addition to the built-in ones. `profiles` adds or
+    replaces profile checks by name. With `base_dir` (the record's folder), attachment
+    files found there are hashed."""
     if not isinstance(record, dict):
         return [Issue("error", "", "an estimation record is a JSON object")]
     issues: list[Issue] = []
@@ -944,7 +988,7 @@ def validate(
     extra = None
     if isinstance(schema, str) and schema == "auto":
         schemas = load_schemas()
-        why = "no schema/ found" if schemas is None else "the 'jsonschema' package is not installed"
+        why = "no packaged schemas" if schemas is None else "the 'jsonschema' package is not installed"
         if schemas is not None and not _have_jsonschema():
             schemas = None
         if schemas is None:
@@ -972,16 +1016,17 @@ def validate(
             Issue("warning", "meta.core_digest", "does not match: the result sections changed after writing")
         )
 
-    key = str(schemas.directory.resolve()) if schemas is not None else ""
     if schemas is not None:
-        issues += _schema_checks(key, None)(enc)
+        issues += schemas.check()(enc)
     claimed = (enc.get("meta") or {}).get("profiles") if isinstance(enc.get("meta"), dict) else None
     seen = {(i.level, i.path, i.message) for i in issues}
     for p in claimed if isinstance(claimed, list) else []:
         if profiles and p in profiles:
             found = profiles[p](enc)
         elif schemas is not None and p in schemas.profiles:
-            found = _schema_checks(key, p)(enc)
+            found = schemas.check(p)(enc)
+            if p in schemas.local:
+                issues.append(Issue("info", "meta.profiles", f"{p!r} is a local draft, not in the catalog"))
         elif schemas is None and p in PROFILES:
             found = PROFILES[p](enc)
         else:
@@ -992,6 +1037,8 @@ def validate(
             if (i.level, i.path, i.message) not in seen:
                 seen.add((i.level, i.path, i.message))
                 issues.append(Issue(i.level, i.path, f"[{p}] {i.message}"))
+    if schemas is not None:
+        issues += _base_issues(enc, schemas, claimed if isinstance(claimed, list) else [], seen)
 
     if extra is not None:
         check = extra if callable(extra) else jsonschema_check(extra)
@@ -1009,6 +1056,43 @@ def validate(
                     Issue("warning", f"attachments.{a.get('id')}", "file does not match its sha256")
                 )
     return issues
+
+
+def _base_issues(enc: dict, schemas: Schemas, claimed: list, seen: set) -> list[Issue]:
+    """How a record of each claimed profile compares with the bases that profile extends
+    but the record doesn't claim (a base it claims was already checked in full)."""
+    out: list[Issue] = []
+    for p in claimed:
+        if p not in schemas.profiles:
+            continue
+        for base in schemas.extends(p):
+            if base in claimed:
+                continue
+            if base not in schemas.profiles:
+                out.append(Issue("info", "meta.profiles", f"[{p}] extends {base!r}, which isn't known here"))
+                continue
+            everything = schemas.check(base)(enc)
+            if not everything:
+                out.append(Issue("info", "meta.profiles", f"[{p}] also meets {base}"))
+            # problems the profile's own rules already reported aren't repeated
+            found = [i for i in everything if (i.level, i.path, i.message) not in seen]
+            for i in found:
+                seen.add((i.level, i.path, i.message))
+                d = _deviation(schemas.deviations(p), i.path)
+                if d is not None:
+                    reason = f": {d['reason']}" if d.get("reason") else ""
+                    out.append(
+                        Issue("info", i.path, f"[{p}] differs from {base}, as declared{reason} ({i.message})")
+                    )
+                else:
+                    out.append(
+                        Issue(
+                            "warning",
+                            i.path,
+                            f"[{p}] differs from {base} without a declaration in x-deviations ({i.message})",
+                        )
+                    )
+    return out
 
 
 # ---------------------------------------------------------------- redactor
@@ -1113,7 +1197,7 @@ def redact(
     covered by the core digest are never touched.
 
     The fields are `paths` if given; else those marked `x-identifying` in the core and
-    each profile the record claims (`schema="auto"` finds schema/, or pass `Schemas`),
+    each profile the record claims (`schema="auto"` uses `load_schemas()`, or pass `Schemas`),
     or in one JSON Schema given as a dict; else (no schemas, or None) DEFAULT_IDENTIFYING."""
     if paths is None:
         if isinstance(schema, str) and schema == "auto":
@@ -1157,14 +1241,17 @@ def redact(
 # ---------------------------------------------------------------- command line
 
 
-def _cli_schemas(ap: argparse.ArgumentParser, directory: str | None, off: bool) -> Schemas | str | None:
+def _cli_schemas(ap: argparse.ArgumentParser, folders: list[str], off: bool) -> Schemas | str | None:
     if off:
         return None
-    if directory is None:
+    if not folders:
         return "auto"
-    schemas = load_schemas(directory)
+    for f in folders:
+        if not Path(f).is_dir():
+            ap.error(f"--schema-path {f}: not a folder")
+    schemas = load_schemas(folders)
     if schemas is None:
-        ap.error(f"{directory}: no estimation-0.1.json there")
+        ap.error("the packaged schemas are missing from this dfeols installation")
     return schemas
 
 
@@ -1173,7 +1260,12 @@ def main(argv: list[str] | None = None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     v = sub.add_parser("validate", help="check records; exit 1 on errors")
     v.add_argument("files", nargs="+")
-    v.add_argument("--schema-dir", help="folder with estimation-0.1.json and profiles/ (default: schema/)")
+    v.add_argument(
+        "--schema-path",
+        action="append",
+        default=[],
+        help="folder of draft profiles to use besides the packaged ones (repeatable)",
+    )
     v.add_argument("--no-schema", action="store_true", help="built-in checks only")
     v.add_argument("--schema", help="another JSON Schema to check against as well")
     v.add_argument("-q", "--quiet", action="store_true", help="errors only")
@@ -1186,7 +1278,7 @@ def main(argv: list[str] | None = None) -> int:
         help="replace values with HMAC-SHA256; the salt comes from --salt-file or $ESTIMATION_REDACT_SALT",
     )
     r.add_argument("--salt-file")
-    r.add_argument("--schema-dir", help="take the fields from the core and claimed profiles in this folder")
+    r.add_argument("--schema-path", action="append", default=[], help="folder of draft profiles (repeatable)")
     r.add_argument("--schema", help="take the fields from this one schema's x-identifying marks")
     r.add_argument("--path", action="append", default=[], help="also redact this path (repeatable)")
     d = sub.add_parser("digest", help="print the core digest and whether it matches")
@@ -1195,7 +1287,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "validate":
         bad = 0
-        schemas = _cli_schemas(ap, args.schema_dir, args.no_schema)
+        schemas = _cli_schemas(ap, args.schema_path, args.no_schema)
         for f in args.files:
             rec = loads(Path(f).read_bytes(), nonfinite="string")
             issues = validate(rec, schema=schemas, base_dir=Path(f).parent)
@@ -1223,7 +1315,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.schema:
             paths = identifying_paths(json.loads(Path(args.schema).read_text(encoding="utf-8")))
         else:
-            schemas = _cli_schemas(ap, args.schema_dir, False)
+            schemas = _cli_schemas(ap, args.schema_path, False)
+            if schemas == "auto":
+                schemas = load_schemas()
             paths = (
                 record_identifying_paths(rec, schemas)
                 if isinstance(schemas, Schemas)

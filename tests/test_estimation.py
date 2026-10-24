@@ -137,17 +137,16 @@ def errors(issues):
 
 
 def schemas():
-    """The schemas in schema/; skips the test where they or jsonschema are missing."""
+    """The packaged schemas; skips the test where jsonschema is missing."""
     pytest.importorskip("jsonschema")
     sc = est.load_schemas()
-    if sc is None:
-        pytest.skip("no schema/ folder")
+    assert sc is not None, "dfeols/schema/catalog.json missing from the package"
     return sc
 
 
 @pytest.fixture(params=["schema", "builtin"])
 def mode(request):
-    """Validate with the schemas in schema/, or with the built-in fallback checks."""
+    """Validate with the packaged schemas, or with the built-in fallback checks."""
     return schemas() if request.param == "schema" else None
 
 
@@ -435,19 +434,17 @@ def test_schema_plugin():
     assert calls and any(i.message == "from plug-in" for i in issues)
 
 
-def test_default_uses_schema_dir_or_says_it_fell_back(monkeypatch, tmp_path):
+def test_default_uses_packaged_schemas_or_says_it_fell_back(monkeypatch, tmp_path):
     rec = est.prepare(fe_record())
     del rec["metrics"]["n_singletons"]
-    monkeypatch.setenv("ESTIMATION_SCHEMA_DIR", str(tmp_path))  # no schemas there
-    issues = est.validate(rec)
-    assert any(i.level == "info" and "built-in" in i.message for i in issues)
-    assert "metrics.n_singletons" in {i.path for i in errors(issues)}
-    monkeypatch.delenv("ESTIMATION_SCHEMA_DIR")
-    sc = schemas()
-    assert est.find_schema_dir() == sc.directory
+    schemas()
     issues = est.validate(rec)
     assert not any("built-in" in i.message for i in issues)
     assert [i.path for i in errors(issues)] == ["metrics.n_singletons"]
+    monkeypatch.setattr(est, "PACKAGED_SCHEMAS", tmp_path)  # an installation without them
+    issues = est.validate(rec)
+    assert any(i.level == "info" and "built-in" in i.message for i in issues)
+    assert "metrics.n_singletons" in {i.path for i in errors(issues)}
 
 
 def test_profile_file_resolves_the_core_offline():
@@ -469,6 +466,97 @@ def test_size_limits_match_schema():
         est.WARN_ELEMENTS,
         est.FAIL_BYTES,
     )
+
+
+def draft_profile(rules_include_base=False, deviations=None):
+    """A tool profile from a local folder: builds on linear-fe/0.1 but (by default) doesn't
+    include its rules, and declares that it doesn't store n_singletons."""
+    sc = schemas()
+    core_id = sc.core["$id"]
+    rules = {
+        "type": "object",
+        "required": ["extensions"],
+        "properties": {"extensions": {"required": ["toolx"]}},
+    }
+    if rules_include_base:
+        rules["allOf"] = [{"$ref": sc.profiles["linear-fe/0.1"]["$id"] + "#/$defs/rules"}]
+    return {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": "https://example.org/toolx-0.1.json",
+        "title": "toolx/0.1",
+        "x-extends": ["linear-fe/0.1"],
+        "x-deviations": deviations
+        if deviations is not None
+        else [{"path": "metrics.n_singletons", "reason": "toolx doesn't count singletons"}],
+        "allOf": [{"$ref": core_id}, {"$ref": "#/$defs/rules"}],
+        "$defs": {"rules": rules},
+    }
+
+
+def toolx_record():
+    rec = fe_record()
+    rec["meta"]["profiles"] = ["toolx/0.1"]
+    rec["extensions"] = {"toolx": {"schema": "toolx/0.1"}}
+    return est.prepare(rec)
+
+
+def test_tool_profile_that_meets_its_base(tmp_path):
+    (tmp_path / "toolx-0.1.json").write_text(json.dumps(draft_profile()))
+    sc = est.load_schemas([tmp_path])
+    assert "toolx/0.1" in sc.local and "toolx/0.1" not in {e["name"] for e in sc.catalog["profiles"]}
+    issues = est.validate(toolx_record(), schema=sc)
+    assert errors(issues) == [] and not [i for i in issues if i.level == "warning"]
+    msgs = [i.message for i in issues if i.level == "info"]
+    assert "[toolx/0.1] also meets linear-fe/0.1" in msgs
+    assert any("local draft" in m for m in msgs)
+
+
+def test_tool_profile_departures_declared_and_not(tmp_path):
+    (tmp_path / "toolx-0.1.json").write_text(json.dumps(draft_profile()))
+    sc = est.load_schemas([tmp_path])
+    rec = toolx_record()
+    del rec["metrics"]["n_singletons"]  # declared
+    del rec["specification"]["options"]["drop_singletons"]  # not declared
+    issues = est.validate(rec, schema=sc)
+    assert errors(issues) == []  # valid under the tool's own profile
+    by_path = {i.path: i for i in issues}
+    assert by_path["metrics.n_singletons"].level == "info"
+    assert "as declared: toolx doesn't count singletons" in by_path["metrics.n_singletons"].message
+    assert by_path["specification.options.drop_singletons"].level == "warning"
+    assert "without a declaration" in by_path["specification.options.drop_singletons"].message
+    assert not any("also meets" in i.message for i in issues)
+
+
+def test_profile_that_includes_its_base_reports_once(tmp_path):
+    (tmp_path / "toolx-0.1.json").write_text(json.dumps(draft_profile(True, [])))
+    rec = toolx_record()
+    del rec["metrics"]["n_singletons"]
+    issues = est.validate(rec, schema=est.load_schemas([tmp_path]))
+    hits = [i for i in issues if i.path == "metrics.n_singletons"]
+    assert [(i.level, i.message.split("]")[0]) for i in hits] == [("error", "[toolx/0.1")]
+
+
+def test_deviation_paths():
+    declared = [{"path": "structures.fixed_effects[*].levels"}, {"path": "metrics.r2"}]
+    assert est._deviation(declared, "structures.fixed_effects[3].levels")
+    assert est._deviation(declared, "metrics.r2")
+    assert not est._deviation(declared, "metrics.r2_within")
+    assert est._deviation([{"path": "extensions.*"}], "extensions.toolx.x")
+
+
+def test_local_profile_cannot_replace_a_catalog_one(tmp_path):
+    fake = draft_profile()
+    fake["title"] = "linear-fe/0.1"
+    (tmp_path / "linear-fe-0.1.json").write_text(json.dumps(fake))
+    with pytest.warns(UserWarning, match="catalog's takes precedence"):
+        sc = est.load_schemas([tmp_path], packaged=est.PACKAGED_SCHEMAS)
+    assert sc.profiles["linear-fe/0.1"] == schemas().profiles["linear-fe/0.1"] and not sc.local
+
+
+def test_schema_path_environment(tmp_path, monkeypatch):
+    (tmp_path / "toolx-0.1.json").write_text(json.dumps(draft_profile()))
+    monkeypatch.setenv("ESTIMATION_SCHEMA_PATH", str(tmp_path))
+    assert "toolx/0.1" in est.load_schemas().profiles
 
 
 def test_jsonschema_plugin():
@@ -603,12 +691,21 @@ def test_cli_schema_options(tmp_path, capsys):
     p.write_text(json.dumps(rec))
     assert est.main(["validate", "--no-schema", str(p)]) == 1
     assert "built-in" not in capsys.readouterr().out
-    assert est.main(["validate", "--schema-dir", str(schemas().directory), str(p)]) == 1
-    assert "[linear-fe/0.1] 'n_singletons' is a required property" in capsys.readouterr().out
+    drafts = tmp_path / "drafts"
+    drafts.mkdir()
+    (drafts / "toolx-0.1.json").write_text(json.dumps(draft_profile()))
+    rec["meta"]["profiles"] = ["toolx/0.1"]
+    rec["extensions"]["toolx"] = {"schema": "toolx/0.1"}
+    p.write_text(json.dumps(rec))
+    assert est.main(["validate", "--schema-path", str(drafts), str(p)]) == 0  # no errors
+    out = capsys.readouterr().out
+    assert "local draft" in out and "differs from linear-fe/0.1" in out
     with pytest.raises(SystemExit):
-        est.main(["validate", "--schema-dir", str(tmp_path), str(p)])
+        est.main(["validate", "--schema-path", str(tmp_path / "nope"), str(p)])
+    rec["meta"]["profiles"] = ["dfeols/0.1"]
+    p.write_text(json.dumps(rec))
     o = tmp_path / "r.json"
-    assert est.main(["redact", str(p), "-o", str(o), "--schema-dir", str(schemas().directory)]) == 0
+    assert est.main(["redact", str(p), "-o", str(o)]) == 0
     assert "folder" not in json.loads(o.read_text())["extensions"]["dfeols"]["shards"]
 
 
@@ -622,6 +719,6 @@ def test_cli_hash_needs_salt(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("name", ["lm-minimal", "dfeols-linear-fe", "iv"])
 def test_schema_examples_validate(name):
-    sc = schemas()
-    rec = est.read(sc.directory / "examples" / f"{name}.estimation.json")
+    schemas()
+    rec = est.read(est.PACKAGED_SCHEMAS / "examples" / f"{name}.estimation.json")
     assert errors(est.validate(rec)) == []
