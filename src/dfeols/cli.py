@@ -127,17 +127,38 @@ def jobscript_cmd(args):
     print(coordinator_script(profile(args.profile), args.command, job_name=args.name))
 
 
+def _submit_options(args):
+    """Split the REMAINDER after SCRIPT: submit's own options before `--`, the script's after.
+
+    argparse's REMAINDER swallows `--profile P` written after the script (the documented
+    form), so pick those out here. Without `--`, unknown words go to the script as before.
+    """
+    words = list(args.args)
+    if "--" in words:
+        i = words.index("--")
+        own, rest = words[:i], words[i + 1:]
+    else:
+        own, rest = words, []
+    op = argparse.ArgumentParser(prog="dfeols submit", add_help=False)
+    op.add_argument("--profile", default=args.profile)
+    op.add_argument("--name", default=args.name)
+    op.add_argument("-m", "--module", default=args.module)
+    known, extra = op.parse_known_args(own)
+    args.profile, args.name, args.module = known.profile, known.name, known.module
+    return extra + rest
+
+
 def submit_cmd(args):
     import shlex as _sh
 
     from .cluster import coordinator_script
     from .site import profile
 
+    rest = _submit_options(args)
     p = profile(args.profile)
     jobs = p.scratch_dir("jobs")
     jobs.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    rest = [a for a in args.args if a != "--"]
     if args.module:
         target = f"-m {args.module}"
         if args.script:

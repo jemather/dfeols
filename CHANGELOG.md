@@ -7,6 +7,16 @@ break the API).
 
 ## [Unreleased]
 
+### Changed
+- Singletons are dropped over all fixed effects, iterating across shards, as fixest and reghdfe
+  do (previously only in the FE local to the partition, so N could depend on the partition).
+
+### Fixed
+- `dfeols submit SCRIPT.py --profile P -- ARGS` passed `--profile P` to the script instead of
+  using it; options after the script and before `--` now go to `submit`.
+- The sparse path crashed with two or more crossing FEs (offsets applied twice).
+- `executor(profile, **overrides)` ignored the overrides when given a Profile.
+
 ## [0.7.0] - 2026-10-22
 
 First public release.
