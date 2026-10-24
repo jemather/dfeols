@@ -262,12 +262,14 @@ def _drop_singletons(plan: Plan, ds: Dataset, executor, prog: Progress, rows: di
         name = f"singletons{p}"
         acc = {"g": [np.zeros(L, np.int64) for *_, L in plan.global_fes], "dropped": 0}
 
-        def on(tid, r):
+        def on(tid, r, acc=acc):
             acc["dropped"] += r["dropped"]
             for i, c in enumerate(r["gcount"]):
                 acc["g"][i] += c
 
-        tasks = [(s["id"], rows[s["id"]], (plan, s["id"], ds.shard_paths(s), gcount, p == 1)) for s in ds.shards]
+        tasks = [
+            (s["id"], rows[s["id"]], (plan, s["id"], ds.shard_paths(s), gcount, p == 1)) for s in ds.shards
+        ]
         prog.add_stage(name, rows)
         prog.start(name)
         executor.run(shard_singletons, tasks, on, prog, name)

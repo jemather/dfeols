@@ -147,9 +147,9 @@ def shard_singletons(plan: Plan, shard_id: int, files: list[str], gcount, first:
     local = [densify(df[c].to_numpy())[0] for _, c in plan.local_fes]
     glob = [(df[c].to_numpy().astype(np.int64), L) for _, c, L in plan.global_fes]
     before = int(keep.sum())
-    others = (
-        [gc - np.bincount(g[keep], minlength=L) for gc, (g, L) in zip(gcount, glob)] if gcount is not None else None
-    )
+    others = None
+    if gcount is not None:
+        others = [gc - np.bincount(g[keep], minlength=L) for gc, (g, L) in zip(gcount, glob)]
     changed = n0 > 0
     while changed:
         changed = False

@@ -222,7 +222,10 @@ def executor(
 
     from .executors import DaskExecutor
 
-    p = profile.with_overrides(**overrides) if isinstance(profile, Profile) else load_profile(profile, **overrides)
+    if isinstance(profile, Profile):
+        p = profile.with_overrides(**overrides)
+    else:
+        p = load_profile(profile, **overrides)
     cl = make_cluster(p, log_directory)
     w = p.worker
     if p.scheduler == "local":

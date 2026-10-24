@@ -54,7 +54,12 @@ def test_submit_options_after_script(monkeypatch, tmp_path, argv, profile, name,
         return real("local", scratch=str(tmp_path))
 
     monkeypatch.setattr(dfeols.site, "profile", fake_profile)
-    monkeypatch.setattr(dfeols.cluster, "coordinator_script", lambda p, cmd, **k: seen.update(cmd=cmd, **k) or cmd)
+
+    def fake_script(p, cmd, **k):
+        seen.update(cmd=cmd, **k)
+        return cmd
+
+    monkeypatch.setattr(dfeols.cluster, "coordinator_script", fake_script)
     monkeypatch.setattr(cli, "_submit_and_report", lambda *a: None)
     main(argv)
     assert seen["p"] == profile and seen["job_name"] == name

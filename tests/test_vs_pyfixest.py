@@ -164,7 +164,8 @@ def test_singletons_over_all_fes_match_fixest(singleton_data, tmp_path, partitio
                    max_dummy_levels=10_000, log_every=1e9)
     pdf = singleton_data.to_pandas()
     for v in ("CRV1", "hetero"):
-        m = pf.feols(f, data=pdf, vcov=_pf_vcov(v, "id_a"), fixef_rm="singleton", **pyfixest_tol_kwargs(1e-13))
+        vc = _pf_vcov(v, "id_a")
+        m = pf.feols(f, data=pdf, vcov=vc, fixef_rm="singleton", **pyfixest_tol_kwargs(1e-13))
         assert r.N == m._N
         np.testing.assert_allclose(r.coef(), m.coef().to_numpy(), **TOL)
         np.testing.assert_allclose(np.sqrt(np.diag(r.vcov(None, v))), m.se().to_numpy(), rtol=1e-7)

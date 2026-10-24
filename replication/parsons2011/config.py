@@ -26,7 +26,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from common import DatasetSpec, Spec  # noqa: E402
+from common import DatasetSpec, Spec
 
 TITLE = "Parsons et al. (2011), Strike Three: dfeols replication"
 

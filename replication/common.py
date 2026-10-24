@@ -30,10 +30,9 @@ import json
 import logging
 import math
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
-import numpy as np
 import pandas as pd
 
 log = logging.getLogger("dfeols.replication")
@@ -197,6 +196,7 @@ def fit_pyfixest(data: pd.DataFrame, spec: Spec) -> dict:
     import warnings
 
     import pyfixest as pf
+
     from dfeols.formula import to_pyfixest
 
     fml = to_pyfixest(spec.formula)
@@ -354,7 +354,9 @@ def compare(specs: list[Spec], ours: dict, pyf: dict, stata: dict, published: di
                         pb, pse, dec = pub[t]
                         half = 0.5 * 10 ** (-dec) + 1e-12
                         row.update(pub_b=pb, pub_se=pse)
-                        ok = abs(round(b, dec) - pb) <= half and (pse is None or abs(round(se, dec) - pse) <= half)
+                        ok = abs(round(b, dec) - pb) <= half and (
+                            pse is None or abs(round(se, dec) - pse) <= half
+                        )
                         row["pub_match"] = ok
                         if not ok:
                             pn = (published_n or {}).get(s.label)
@@ -434,7 +436,9 @@ def write_report(path: Path, title: str, specs: list[Spec], cmp: pd.DataFrame, o
         bad = cmp[cmp["status"].isin(["FAIL", "WARN"]) & ~cmp["key"]]
         if len(bad):
             lines += ["Non-key terms with problems:", ""]
-            lines += [f"- {r['run']} `{r['term']}` ({r['vcov']}): {r['detail']}" for _, r in bad.head(30).iterrows()]
+            lines += [
+                f"- {r['run']} `{r['term']}` ({r['vcov']}): {r['detail']}" for _, r in bad.head(30).iterrows()
+            ]
             lines.append("")
     Path(path).write_text("\n".join(lines))
     return {"verdict": verdict, "counts": counts}
