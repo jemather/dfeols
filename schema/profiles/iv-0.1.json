@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/jemather/dfeols/main/schema/profiles/iv-0.1.json",
+  "title": "iv/0.1",
+  "description": "Profile for instrumental-variables models (fixest, ivreg; pyfixest, linearmodels IV; ivreghdfe, ivreg2, ivregress). Requires inference/0.1 plus specification.endogenous and specification.instruments, and structures.first_stage. Written from the design doc's one-line requirement; the cross-tool survey of first-stage diagnostics has not been done, so the first_stage names below are a proposal. A FE IV record also claims linear-fe/0.1.",
+  "allOf": [
+    {"$ref": "../estimation-0.1.json"},
+    {"$ref": "#/$defs/rules"}
+  ],
+  "$defs": {
+    "rules": {
+      "allOf": [{"$ref": "inference-0.1.json#/$defs/rules"}],
+      "type": "object",
+      "required": ["specification"],
+      "properties": {
+        "specification": {
+          "required": ["endogenous", "instruments"],
+          "properties": {
+            "endogenous": {"description": "Endogenous regressors.", "minItems": 1},
+            "instruments": {"description": "Excluded instruments.", "minItems": 1}
+          }
+        },
+        "structures": {
+          "required": ["first_stage"],
+          "properties": {
+            "first_stage": {
+              "description": "First-stage diagnostics. Proposed: a table with one row per endogenous regressor (columns such as endogenous, f_stat, partial_r2, sw_f) and/or an object with joint statistics (kp_rk_lm, kp_rk_wald_f, cd_wald_f). Per-coefficient first-stage estimates go in parameters with component \"first_stage\"."
+            }
+          }
+        }
+      }
+    }
+  }
+}

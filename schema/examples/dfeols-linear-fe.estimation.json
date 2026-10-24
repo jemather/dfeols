@@ -1,0 +1,96 @@
+{
+  "schema": "estimation/0.1",
+  "meta": {
+    "id": "0b7e2c1a-5d4f-4c3b-9a21-7f6e5d4c3b2a",
+    "created": "2026-10-24T15:02:11Z",
+    "status": "ok",
+    "estimator": {"family": "linear", "method": "ols"},
+    "responses": ["y"],
+    "profiles": ["inference/0.1", "linear-fe/0.1", "dfeols/0.1"],
+    "title": "Illustrative dfeols record",
+    "notes": "Shape example for the schema; the numbers are illustrative, not a real run.",
+    "messages": [{"level": "info", "code": "singletons", "message": "41 singleton rows dropped", "source": "dfeols"}]
+  },
+  "specification": {
+    "call": "dfeols.fit(\"y ~ x1 + x2 | firm + year\", data, vcov={\"CRV1\": \"firm\"})",
+    "formula": {"text": "y ~ x1 + x2 | firm + year", "syntax": "fixest"},
+    "terms": ["x1", "x2"],
+    "weights": null,
+    "fixed_effects": ["firm", "year"],
+    "clusters": ["firm"],
+    "sample": {"restriction": null, "rows_input": 100000, "dropped": {"missing": {"x2": 12}, "singletons": 41}},
+    "options": {"drop_singletons": true, "threads": 8}
+  },
+  "metrics": {
+    "nobs": 99947,
+    "nobs_full": 99988,
+    "n_singletons": 41,
+    "df_residual": 98945,
+    "df_absorbed": 1000,
+    "r2": 0.6123,
+    "r2_within": {"value": 0.2101, "definition": "1 - RSS / TSS of the demeaned response"},
+    "sigma": 1.0021,
+    "conf_level": 0.95
+  },
+  "parameters": [
+    {"term": "x1", "canonical": {"name": "x1", "factors": [{"variable": "x1"}]},
+     "estimate": 0.4987, "std_error": 0.0101, "statistic": 49.38, "p_value": 1.2e-250, "conf_low": 0.4789, "conf_high": 0.5185},
+    {"term": "x2", "canonical": {"name": "x2", "factors": [{"variable": "x2"}]},
+     "estimate": -0.2013, "std_error": 0.0099, "statistic": -20.33, "p_value": 3.4e-77, "conf_low": -0.2207, "conf_high": -0.1819}
+  ],
+  "structures": {
+    "vcov": [
+      {"kind": "matrix", "labels": ["x1", "x2"], "data": [[0.000102, 0.000001], [0.000001, 0.000098]],
+       "type": "CRV1", "cluster": ["firm"], "n_clusters": {"firm": 980}, "n_clusters_min": 980,
+       "ssc": {"convention": "fixest", "formula": "G/(G-1) * (N-1)/(N-K)",
+               "factors": {"G/(G-1)": 1.00102, "(N-1)/(N-K)": 1.00002}, "K_counts": "regressors only (FE nested in cluster)"},
+       "df_t": 979, "default": true},
+      {"kind": "matrix", "labels": ["x1", "x2"], "data": [[0.000081, 0.0], [0.0, 0.000079]],
+       "type": "iid", "ssc": {"convention": "fixest"}, "df_t": 98945, "default": false}
+    ],
+    "fixed_effects": [
+      {"kind": "object", "name": "firm", "levels": 980, "levels_in_data": 990, "redundant": 0,
+       "nested_in": ["firm"], "group_size": {"min": 2, "mean": 101.99, "max": 240}},
+      {"kind": "object", "name": "year", "levels": 20, "redundant": 1, "redundant_method": "pairwise"}
+    ],
+    "numerics": {"kind": "object", "iterative": true, "algorithm": "map", "tolerance": 1e-8,
+                 "max_iterations": 10000, "iterations": 37, "converged": true}
+  },
+  "provenance": {
+    "software": [
+      {"name": "dfeols", "version": "0.7.0", "purl": "pkg:github/jemather/dfeols@ce05eec", "role": "estimator",
+       "source": {"repository": "https://github.com/jemather/dfeols", "commit": "ce05eec", "dirty": false}},
+      {"name": "python", "version": "3.12.3", "role": "language"},
+      {"name": "numpy", "version": "2.1.0", "purl": "pkg:pypi/numpy@2.1.0", "role": "dependency"}
+    ],
+    "environment": {"os": "Linux", "kernel": "6.8.0", "host": "node001", "timezone": "America/Chicago",
+                    "variables": {"POLARS_MAX_THREADS": "8"}},
+    "execution": {
+      "started": "2026-10-24T15:00:02Z", "finished": "2026-10-24T15:02:11Z",
+      "elapsed_seconds": 129.0, "processor_seconds": 801.5,
+      "invocation": {"command_line": "python run.py", "argv": ["run.py"], "working_directory": "/scratch/user/run", "mode": "batch"},
+      "scheduler": {"type": "slurm", "JobID": "123456", "JobName": "fit", "Partition": "normal", "Account": "acct",
+                    "NodeList": "node[001-004]", "AllocCPUS": 32, "State": "COMPLETED", "ExitCode": "0:0"},
+      "workers": [{"host": "node002", "cores": 8}, {"host": "node003", "cores": 8}]
+    },
+    "agent": {"user": "user", "host": "node001"},
+    "data": [
+      {"role": "estimation", "name": "panel_v1", "location": "outbox/panel_v1/data",
+       "checksum": {"algorithm": "sha256", "value": "0000000000000000000000000000000000000000000000000000000000000000", "of": "manifest"},
+       "rows": 100000}
+    ]
+  },
+  "extensions": {
+    "dfeols": {
+      "schema": "dfeols/0.1", "by": {"name": "dfeols", "version": "0.7.0"}, "added": "2026-10-24T15:02:11Z",
+      "shards": {"folder": "/scratch/user/shards", "partition_key": "firm", "target_rows": 50000, "n_shards": 2},
+      "row_key": {"algorithm": "xxh3-64 xor over shards", "value": "9f86d081884c7d65"},
+      "absorption": {"firm": {"method": "local", "nested_in_partition": true}, "year": {"method": "crossing_dense", "nested_in_partition": false}},
+      "dask": {"scheduler_address": "tcp://10.0.0.1:8786"}
+    }
+  },
+  "history": [
+    {"when": "2026-10-24T15:02:11Z", "by": {"name": "dfeols", "version": "0.7.0"}, "action": "created",
+     "sections": ["meta", "specification", "metrics", "parameters", "structures", "provenance", "extensions"]}
+  ]
+}

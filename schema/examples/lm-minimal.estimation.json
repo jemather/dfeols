@@ -1,0 +1,94 @@
+{
+  "schema": "estimation/0.1",
+  "meta": {
+    "id": "6f1c0000-0000-4000-8000-000000000001",
+    "created": "2026-10-24T15:02:11Z",
+    "status": "ok",
+    "estimator": {
+      "family": "linear",
+      "method": "ols"
+    },
+    "responses": [
+      "mpg"
+    ],
+    "profiles": [
+      "inference/0.1"
+    ]
+  },
+  "specification": {
+    "call": "lm(mpg ~ wt, data = mtcars)",
+    "formula": {
+      "text": "mpg ~ wt",
+      "syntax": "R"
+    }
+  },
+  "metrics": {
+    "nobs": 32,
+    "df_residual": 30,
+    "r2": 0.7528,
+    "sigma": 3.046,
+    "conf_level": 0.95
+  },
+  "parameters": [
+    {
+      "term": "(Intercept)",
+      "estimate": 37.285,
+      "std_error": 1.8776,
+      "statistic": 19.858,
+      "p_value": 8.24e-19
+    },
+    {
+      "term": "wt",
+      "estimate": -5.3445,
+      "std_error": 0.5591,
+      "statistic": -9.559,
+      "p_value": 1.29e-10
+    }
+  ],
+  "structures": {
+    "vcov": [
+      {
+        "kind": "matrix",
+        "labels": [
+          "(Intercept)",
+          "wt"
+        ],
+        "data": [
+          [
+            3.525,
+            -1.0
+          ],
+          [
+            -1.0,
+            0.3126
+          ]
+        ],
+        "type": "iid",
+        "ssc": {
+          "convention": "R lm",
+          "formula": "sigma^2 with N - K"
+        },
+        "df_t": 30,
+        "default": true
+      }
+    ]
+  },
+  "provenance": {
+    "software": [
+      {
+        "name": "R",
+        "version": "4.5.1",
+        "role": "language"
+      },
+      {
+        "name": "stats",
+        "version": "4.5.1",
+        "role": "estimator"
+      }
+    ],
+    "environment": {
+      "os": "Ubuntu 24.04",
+      "blas": "OpenBLAS 0.3.26"
+    }
+  }
+}

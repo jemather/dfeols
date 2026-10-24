@@ -1,0 +1,31 @@
+{
+  "schema": "estimation/0.1",
+  "meta": {
+    "id": "3c2d1e0f-1a2b-4c3d-8e4f-5a6b7c8d9e0f",
+    "created": "2026-10-24T15:10:00Z",
+    "status": "ok",
+    "estimator": {"family": "linear", "method": "2sls"},
+    "responses": ["y"],
+    "profiles": ["inference/0.1", "iv/0.1"],
+    "notes": "Shape example for the schema; the numbers are illustrative."
+  },
+  "specification": {
+    "call": "feols(y ~ w | x ~ z, data)",
+    "formula": {"text": "y ~ w | x ~ z", "syntax": "fixest"},
+    "endogenous": ["x"],
+    "instruments": ["z"]
+  },
+  "metrics": {"nobs": 500, "df_residual": 497},
+  "parameters": [
+    {"term": "(Intercept)", "estimate": 0.1, "std_error": 0.05, "statistic": 2.0, "p_value": 0.046},
+    {"term": "fit_x", "canonical": {"name": "x", "factors": [{"variable": "x"}]}, "estimate": 0.8, "std_error": 0.1, "statistic": 8.0, "p_value": 1e-14},
+    {"term": "w", "estimate": 0.3, "std_error": 0.04, "statistic": 7.5, "p_value": 3e-13},
+    {"term": "z", "component": "first_stage", "response": "x", "estimate": 0.6, "std_error": 0.03, "statistic": 20.0, "p_value": 1e-60}
+  ],
+  "structures": {
+    "vcov": [{"kind": "matrix", "labels": ["(Intercept)", "fit_x", "w"],
+              "data": [[0.0025, 0, 0], [0, 0.01, 0], [0, 0, 0.0016]],
+              "type": "HC1", "ssc": {"convention": "fixest"}, "default": true}],
+    "first_stage": {"kind": "table", "columns": ["endogenous", "f_stat", "partial_r2"], "rows": [["x", 400.0, 0.44]]}
+  }
+}

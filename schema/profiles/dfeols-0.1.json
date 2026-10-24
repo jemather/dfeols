@@ -1,0 +1,93 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/jemather/dfeols/main/schema/profiles/dfeols-0.1.json",
+  "title": "dfeols/0.1",
+  "description": "Profile for dfeols records: linear-fe/0.1 plus an extensions.dfeols block, which this file also defines (its schema is \"dfeols/0.1\").",
+  "allOf": [
+    {"$ref": "../estimation-0.1.json"},
+    {"$ref": "#/$defs/rules"}
+  ],
+  "$defs": {
+    "rules": {
+      "allOf": [{"$ref": "linear-fe-0.1.json#/$defs/rules"}],
+      "type": "object",
+      "required": ["extensions"],
+      "properties": {
+        "extensions": {
+          "required": ["dfeols"],
+          "properties": {
+            "dfeols": {"$ref": "#/$defs/extension"}
+          }
+        }
+      }
+    },
+    "extension": {
+      "description": "What only dfeols has.",
+      "type": "object",
+      "required": ["schema"],
+      "properties": {
+        "schema": {"const": "dfeols/0.1"},
+        "by": {"type": "object", "properties": {"name": {"type": "string"}, "version": {"type": "string"}}},
+        "added": {"type": "string", "format": "date-time"},
+        "shards": {
+          "description": "Results must not depend on the partition, but it is the first thing to check when they do.",
+          "type": "object",
+          "properties": {
+            "folder": {"x-identifying": true, "type": "string"},
+            "prep_version": {"type": "string"},
+            "partition_key": {"type": ["string", "array", "null"]},
+            "target_rows": {"type": "integer", "minimum": 0},
+            "n_shards": {"type": "integer", "minimum": 0},
+            "meta_sha256": {"description": "sha256 of dfeols_meta.json.", "type": "string", "pattern": "^[0-9a-f]{64}$"}
+          }
+        },
+        "row_key": {
+          "description": "Hash of the indices of the rows used, combined shard by shard: two runs used the same sample iff their row keys match.",
+          "type": "object",
+          "required": ["algorithm", "value"],
+          "properties": {
+            "algorithm": {"type": "string"},
+            "value": {"type": "string"}
+          }
+        },
+        "absorption": {
+          "description": "Per FE name.",
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "method": {"enum": ["local", "crossing_dense", "crossing_sparse"]},
+              "nested_in_partition": {"type": "boolean"}
+            }
+          }
+        },
+        "demeaning": {
+          "type": "object",
+          "properties": {
+            "iterations_max": {"type": "integer", "minimum": 0},
+            "iterations_median": {"type": "number"},
+            "worst_shard_change": {"type": ["number", "string"]},
+            "round_seconds": {"type": "array", "items": {"type": "number"}},
+            "persisted_key": {"type": ["string", "null"]}
+          }
+        },
+        "dask": {
+          "type": "object",
+          "properties": {
+            "scheduler_address": {"x-identifying": true, "type": "string"},
+            "workers": {"type": ["array", "object"]},
+            "profile": {"description": "Resolved dfeols profile.", "type": "object"}
+          }
+        },
+        "estimate": {"description": "The time estimate shown at submission.", "type": "object"},
+        "replay": {
+          "type": "object",
+          "properties": {
+            "call": {"description": "dfeols.fit call with every argument explicit.", "type": "string"},
+            "commit": {"description": "Required dfeols commit.", "type": "string"}
+          }
+        }
+      }
+    }
+  }
+}

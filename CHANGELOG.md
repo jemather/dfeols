@@ -11,6 +11,9 @@ break the API).
 - `dfeols.estimation`: writer, reader, validator and redactor for `estimation/0.1` records
   (docs/design/estimation-format.md), with the RFC 8785 core digest and automatic spilling of
   large structures to attachments; `dfeols estimation {validate,redact,digest}`.
+- JSON Schemas for `estimation/0.1` (`schema/estimation-0.1.json`) and the `inference`,
+  `linear-fe`, `iv` and `dfeols` profiles (`schema/profiles/`), with `x-identifying` marks,
+  example records and `tests/test_schema.py`.
 
 ### Changed
 - Singletons are dropped over all fixed effects, iterating across shards, as fixest and reghdfe

@@ -1,6 +1,8 @@
 # Design: the `estimation` format (`estimation/0.1`)
 
-Status: draft 6 (2026-10-24), all questions settled (`ssc` last); ready for the schema. Draft 6
+Status: draft 6 (2026-10-24), all design questions settled (`ssc` last). Tool fields verified
+and the JSON Schema written (2026-10-24, Next steps 1–2); six points from that are listed under
+Questions for Ted. Draft 6
 settles term names (verbatim, plus an optional R-style canonical form), the `linear-fe`
 required set and the core digest (on by default). Draft 5 added canonical names, flagged disagreements and collection kinds. Draft 1 was the dfeols-only `dfeols-result/1`
 (b903bc1); draft 2 made it general (faddceb, as `result-format.md`); draft 3 (463110d) settled
@@ -352,8 +354,12 @@ reference values (validation style `published`) and published data (`provenance.
 
 ```json
 "publication": {
-  "citation": {"type": "article-journal", "title": "Strike Three: Discrimination, Incentives, and Evaluation",
-               "author": [{"family": "Parsons", "given": "Christopher A."}, "..."],
+  "citation": {"id": "parsons2011", "type": "article-journal",
+               "title": "Strike Three: Discrimination, Incentives, and Evaluation",
+               "author": [{"family": "Parsons", "given": "Christopher A."},
+                          {"family": "Sulaeman", "given": "Johan"},
+                          {"family": "Yates", "given": "Michael C."},
+                          {"family": "Hamermesh", "given": "Daniel S."}],
                "issued": {"date-parts": [[2011]]}, "container-title": "American Economic Review",
                "volume": "101", "issue": "4", "page": "1410-1435",
                "DOI": "10.1257/aer.101.4.1410"},
@@ -375,7 +381,9 @@ and belong to other papers. They only illustrate the fields.)
 - `citation`: **CSL-JSON**, the citation format Zotero, pandoc, Mendeley and CrossRef use, so
   a citation can be pasted in from a reference manager or fetched from a DOI. Common fields:
   `type`, `title`, `author`, `issued`, `container-title`, `volume`, `issue`, `page`, `DOI`,
-  `URL`, `version`. Working papers and preprints use `type: "report"` or `"article"` with
+  `URL`, `version`. CSL's own schema (`csl-data.json`, JSON Schema draft-07) requires `id` and
+  `type`, allows 45 `type` values, and allows only its listed keys in a name object (`family`,
+  `given`, `literal`, particles, `suffix`, ...). Working papers and preprints use `type: "report"` or `"article"` with
   `number` and `publisher`.
 - `locator`: where in the work, as structured fields **plus** a `label` as printed. Fields:
   `study`, `table`, `panel`, `column`, `row`, `figure`, `equation`, `page`, `appendix`,
@@ -533,56 +541,69 @@ MixedLM), `ml/0.1` (scikit-learn, tidymodels/parsnip, xgboost).
 
 ### Worked example: `linear-fe/0.1`
 
-Sources: fixest `feols` value and arguments, reghdfe stored results and options, linearmodels
-`PanelEffectsResults` (all checked against current documentation, 2026-10-24). pyfixest, lfe,
-Stata `areg`/`xtreg` and FixedEffectModels.jl are from memory and must be checked before the
-schema is written.
+Sources: all checked against current documentation or source on 2026-10-24 (see
+[Verification](#verification-of-tool-fields-2026-10-24)): fixest 0.14.2 `feols` reference and
+source; reghdfe help (v6); linearmodels `PanelEffectsResults`; pyfixest 0.60.0 source (installed
+here); StataNow 19 `areg` and `xtreg` help; FixedEffectModels.jl source (`FixedEffectModel.jl`,
+`fit.jl`); lfe `felm`/`summary.felm` reference.
 
 **Metrics** (✓ = required):
 
 | Profile name | Meaning | fixest | reghdfe | linearmodels | others |
 |---|---|---|---|---|---|
-| ✓ `nobs` | rows used | `nobs` | `e(N)` | `nobs` | pyfixest `_N`; FEM.jl `nobs` |
-| `nobs_full` | rows before singleton removal | `nobs_origin`† | `e(N_full)` | — | |
-| ✓ `n_singletons` | singleton rows dropped | (`obs_selection`) | `e(num_singletons)` | — | |
-| ✓ `df_residual` | residual df | `df.residual`* | `e(df_r)` | `df_resid` | FEM.jl `dof_residual` |
-| `df_model` | model df | | `e(df_m)` | `df_model` | |
-| `df_absorbed` | df lost to the FEs | | `e(df_a)` | | FEM.jl `dof_fes` |
+| ✓ `nobs` | rows used | `nobs` | `e(N)` | `nobs` | pyfixest `_N`; lfe `N`; areg/xtreg `e(N)`; FEM.jl `nobs` |
+| `nobs_full` | rows used plus singleton rows dropped | — (`nobs_origin`† is earlier: before subset, NA and singleton removal, so it is `specification.sample.rows_input`) | `e(N_full)` | — | |
+| ✓ `n_singletons` | singleton rows dropped | not stored separately (`obs_selection$obsRemoved` mixes NA and FE removals) | `e(num_singletons)` | — | pyfixest: a warning only, not stored; areg/xtreg `e(ksingle)` (per absorbed variable) |
+| ✓ `df_residual` | residual df (N − K − absorbed levels) | `df.residual`* | `e(df_r)` | `df_resid` | areg/xtreg `e(df_r)`; FEM.jl `dof_residual` **only without clustering** (with clustering it is min(G) − 1, i.e. `vcov.df_t`); pyfixest `_dfd` is the F-test df, also min(G) − 1 under clustering |
+| `df_model` | model df | | `e(df_m)` | `df_model` | areg/xtreg `e(df_m)`; FEM.jl `dof` |
+| `df_absorbed` | df lost to the FEs | | `e(df_a)` | | areg `e(df_a)`, `e(dfabsorb)` per variable; xtreg `e(df_a)` (panel effect); FEM.jl `dof_fes` (an FE nested in a cluster counts 1) |
 | `df_absorbed_nested` | FE df redundant because nested in a cluster | | `e(df_a_nested)` | | |
-| `rss`, `tss`, `tss_within` | sums of squares | `ssr`*, `ssr_null`, `ssr_fe_only` | `e(rss)`, `e(tss)`, within tss | `resid_ss`, `total_ss`, `model_ss` | |
-| `r2`, `adj_r2` | R² | `r2()` | `e(r2)`, `e(r2_a)` | `rsquared` | |
-| `r2_within`, `adj_r2_within` | within R² | `r2(, "wr2")` | `e(r2_within)`, `e(r2_a_within)` | `rsquared_within` | xtreg `e(r2_w)` |
+| `rss`, `tss`, `tss_within` | sums of squares | `ssr`*, `ssr_null`, `ssr_fe_only` | `e(rss)`, `e(tss)` | `resid_ss`, `total_ss`, `model_ss` | areg/xtreg `e(rss)`, `e(mss)`; xtreg `e(tss)`; FEM.jl `rss`, `tss`; lfe `P.TSS` (TSS of the demeaned response) |
+| `r2`, `adj_r2` | R² | `r2()` | `e(r2)`, `e(r2_a)` | `rsquared` | areg/xtreg `e(r2)`, `e(r2_a)`; lfe `r2`, `r2adj` (full model); pyfixest `_r2`, `_adj_r2`; FEM.jl `r2()`, `adjr2()` |
+| `r2_within`, `adj_r2_within` | within R² | `r2(, "wr2")` | `e(r2_within)`, `e(r2_a_within)` | `rsquared_within` | xtreg `e(r2_w)`; pyfixest `_r2_within`, `_adj_r2_within`; FEM.jl `r2_within`; areg: none |
 | `r2_between`, `r2_overall` | panel R²s | | | `rsquared_between`, `rsquared_overall` | xtreg `e(r2_b)`, `e(r2_o)` |
 | `r2_inclusive` | R² including the fit of the FEs | | | `rsquared_inclusive` | |
 | `sq_corr_fitted` | squared corr(y, ŷ) | `sq.cor` | | `corr_squared_*` | |
-| `sigma` | RMSE | `sigma()` | `e(rmse)` | `s2` (variance) | xtreg `e(sigma_e)` |
+| `sigma` | RMSE | `sigma()` | `e(rmse)` | `s2` (variance) | areg/xtreg `e(rmse)`; xtreg `e(sigma_e)`; pyfixest `_rmse`; lfe `rse` |
 | `sigma_fe`, `rho` | FE standard deviation; share of variance due to the FEs | | | `variance_decomposition` | xtreg `e(sigma_u)`, `e(rho)` |
-| `log_lik`, `log_lik_fe_only`, `log_lik_null` | log-likelihoods | `loglik`, `ll_fe_only`, `ll_null` | `e(ll)`, `e(ll_0)` | `loglik` | |
-| `f_stat`, `f_stat_robust` | joint test of regressors | `fitstat` | `e(F)` | `f_statistic`, `f_statistic_robust` | |
-| `f_fe` | test that the FEs are jointly zero | | | `f_pooled` | xtreg `e(F_f)` |
+| `log_lik`, `log_lik_fe_only`, `log_lik_null` | log-likelihoods | `loglik`, `ll_fe_only`, `ll_null` | `e(ll)`, `e(ll_0)` | `loglik` | areg/xtreg `e(ll)`, `e(ll_0)`; FEM.jl `loglikelihood()` |
+| `f_stat`, `f_stat_robust` | joint test of regressors | `fitstat` | `e(F)` | `f_statistic`, `f_statistic_robust` | areg/xtreg `e(F)`; pyfixest `_f_statistic`; lfe `fstat`, `P.fstat`; FEM.jl `F` |
+| `f_fe` | test that the FEs are jointly zero | | | `f_pooled` | xtreg `e(F_f)`; areg `e(F_absorb)` |
 | `sum_weights` | | | `e(sumweights)` | | |
-| `rank` | rank of the vcov | | `e(rank)` | | |
+| `rank` | rank of the vcov | | `e(rank)` | | areg/xtreg `e(rank)` |
 
-\* method or derived (`r2()`, `fitstat()`, `sigma()`), not a stored element. † not in the
-documented Value list; from memory, to check.
+\* method or derived (`r2()`, `fitstat()`, `sigma()`), not a stored element. † stored in the
+result object (`R/fixest_env.R`) but not in the documented Value list.
 
 **Required set: decided (Ted, 2026-10-24):**
 
-1. **`nobs` means different samples** across tools: reghdfe drops singletons by default, while
-   fixest (`fixef.rm`) and pyfixest keep them unless asked. `nobs`, `n_singletons` and
-   `specification.options.drop_singletons` are all required, so the difference is visible.
+1. **`nobs` means different samples** across tools: reghdfe, fixest (`fixef.rm =
+   "perfect_fit"`, which includes singletons), pyfixest (`fixef_rm = "singleton"`) and
+   FixedEffectModels.jl (`drop_singletons = true`) drop singletons by default; lfe documents no
+   singleton removal; linearmodels and Stata `areg`/`xtreg` (which report `e(ksingle)`) not
+   checked. `nobs`, `n_singletons` and `specification.options.drop_singletons` are all required,
+   so the difference is visible. *(Corrected 2026-10-24: draft 6 said fixest and pyfixest keep
+   singletons unless asked; their current documentation and source say otherwise.)*
 2. **`df_residual`** = N − K − absorbed levels (the model's residual df), always. The df used
    for t tests and CIs goes in `vcov.df_t`, with the tool's convention (reghdfe and fixest
    use G − 1 under clustering).
 3. **`r2_within`** is not required (areg has none, lfe defines it differently). It is
-   vocabulary, with `definition` when it isn't the standard within R².
+   vocabulary, with `definition` when it isn't the standard within R². *(Checked 2026-10-24:
+   `areg` stores no within R², confirmed. The lfe part is not confirmed: `summary.felm`
+   documents only full-model `r2`/`r2adj`, and `felm` keeps `P.TSS`, the TSS of the demeaned
+   response, which points to the standard within R² for the projected model. Flagged for Ted;
+   the decision stands on `areg` alone.)*
 4. **FE level counts** (`fixed_effects[].levels`) are required for FE models.
 5. **`ssc`** is required for inference records, with at least `convention` (e.g. `"fixest"`,
    `"reghdfe"`, `"linearmodels debiased=True"`) and the individual factors (what K counted,
    G/(G−1), (N−1)/(N−K)) when the producer has them.
 6. **Convergence** (`iterations`, `converged`) is required when the algorithm is iterative
-   (reghdfe, fixest, pyfixest, dfeols, FEM.jl), and absent for exact methods (xtreg, areg,
-   one-FE linearmodels).
+   (reghdfe, fixest, pyfixest, dfeols, FEM.jl; StataNow 19 `areg`/`xtreg` with more than one
+   absorbed variable, which use alternating projections and store `e(converged)`), and absent
+   for exact methods (`areg`/`xtreg` with one absorbed variable, one-FE linearmodels). Not every
+   iterative tool stores the count: fixest has an undocumented `$iterations` slot, pyfixest and
+   Stata `areg`/`xtreg` store none, and Stata stores `e(converged)` only. The schema expresses
+   this as `structures.numerics.iterative`; see the schema notes.
 
 **`structures.fixed_effects`**, one entry per FE: `name`, `components` (for interactions and
 slopes, as reghdfe `e(extended_absvars)`), `levels` (fixest `fixef_sizes`), `redundant`
@@ -592,26 +613,37 @@ and `redundant_method` (reghdfe `e(dof_table)` and `dofadjustments()`: exact for
 `e(g_avg)`, `e(g_max)`), `constant_reported` (reghdfe `e(report_constant)`).
 
 **`structures.numerics`**: `algorithm` (reghdfe `technique()`: map, lsmr, lsqr;
-fixest `fixef.algo`), `acceleration` (reghdfe: cg, sd, aitken, none), `transform` (reghdfe:
+fixest `fixef.algo`; Stata `areg`/`xtreg` `e(apm)`: halperin, cimmino; pyfixest `demeaner`),
+`acceleration` (reghdfe: cg, sd, aitken, none), `transform` (reghdfe:
 symmetric_kaczmarz, kaczmarz, cimmino), `preconditioner`, `tolerance` (fixest `fixef.tol`,
-reghdfe `tolerance()`), `max_iterations` (fixest `fixef.iter`, reghdfe `iterations()`),
-`iterations` (reghdfe `e(ic)`, FEM.jl `iterations`), `converged` (reghdfe `e(converged)`,
-FEM.jl `converged`), `collinearity_tolerance` (fixest `collin.tol`), `collinear_terms`
+reghdfe `tolerance()`, pyfixest `fixef_tol`, FEM.jl `tol`, Stata `tolerance()`),
+`max_iterations` (fixest `fixef.iter`, reghdfe `iterations()`, pyfixest `fixef_maxiter`, FEM.jl
+`maxiter`, Stata `iterate()`), `iterations` (reghdfe `e(ic)`, FEM.jl `iterations`), `converged`
+(reghdfe `e(converged)`, FEM.jl `converged`, Stata `areg`/`xtreg` `e(converged)`),
+`collinearity_tolerance` (fixest `collin.tol`, pyfixest `collin_tol`), `collinear_terms`
 (fixest `collin.var`), `collinearity_min_norm` (fixest `collin.min_norm`).
 
 **`structures.vcov`**: `type` (vocabulary: `iid`, `HC0`-`HC3`, `CRV1`, `CRV3`,
 `twoway`/`multiway`, `HAC`, `DK`; mapped to fixest `vcov=`, reghdfe `vce()`, linearmodels
 `cov_type`), `cluster`, `n_clusters` per variable (reghdfe `e(clust#)`) and the minimum
 (`e(N_clust)`), and `ssc` written out with every factor: fixest `ssc()` (`K.adj`, `K.fixef`,
-`G.adj`, `G.df`, `t.df`, `K.exact`), pyfixest `ssc()`, reghdfe `e(dofmethod)`. These factors
+`G.adj`, `G.df`, `t.df`, `K.exact`), pyfixest `ssc()` (`k_adj`, `k_fixef`, `G_adj`, `G_df`;
+defaults `True`, `"nonnested"`, `True`, `"min"`; the resolved values are in `_ssc_dict`, the
+older names `adj`, `fixef_k`, `cluster_adj`, `cluster_df` are still accepted), reghdfe
+`e(dofmethod)`, FEM.jl (no options: an FE nested in a cluster counts 1 in `dof_fes`). These factors
 are the most common source of SE differences between tools, so `ssc` must name the convention
 it reproduces (`fixest`, `reghdfe`, `stata`, `linearmodels`).
 
 **`specification.options`**, the union with each tool's default (reghdfe tolerance `1e-8` and
-16,000 iterations; fixest `fixef.tol` `1e-6`, `fixef.iter` 10,000, `collin.tol` `1e-9`,
-`fixef.rm` `"perfect_fit"`): `drop_singletons` (reghdfe `keepsingletons` off), `fixef_rm`
-(fixest), `threads` (fixest `nthreads`, reghdfe `parallel()`), weights type (frequency,
-analytic, probability).
+16,000 iterations; fixest `fixef.tol` `1e-6` (the usage line; the argument text says `1e-5`),
+`fixef.iter` 10,000, `collin.tol` `1e-9`, `fixef.rm` `"perfect_fit"`; pyfixest `fixef_tol`
+`1e-6`, `fixef_maxiter` 10,000, `collin_tol` `1e-9` (its docstring says `1e-10`), `fixef_rm`
+`"singleton"`; FEM.jl `tol` `1e-6`, `maxiter` 10,000, `drop_singletons` `true`; Stata
+`areg`/`xtreg` with several absorbed variables `tolerance(1e-8)`, `iterate(50)`,
+`apcriterion(max)`; lfe `exactDOF = FALSE`, `cmethod = "cgm"`): `drop_singletons` (reghdfe
+`keepsingletons` off), `fixef_rm` (fixest, pyfixest), `threads` (fixest `nthreads`, reghdfe
+`parallel()`, FEM.jl `nthreads`), weights type (frequency, analytic, probability; pyfixest
+`weights_type`, default `"aweights"`).
 
 **Sample**: reghdfe `e(sample)` and fixest `obs_selection` mark the rows used. The profile
 records the counts (above) and, as an attachment or a hash (dfeols `row_key`), the rows
@@ -709,7 +741,8 @@ locator) is a convenience export for tables and plots.
     "p_value": 1.29e-10}],
  "structures": {"vcov": [{"kind": "matrix", "labels": ["(Intercept)", "wt"],
                           "data": [[3.525, -1.0], [-1.0, 0.3126]], "type": "iid",
-                          "default": true}]},
+                          "ssc": {"convention": "R lm", "formula": "sigma^2 with N - K"},
+                          "df_t": 30, "default": true}]},
  "provenance": {"software": [{"name": "R", "version": "4.5.1", "role": "language"},
                              {"name": "stats", "version": "4.5.1", "role": "estimator"}],
                 "environment": {"os": "Ubuntu 24.04", "blas": "OpenBLAS 0.3.26"}}}
@@ -744,22 +777,100 @@ filled, plus `extensions.dfeols` and `history`.
 - AsCollected: https://ascollected.org/, https://ascollected.org/help, examples
   https://ascollected.org/ZJ6_Z47 and https://ascollected.org/G2Q_W7V; ResearchBox example
   https://researchbox.org/15
-- From memory, to verify before the schema: pyfixest, lfe, Stata `areg`/`xtreg` stored
-  results, FixedEffectModels.jl, `threadpoolctl`, R `sessionInfo()` fields, SLURM `sacct`
-  fields, CSL-JSON, purl, PEP 751.
+- Checked 2026-10-24 (see Verification below): fixest 0.14.2 source
+  https://raw.githubusercontent.com/lrberge/fixest/master/R/fixest_env.R; pyfixest 0.60.0
+  source (`.venv`, `estimation/api/feols.py`, `estimation/models/feols_.py`, `utils/utils.py`,
+  plus a test fit); lfe https://rdrr.io/cran/lfe/man/felm.html,
+  https://rdrr.io/cran/lfe/man/summary.felm.html, https://raw.githubusercontent.com/cran/lfe/master/R/felm.R;
+  StataNow 19 https://www.stata.com/help.cgi?areg, https://www.stata.com/help.cgi?xtreg;
+  FixedEffectModels.jl https://github.com/FixedEffects/FixedEffectModels.jl,
+  `src/FixedEffectModel.jl`, `src/fit.jl`; threadpoolctl https://github.com/joblib/threadpoolctl;
+  `sessionInfo()` https://stat.ethz.ch/R-manual/R-devel/library/utils/html/sessionInfo.html;
+  SLURM 26.05 https://slurm.schedmd.com/sacct.html; CSL-JSON
+  https://raw.githubusercontent.com/citation-style-language/schema/master/schemas/input/csl-data.json;
+  purl https://github.com/package-url/purl-spec (`purl-types-index.json`, `types/*-definition.json`);
+  PEP 751 https://packaging.python.org/en/latest/specifications/pylock-toml/.
+
+## Verification of tool fields (2026-10-24)
+
+Next step 1: every field marked "from memory" in draft 6, checked against current documentation
+or source. Corrections are made in place above; this list says what was found.
+
+| Item | Checked against | Result |
+|---|---|---|
+| pyfixest | 0.60.0 source in `.venv` and a test fit | `_N` (and `_N_rows`) confirmed. **Drops singletons by default** (`fixef_rm="singleton"`); the count is only a warning, not stored. `_dfd` is the F-test df (min(G) − 1 under clustering), not the residual df. `_ssc_dict` holds `k_adj`, `k_fixef`, `G_adj`, `G_df`. No iteration count or convergence flag is stored. Defaults `fixef_tol=1e-6`, `fixef_maxiter=10000`, `collin_tol=1e-9` |
+| fixest `nobs_origin` | `R/fixest_env.R` (0.14.2) | Stored, though not in the documented Value list. It counts rows **before subset, NA and singleton removal**, so it is not `nobs_full`; it maps to `specification.sample.rows_input`. **`fixef.rm="perfect_fit"` (the default) drops singletons** |
+| lfe | `felm`, `summary.felm` reference; `R/felm.R` | `felm`: `N`, `p` (coefficients including those projected out), `vcv`, `fe`, `cfactor`; `summary.felm`: `r2`, `r2adj`, `rse`, `fstat`, `P.fstat`, `Pp`. `exactDOF=FALSE`, `cmethod="cgm"`. No singleton removal documented. "Defines within R² differently" not supported (see decision 3) |
+| Stata `areg` | StataNow 19 help | Now absorbs several variables by alternating projections (`halperin` default, `cimmino`), `tolerance(1e-8)`, `iterate(50)`. Stores `e(df_a)`, `e(k_absorb)`, `e(kabsorb)`, `e(dfabsorb)`, `e(ksingle)`, `e(converged)`, `e(apm)`, `e(F_absorb)`. No within R² |
+| Stata `xtreg, fe` | StataNow 19 help | `e(r2_w)`, `e(r2_b)`, `e(r2_o)`, `e(sigma_u)`, `e(sigma_e)`, `e(rho)`, `e(F_f)`, `e(g_min/g_avg/g_max)`, `e(N_g)`, `e(Tbar)`, `e(corr)`, `e(df_a)` confirmed; also accepts `absorb()` now, with the same APM results as `areg`. The help says nothing on df when panels nest in clusters (Statalist and the reghdfe docs say `xtreg` drops the nested FE df, `areg` does not) |
+| reghdfe | help (v6), re-checked at Ted's request | `e(N)`, `e(N_full)` ("including singletons"), `e(num_singletons)`, `e(df_a)`, `e(df_a_nested)`, `e(df_r)`, `e(ic)`, `e(converged)`, `e(drop_singletons)`, `e(report_constant)`, `e(clust#)`, `e(N_clust)`, `e(dofmethod)`, `e(extended_absvars)`, `e(dof_table)` confirmed. No documented within TSS (removed from the table). Defaults: tolerance 1e-8, 16,000 iterations, `dof(all)` = pairwise clusters continuous |
+| FixedEffectModels.jl | `src/FixedEffectModel.jl`, `src/fit.jl` | Fields `nobs`, `dof`, `dof_fes`, `dof_residual`, `rss`, `tss`, `F`, `p`, `iterations`, `converged`, `r2_within`, `nclusters`, `esample`, `F_kp`, `p_kp`. `drop_singletons=true`, `tol=1e-6`, `maxiter=10000`. **`dof_residual` is min(G) − 1 under clustering**, and an FE nested in a cluster counts 1 in `dof_fes` |
+| threadpoolctl | README | `threadpoolctl.threadpool_info()` returns dicts with `user_api`, `internal_api`, `prefix`, `filepath`, `version`, `num_threads`, and `threading_layer`/`architecture` for some libraries. Not installed in `.venv` |
+| `sessionInfo()` | R-devel manual | `R.version`, `platform`, `running`, `RNGkind`, `matprod`, `BLAS` (`extSoftVersion()`), `LAPACK` (`La_library()`), `LA_version` (`La_version()`), `locale`, `tzone`, `tzcode_type`, `basePkgs`, `otherPkgs`, `loadedOnly` |
+| SLURM `sacct` | 26.05 man page | All 18 field names in `scheduler` are valid `--format` fields with that spelling (also `User`, `Cluster`, `CPUTime`, `TotalCPU`, `ReqTRES`, `NNodes`) |
+| CSL-JSON | `csl-data.json` | Draft-07 schema; **`id` and `type` required**; name objects closed (`additionalProperties: false`). The draft 6 example lacked `id` and had `"..."` as an author: fixed |
+| purl | purl-spec type index and definitions | `cran`, `pypi`, `conda`, `github`, `generic`, `docker`, `oci`, `julia` are registered. GitHub version is a commit or tag; namespace and name lowercased. Conda qualifiers `channel`, `subdir`, `build`, `type` |
+| PEP 751 | PyPA spec | `pylock.toml` (or `pylock.<name>.toml`); required `lock-version`, `created-by`, `[[packages]]`; hashes as `{sha256 = "..."}`; approved April 2025 |
 
 ## Questions for Ted
 
-None open. Still to revisit: interaction order ("as specified" for now; revisit if matching
+None open on the design. Raised by the verification and the schema, to confirm or change
+(the schema follows the choice shown):
+
+1. **Singleton rationale (decision 1).** The tools mostly *agree* now: reghdfe, fixest, pyfixest
+   and FEM.jl all drop singletons by default. The required set still makes sense (lfe, Stata
+   and user overrides differ), but the reason given was wrong and has been corrected.
+2. **lfe within R² (decision 3).** Not confirmed that lfe defines it differently. The decision
+   stands on `areg` alone.
+3. **`nobs_full` for fixest.** `nobs_origin` is not `nobs_full`, so fixest has no direct
+   `nobs_full`; mapped to `specification.sample.rows_input` instead.
+4. **Convergence (decision 6), two points.** (a) "Required when iterative" needs the record to
+   say it was iterative: the schema adds `structures.numerics.iterative` (boolean), requires
+   it (so `structures.numerics`) in `linear-fe`, and when it is `true` requires `iterations`
+   and `converged`. (b) **Disagreement:** pyfixest and Stata
+   `areg`/`xtreg` don't report an iteration count, and pyfixest no convergence flag either, so
+   their records can't meet decision 6 unless `null` is allowed ("applies but wasn't
+   computed"). The schema follows the decision as written and accepts `null` for both, so
+   those tools pass with `"iterations": null` while the key is still required. Ted to confirm
+   or tighten.
+5. **CSL `id`.** CSL requires `id` and `type`; the schema requires only `type`, so a hand-written
+   citation without an `id` is still valid.
+6. **`df_residual` vs FEM.jl and pyfixest.** Their stored "residual" df is min(G) − 1 under
+   clustering. Writers for those tools must compute N − K − absorbed for `df_residual` and put
+   the tool's value in `vcov.df_t`. No design change; noted for converters. Still to revisit: interaction order ("as specified" for now; revisit if matching
 across tools needs a normalised order in `name` as well).
 
 ## Next
 
 1. Verify the tool fields marked "from memory" (pyfixest, lfe, Stata `areg`/`xtreg`,
    FixedEffectModels.jl, `threadpoolctl`, `sessionInfo()`, SLURM `sacct`, CSL-JSON, purl,
-   PEP 751).
+   PEP 751). **Done** (see Verification; questions 1–6 above).
 2. JSON Schema: `schema/estimation-0.1.json`, `schema/profiles/{inference,linear-fe,iv,dfeols}-0.1.json`,
-   with `x-identifying` marks.
+   with `x-identifying` marks. **Done**, with example records in `schema/examples/` and
+   `tests/test_schema.py` (every JSON block in this document, the examples against their
+   profiles, failure cases per required field, and the marks against the library's list).
+   Schema notes:
+   - Annotations JSON Schema can't enforce: `x-expected` (warn when absent), `x-vocabulary`
+     (recommended values of an open string), `x-size-limits`, and `x-tools` in the profiles
+     (each name mapped to the tools' own, from the Verification table).
+   - Each profile is `allOf` [core, `$defs/rules`], and a profile's rules include the rules of
+     the one it builds on (`linear-fe` → `inference`; `dfeols` → `linear-fe`; `iv` →
+     `inference`). The `dfeols/0.1` extension block is defined in the dfeols profile.
+   - Fields a `--hash` redaction can turn into strings (`agent`, `argv`) accept the
+     `hmac-sha256:<hex>` form. The marks are exactly the library's `DEFAULT_IDENTIFYING`
+     (core plus the dfeols profile); a test keeps them equal.
+   - The schema's choices on the step 3 list: `core_digest` as written there; a `link`
+     structure keeps `type`/`ssc`/`default`, so a spilled default vcov still meets
+     `inference`; `fixed_effects` a list of `{kind: "object", name, levels, ...}`;
+     `constant_reported` sits on each FE entry.
+   - `$id`s are `https://raw.githubusercontent.com/jemather/dfeols/main/schema/...` and the
+     profiles refer to the core relatively; they resolve once the repo is pushed. Validators
+     load them locally (`tests/test_schema.py` shows how).
+   - For step 3: `jsonschema_check` builds a validator with no registry, so a profile file
+     can't resolve `../estimation-0.1.json`; `identifying_paths` needs the core and each
+     claimed profile (it follows local `$ref`s only); `jsonschema` is not in `.venv`, so the
+     schema tests run only where it is installed (system `python3` has 4.10.3).
+   - Not written: `estimation-collection/0.1` (not part of this step).
 3. `src/dfeols/estimation.py`: writer, reader, validator, redactor, core digest, attachment
    spilling; tests. **Done** (`tests/test_estimation.py`), written against this document
    because the schema files weren't committed yet: profile checks and the identifying-field

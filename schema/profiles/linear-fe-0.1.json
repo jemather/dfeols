@@ -1,0 +1,115 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/jemather/dfeols/main/schema/profiles/linear-fe-0.1.json",
+  "title": "linear-fe/0.1",
+  "description": "Profile for linear models with absorbed fixed effects (fixest, lfe; pyfixest, linearmodels; reghdfe, areg, xtreg; FixedEffectModels.jl). Requires inference/0.1 plus metrics.n_singletons, specification.options.drop_singletons, one structures.fixed_effects entry per FE with name and levels, and structures.numerics.iterative; when iterative is true, iterations and converged (null when the tool doesn't report them). x-tools maps each name to the tools' own, as checked on 2026-10-24 (docs/design/estimation-format.md).",
+  "allOf": [
+    {"$ref": "../estimation-0.1.json"},
+    {"$ref": "#/$defs/rules"}
+  ],
+  "$defs": {
+    "rules": {
+      "allOf": [{"$ref": "inference-0.1.json#/$defs/rules"}],
+      "type": "object",
+      "required": ["specification"],
+      "properties": {
+        "metrics": {
+          "required": ["n_singletons"],
+          "properties": {
+            "nobs": {
+              "description": "Rows used. Tools differ on whether singletons are in it: see drop_singletons.",
+              "x-tools": {"fixest": "nobs", "reghdfe": "e(N)", "linearmodels": "nobs", "pyfixest": "_N", "lfe": "N", "areg/xtreg": "e(N)", "FixedEffectModels.jl": "nobs"}
+            },
+            "nobs_full": {
+              "description": "Rows used plus singleton rows dropped.",
+              "x-tools": {"reghdfe": "e(N_full)"}
+            },
+            "n_singletons": {
+              "description": "Singleton rows dropped (0 when none were dropped or drop_singletons is false).",
+              "x-tools": {"reghdfe": "e(num_singletons)", "areg/xtreg": "sum of e(ksingle)", "pyfixest": "warning text only", "fixest": "not stored separately"}
+            },
+            "df_residual": {
+              "description": "N - K - absorbed levels. Tools whose stored value is min(G) - 1 under clustering (FixedEffectModels.jl dof_residual, pyfixest _dfd) put that in vcov.df_t instead.",
+              "x-tools": {"fixest": "df.residual()", "reghdfe": "e(df_r)", "linearmodels": "df_resid", "areg/xtreg": "e(df_r)", "FixedEffectModels.jl": "dof_residual (unclustered only)"}
+            },
+            "df_model": {"x-tools": {"reghdfe": "e(df_m)", "linearmodels": "df_model", "areg/xtreg": "e(df_m)", "FixedEffectModels.jl": "dof"}},
+            "df_absorbed": {
+              "description": "df lost to the FEs.",
+              "x-tools": {"reghdfe": "e(df_a)", "areg": "e(df_a)", "xtreg": "e(df_a) (panel effect)", "FixedEffectModels.jl": "dof_fes (an FE nested in a cluster counts 1)"}
+            },
+            "df_absorbed_nested": {"description": "FE df redundant because nested in a cluster.", "x-tools": {"reghdfe": "e(df_a_nested)"}},
+            "rss": {"x-tools": {"fixest": "ssr()", "reghdfe": "e(rss)", "linearmodels": "resid_ss", "areg/xtreg": "e(rss)", "FixedEffectModels.jl": "rss"}},
+            "tss": {"x-tools": {"reghdfe": "e(tss)", "linearmodels": "total_ss", "xtreg": "e(tss)", "FixedEffectModels.jl": "tss"}},
+            "tss_within": {"description": "TSS of the demeaned response.", "x-tools": {"lfe": "P.TSS"}},
+            "r2": {"x-tools": {"fixest": "r2(, \"r2\")", "reghdfe": "e(r2)", "linearmodels": "rsquared", "areg/xtreg": "e(r2)", "lfe": "r2", "pyfixest": "_r2", "FixedEffectModels.jl": "r2()"}},
+            "adj_r2": {"x-tools": {"reghdfe": "e(r2_a)", "areg/xtreg": "e(r2_a)", "lfe": "r2adj", "pyfixest": "_adj_r2", "FixedEffectModels.jl": "adjr2()"}},
+            "r2_within": {
+              "description": "Within R2: 1 - RSS / TSS of the demeaned response. Use {value, definition} for any other definition.",
+              "x-tools": {"fixest": "r2(, \"wr2\")", "reghdfe": "e(r2_within)", "linearmodels": "rsquared_within", "xtreg": "e(r2_w)", "pyfixest": "_r2_within", "FixedEffectModels.jl": "r2_within", "areg": "none"}
+            },
+            "adj_r2_within": {"x-tools": {"reghdfe": "e(r2_a_within)", "pyfixest": "_adj_r2_within"}},
+            "r2_between": {"x-tools": {"linearmodels": "rsquared_between", "xtreg": "e(r2_b)"}},
+            "r2_overall": {"x-tools": {"linearmodels": "rsquared_overall", "xtreg": "e(r2_o)"}},
+            "r2_inclusive": {"description": "R2 including the fit of the FEs.", "x-tools": {"linearmodels": "rsquared_inclusive"}},
+            "sq_corr_fitted": {"description": "Squared corr(y, fitted).", "x-tools": {"fixest": "sq.cor", "linearmodels": "corr_squared_*"}},
+            "sigma": {"x-tools": {"fixest": "sigma()", "reghdfe": "e(rmse)", "linearmodels": "sqrt(s2)", "areg/xtreg": "e(rmse)", "xtreg": "e(sigma_e)", "pyfixest": "_rmse", "lfe": "rse"}},
+            "sigma_fe": {"description": "Standard deviation of the FE.", "x-tools": {"xtreg": "e(sigma_u)"}},
+            "rho": {"description": "Share of variance due to the FE.", "x-tools": {"xtreg": "e(rho)"}},
+            "log_lik": {"x-tools": {"fixest": "loglik", "reghdfe": "e(ll)", "linearmodels": "loglik", "areg/xtreg": "e(ll)", "FixedEffectModels.jl": "loglikelihood()"}},
+            "log_lik_null": {"x-tools": {"fixest": "ll_null", "reghdfe": "e(ll_0)", "areg/xtreg": "e(ll_0)"}},
+            "log_lik_fe_only": {"x-tools": {"fixest": "ll_fe_only"}},
+            "f_stat": {"x-tools": {"fixest": "fitstat()", "reghdfe": "e(F)", "linearmodels": "f_statistic", "areg/xtreg": "e(F)", "pyfixest": "_f_statistic", "lfe": "fstat / P.fstat", "FixedEffectModels.jl": "F"}},
+            "f_stat_robust": {"x-tools": {"linearmodels": "f_statistic_robust"}},
+            "f_fe": {"description": "Test that the FEs are jointly zero.", "x-tools": {"linearmodels": "f_pooled", "xtreg": "e(F_f)", "areg": "e(F_absorb)"}},
+            "sum_weights": {"x-tools": {"reghdfe": "e(sumweights)"}},
+            "rank": {"description": "Rank of the vcov.", "x-tools": {"reghdfe": "e(rank)", "areg/xtreg": "e(rank)"}}
+          }
+        },
+        "specification": {
+          "required": ["options"],
+          "properties": {
+            "options": {
+              "required": ["drop_singletons"],
+              "properties": {
+                "drop_singletons": {
+                  "description": "Whether singleton rows were dropped. Defaults: reghdfe true (keepsingletons off), fixest true (fixef.rm \"perfect_fit\"), pyfixest true (fixef_rm \"singleton\"), FixedEffectModels.jl true.",
+                  "type": "boolean"
+                },
+                "fixef_rm": {"description": "fixest fixef.rm / pyfixest fixef_rm, as given.", "type": "string"},
+                "threads": {"description": "fixest nthreads, reghdfe parallel(), FixedEffectModels.jl nthreads.", "type": ["integer", "null"]},
+                "weights_type": {"description": "Also in specification.weights.type; pyfixest weights_type.", "type": "string"}
+              }
+            }
+          }
+        },
+        "structures": {
+          "required": ["fixed_effects", "numerics"],
+          "properties": {
+            "fixed_effects": {
+              "minItems": 1,
+              "items": {
+                "required": ["name", "levels"],
+                "x-tools": {"levels": {"fixest": "fixef_sizes", "areg/xtreg": "e(kabsorb)"}, "components": {"reghdfe": "e(extended_absvars)"}, "redundant": {"reghdfe": "e(dof_table)"}, "group_size": {"linearmodels": "entity_info / time_info", "xtreg": "e(g_min), e(g_avg), e(g_max)"}, "constant_reported": {"reghdfe": "e(report_constant)"}, "singletons": {"areg/xtreg": "e(ksingle)"}}
+              }
+            },
+            "numerics": {
+              "required": ["iterative"],
+              "x-tools": {
+                "algorithm": {"reghdfe": "technique()", "fixest": "fixef.algo", "areg/xtreg": "e(apm)", "pyfixest": "demeaner"},
+                "tolerance": {"fixest": "fixef.tol", "reghdfe": "tolerance()", "pyfixest": "fixef_tol", "FixedEffectModels.jl": "tol", "areg/xtreg": "tolerance()"},
+                "max_iterations": {"fixest": "fixef.iter", "reghdfe": "iterations()", "pyfixest": "fixef_maxiter", "FixedEffectModels.jl": "maxiter", "areg/xtreg": "iterate()"},
+                "iterations": {"reghdfe": "e(ic)", "FixedEffectModels.jl": "iterations", "fixest": "$iterations (undocumented)"},
+                "converged": {"reghdfe": "e(converged)", "FixedEffectModels.jl": "converged", "areg/xtreg": "e(converged)"},
+                "collinearity_tolerance": {"fixest": "collin.tol", "pyfixest": "collin_tol"},
+                "collinear_terms": {"fixest": "collin.var"},
+                "collinearity_min_norm": {"fixest": "collin.min_norm"}
+              },
+              "if": {"required": ["iterative"], "properties": {"iterative": {"const": true}}},
+              "then": {"required": ["iterations", "converged"]}
+            }
+          }
+        }
+      }
+    }
+  }
+}
