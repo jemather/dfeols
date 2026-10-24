@@ -136,6 +136,21 @@ def errors(issues):
     return [i for i in issues if i.level == "error"]
 
 
+def schemas():
+    """The schemas in schema/; skips the test where they or jsonschema are missing."""
+    pytest.importorskip("jsonschema")
+    sc = est.load_schemas()
+    if sc is None:
+        pytest.skip("no schema/ folder")
+    return sc
+
+
+@pytest.fixture(params=["schema", "builtin"])
+def mode(request):
+    """Validate with the schemas in schema/, or with the built-in fallback checks."""
+    return schemas() if request.param == "schema" else None
+
+
 # ---------------------------------------------------------------- RFC 8785
 
 
@@ -363,42 +378,43 @@ def test_lm_example_is_valid():
     assert [i.message for i in issues if i.level == "warning"] == []
 
 
-def test_missing_sections_and_bad_shapes():
+def test_missing_sections_and_bad_shapes(mode):
     rec = lm_record()
     del rec["parameters"], rec["metrics"]
     rec["meta"]["status"] = "great"
     rec["structures"]["x"] = {"kind": "link", "attachment": "nope"}
     rec["oops"] = 1
-    issues = est.validate(rec)
+    issues = est.validate(rec, schema=mode)
     paths = {(i.level, i.path) for i in issues}
     assert ("error", "parameters") in paths
     assert ("warning", "metrics") in paths
     assert ("error", "meta.status") in paths
     assert ("error", "structures.x.attachment") in paths
     assert ("warning", "oops") in paths
-    assert errors(est.validate({"schema": "other/1"}))
+    assert errors(est.validate({"schema": "other/1"}, schema=mode))
 
 
-def test_profiles():
+def test_profiles(mode):
     rec = est.prepare(fe_record())
-    assert errors(est.validate(rec)) == []
+    assert errors(est.validate(rec, schema=mode)) == []
     del rec["metrics"]["n_singletons"]
     del rec["specification"]["options"]["drop_singletons"]
     del rec["structures"]["vcov"][1]["ssc"]
     rec["structures"]["fixed_effects"][1].pop("levels")
     del rec["extensions"]["dfeols"]
     del rec["parameters"][0]["p_value"]
-    paths = {i.path for i in errors(est.validate(rec))}
-    assert {
-        "metrics.n_singletons",
-        "specification.options.drop_singletons",
-        "structures.vcov.ssc",
-        "structures.fixed_effects[1]",
-        "extensions.dfeols",
-        "parameters[0]",
-    } <= paths
+    found = errors(est.validate(rec, schema=mode))
+    paths = {i.path for i in found}
+    expected = {"metrics.n_singletons", "specification.options.drop_singletons", "extensions.dfeols"}
+    if mode is None:
+        expected |= {"structures.vcov.ssc", "structures.fixed_effects[1]", "parameters[0]"}
+    else:
+        expected |= {"structures.vcov", "structures.fixed_effects[1].levels", "parameters[0].p_value"}
+    assert expected <= paths
+    # dfeols/0.1 includes the linear-fe rules: each problem is reported once
+    assert len(found) == len(paths)
     rec["meta"]["profiles"] = ["glm/0.1"]
-    assert any(i.level == "info" and "glm/0.1" in i.message for i in est.validate(rec))
+    assert any(i.level == "info" and "glm/0.1" in i.message for i in est.validate(rec, schema=mode))
 
 
 def test_digest_mismatch_is_a_warning():
@@ -417,6 +433,42 @@ def test_schema_plugin():
 
     issues = est.validate(lm_record(), schema=check)
     assert calls and any(i.message == "from plug-in" for i in issues)
+
+
+def test_default_uses_schema_dir_or_says_it_fell_back(monkeypatch, tmp_path):
+    rec = est.prepare(fe_record())
+    del rec["metrics"]["n_singletons"]
+    monkeypatch.setenv("ESTIMATION_SCHEMA_DIR", str(tmp_path))  # no schemas there
+    issues = est.validate(rec)
+    assert any(i.level == "info" and "built-in" in i.message for i in issues)
+    assert "metrics.n_singletons" in {i.path for i in errors(issues)}
+    monkeypatch.delenv("ESTIMATION_SCHEMA_DIR")
+    sc = schemas()
+    assert est.find_schema_dir() == sc.directory
+    issues = est.validate(rec)
+    assert not any("built-in" in i.message for i in issues)
+    assert [i.path for i in errors(issues)] == ["metrics.n_singletons"]
+
+
+def test_profile_file_resolves_the_core_offline():
+    """A profile's allOf refers to ../estimation-0.1.json; with the other schemas as
+    documents it resolves locally, and the core's rules apply."""
+    sc = schemas()
+    check = est.jsonschema_check(sc.profiles["linear-fe/0.1"], sc.documents())
+    rec = est.prepare(fe_record())
+    assert check(rec) == []
+    rec["meta"]["status"] = "great"  # a core rule
+    del rec["metrics"]["n_singletons"]  # a profile rule
+    assert {i.path for i in check(rec)} >= {"meta.status", "metrics.n_singletons"}
+
+
+def test_size_limits_match_schema():
+    lim = schemas().core["x-size-limits"]
+    assert (lim["warn_bytes"], lim["warn_elements"], lim["fail_bytes"]) == (
+        est.WARN_BYTES,
+        est.WARN_ELEMENTS,
+        est.FAIL_BYTES,
+    )
 
 
 def test_jsonschema_plugin():
@@ -451,6 +503,30 @@ def test_redact_hash_compares_equal_with_same_salt():
     assert host(a) == host(b) != host(c)
     assert host(a).startswith("hmac-sha256:")
     assert a["history"][-1]["salt_id"] == b["history"][-1]["salt_id"] != c["history"][-1]["salt_id"]
+
+
+def test_redact_takes_marks_from_core_and_claimed_profiles():
+    sc = schemas()
+    rec = est.prepare(fe_record())
+    rec["provenance"]["agent"] = {"user": "ted"}
+    # claims dfeols/0.1: the core's marks and the dfeols profile's (its extension block)
+    assert est.record_identifying_paths(rec, sc) == sorted(est.DEFAULT_IDENTIFYING)
+    out = est.redact(rec)
+    assert "folder" not in out["extensions"]["dfeols"]["shards"] and "agent" not in out["provenance"]
+    # without the claim, the dfeols block isn't covered by any schema it follows
+    rec["meta"]["profiles"] = ["linear-fe/0.1"]
+    out = est.redact(rec)
+    assert (
+        out["extensions"]["dfeols"]["shards"]["folder"] == "/scratch/x" and "agent" not in out["provenance"]
+    )
+    assert "extensions.dfeols.shards.folder" not in est.record_identifying_paths(rec, sc)
+
+
+def test_identifying_paths_follow_refs_across_files():
+    sc = schemas()
+    alone = set(est.identifying_paths(sc.profiles["dfeols/0.1"]))
+    across = set(est.identifying_paths(sc.profiles["dfeols/0.1"], sc.documents()))
+    assert alone < across and "provenance.agent" in across - alone
 
 
 def test_redact_refuses_digest_sections():
@@ -520,9 +596,32 @@ def test_cli(tmp_path, capsys, monkeypatch):
     assert "meta.status" in capsys.readouterr().out
 
 
+def test_cli_schema_options(tmp_path, capsys):
+    p = tmp_path / "a.estimation.json"
+    rec = est.prepare(fe_record())
+    del rec["metrics"]["n_singletons"]
+    p.write_text(json.dumps(rec))
+    assert est.main(["validate", "--no-schema", str(p)]) == 1
+    assert "built-in" not in capsys.readouterr().out
+    assert est.main(["validate", "--schema-dir", str(schemas().directory), str(p)]) == 1
+    assert "[linear-fe/0.1] 'n_singletons' is a required property" in capsys.readouterr().out
+    with pytest.raises(SystemExit):
+        est.main(["validate", "--schema-dir", str(tmp_path), str(p)])
+    o = tmp_path / "r.json"
+    assert est.main(["redact", str(p), "-o", str(o), "--schema-dir", str(schemas().directory)]) == 0
+    assert "folder" not in json.loads(o.read_text())["extensions"]["dfeols"]["shards"]
+
+
 def test_cli_hash_needs_salt(tmp_path, monkeypatch):
     p = tmp_path / "a.estimation.json"
     est.write(lm_record(), p)
     monkeypatch.delenv("ESTIMATION_REDACT_SALT", raising=False)
     with pytest.raises(SystemExit):
         est.main(["redact", str(p), "-o", str(tmp_path / "o.json"), "--hash"])
+
+
+@pytest.mark.parametrize("name", ["lm-minimal", "dfeols-linear-fe", "iv"])
+def test_schema_examples_validate(name):
+    sc = schemas()
+    rec = est.read(sc.directory / "examples" / f"{name}.estimation.json")
+    assert errors(est.validate(rec)) == []

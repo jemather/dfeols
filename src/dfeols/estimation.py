@@ -12,10 +12,11 @@ arrays) and pyarrow (for spilled attachments), both imported lazily.
     redact(record)            remove or HMAC the identifying fields
     core_digest(record)       sha256 over the RFC 8785 canonical form of the result sections
 
-The JSON Schemas (schema/estimation-0.1.json, profiles) are not written yet. Until
-they are, `validate` checks the rules in the design doc by hand and takes a schema
-(dict, path or callable) as a plug-in; `redact` uses a built-in list of
-identifying paths, or the `x-identifying` marks of a schema when given one.
+The JSON Schemas are in the repository's schema/ folder (or $ESTIMATION_SCHEMA_DIR):
+`validate` checks the core schema plus each profile the record claims, and `redact`
+takes the fields marked `x-identifying` in the core and each claimed profile. Where
+the schemas or the `jsonschema` package are missing, both fall back to built-in
+checks and DEFAULT_IDENTIFYING, and `validate` says so.
 
 Command line: `python -m dfeols.estimation {validate,redact,digest} ...`
 (also `dfeols estimation ...`).
@@ -26,11 +27,13 @@ from __future__ import annotations
 import argparse
 import copy
 import datetime as _dt
+import functools
 import hashlib
 import hmac
 import json
 import math
 import os
+import re
 import sys
 import uuid
 import warnings
@@ -38,6 +41,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urljoin
 
 SCHEMA = "estimation/0.1"
 WARN_BYTES = 1_000_000  # whole record
@@ -55,9 +59,9 @@ NONFINITE = {"NaN": math.nan, "Inf": math.inf, "-Inf": -math.inf}
 # parameters columns that hold text; every other column is numeric for decoding
 TEXT_COLUMNS = {"term", "canonical", "response", "component", "group", "dropped", "label"}
 
-# Identifying fields until the schema marks them with "x-identifying": user, host, paths,
-# job ids, account, command lines, working directory, data locations. `*` matches any key
-# of a dict, `[*]` any item of a list. Content hashes are not identifying and stay.
+# Identifying fields when the schemas aren't available: what schema/ marks "x-identifying"
+# in the core and the dfeols profile (tests/test_schema.py keeps the two equal). `*` matches
+# any key of a dict, `[*]` any item of a list. Content hashes are not identifying and stay.
 DEFAULT_IDENTIFYING = (
     "provenance.agent",
     "provenance.environment.host",
@@ -616,9 +620,16 @@ def _size_issues(rec: dict, size: int) -> list[Issue]:
     return issues
 
 
-def _check_core(rec: dict) -> list[Issue]:
+def _check_core(rec: dict, structural: bool = True) -> list[Issue]:
+    """Checks JSON Schema can't express (expected sections, cross-references, duplicate
+    ids), plus, when `structural` (no schema in use), the core's shape by hand."""
     issues: list[Issue] = []
-    err = lambda p, m: issues.append(Issue("error", p, m))
+
+    def err(p: str, m: str) -> None:
+        if structural:
+            issues.append(Issue("error", p, m))
+
+    xerr = lambda p, m: issues.append(Issue("error", p, m))  # always: the schema can't check these
     warn = lambda p, m: issues.append(Issue("warning", p, m))
     schema = rec.get("schema")
     if not isinstance(schema, str) or not schema.startswith("estimation/"):
@@ -690,7 +701,7 @@ def _check_core(rec: dict) -> list[Issue]:
                     err(f"attachments[{i}]", "needs 'id' and 'path'")
                     continue
                 if a["id"] in att_ids:
-                    err(f"attachments[{i}].id", f"duplicate id {a['id']!r}")
+                    xerr(f"attachments[{i}].id", f"duplicate id {a['id']!r}")
                 att_ids.add(a["id"])
                 if "sha256" not in a:
                     warn(f"attachments[{i}]", "no sha256: a file found later can't be checked")
@@ -702,9 +713,11 @@ def _check_core(rec: dict) -> list[Issue]:
             if not isinstance(s, dict):
                 err(p, "must be an object with 'kind'")
             elif s.get("kind") not in STRUCTURE_KINDS:
+                if not structural:
+                    continue
                 err(f"{p}.kind", f"must be one of {', '.join(STRUCTURE_KINDS)}")
             elif s["kind"] == "link" and s.get("attachment") not in att_ids:
-                err(f"{p}.attachment", f"no attachment with id {s.get('attachment')!r}")
+                xerr(f"{p}.attachment", f"no attachment with id {s.get('attachment')!r}")
 
     for ns, block in (rec.get("extensions") or {}).items() if isinstance(rec.get("extensions"), dict) else []:
         if not isinstance(block, dict):
@@ -752,8 +765,7 @@ def _profile_inference(rec: dict) -> list[Issue]:
 
 
 def _profile_linear_fe(rec: dict) -> list[Issue]:
-    # Convergence (required for iterative algorithms) is left to the profile schema:
-    # the record does not yet say on its own whether its algorithm was iterative.
+    # Convergence is vocabulary, not required (Ted, 2026-10-24)
     issues = _profile_inference(rec)
     if "n_singletons" not in (rec.get("metrics") or {}):
         issues.append(Issue("error", "metrics.n_singletons", "required"))
@@ -778,7 +790,8 @@ def _profile_dfeols(rec: dict) -> list[Issue]:
     return issues
 
 
-# Hand-written checks of the decided required sets, until schema/profiles/*.json exist
+# Built-in checks of the decided required sets, used only when schema/ or jsonschema is
+# missing. The schemas are the reference; these cover the main required fields.
 PROFILES: dict[str, Callable[[dict], list[Issue]]] = {
     "inference/0.1": _profile_inference,
     "linear-fe/0.1": _profile_linear_fe,
@@ -786,31 +799,128 @@ PROFILES: dict[str, Callable[[dict], list[Issue]]] = {
 }
 
 
-def jsonschema_check(schema: dict | str | os.PathLike) -> Callable[[dict], list[Issue]]:
-    """A schema plug-in for `validate` from a JSON Schema (needs the `jsonschema` package)."""
+@dataclass(frozen=True)
+class Schemas:
+    """The core schema and the profiles, by profile name (each file's `title`)."""
+
+    directory: Path
+    core: dict
+    profiles: dict[str, dict]
+
+    def documents(self) -> list[dict]:
+        return [self.core, *self.profiles.values()]
+
+
+def find_schema_dir() -> Path | None:
+    """$ESTIMATION_SCHEMA_DIR, else schema/ in the repository checkout this module is in."""
+    env = os.environ.get("ESTIMATION_SCHEMA_DIR")
+    for d in [Path(env)] if env else [Path(__file__).resolve().parents[2] / "schema"]:
+        if (d / "estimation-0.1.json").is_file():
+            return d
+    return None
+
+
+@functools.lru_cache(maxsize=8)
+def _load_schemas(directory: str) -> Schemas:
+    d = Path(directory)
+    load = lambda p: json.loads(p.read_text(encoding="utf-8"))
+    profiles = {}
+    for f in sorted((d / "profiles").glob("*.json")):
+        doc = load(f)
+        profiles[doc.get("title") or f.stem] = doc
+    return Schemas(d, load(d / "estimation-0.1.json"), profiles)
+
+
+def load_schemas(directory: str | os.PathLike | None = None) -> Schemas | None:
+    """The schemas in `directory` (default `find_schema_dir()`), or None if there are none.
+    Loaded once per folder; treat the result as read-only."""
+    d = Path(directory) if directory is not None else find_schema_dir()
+    if d is None or not (d / "estimation-0.1.json").is_file():
+        return None
+    return _load_schemas(str(d.resolve()))
+
+
+def _have_jsonschema() -> bool:
+    try:
+        import jsonschema  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def jsonschema_check(
+    schema: dict | str | os.PathLike, documents: Iterable[dict] = ()
+) -> Callable[[dict], list[Issue]]:
+    """A schema plug-in for `validate` from a JSON Schema (needs the `jsonschema` package).
+    `documents` are other schemas its `$ref`s may name (by `$id`, relative refs included),
+    so a profile can refer to the core without a network."""
     try:
         import jsonschema
     except ImportError as e:  # pragma: no cover - depends on the environment
         raise ImportError("JSON Schema validation needs the 'jsonschema' package") from e
-    if not isinstance(schema, dict):
-        schema = json.loads(Path(schema).read_text(encoding="utf-8"))
-    cls = jsonschema.validators.validator_for(schema)
-    v = cls(schema)
+    root: dict = schema if isinstance(schema, dict) else json.loads(Path(schema).read_text(encoding="utf-8"))
+    docs = [d for d in [root, *documents] if "$id" in d]
+    cls = jsonschema.validators.validator_for(root, default=jsonschema.Draft202012Validator)
+    try:
+        from referencing import Registry, Resource
+        from referencing.jsonschema import DRAFT202012
+
+        registry = Registry().with_resources(
+            (d["$id"], Resource.from_contents(d, default_specification=DRAFT202012)) for d in docs
+        )
+        v = cls(root, registry=registry)
+    except ImportError:  # jsonschema < 4.18
+        store = {d["$id"]: d for d in docs}
+        v = cls(root, resolver=jsonschema.RefResolver.from_schema(root, store=store))
 
     def check(rec: dict) -> list[Issue]:
         out = []
-        for e in v.iter_errors(rec):
-            path = "".join(f"[{p}]" if isinstance(p, int) else f".{p}" for p in e.absolute_path)
-            out.append(Issue("error", path.lstrip("."), e.message))
+        for e in v.iter_errors(to_json(rec)):
+            parts = list(e.absolute_path)
+            if e.validator == "required":  # name the missing field, as the built-in checks do
+                m = re.match(r"'(.+)' is a required property", e.message)
+                parts += [m.group(1)] if m else []
+            out.append(Issue("error", _path(parts), _message(e)))
         return out
 
     return check
 
 
+def _path(parts: Iterable[Any]) -> str:
+    return "".join(f"[{p}]" if isinstance(p, int) else f".{p}" for p in parts).lstrip(".")
+
+
+def _message(e: Any) -> str:
+    """jsonschema's message, without the value it quotes when that is long; for a failed
+    anyOf/oneOf, the closest branch's reason instead."""
+    msg = e.message
+    r = repr(e.instance)
+    if len(r) > 80:
+        msg = msg.replace(r, "the value")
+    if e.context:
+        from jsonschema.exceptions import best_match
+
+        best = best_match(e.context)
+        where = _path(list(best.relative_path))
+        msg += f" (closest: {where + ': ' if where else ''}{_message(best)})"
+    return msg
+
+
+@functools.lru_cache(maxsize=32)
+def _schema_checks(directory: str, profile: str | None) -> Callable[[dict], list[Issue]]:
+    """The core check (profile None) or a profile's own rules, without the core again."""
+    sc = _load_schemas(directory)
+    if profile is None:
+        return jsonschema_check(sc.core, sc.documents())
+    doc = sc.profiles[profile]
+    target = {"$ref": f"{doc['$id']}#/$defs/rules"} if "rules" in doc.get("$defs", {}) else doc
+    return jsonschema_check(target, sc.documents())
+
+
 def validate(
     record: dict,
     *,
-    schema: dict | str | os.PathLike | Callable[[dict], Iterable[Issue]] | None = None,
+    schema: Schemas | dict | str | os.PathLike | Callable[[dict], Iterable[Issue]] | None = "auto",
     profiles: dict[str, Callable[[dict], list[Issue]]] | None = None,
     base_dir: str | os.PathLike | None = None,
 ) -> list[Issue]:
@@ -818,18 +928,37 @@ def validate(
 
     Errors make the record invalid; warnings flag missing expected sections, size, a
     digest that doesn't match, or attachment files that don't match their hash; info
-    notes what couldn't be checked. `schema` is a JSON Schema (dict or path) or any
-    callable returning issues; `profiles` adds or replaces profile checks. With
-    `base_dir` (the record's folder), attachment files found there are hashed."""
+    notes what couldn't be checked.
+
+    `schema="auto"` (default) validates against schema/ (`find_schema_dir`): the core
+    plus the rules of each profile in `meta.profiles`; without the schemas or the
+    `jsonschema` package it falls back to the built-in checks. A `Schemas` uses those
+    files; None uses the built-in checks only; any other value (a JSON Schema as dict or
+    path, or a callable returning issues) is checked in addition to the built-in ones.
+    `profiles` adds or replaces profile checks by name. With `base_dir` (the record's
+    folder), attachment files found there are hashed."""
     if not isinstance(record, dict):
         return [Issue("error", "", "an estimation record is a JSON object")]
-    issues = _check_core(record)
+    issues: list[Issue] = []
+    schemas: Schemas | None = None
+    extra = None
+    if isinstance(schema, str) and schema == "auto":
+        schemas = load_schemas()
+        why = "no schema/ found" if schemas is None else "the 'jsonschema' package is not installed"
+        if schemas is not None and not _have_jsonschema():
+            schemas = None
+        if schemas is None:
+            issues.append(Issue("info", "", f"{why}; used the built-in checks"))
+    elif isinstance(schema, Schemas):
+        schemas = schema
+    elif schema is not None:
+        extra = schema
     try:
         enc = to_json(record)
-        issues += _size_issues(enc, len(_dumps(enc).encode()))
     except (EstimationError, ValueError) as e:
-        issues.append(Issue("error", "", f"not encodable as JSON: {e}"))
-        return issues
+        return [*issues, Issue("error", "", f"not encodable as JSON: {e}")]
+    issues += _check_core(enc, structural=schemas is None)
+    issues += _size_issues(enc, len(_dumps(enc).encode()))
 
     try:
         ok = check_digest(record)
@@ -843,15 +972,29 @@ def validate(
             Issue("warning", "meta.core_digest", "does not match: the result sections changed after writing")
         )
 
-    checks = {**PROFILES, **(profiles or {})}
-    for p in (record.get("meta") or {}).get("profiles") or []:
-        if p in checks:
-            issues += [Issue(i.level, i.path, f"[{p}] {i.message}") for i in checks[p](record)]
+    key = str(schemas.directory.resolve()) if schemas is not None else ""
+    if schemas is not None:
+        issues += _schema_checks(key, None)(enc)
+    claimed = (enc.get("meta") or {}).get("profiles") if isinstance(enc.get("meta"), dict) else None
+    seen = {(i.level, i.path, i.message) for i in issues}
+    for p in claimed if isinstance(claimed, list) else []:
+        if profiles and p in profiles:
+            found = profiles[p](enc)
+        elif schemas is not None and p in schemas.profiles:
+            found = _schema_checks(key, p)(enc)
+        elif schemas is None and p in PROFILES:
+            found = PROFILES[p](enc)
         else:
             issues.append(Issue("info", "meta.profiles", f"no checks known for profile {p!r}"))
+            continue
+        # a profile's rules include those it builds on: report each problem once
+        for i in found:
+            if (i.level, i.path, i.message) not in seen:
+                seen.add((i.level, i.path, i.message))
+                issues.append(Issue(i.level, i.path, f"[{p}] {i.message}"))
 
-    if schema is not None:
-        check = schema if callable(schema) else jsonschema_check(schema)
+    if extra is not None:
+        check = extra if callable(extra) else jsonschema_check(extra)
         issues += list(check(record))
 
     if base_dir is not None:
@@ -871,42 +1014,63 @@ def validate(
 # ---------------------------------------------------------------- redactor
 
 
-def identifying_paths(schema: dict) -> list[str]:
+def identifying_paths(schema: dict, documents: Iterable[dict] = ()) -> list[str]:
     """Paths of the fields a JSON Schema marks `"x-identifying": true`, in the syntax of
     DEFAULT_IDENTIFYING. Follows properties, items, additionalProperties,
-    patternProperties, allOf/anyOf/oneOf and local `$ref`s."""
+    patternProperties, allOf/anyOf/oneOf and `$ref`s: local ones, and ones to `documents`
+    by `$id` (relative to the referring file's `$id`, as a profile refers to the core)."""
     found: list[str] = []
+    by_id = {d["$id"]: d for d in [schema, *documents] if isinstance(d, dict) and "$id" in d}
 
-    def resolve(ref: str) -> dict:
-        node: Any = schema
-        for part in ref.removeprefix("#/").split("/"):
+    def resolve(ref: str, doc: dict) -> tuple[Any, dict] | None:
+        uri = urljoin(doc.get("$id", ""), ref)
+        doc_uri, _, frag = uri.partition("#")
+        target = doc if not doc_uri or doc_uri == doc.get("$id") else by_id.get(doc_uri)
+        if target is None:
+            return None  # outside the documents given
+        node: Any = target
+        for part in [p for p in frag.split("/") if p]:
             node = node[part.replace("~1", "/").replace("~0", "~")]
-        return node
+        return node, target
 
-    def walk(node: Any, path: str, seen: frozenset) -> None:
+    def walk(node: Any, path: str, seen: frozenset, doc: dict) -> None:
         if not isinstance(node, dict):
             return
         if node.get("x-identifying") is True and path:
             found.append(path)
             return
         ref = node.get("$ref")
-        if isinstance(ref, str) and ref.startswith("#") and ref not in seen:
-            walk(resolve(ref), path, seen | {ref})
+        if isinstance(ref, str):
+            key = urljoin(doc.get("$id", ""), ref)
+            hit = resolve(ref, doc) if key not in seen else None
+            if hit is not None:
+                walk(hit[0], path, seen | {key}, hit[1])
         join = lambda k: f"{path}.{k}" if path else k
         for k, sub in (node.get("properties") or {}).items():
-            walk(sub, join(k), seen)
+            walk(sub, join(k), seen, doc)
         for sub in (node.get("patternProperties") or {}).values():
-            walk(sub, join("*"), seen)
+            walk(sub, join("*"), seen, doc)
         if isinstance(node.get("additionalProperties"), dict):
-            walk(node["additionalProperties"], join("*"), seen)
+            walk(node["additionalProperties"], join("*"), seen, doc)
         if isinstance(node.get("items"), dict):
-            walk(node["items"], f"{path}[*]", seen)
+            walk(node["items"], f"{path}[*]", seen, doc)
         for key in ("allOf", "anyOf", "oneOf"):
             for sub in node.get(key) or []:
-                walk(sub, path, seen)
+                walk(sub, path, seen, doc)
 
-    walk(schema, "", frozenset())
+    walk(schema, "", frozenset(), schema)
     return sorted(set(found))
+
+
+def record_identifying_paths(record: dict, schemas: Schemas) -> list[str]:
+    """The identifying paths for one record: the core's marks plus those of each profile
+    the record claims."""
+    docs = schemas.documents()
+    paths = set(identifying_paths(schemas.core, docs))
+    for p in (record.get("meta") or {}).get("profiles") or []:
+        if p in schemas.profiles:
+            paths |= set(identifying_paths(schemas.profiles[p], docs))
+    return sorted(paths)
 
 
 def _split(path: str) -> list[str]:
@@ -939,17 +1103,27 @@ def redact(
     record: dict,
     *,
     paths: Iterable[str] | None = None,
-    schema: dict | None = None,
+    schema: Schemas | dict | str | None = "auto",
     salt: bytes | str | None = None,
     by: dict | None = None,
 ) -> dict:
     """A copy of `record` with its identifying fields removed or, with `salt`, replaced
     by an HMAC-SHA256 of the value, so records redacted with the same salt still compare
-    equal. The fields are `paths`, else those `schema` marks, else DEFAULT_IDENTIFYING.
-    Appends a `history` entry listing the fields changed. The result sections covered by
-    the core digest are never touched."""
+    equal. Appends a `history` entry listing the fields changed. The result sections
+    covered by the core digest are never touched.
+
+    The fields are `paths` if given; else those marked `x-identifying` in the core and
+    each profile the record claims (`schema="auto"` finds schema/, or pass `Schemas`),
+    or in one JSON Schema given as a dict; else (no schemas, or None) DEFAULT_IDENTIFYING."""
     if paths is None:
-        paths = identifying_paths(schema) if schema is not None else DEFAULT_IDENTIFYING
+        if isinstance(schema, str) and schema == "auto":
+            schema = load_schemas()
+        if isinstance(schema, Schemas):
+            paths = record_identifying_paths(record, schema)
+        elif isinstance(schema, dict):
+            paths = identifying_paths(schema)
+        else:
+            paths = DEFAULT_IDENTIFYING
     rec = copy.deepcopy(record)
     if isinstance(salt, str):
         salt = salt.encode()
@@ -983,12 +1157,25 @@ def redact(
 # ---------------------------------------------------------------- command line
 
 
+def _cli_schemas(ap: argparse.ArgumentParser, directory: str | None, off: bool) -> Schemas | str | None:
+    if off:
+        return None
+    if directory is None:
+        return "auto"
+    schemas = load_schemas(directory)
+    if schemas is None:
+        ap.error(f"{directory}: no estimation-0.1.json there")
+    return schemas
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="estimation", description="estimation record tools")
     sub = ap.add_subparsers(dest="cmd", required=True)
     v = sub.add_parser("validate", help="check records; exit 1 on errors")
     v.add_argument("files", nargs="+")
-    v.add_argument("--schema", help="JSON Schema to validate against as well (needs jsonschema)")
+    v.add_argument("--schema-dir", help="folder with estimation-0.1.json and profiles/ (default: schema/)")
+    v.add_argument("--no-schema", action="store_true", help="built-in checks only")
+    v.add_argument("--schema", help="another JSON Schema to check against as well")
     v.add_argument("-q", "--quiet", action="store_true", help="errors only")
     r = sub.add_parser("redact", help="remove or hash identifying fields")
     r.add_argument("file")
@@ -999,7 +1186,8 @@ def main(argv: list[str] | None = None) -> int:
         help="replace values with HMAC-SHA256; the salt comes from --salt-file or $ESTIMATION_REDACT_SALT",
     )
     r.add_argument("--salt-file")
-    r.add_argument("--schema", help="take the fields from this schema's x-identifying marks")
+    r.add_argument("--schema-dir", help="take the fields from the core and claimed profiles in this folder")
+    r.add_argument("--schema", help="take the fields from this one schema's x-identifying marks")
     r.add_argument("--path", action="append", default=[], help="also redact this path (repeatable)")
     d = sub.add_parser("digest", help="print the core digest and whether it matches")
     d.add_argument("file")
@@ -1007,12 +1195,12 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "validate":
         bad = 0
+        schemas = _cli_schemas(ap, args.schema_dir, args.no_schema)
         for f in args.files:
-            issues = validate(
-                loads(Path(f).read_bytes(), nonfinite="string"),
-                schema=args.schema,
-                base_dir=Path(f).parent,
-            )
+            rec = loads(Path(f).read_bytes(), nonfinite="string")
+            issues = validate(rec, schema=schemas, base_dir=Path(f).parent)
+            if args.schema:
+                issues += jsonschema_check(args.schema)(rec)
             for i in issues:
                 if not args.quiet or i.level == "error":
                     print(f"{f}: {i}")
@@ -1032,8 +1220,15 @@ def main(argv: list[str] | None = None) -> int:
                 salt = os.environ.get("ESTIMATION_REDACT_SALT", "").encode() or None
             if not salt:
                 ap.error("--hash needs a salt: --salt-file or $ESTIMATION_REDACT_SALT")
-        schema = json.loads(Path(args.schema).read_text(encoding="utf-8")) if args.schema else None
-        paths = identifying_paths(schema) if schema is not None else list(DEFAULT_IDENTIFYING)
+        if args.schema:
+            paths = identifying_paths(json.loads(Path(args.schema).read_text(encoding="utf-8")))
+        else:
+            schemas = _cli_schemas(ap, args.schema_dir, False)
+            paths = (
+                record_identifying_paths(rec, schemas)
+                if isinstance(schemas, Schemas)
+                else list(DEFAULT_IDENTIFYING)
+            )
         out = redact(rec, paths=paths + args.path, salt=salt)
         Path(args.output).write_text(_dumps(out, 1) + "\n", encoding="utf-8")
         print(f"{args.output}: {len(out['history'][-1]['fields'])} fields {out['history'][-1]['method']}")

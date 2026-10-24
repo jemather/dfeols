@@ -919,13 +919,27 @@ Interaction order: kept as specified (final, no longer to revisit).
    - For step 3: `jsonschema_check` builds a validator with no registry, so a profile file
      can't resolve `../estimation-0.1.json`; `identifying_paths` needs the core and each
      claimed profile (it follows local `$ref`s only); `jsonschema` is not in `.venv`, so the
-     schema tests run only where it is installed (system `python3` has 4.10.3).
+     schema tests run only where it is installed (system `python3` has 4.10.3). **All three
+     done** in step 3 below; `jsonschema` 4.26 is now in `.venv`.
    - Not written: `estimation-collection/0.1` (not part of this step).
 3. `src/dfeols/estimation.py`: writer, reader, validator, redactor, core digest, attachment
-   spilling; tests. **Done** (`tests/test_estimation.py`), written against this document
-   because the schema files weren't committed yet: profile checks and the identifying-field
-   list are hand-written stand-ins, and `validate(schema=...)` / `redact(schema=...)` take the
-   JSON Schema once it exists. Choices the schema should confirm or change:
+   spilling; tests. **Done** (`tests/test_estimation.py`; d89af48, then switched to the schema
+   files):
+   - `validate` (default `schema="auto"`) checks the core schema plus the `$defs/rules` of
+     each profile in `meta.profiles`, with every file in `schema/` in a `referencing`
+     registry, so relative `$ref`s resolve offline. Errors repeated by a profile that builds on
+     another are reported once. What JSON Schema can't express stays in code: expected
+     sections, size limits, the digest, link → attachment ids, attachment hashes.
+   - `redact` takes the `x-identifying` marks of the core plus each claimed profile
+     (`identifying_paths` now follows `$ref`s across files). A record that has an
+     `extensions.dfeols` block but doesn't claim `dfeols/0.1` keeps that block's marked fields.
+   - `schema/` is found as `$ESTIMATION_SCHEMA_DIR` or the repository checkout. Without it,
+     or without `jsonschema`, both fall back to the built-in checks and `DEFAULT_IDENTIFYING`,
+     and `validate` reports the fallback as info. A wheel doesn't include `schema/` yet:
+     shipping it as package data is a packaging decision for later.
+   - CLI: `--schema-dir DIR`, `--no-schema` (validate), `--schema FILE` (one extra schema).
+
+   Choices made in the library before the schema (the schema confirmed them):
    - `meta.core_digest` is `{algorithm: "sha256", canonicalization: "RFC8785", value}`, over
      the sections as written (after spilling, non-finite values as strings).
    - The 10,000-element limit counts list items, with nested lists counted by their leaves (a

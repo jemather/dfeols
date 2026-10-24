@@ -10,7 +10,9 @@ break the API).
 ### Added
 - `dfeols.estimation`: writer, reader, validator and redactor for `estimation/0.1` records
   (docs/design/estimation-format.md), with the RFC 8785 core digest and automatic spilling of
-  large structures to attachments; `dfeols estimation {validate,redact,digest}`.
+  large structures to attachments; `dfeols estimation {validate,redact,digest}`. Validation uses
+  the JSON Schemas in `schema/` (core plus each claimed profile; needs `jsonschema`), and
+  redaction takes the fields they mark identifying.
 - JSON Schemas for `estimation/0.1` (`schema/estimation-0.1.json`) and the `inference`,
   `linear-fe`, `iv` and `dfeols` profiles (`schema/profiles/`), with `x-identifying` marks,
   example records and `tests/test_schema.py`.
