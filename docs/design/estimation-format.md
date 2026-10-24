@@ -1005,3 +1005,20 @@ Interaction order: kept as specified (final, no longer to revisit).
    undeclared (warning) against unclaimed bases; `tests/test_catalog.py` as the PR check;
    CONTRIBUTING.md section; `dfeols[estimation]` extra; CI checks the wheel holds the schemas.
    The schema files are CC0 (decided after this step; see Decisions).
+
+Toward other packages (Ted, 2026-10-24: the format gets its own repository and is offered to
+other tools, by issue first; start with pyfixest, then fixest, then reghdfe):
+
+5. **dfeols writes records**: `Result` → record with full provenance and the dfeols
+   extension; every record dfeols writes is validated in the tests.
+6. **Worked converters**: pyfixest (Python), fixest (R) and reghdfe `e()` (Stata), each
+   producing records that validate against `linear-fe/0.1`. They test the profile mappings
+   on real output and give each tool's authors code to adapt.
+7. **Own repository**: under a GitHub organisation; clean specification (this document
+   without its decision history); the CC0 schemas, catalog and examples; a standalone
+   validator package (permissive license) that dfeols depends on. Open: organisation and
+   name ("estimation" is generic; check PyPI and GitHub), validator license (MIT or
+   Apache-2.0).
+8. **Feedback, then a version**: share 0.1 as a draft for comments; publish a version
+   before asking anyone to merge a writer.
+
