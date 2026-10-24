@@ -21,7 +21,7 @@
               "x-tools": {"fixest": "nobs", "reghdfe": "e(N)", "linearmodels": "nobs", "pyfixest": "_N", "lfe": "N", "areg/xtreg": "e(N)", "FixedEffectModels.jl": "nobs"}
             },
             "nobs_full": {
-              "description": "Rows used plus singleton rows dropped.",
+              "description": "Rows used plus singleton rows dropped. Optional; tools without it omit it (fixest nobs_origin counts rows before NA and subset removal too, so it isn't this).",
               "x-tools": {"reghdfe": "e(N_full)"}
             },
             "n_singletons": {
@@ -29,8 +29,8 @@
               "x-tools": {"reghdfe": "e(num_singletons)", "areg/xtreg": "sum of e(ksingle)", "pyfixest": "warning text only", "fixest": "not stored separately"}
             },
             "df_residual": {
-              "description": "N - K - absorbed levels. Tools whose stored value is min(G) - 1 under clustering (FixedEffectModels.jl dof_residual, pyfixest _dfd) put that in vcov.df_t instead.",
-              "x-tools": {"fixest": "df.residual()", "reghdfe": "e(df_r)", "linearmodels": "df_resid", "areg/xtreg": "e(df_r)", "FixedEffectModels.jl": "dof_residual (unclustered only)"}
+              "description": "As the tool reports it, normally N - K - absorbed levels. FixedEffectModels.jl dof_residual and pyfixest _dfd are min(G) - 1 under clustering: record them as {value, definition}.",
+              "x-tools": {"fixest": "df.residual()", "reghdfe": "e(df_r)", "linearmodels": "df_resid", "areg/xtreg": "e(df_r)", "FixedEffectModels.jl": "dof_residual", "pyfixest": "_dfd"}
             },
             "df_model": {"x-tools": {"reghdfe": "e(df_m)", "linearmodels": "df_model", "areg/xtreg": "e(df_m)", "FixedEffectModels.jl": "dof"}},
             "df_absorbed": {

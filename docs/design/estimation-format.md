@@ -1,8 +1,8 @@
 # Design: the `estimation` format (`estimation/0.1`)
 
 Status: draft 6 (2026-10-24), all design questions settled (`ssc` last). Tool fields verified
-and the JSON Schema written (2026-10-24, Next steps 1–2); six points from that are listed under
-Questions for Ted. Draft 6
+and the JSON Schema written (2026-10-24, Next steps 1–2); Ted answered the seven points they
+raised (Questions for Ted), so nothing is open. Draft 6
 settles term names (verbatim, plus an optional R-style canonical form), the `linear-fe`
 required set and the core digest (on by default). Draft 5 added canonical names, flagged disagreements and collection kinds. Draft 1 was the dfeols-only `dfeols-result/1`
 (b903bc1); draft 2 made it general (faddceb, as `result-format.md`); draft 3 (463110d) settled
@@ -552,9 +552,9 @@ here); StataNow 19 `areg` and `xtreg` help; FixedEffectModels.jl source (`FixedE
 | Profile name | Meaning | fixest | reghdfe | linearmodels | others |
 |---|---|---|---|---|---|
 | ✓ `nobs` | rows used | `nobs` | `e(N)` | `nobs` | pyfixest `_N`; lfe `N`; areg/xtreg `e(N)`; FEM.jl `nobs` |
-| `nobs_full` | rows used plus singleton rows dropped | — (`nobs_origin`† is earlier: before subset, NA and singleton removal, so it is `specification.sample.rows_input`) | `e(N_full)` | — | |
+| `nobs_full` | rows used plus singleton rows dropped | — (`nobs_origin`† is earlier: before subset, NA and singleton removal; the writer chooses where it goes, e.g. `specification.sample.rows_input`) | `e(N_full)` | — | |
 | ✓ `n_singletons` | singleton rows dropped | not stored separately (`obs_selection$obsRemoved` mixes NA and FE removals) | `e(num_singletons)` | — | pyfixest: a warning only, not stored; areg/xtreg `e(ksingle)` (per absorbed variable) |
-| ✓ `df_residual` | residual df (N − K − absorbed levels) | `df.residual`* | `e(df_r)` | `df_resid` | areg/xtreg `e(df_r)`; FEM.jl `dof_residual` **only without clustering** (with clustering it is min(G) − 1, i.e. `vcov.df_t`); pyfixest `_dfd` is the F-test df, also min(G) − 1 under clustering |
+| ✓ `df_residual` | residual df, as the tool reports it (N − K − absorbed levels, or `{value, definition}` when not) | `df.residual`* | `e(df_r)` | `df_resid` | areg/xtreg `e(df_r)`; FEM.jl `dof_residual` (min(G) − 1 under clustering); pyfixest `_dfd` (the F-test df, min(G) − 1 under clustering) |
 | `df_model` | model df | | `e(df_m)` | `df_model` | areg/xtreg `e(df_m)`; FEM.jl `dof` |
 | `df_absorbed` | df lost to the FEs | | `e(df_a)` | | areg `e(df_a)`, `e(dfabsorb)` per variable; xtreg `e(df_a)` (panel effect); FEM.jl `dof_fes` (an FE nested in a cluster counts 1) |
 | `df_absorbed_nested` | FE df redundant because nested in a cluster | | `e(df_a_nested)` | | |
@@ -584,7 +584,10 @@ result object (`R/fixest_env.R`) but not in the documented Value list.
    checked. `nobs`, `n_singletons` and `specification.options.drop_singletons` are all required,
    so the difference is visible. *(Corrected 2026-10-24: draft 6 said fixest and pyfixest keep
    singletons unless asked; their current documentation and source say otherwise.)*
-2. **`df_residual`** = N − K − absorbed levels (the model's residual df), always. The df used
+2. **`df_residual`** is the model's residual df, N − K − absorbed levels. *(Revised by Ted,
+   2026-10-24: a writer records the tool's own value and doesn't have to recompute it; when the
+   tool's value means something else, e.g. min(G) − 1 under clustering in FEM.jl and pyfixest,
+   it uses `{value, definition}`.)* The df used
    for t tests and CIs goes in `vcov.df_t`, with the tool's convention (reghdfe and fixest
    use G − 1 under clustering).
 3. **`r2_within`** is not required (areg has none, lfe defines it differently). It is
@@ -869,34 +872,23 @@ or source. Corrections are made in place above; this list says what was found.
 
 ## Questions for Ted
 
-None open on the design. Raised by the verification and the schema, to confirm or change
-(the schema follows the choice shown):
+None open. Ted's answers (2026-10-24) to the points raised by the verification and the schema:
 
-1. **Singleton rationale (decision 1).** The tools mostly *agree* now: reghdfe, fixest, pyfixest
-   and FEM.jl all drop singletons by default. The required set still makes sense (lfe, Stata
-   and user overrides differ), but the reason given was wrong and has been corrected.
-2. **lfe within R² (decision 3).** Not confirmed that lfe defines it differently. The decision
-   stands on `areg` alone.
-3. **`nobs_full` for fixest.** `nobs_origin` is not `nobs_full`, so fixest has no direct
-   `nobs_full`; mapped to `specification.sample.rows_input` instead.
-4. ~~Convergence (decision 6).~~ **Settled by Ted (2026-10-24):** not required, since several
-   tools don't report it by default. `structures.numerics.iterative`, `iterations` and
-   `converged` are vocabulary only.
-5. **CSL `id`.** CSL requires `id` and `type`; the schema requires only `type`, so a hand-written
-   citation without an `id` is still valid.
-6. **`df_residual` vs FEM.jl and pyfixest.** Their stored "residual" df is min(G) − 1 under
-   clustering. Writers for those tools must compute N − K − absorbed for `df_residual` and put
-   the tool's value in `vcov.df_t`. No design change; noted for converters.
-7. **`iv/0.1`: `structures.first_stage` from required to expected.** See the IV survey below.
-   Applying the decision 6 rule: of the 10 tools, only ivreg2/ivreghdfe (joint weak-ID
-   statistics), R `ivreg` (in `summary`), lfe, pyfixest and FEM.jl compute a first-stage
-   statistic by default; Stata `ivregress`, fixest, linearmodels and estimatr compute them on
-   request. The profile now requires only `endogenous` and `instruments` (every tool stores
-   them) and marks `first_stage` as expected (validators warn when it's missing). Ted to
-   confirm.
+1. **Singleton rationale (decision 1):** the required set stays; the corrected reason stands.
+2. **lfe within R² (decision 3):** the decision stands on `areg` alone.
+3. **`nobs_full` for fixest:** left to each tool's writer. `nobs_full` is optional; a fixest
+   writer may omit it, and `nobs_origin` goes wherever the writer judges it fits
+   (`specification.sample.rows_input` fits its meaning).
+4. **Convergence (decision 6):** not required, since several tools don't report it by default.
+   `structures.numerics.iterative`, `iterations` and `converged` are vocabulary only.
+5. **CSL `id`:** not required; the schema requires only `type`.
+6. **`df_residual` in FEM.jl and pyfixest:** the tool's own convention, not a requirement on
+   the writer (decision 2 revised). `df_residual` stays required, but it holds the residual df
+   as the tool reports it; when that isn't N − K − absorbed (FEM.jl `dof_residual` and pyfixest
+   `_dfd` are min(G) − 1 under clustering), writers say so with `{value, definition}`.
+7. **`iv/0.1`:** `structures.first_stage` is expected, not required (see the IV survey).
 
-Still to revisit: interaction order ("as specified" for now; revisit if matching across tools
-needs a normalised order in `name` as well).
+Interaction order: kept as specified (final, no longer to revisit).
 
 ## Next
 

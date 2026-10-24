@@ -205,7 +205,7 @@
       "type": "object",
       "properties": {
         "nobs": {"description": "Rows used in estimation.", "$ref": "#/$defs/count_metric"},
-        "df_residual": {"description": "Residual degrees of freedom of the model: N - K - absorbed levels. The df used for t tests goes in structures.vcov[].df_t.", "$ref": "#/$defs/metric"},
+        "df_residual": {"description": "Residual degrees of freedom as the tool reports it, normally N - K - absorbed levels; use {value, definition} when the tool's value means something else (e.g. min(G) - 1 under clustering). The df used for t tests goes in structures.vcov[].df_t.", "$ref": "#/$defs/metric"},
         "df_model": {"description": "Model degrees of freedom.", "$ref": "#/$defs/metric"},
         "conf_level": {"description": "Level of conf_low/conf_high in parameters.", "$ref": "#/$defs/metric"},
         "r2": {"$ref": "#/$defs/metric"},
