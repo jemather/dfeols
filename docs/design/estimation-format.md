@@ -1062,6 +1062,13 @@ other tools, by issue first; start with pyfixest, then fixest, then reghdfe):
    personal account; `estimation`, `estimation-format`, `estrec` were free on PyPI
    (`estimates` is taken); `estimation-format`, `estimation-records`, `open-estimation` were
    free on github.com. The format's own name stays `estimation`.
+   **Built** (2026-10-24) in `/srv/dfeols/estimation` (first commit 1fc2cfd, not yet pushed):
+   `spec/estimation.md` (this document without its history), `spec/profiles/`, the schemas
+   from a33a767 with `$id`s at `https://estimation-format.github.io/estimation/schema/` (Pages
+   from the repo for now; Ted wants feedback on a `.org` domain before 0.1 is published),
+   `dfeols/0.1` as the first tool profile in its catalog, and the `estimation_format` package.
+   The spec text is CC0 too (Ted). Still to do: dfeols depends on `estimation-format` and
+   drops its own copy of the schemas and `dfeols.estimation`; until then, change both.
 8. **Feedback, then a version**: share 0.1 as a draft for comments; publish a version
    before asking anyone to merge a writer.
 
