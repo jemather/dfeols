@@ -675,7 +675,7 @@ reghdfe `tolerance()`, pyfixest `fixef_tol`, FEM.jl `tol`, Stata `tolerance()`),
 
 **`structures.vcov`**: `type` (vocabulary: `iid`, `HC0`-`HC3`, `CRV1`, `CRV3`,
 `twoway`/`multiway`, `HAC`, `DK`; mapped to fixest `vcov=`, reghdfe `vce()`, linearmodels
-`cov_type`), `cluster`, `n_clusters` per variable (reghdfe `e(clust#)`) and the minimum
+`cov_type`), `cluster`, `n_clusters` per variable (reghdfe `e(N_clust#)`) and the minimum
 (`e(N_clust)`), and `ssc` written out with every factor: fixest `ssc()` (`K.adj`, `K.fixef`,
 `G.adj`, `G.df`, `t.df`, `K.exact`), pyfixest `ssc()` (`k_adj`, `k_fixef`, `G_adj`, `G_df`;
 defaults `True`, `"nonnested"`, `True`, `"min"`; the resolved values are in `_ssc_dict`, the

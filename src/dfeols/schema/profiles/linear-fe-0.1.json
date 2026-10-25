@@ -32,8 +32,8 @@
               "x-tools": {"reghdfe": "e(num_singletons)", "areg/xtreg": "sum of e(ksingle)", "pyfixest": "warning text only", "fixest": "not stored separately"}
             },
             "df_residual": {
-              "description": "As the tool reports it, normally N - K - absorbed levels. FixedEffectModels.jl dof_residual and pyfixest _dfd are min(G) - 1 under clustering: record them as {value, definition}.",
-              "x-tools": {"fixest": "df.residual()", "reghdfe": "e(df_r)", "linearmodels": "df_resid", "areg/xtreg": "e(df_r)", "FixedEffectModels.jl": "dof_residual", "pyfixest": "_dfd"}
+              "description": "As the tool reports it, normally N - K - absorbed levels. FixedEffectModels.jl dof_residual and reghdfe e(df_r) are min(G) - 1 under clustering, and pyfixest has no residual df (its _dfd is the Wald test's denominator df: min(G) - 1 under clustering, else N - k - all FE levels): record these as {value, definition}.",
+              "x-tools": {"fixest": "df.residual()", "reghdfe": "e(df_r)", "linearmodels": "df_resid", "areg/xtreg": "e(df_r)", "FixedEffectModels.jl": "dof_residual", "pyfixest": "none (_dfd, the Wald denominator df, with its definition)"}
             },
             "df_model": {"x-tools": {"reghdfe": "e(df_m)", "linearmodels": "df_model", "areg/xtreg": "e(df_m)", "FixedEffectModels.jl": "dof"}},
             "df_absorbed": {
@@ -55,7 +55,7 @@
             "r2_overall": {"x-tools": {"linearmodels": "rsquared_overall", "xtreg": "e(r2_o)"}},
             "r2_inclusive": {"description": "R2 including the fit of the FEs.", "x-tools": {"linearmodels": "rsquared_inclusive"}},
             "sq_corr_fitted": {"description": "Squared corr(y, fitted).", "x-tools": {"fixest": "sq.cor", "linearmodels": "corr_squared_*"}},
-            "sigma": {"x-tools": {"fixest": "sigma()", "reghdfe": "e(rmse)", "linearmodels": "sqrt(s2)", "areg/xtreg": "e(rmse)", "xtreg": "e(sigma_e)", "pyfixest": "_rmse", "lfe": "rse"}},
+            "sigma": {"description": "Root mean squared error, sqrt(RSS / (N - K)), K the regressors plus absorbed levels as the tool counts them (fixest sigma(), reghdfe e(rmse), not over a clustered df_residual). A tool with another definition records {value, definition} (pyfixest _rmse is sqrt(RSS / N)).", "x-tools": {"fixest": "sigma()", "reghdfe": "e(rmse)", "linearmodels": "sqrt(s2)", "areg/xtreg": "e(rmse)", "xtreg": "e(sigma_e)", "pyfixest": "_rmse (sqrt(RSS / N): {value, definition})", "lfe": "rse"}},
             "sigma_fe": {"description": "Standard deviation of the FE.", "x-tools": {"xtreg": "e(sigma_u)"}},
             "rho": {"description": "Share of variance due to the FE.", "x-tools": {"xtreg": "e(rho)"}},
             "log_lik": {"x-tools": {"fixest": "loglik", "reghdfe": "e(ll)", "linearmodels": "loglik", "areg/xtreg": "e(ll)", "FixedEffectModels.jl": "loglikelihood()"}},
