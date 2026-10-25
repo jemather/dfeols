@@ -404,7 +404,11 @@ def test_profiles(mode):
     del rec["parameters"][0]["p_value"]
     found = errors(est.validate(rec, schema=mode))
     paths = {i.path for i in found}
-    expected = {"metrics.n_singletons", "specification.options.drop_singletons", "extensions.dfeols"}
+    expected = {"specification.options.drop_singletons", "extensions.dfeols"}
+    assert "metrics.n_singletons" not in paths  # expected, not required
+    assert any(
+        i.level == "warning" and i.path == "metrics.n_singletons" for i in est.validate(rec, schema=mode)
+    )
     if mode is None:
         expected |= {"structures.vcov.ssc", "structures.fixed_effects[1]", "parameters[0]"}
     else:
@@ -436,15 +440,15 @@ def test_schema_plugin():
 
 def test_default_uses_packaged_schemas_or_says_it_fell_back(monkeypatch, tmp_path):
     rec = est.prepare(fe_record())
-    del rec["metrics"]["n_singletons"]
+    del rec["specification"]["options"]["drop_singletons"]
     schemas()
     issues = est.validate(rec)
     assert not any("built-in" in i.message for i in issues)
-    assert [i.path for i in errors(issues)] == ["metrics.n_singletons"]
+    assert [i.path for i in errors(issues)] == ["specification.options.drop_singletons"]
     monkeypatch.setattr(est, "PACKAGED_SCHEMAS", tmp_path)  # an installation without them
     issues = est.validate(rec)
     assert any(i.level == "info" and "built-in" in i.message for i in issues)
-    assert "metrics.n_singletons" in {i.path for i in errors(issues)}
+    assert "specification.options.drop_singletons" in {i.path for i in errors(issues)}
 
 
 def test_profile_file_resolves_the_core_offline():
@@ -455,8 +459,8 @@ def test_profile_file_resolves_the_core_offline():
     rec = est.prepare(fe_record())
     assert check(rec) == []
     rec["meta"]["status"] = "great"  # a core rule
-    del rec["metrics"]["n_singletons"]  # a profile rule
-    assert {i.path for i in check(rec)} >= {"meta.status", "metrics.n_singletons"}
+    del rec["specification"]["options"]["drop_singletons"]  # a profile rule
+    assert {i.path for i in check(rec)} >= {"meta.status", "specification.options.drop_singletons"}
 
 
 def test_size_limits_match_schema():
@@ -470,7 +474,7 @@ def test_size_limits_match_schema():
 
 def draft_profile(rules_include_base=False, deviations=None):
     """A tool profile from a local folder: builds on linear-fe/0.1 but (by default) doesn't
-    include its rules, and declares that it doesn't store n_singletons."""
+    include its rules, and declares that it doesn't record drop_singletons."""
     sc = schemas()
     core_id = sc.core["$id"]
     rules = {
@@ -487,7 +491,7 @@ def draft_profile(rules_include_base=False, deviations=None):
         "x-extends": ["linear-fe/0.1"],
         "x-deviations": deviations
         if deviations is not None
-        else [{"path": "metrics.n_singletons", "reason": "toolx doesn't count singletons"}],
+        else [{"path": "specification.options.drop_singletons", "reason": "toolx has no such option"}],
         "allOf": [{"$ref": core_id}, {"$ref": "#/$defs/rules"}],
         "$defs": {"rules": rules},
     }
@@ -515,24 +519,25 @@ def test_tool_profile_departures_declared_and_not(tmp_path):
     (tmp_path / "toolx-0.1.json").write_text(json.dumps(draft_profile()))
     sc = est.load_schemas([tmp_path])
     rec = toolx_record()
-    del rec["metrics"]["n_singletons"]  # declared
-    del rec["specification"]["options"]["drop_singletons"]  # not declared
+    del rec["specification"]["options"]["drop_singletons"]  # declared
+    del rec["structures"]["fixed_effects"][1]["levels"]  # not declared
     issues = est.validate(rec, schema=sc)
     assert errors(issues) == []  # valid under the tool's own profile
     by_path = {i.path: i for i in issues}
-    assert by_path["metrics.n_singletons"].level == "info"
-    assert "as declared: toolx doesn't count singletons" in by_path["metrics.n_singletons"].message
-    assert by_path["specification.options.drop_singletons"].level == "warning"
-    assert "without a declaration" in by_path["specification.options.drop_singletons"].message
+    declared = by_path["specification.options.drop_singletons"]
+    assert declared.level == "info"
+    assert "as declared: toolx has no such option" in declared.message
+    assert by_path["structures.fixed_effects[1].levels"].level == "warning"
+    assert "without a declaration" in by_path["structures.fixed_effects[1].levels"].message
     assert not any("also meets" in i.message for i in issues)
 
 
 def test_profile_that_includes_its_base_reports_once(tmp_path):
     (tmp_path / "toolx-0.1.json").write_text(json.dumps(draft_profile(True, [])))
     rec = toolx_record()
-    del rec["metrics"]["n_singletons"]
+    del rec["specification"]["options"]["drop_singletons"]
     issues = est.validate(rec, schema=est.load_schemas([tmp_path]))
-    hits = [i for i in issues if i.path == "metrics.n_singletons"]
+    hits = [i for i in issues if i.path == "specification.options.drop_singletons"]
     assert [(i.level, i.message.split("]")[0]) for i in hits] == [("error", "[toolx/0.1")]
 
 
@@ -687,7 +692,7 @@ def test_cli(tmp_path, capsys, monkeypatch):
 def test_cli_schema_options(tmp_path, capsys):
     p = tmp_path / "a.estimation.json"
     rec = est.prepare(fe_record())
-    del rec["metrics"]["n_singletons"]
+    del rec["specification"]["options"]["drop_singletons"]
     p.write_text(json.dumps(rec))
     assert est.main(["validate", "--no-schema", str(p)]) == 1
     assert "built-in" not in capsys.readouterr().out
@@ -722,3 +727,22 @@ def test_schema_examples_validate(name):
     schemas()
     rec = est.read(est.PACKAGED_SCHEMAS / "examples" / f"{name}.estimation.json")
     assert errors(est.validate(rec)) == []
+
+
+def test_expected_profile_fields_warn():
+    """x-expected in a claimed profile's rules: missing is a warning, not an error."""
+    sc = schemas()
+    rec = est.prepare(fe_record())
+    del rec["metrics"]["n_singletons"]
+    issues = est.validate(rec, schema=sc)
+    assert errors(issues) == []
+    hits = [i for i in issues if i.path == "metrics.n_singletons"]
+    assert [(i.level, i.message) for i in hits] == [("warning", "[linear-fe/0.1] expected, missing")]
+    assert ("metrics", "n_singletons") in est.expected_paths(
+        {"$ref": sc.profiles["dfeols/0.1"]["$id"] + "#/$defs/rules"}, sc.documents()
+    )
+    iv = json.loads((est.PACKAGED_SCHEMAS / "examples" / "iv.estimation.json").read_text())
+    del iv["structures"]["first_stage"]
+    issues = est.validate(iv, schema=sc)
+    assert errors(issues) == []
+    assert ("warning", "structures.first_stage") in {(i.level, i.path) for i in issues}

@@ -3,7 +3,7 @@
   "$id": "https://raw.githubusercontent.com/jemather/dfeols/main/src/dfeols/schema/profiles/linear-fe-0.1.json",
   "title": "linear-fe/0.1",
   "x-license": "CC0-1.0",
-  "description": "Profile for linear models with absorbed fixed effects (fixest, lfe; pyfixest, linearmodels; reghdfe, areg, xtreg; FixedEffectModels.jl). Requires inference/0.1 plus metrics.n_singletons, specification.options.drop_singletons, and one structures.fixed_effects entry per FE with name and levels. Convergence (structures.numerics) is vocabulary, not required. x-tools maps each name to the tools' own, as checked on 2026-10-24 (docs/design/estimation-format.md).",
+  "description": "Profile for linear models with absorbed fixed effects (fixest, lfe; pyfixest, linearmodels; reghdfe, areg, xtreg; FixedEffectModels.jl). Requires inference/0.1 plus specification.options.drop_singletons and one structures.fixed_effects entry per FE with name and levels; metrics.n_singletons is expected (a warning when missing), since pyfixest and fixest don't store it. Convergence (structures.numerics) is vocabulary, not required. x-tools maps each name to the tools' own, as checked on 2026-10-24 (docs/design/estimation-format.md).",
   "x-extends": ["inference/0.1"],
   "x-deviations": [],
   "allOf": [
@@ -17,7 +17,7 @@
       "required": ["specification"],
       "properties": {
         "metrics": {
-          "required": ["n_singletons"],
+          "x-expected": ["n_singletons"],
           "properties": {
             "nobs": {
               "description": "Rows used. Tools differ on whether singletons are in it: see drop_singletons.",
@@ -28,7 +28,7 @@
               "x-tools": {"reghdfe": "e(N_full)"}
             },
             "n_singletons": {
-              "description": "Singleton rows dropped (0 when none were dropped or drop_singletons is false).",
+              "description": "Singleton rows dropped (0 when none were dropped or drop_singletons is false). Expected, not required: tools that don't store it (pyfixest, fixest) may leave it out.",
               "x-tools": {"reghdfe": "e(num_singletons)", "areg/xtreg": "sum of e(ksingle)", "pyfixest": "warning text only", "fixest": "not stored separately"}
             },
             "df_residual": {

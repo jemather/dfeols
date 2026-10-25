@@ -240,7 +240,6 @@ def test_linear_fe_requires():
     p = PROFILES["linear-fe/0.1"]
     assert errors(p, rec) == []
     for path in (
-        ("metrics", "n_singletons"),
         ("specification", "options", "drop_singletons"),
         ("structures", "fixed_effects", 0, "levels"),
     ):
@@ -250,6 +249,10 @@ def test_linear_fe_requires():
             node = node[k]
         del node[path[-1]]
         assert errors(p, bad), path
+    # n_singletons is expected, not required (pyfixest and fixest don't store it)
+    no_singletons = copy.deepcopy(rec)
+    del no_singletons["metrics"]["n_singletons"]
+    assert errors(p, no_singletons) == []
     # Convergence is vocabulary, not required (pyfixest, Stata areg/xtreg don't report it)
     no_count = copy.deepcopy(rec)
     del no_count["structures"]["numerics"]["iterations"]
@@ -287,7 +290,7 @@ def test_iv_and_dfeols_require():
     bad["extensions"]["dfeols"]["absorption"]["firm"]["method"] = "global"
     assert errors(p, bad)
     bad = copy.deepcopy(rec)
-    del bad["metrics"]["n_singletons"]  # linear-fe rules apply through dfeols
+    del bad["specification"]["options"]["drop_singletons"]  # linear-fe rules apply through dfeols
     assert errors(p, bad)
 
 

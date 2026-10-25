@@ -600,7 +600,7 @@ here); StataNow 19 `areg` and `xtreg` help; FixedEffectModels.jl source (`FixedE
 |---|---|---|---|---|---|
 | ✓ `nobs` | rows used | `nobs` | `e(N)` | `nobs` | pyfixest `_N`; lfe `N`; areg/xtreg `e(N)`; FEM.jl `nobs` |
 | `nobs_full` | rows used plus singleton rows dropped | — (`nobs_origin`† is earlier: before subset, NA and singleton removal; the writer chooses where it goes, e.g. `specification.sample.rows_input`) | `e(N_full)` | — | |
-| ✓ `n_singletons` | singleton rows dropped | not stored separately (`obs_selection$obsRemoved` mixes NA and FE removals) | `e(num_singletons)` | — | pyfixest: a warning only, not stored; areg/xtreg `e(ksingle)` (per absorbed variable) |
+| (✓) `n_singletons` | singleton rows dropped (expected, 2026-10-25) | not stored separately (`obs_selection$obsRemoved` mixes NA and FE removals) | `e(num_singletons)` | — | pyfixest: a warning only, not stored; areg/xtreg `e(ksingle)` (per absorbed variable) |
 | ✓ `df_residual` | residual df, as the tool reports it (N − K − absorbed levels, or `{value, definition}` when not) | `df.residual`* | `e(df_r)` | `df_resid` | areg/xtreg `e(df_r)`; FEM.jl `dof_residual` (min(G) − 1 under clustering); pyfixest `_dfd` (the F-test df, min(G) − 1 under clustering) |
 | `df_model` | model df | | `e(df_m)` | `df_model` | areg/xtreg `e(df_m)`; FEM.jl `dof` |
 | `df_absorbed` | df lost to the FEs | | `e(df_a)` | | areg `e(df_a)`, `e(dfabsorb)` per variable; xtreg `e(df_a)` (panel effect); FEM.jl `dof_fes` (an FE nested in a cluster counts 1) |
@@ -631,6 +631,9 @@ result object (`R/fixest_env.R`) but not in the documented Value list.
    checked. `nobs`, `n_singletons` and `specification.options.drop_singletons` are all required,
    so the difference is visible. *(Corrected 2026-10-24: draft 6 said fixest and pyfixest keep
    singletons unless asked; their current documentation and source say otherwise.)*
+   *(Revised by Ted, 2026-10-25: `n_singletons` is expected, not required. pyfixest and fixest
+   store it only in a message and their wide use suggests that isn't a problem, so tools get
+   the flexibility; a validator warns when it is missing. `drop_singletons` stays required.)*
 2. **`df_residual`** is the model's residual df, N − K − absorbed levels. *(Revised by Ted,
    2026-10-24: a writer records the tool's own value and doesn't have to recompute it; when the
    tool's value means something else, e.g. min(G) − 1 under clustering in FEM.jl and pyfixest,

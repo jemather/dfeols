@@ -776,7 +776,7 @@ def _profile_linear_fe(rec: dict) -> list[Issue]:
     # Convergence is vocabulary, not required (Ted, 2026-10-24)
     issues = _profile_inference(rec)
     if "n_singletons" not in (rec.get("metrics") or {}):
-        issues.append(Issue("error", "metrics.n_singletons", "required"))
+        issues.append(Issue("warning", "metrics.n_singletons", "expected, missing"))
     opts = (rec.get("specification") or {}).get("options") or {}
     if "drop_singletons" not in opts:
         issues.append(Issue("error", "specification.options.drop_singletons", "required"))
@@ -1045,6 +1045,7 @@ def validate(
                 issues.append(Issue(i.level, i.path, f"[{p}] {i.message}"))
     if schemas is not None:
         issues += _base_issues(enc, schemas, claimed if isinstance(claimed, list) else [], seen)
+        issues += _expected_issues(enc, schemas, claimed if isinstance(claimed, list) else [], set())
 
     if extra is not None:
         check = extra if callable(extra) else jsonschema_check(extra)
@@ -1104,12 +1105,12 @@ def _base_issues(enc: dict, schemas: Schemas, claimed: list, seen: set) -> list[
 # ---------------------------------------------------------------- redactor
 
 
-def identifying_paths(schema: dict, documents: Iterable[dict] = ()) -> list[str]:
-    """Paths of the fields a JSON Schema marks `"x-identifying": true`, in the syntax of
-    DEFAULT_IDENTIFYING. Follows properties, items, additionalProperties,
-    patternProperties, allOf/anyOf/oneOf and `$ref`s: local ones, and ones to `documents`
-    by `$id` (relative to the referring file's `$id`, as a profile refers to the core)."""
-    found: list[str] = []
+def _walk_schema(schema: dict, documents: Iterable[dict], visit: Callable[[dict, str], bool]) -> None:
+    """Call `visit(node, path)` on every subschema, with the record path it describes in the
+    syntax of DEFAULT_IDENTIFYING; stop below a node when `visit` returns True. Follows
+    properties, items, additionalProperties, patternProperties, allOf/anyOf/oneOf and
+    `$ref`s: local ones, and ones to `documents` by `$id` (relative to the referring file's
+    `$id`, as a profile refers to the core)."""
     by_id = {d["$id"]: d for d in [schema, *documents] if isinstance(d, dict) and "$id" in d}
 
     def resolve(ref: str, doc: dict) -> tuple[Any, dict] | None:
@@ -1124,10 +1125,7 @@ def identifying_paths(schema: dict, documents: Iterable[dict] = ()) -> list[str]
         return node, target
 
     def walk(node: Any, path: str, seen: frozenset, doc: dict) -> None:
-        if not isinstance(node, dict):
-            return
-        if node.get("x-identifying") is True and path:
-            found.append(path)
+        if not isinstance(node, dict) or visit(node, path):
             return
         ref = node.get("$ref")
         if isinstance(ref, str):
@@ -1149,7 +1147,54 @@ def identifying_paths(schema: dict, documents: Iterable[dict] = ()) -> list[str]
                 walk(sub, path, seen, doc)
 
     walk(schema, "", frozenset(), schema)
+
+
+def identifying_paths(schema: dict, documents: Iterable[dict] = ()) -> list[str]:
+    """Paths of the fields a JSON Schema marks `"x-identifying": true`, in the syntax of
+    DEFAULT_IDENTIFYING (see `_walk_schema` for what is followed)."""
+    found: list[str] = []
+
+    def visit(node: dict, path: str) -> bool:
+        if node.get("x-identifying") is True and path:
+            found.append(path)
+            return True
+        return False
+
+    _walk_schema(schema, documents, visit)
     return sorted(set(found))
+
+
+def expected_paths(schema: dict, documents: Iterable[dict] = ()) -> list[tuple[str, str]]:
+    """(object path, field) for each field a JSON Schema lists in `x-expected`: present in
+    a conforming record as a rule, but not required ("" is the record itself)."""
+    found: set[tuple[str, str]] = set()
+
+    def visit(node: dict, path: str) -> bool:
+        for field in node.get("x-expected") or []:
+            found.add((path, field))
+        return False
+
+    _walk_schema(schema, documents, visit)
+    return sorted(found)
+
+
+def _expected_issues(enc: dict, schemas: Schemas, claimed: list, seen: set) -> list[Issue]:
+    """A warning for each `x-expected` field of a claimed profile's rules that is missing
+    from an object the record has."""
+    issues = []
+    docs = schemas.documents()
+    for p in claimed:
+        doc = schemas.profiles.get(p)
+        if doc is None or "rules" not in doc.get("$defs", {}):
+            continue
+        for path, field in expected_paths({"$ref": f"{doc['$id']}#/$defs/rules"}, docs):
+            objects = [(enc, "")] if not path else [(c[k], q) for c, k, q in _matches(enc, _split(path), "")]
+            for obj, where in objects:
+                full = f"{where}.{field}" if where else field
+                if isinstance(obj, dict) and field not in obj and ("warning", full) not in seen:
+                    seen.add(("warning", full))
+                    issues.append(Issue("warning", full, f"[{p}] expected, missing"))
+    return issues
 
 
 def record_identifying_paths(record: dict, schemas: Schemas) -> list[str]:
