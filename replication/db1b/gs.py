@@ -12,10 +12,9 @@ Ticket rules (App. B, pp. 33-34; docs/db1b.md):
   credible    dollar_cred == 1; itin_fare > 0; fare > $20 round trip, > $10 one-way
   coach       the first coupon's fare class is X or Y, or any class for single-cabin carriers
               (SINGLE_CABIN: Southwest and JetBlue code ~all fares F/G but have no first class)
-  code-share  ticketing != operating carrier on any coupon drops the ticket, unless the
-              operating carrier is a regional affiliate: it operates code-shares but sells under
-              0.5% of direct tickets itself, pooled 1998Q3-2006Q3 (`regionals`). Applied from
-              1998Q1; the data have no code-shares before (STATE.md 2026-10-26)
+  code-share  ticketing != operating carrier on any coupon drops the ticket (App. B). The
+              `regionals` exemption (operating carriers selling < 0.5% of direct tickets) is kept
+              as an option, `--cs-exempt regionals`; it only fit while Southwest was missing
 
 Each kept ticket gives one directional observation per coupon (round trips two), priced at the
 fare (one-way) or half the fare (round trip), with the coupon's ticketing carrier. `collapse`
@@ -339,7 +338,7 @@ def main(argv=None) -> int:
     ap.add_argument("--mean-over", default="merged", choices=["merged", "after_min"])
     ap.add_argument(
         "--cs-exempt",
-        default="regionals",
+        default="none",
         help="operating carriers exempt from the code-share rule: 'regionals' (derived), 'none', or a list",
     )
     ap.add_argument("--cs-exempt-from", default="1998Q1", type=parse_quarter)
