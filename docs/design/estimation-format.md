@@ -1083,8 +1083,17 @@ other tools, by issue first; start with pyfixest, then fixest, then reghdfe):
    from a33a767 with `$id`s at `https://estimation-format.github.io/estimation/schema/` (Pages
    from the repo for now; Ted wants feedback on a `.org` domain before 0.1 is published),
    `dfeols/0.1` as the first tool profile in its catalog, and the `estimation_format` package.
-   The spec text is CC0 too (Ted). Still to do: dfeols depends on `estimation-format` and
-   drops its own copy of the schemas and `dfeols.estimation`; until then, change both.
+   The spec text is CC0 too (Ted). **Done** (2026-10-26): dfeols depends on
+   `estimation-format`, pinned to a commit by git URL until the package is on PyPI (no dfeols
+   PyPI release before then), and dropped `src/dfeols/schema/`, `tests/test_schema.py`,
+   `tests/test_catalog.py` and `tests/test_estimation.py`. `dfeols.estimation` is a deprecated
+   re-export; `dfeols estimation` runs the `estimation` command line. jsonschema stays
+   optional: `dfeols.record.IDENTIFYING` (kept equal to the `dfeols/0.1` marks by
+   `tests/test_record.py`) is always redacted, now also from fits without FEs, through
+   `write(redact_identifying=[paths])` (estimation 45ad092); `record.check_profile` is the
+   built-in `dfeols/0.1` check, used by the shim's `validate` when jsonschema is missing.
+   Changes to the format, schemas or `dfeols/0.1` now go to the estimation repo only; bump
+   the pin in `pyproject.toml` to pick them up.
 8. **Feedback, then a version**: share 0.1 as a draft for comments; publish a version
    before asking anyone to merge a writer.
 

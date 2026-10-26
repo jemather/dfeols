@@ -320,7 +320,7 @@ def main(argv=None):
     if args.cmd == "bench":
         return bench_cmd(args, rest)
     if args.cmd == "estimation":
-        from .estimation import main as estimation_main
+        from estimation_format import main as estimation_main
 
         sys.exit(estimation_main(rest))
     if rest:

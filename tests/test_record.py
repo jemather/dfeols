@@ -1,5 +1,5 @@
 """dfeols writes its own `estimation` records (dfeols.record); every record a fit writes
-here is validated against the packaged schemas (core + inference, linear-fe, dfeols)."""
+here is validated against estimation-format's schemas (core + inference, linear-fe, dfeols)."""
 
 import json
 import sys
@@ -10,8 +10,10 @@ import numpy as np
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent))
+import estimation_format as estimation
+
 import dfeols
-from dfeols import estimation
+from dfeols import record
 from simdata import sim_panel
 
 pytest.importorskip("jsonschema")
@@ -179,6 +181,49 @@ def test_redacted_record(ds, tmp_path):
     assert "working_directory" not in rec["provenance"]["execution"]["invocation"]
     assert str(tmp_path) not in text and str(Path.cwd()) not in text
     assert [h["action"] for h in rec["history"]] == ["created", "redacted"]
+
+
+def test_redacted_record_without_fes(ds, tmp_path):
+    """A fit without FEs claims inference/0.1 only, but its dfeols block is redacted too."""
+    _, rec = _fit(ds, tmp_path, "eng ~ feat + posts", redact=True)
+    assert rec["meta"]["profiles"] == ["inference/0.1"]
+    assert "folder" not in rec["extensions"]["dfeols"]["shards"]
+    assert str(tmp_path) not in json.dumps(rec)
+
+
+def test_identifying_matches_the_dfeols_profile():
+    sc = estimation.load_schemas()
+    marked = set(estimation.identifying_paths(sc.profiles["dfeols/0.1"], sc.documents()))
+    core = set(estimation.identifying_paths(sc.core, sc.documents()))
+    assert marked - core == set(record.IDENTIFYING)
+
+
+def test_dfeols_profile_builtin_check():
+    rec = {"metrics": {"nobs": 10}}
+    found = {(i.level, i.path) for i in record.check_profile(rec)}
+    assert ("error", "extensions.dfeols") in found
+    assert ("error", "specification.options.drop_singletons") in found
+
+
+def test_deprecated_module_and_cli(ds, tmp_path, monkeypatch):
+    from dfeols import cli
+
+    sys.modules.pop("dfeols.estimation", None)
+    with pytest.warns(DeprecationWarning, match="estimation_format"):
+        from dfeols import estimation as old
+    assert old.read is estimation.read and set(record.IDENTIFYING) <= set(old.DEFAULT_IDENTIFYING)
+    path = tmp_path / "result.estimation.json"
+    dfeols.fit(ds, "eng ~ feat | spell", workdir=tmp_path, log_every=1e9)
+    rec = estimation.read(path)
+    assert not [i for i in old.validate(rec) if i.level == "error"]
+    # without jsonschema, dfeols/0.1 gets the built-in check rather than "no checks known"
+    monkeypatch.setattr(estimation.records, "_have_jsonschema", lambda: False)
+    del rec["extensions"]
+    issues = old.validate(rec)
+    assert any(i.level == "error" and i.path == "extensions.dfeols" for i in issues)
+    with pytest.raises(SystemExit) as e:
+        cli.main(["estimation", "validate", "-q", str(path)])
+    assert e.value.code == 0
 
 
 def test_publication_and_record_path(ds, tmp_path):

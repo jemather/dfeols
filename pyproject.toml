@@ -7,8 +7,8 @@ name = "dfeols"
 dynamic = ["version"]
 description = "Sharded, elastic high-dimensional fixed-effects OLS for HPC clusters (Slurm, PBS, SGE, LSF)"
 readme = "README.md"
-license = "GPL-3.0-or-later AND CC0-1.0"  # CC0: the estimation schemas in src/dfeols/schema/
-license-files = ["LICENSE", "src/dfeols/schema/LICENSE"]
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
 authors = [{ name = "Ted Matherly" }]
 requires-python = ">=3.10"
 keywords = [
@@ -43,12 +43,15 @@ dependencies = [
   "pyarrow>=14",
   "pyfixest>=0.50.1,<1",
   "psutil>=5.9",
+  # estimation records (reader, writer, validator, schemas). Pinned to a commit until
+  # estimation-format is on PyPI; dfeols can't be released to PyPI before then.
+  "estimation-format @ git+https://github.com/estimation-format/estimation@7ec8b0b0909ace5644fdaf1b78435f640b3ba340",
   "tomli>=2.0; python_version < '3.11'",
 ]
 
 [project.optional-dependencies]
 dask = ["dask>=2024.1", "distributed>=2024.1", "dask-jobqueue>=0.8"]
-# JSON Schema validation of estimation records; without it dfeols.estimation uses built-in checks
+# JSON Schema validation of estimation records; without it estimation_format uses built-in checks
 estimation = ["jsonschema>=4.18"]
 test = ["pytest>=7", "jsonschema>=4.18"]
 dev = ["dfeols[dask,test]", "ruff>=0.6", "mypy>=1.10", "build", "twine", "pre-commit"]
@@ -68,10 +71,6 @@ version = { attr = "dfeols.__version__" }
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["dfeols*"]
-
-[tool.setuptools.package-data]
-# the estimation format's catalog, core schema, profiles and example records
-dfeols = ["schema/*.json", "schema/profiles/*.json", "schema/examples/*.json", "schema/LICENSE"]
 
 # ---------------------------------------------------------------- pytest
 [tool.pytest.ini_options]

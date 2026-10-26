@@ -13,26 +13,18 @@ break the API).
   git commit, environment, invocation, SLURM job fields, Dask workers), the sample by drop
   reason, canonical term names, each vcov's small-sample correction and the `dfeols/0.1`
   extension; `publication=` and `redact=` options. `Result.to_estimation(y)` and
-  `Result.write_estimation(path)` build them later. Every record is validated against the
-  packaged schemas in `tests/test_record.py`.
+  `Result.write_estimation(path)` build them later. Every record is validated against
+  estimation-format's schemas in `tests/test_record.py`.
 - `prep` records the source's sha256 (per file, plus a manifest hash for several files) or, for
   an in-memory frame, a content hash, and its row count, in `dfeols_meta.json` (`checksum=False`
   skips it). Records carry it, and `extensions.dfeols.row_key` identifies the exact sample with
   a partition-independent hash of the rows used (`dfeols.rowhash`).
-- `dfeols.estimation`: writer, reader, validator and redactor for `estimation/0.1` records
-  (docs/design/estimation-format.md), with the RFC 8785 core digest and automatic spilling of
-  large structures to attachments; `dfeols estimation {validate,redact,digest}`. Validation uses
-  the packaged JSON Schemas (core plus each claimed profile; `pip install 'dfeols[estimation]'`
-  for `jsonschema`), and redaction takes the fields they mark identifying.
-- Estimation schemas ship in the package (`dfeols/schema/`) with a `catalog.json` of profiles.
-  Tool profiles declare their base (`x-extends`) and departures (`x-deviations`); the validator
-  reports whether a record also meets the base, and warns on undeclared departures. Draft
-  profiles load from `$ESTIMATION_SCHEMA_PATH` or `--schema-path`. `tests/test_catalog.py`
-  checks contributed profiles. The schemas, catalog and example records are CC0 1.0 (public
-  domain; `src/dfeols/schema/LICENSE`); the package license is now `GPL-3.0-or-later AND CC0-1.0`.
-- JSON Schemas for `estimation/0.1` (`src/dfeols/schema/estimation-0.1.json`) and the `inference`,
-  `linear-fe`, `iv` and `dfeols` profiles (`src/dfeols/schema/profiles/`), with `x-identifying` marks,
-  example records and `tests/test_schema.py`.
+- dfeols depends on [estimation-format](https://github.com/estimation-format/estimation) for
+  reading, writing, validating and redacting `estimation` records and for the format's schemas
+  and profile catalog (including `dfeols/0.1`), pinned to a commit until it is on PyPI;
+  `dfeols estimation {validate,redact,digest}` runs its command line. `dfeols.estimation`
+  re-exports it, deprecated. `redact=True` also removes the dfeols block's identifying fields
+  from records that don't claim `dfeols/0.1` (fits without FEs).
 
 ### Changed
 - Singletons are dropped over all fixed effects, iterating across shards, as fixest and reghdfe

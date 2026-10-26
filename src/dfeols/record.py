@@ -36,12 +36,25 @@ import time
 from pathlib import Path
 from typing import Any
 
+import estimation_format as ef
 import numpy as np
 
-from . import estimation
 from .vcov import df_k as _df_k
 
 PROFILES = ["inference/0.1", "linear-fe/0.1", "dfeols/0.1"]
+# The fields the dfeols/0.1 profile marks identifying (tests/test_record.py keeps the two
+# equal). Redaction always takes them, so a record that doesn't claim dfeols/0.1 (a fit
+# without FEs) loses them too, and so does one redacted without the schemas.
+IDENTIFYING = (
+    "extensions.dfeols.shards.folder",
+    "extensions.dfeols.dask.scheduler_address",
+    "extensions.dfeols.dask.profile.account",
+    "extensions.dfeols.dask.profile.project",
+    "extensions.dfeols.dask.profile.scratch",
+    "extensions.dfeols.dask.profile.source",
+    "extensions.dfeols.dask.profile.prologue",
+    "extensions.dfeols.dask.profile.env",
+)
 REPOSITORY = "https://github.com/jemather/dfeols"
 # dfeols vcov names -> the format's vocabulary (hetero is N/(N-K) * sandwich: HC1)
 VCOV_TYPES = {"iid": "iid", "hetero": "HC1", "CRV1": "CRV1"}
@@ -76,6 +89,25 @@ CPU_FLAGS = ("sse4_2", "avx", "avx2", "fma", "avx512f", "avx512dq", "avx512bw", 
 
 def _utc(t: float) -> str:
     return _dt.datetime.fromtimestamp(t, _dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def identifying_paths(record: dict) -> list[str]:
+    """The fields `redact=True` removes: those marked identifying in the core and each
+    profile the record claims (the format's DEFAULT_IDENTIFYING without the schemas), plus
+    the dfeols block's."""
+    schemas = ef.load_schemas()
+    base = ef.record_identifying_paths(record, schemas) if schemas else ef.DEFAULT_IDENTIFYING
+    return sorted({*base, *IDENTIFYING})
+
+
+def check_profile(record: dict) -> list[ef.Issue]:
+    """Built-in check of dfeols/0.1 (linear-fe's plus the dfeols block), for
+    `estimation_format.validate(..., profiles={"dfeols/0.1": check_profile})` when
+    jsonschema is missing; with it, the profile's schema is the check."""
+    issues = ef.records.PROFILES["linear-fe/0.1"](record)
+    if "dfeols" not in (record.get("extensions") or {}):
+        issues.append(ef.Issue("error", "extensions.dfeols", "required"))
+    return issues
 
 
 def _sha256(path: Path) -> str | None:
@@ -398,7 +430,7 @@ def run_info(ds, executor, *, started: float, finished: float, cpu_seconds: floa
     dfe: dict[str, Any] = {"shards": shards, "executor": type(executor).__name__}
     if dask:
         dfe["dask"] = dask
-    return estimation.to_json({"provenance": prov, "dfeols": dfe})
+    return ef.to_json({"provenance": prov, "dfeols": dfe})
 
 
 # ---------------------------------------------------------------- the record
@@ -485,7 +517,7 @@ def to_estimation(
     publication  a `publication` block: citation (CSL-JSON), locator, links
     provenance   False leaves out provenance (software, environment, execution, ...)
 
-    Write it with `estimation.write` (or `Result.write_estimation`), which encodes it,
+    Write it with `estimation_format.write` (or `Result.write_estimation`), which encodes it,
     adds history and the core digest, spills large structures and can redact."""
     from . import __version__
 
@@ -675,9 +707,7 @@ def to_estimation(
     if run.get("factor_terms"):
         spec["factor_terms"] = run["factor_terms"]
 
-    record = estimation.new_record(
-        params, meta=meta, specification=spec, metrics=metrics, structures=structures
-    )
+    record = ef.new_record(params, meta=meta, specification=spec, metrics=metrics, structures=structures)
     if provenance and run.get("provenance"):
         record["provenance"] = run["provenance"]
     if publication:
@@ -686,7 +716,7 @@ def to_estimation(
     ext: dict[str, Any] = {
         "schema": "dfeols/0.1",
         "by": {"name": "dfeols", "version": __version__},
-        "added": estimation._now(),
+        "added": _utc(time.time()),
         # the fit this record came from; a fit with several responses writes one record each
         "fit": {"id": run.get("fit_id", r.label), "label": r.label, "responses": list(r.outcomes)},
     }
@@ -731,12 +761,12 @@ def write_estimation(
     from . import __version__
 
     rec = to_estimation(result, y, **kwargs)
-    return estimation.write(
+    return ef.write(
         rec,
         path,
         digest=digest,
         spill_large=spill_large,
-        redact_identifying=redact,
+        redact_identifying=identifying_paths(rec) if redact else False,
         by={"name": "dfeols", "version": __version__},
     )
 
