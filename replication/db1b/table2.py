@@ -89,7 +89,7 @@ def bankrupt_quarters() -> pl.DataFrame:
     """carrier, year, quarter for quarters with any day in Chapter 11 (STATE.md 2026-10-27)."""
     rows = set()
     for p in bankruptcy.periods():
-        for y in range(1993, 2007):
+        for y in range(1993, 2026):  # 1993Q1-2025Q2 and beyond; quarters outside the panel never join
             for q in range(1, 5):
                 start, end = date(y, 3 * q - 2, 1), date(y + (q == 4), (3 * q) % 12 + 1, 1)
                 if p["start"] < end and p["end"] >= start:
