@@ -78,7 +78,9 @@ Small-sample corrections follow fixest/pyfixest (`vcov.py`).
   coordinator keeps one attempt per task and sweeps the rest, because a task
   can run twice at once (a rerun overlapping a worker the scheduler gave up on).
 - Shard folders and benchmark data sets are locked (`lock.DirLock`: a sibling
-  `<folder>.lock`, O_EXCL, heartbeat every 30 s, stale after 5 min).
+  `<folder>.lock`, hard-linked into place fully written, heartbeat every 30 s,
+  stale after 5 min; a takeover renames the stale lock aside and deletes it only
+  if it is still the file it judged stale).
 - Overwrites rename a folder before deleting it; an interrupted prep's folder
   (no metadata file) is cleared before reuse.
 - Row counts are Int64 everywhere (polars' `len()` is UInt32 and wraps).

@@ -86,6 +86,38 @@ def test_lock_is_refreshed_and_only_owner_releases(tmp_path):
     assert not b.path.exists()
 
 
+@pytest.mark.parametrize("content", ["", '{"host": "elsewhere", "pid": 1}'])
+def test_two_takeovers_of_one_stale_lock(tmp_path, content):
+    """Regression (OSCER, Parsons): two jobs found the same stale lock; the first
+    replaced it, and the second then deleted the first's fresh lock as stale."""
+    path = DirLock(tmp_path / "x").path
+    path.write_text(content)
+    old = time.time() - 3600
+    os.utime(path, (old, old))
+    a, b = DirLock(tmp_path / "x"), DirLock(tmp_path / "x")
+    judge = b._is_stale
+
+    def a_takes_over_first(info, age):  # b has judged the old lock; a gets in before b removes it
+        stale = judge(info, age)
+        if stale and not a._thread:
+            a.acquire()
+        return stale
+
+    b._is_stale = a_takes_over_first
+    with pytest.raises(LockedError, match="in use by"):
+        b.acquire()
+    assert json.loads(path.read_text())["token"] == a._me["token"]  # a still holds its lock
+    a.release()
+    assert sorted(p.name for p in tmp_path.iterdir()) == []  # no temporary or set-aside files
+
+
+def test_lock_is_never_seen_half_written(tmp_path):
+    a = DirLock(tmp_path / "x").acquire()
+    assert json.loads(a.path.read_text())["token"] == a._me["token"]
+    assert [p.name for p in tmp_path.iterdir()] == ["x.lock"]
+    a.release()
+
+
 def test_bench_rebuilds_overflowed_shard_sets():
     from types import SimpleNamespace
 

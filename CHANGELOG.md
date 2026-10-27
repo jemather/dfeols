@@ -41,6 +41,11 @@ break the API).
   do (previously only in the FE local to the partition, so N could depend on the partition).
 
 ### Fixed
+- Folder locks: two jobs that found the same stale lock could both take it, the second
+  deleting the first's fresh lock (seen on OSCER, where the second job then crashed). A
+  takeover now sets the stale lock aside and deletes it only if it is the file it judged
+  stale, and new locks are hard-linked into place fully written, so a fresh lock is never
+  read as empty.
 - `dfeols submit SCRIPT.py --profile P -- ARGS` passed `--profile P` to the script instead of
   using it; options after the script and before `--` now go to `submit`.
 - The sparse path crashed with two or more crossing FEs (offsets applied twice).
