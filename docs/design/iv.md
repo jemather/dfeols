@@ -42,7 +42,9 @@ special case `A = [I; −β]`, `H = I`. The bread is [X'(I − κM_Z)X]⁻¹, th
 (hetero) or by cluster, and iid uses σ² = RSS / (N − K) with RSS from the actual X. For
 LIML the scores are X̂ too, as ivreg2 and linearmodels compute them (the k-class estimating
 equation's own X̃ = (1 − κ)X + κX̂ differs by O(1/N)). Claude's choice, 2026-10-27, to
-match the two reference tools; for Ted to confirm.
+match the reference tools: ivreg2/ivreghdfe, linearmodels and Stata's `ivregress liml`
+all use X̂, and dfeols matches each to about 1e-11 (X̃ was off by 1e-7 to 1e-6). For Ted to
+confirm.
 On the sparse path, the dummy part of X̃ and e is partialled out by FWL as for OLS: the
 coordinator also passes the dummy coefficients of X₂ and of the non-dummy Z columns.
 
@@ -107,7 +109,8 @@ maps for OLS too). `tests/test_iv.py`:
   regressors, not FE levels: ivreghdfe implies L = 4 for `posts` + 3 instruments); 2SLS
   `ffirst` F and partial R², Sargan.
 
-Open for Ted: fixest's iid `ivf` takes its denominator df from the fit's small-sample K,
+Decided (Ted, 2026-10-27): dfeols keeps its iid first-stage F, as the tools other than
+fixest compute it. Background: fixest's iid `ivf` takes its denominator df from the fit's small-sample K,
 which under clustering counts an FE nested in the cluster once (`fixef.K = "nested"`), so
 the same iid statistic changes with the cluster variable (3,477.8 iid, 3,878.9 clustered by
 id_a, 3,482.0 by week, 3,477.8 with `fixef.K = "full"`). dfeols's iid F counts every
