@@ -282,12 +282,35 @@ def variables(collapsed: pl.DataFrame, panel: pl.DataFrame, t100: pl.DataFrame) 
     Route competition comes from every carrier on the directional airport pair in the collapsed
     DB1B data (before the T-100 merge and filters): HERF from passenger shares, N carriers.
     LEGN/LCCN count legacy and low-cost carriers on the directional city-market pair (n. 24).
-    PASSRTE is T-100 passengers on the airport pair, all carriers.
+    PASSRTE is T-100 passengers on the airport pair, all carriers. MKTSHARE is the carrier's share
+    of the route's DB1B passengers. GENSP (App. A; Borenstein and Rose 1994, App. A, GEOSHARE) is
+    sqrt(ENP_i1 ENP_i2) / sum_k sqrt(ENP_k1 ENP_k2), ENP_k1 being carrier k's T-100 enplanements at
+    endpoint 1 in the quarter.
     """
     t = ["year", "quarter"]
     route = collapsed.group_by(*t, *ROUTE).agg(
         ((pl.col("passengers") / pl.col("passengers").sum()) ** 2).sum().alias("herf"),
         pl.col("carrier").n_unique().alias("n_carriers"),
+    )
+    share = collapsed.select(
+        *t,
+        "carrier",
+        *ROUTE,
+        (pl.col("passengers") / pl.col("passengers").sum().over(*t, *ROUTE)).alias("mktshare"),
+    )
+    enp = t100.group_by(*t, "carrier", pl.col("origin_airport_id").alias("airport")).agg(
+        pl.col("t100_passengers").sum().alias("enp")
+    )
+    pairs = panel.select(*t, *ROUTE).unique()
+    geo = (
+        pairs.join(enp.rename({"airport": "origin_airport_id", "enp": "enp1"}), on=[*t, "origin_airport_id"])
+        .join(
+            enp.rename({"airport": "dest_airport_id", "enp": "enp2"}), on=[*t, "dest_airport_id", "carrier"]
+        )
+        .with_columns(g=(pl.col("enp1") * pl.col("enp2")).sqrt())
+    )
+    gensp = geo.with_columns(gensp=pl.col("g") / pl.col("g").sum().over(*t, *ROUTE)).select(
+        *t, "carrier", *ROUTE, "gensp"
     )
     city = ["origin_city_market_id", "dest_city_market_id"]
     cities = collapsed.group_by(*t, *city).agg(
@@ -299,6 +322,8 @@ def variables(collapsed: pl.DataFrame, panel: pl.DataFrame, t100: pl.DataFrame) 
         panel.join(route, on=[*t, *ROUTE], how="left")
         .join(cities, on=[*t, *city], how="left")
         .join(passrte, on=[*t, *ROUTE], how="left")
+        .join(share, on=[*t, "carrier", *ROUTE], how="left")
+        .join(gensp, on=[*t, "carrier", *ROUTE], how="left")
         .with_columns(
             lodd=(pl.col("gini") / (1 - pl.col("gini"))).log(),
             ln_p10=pl.col("p10").log(),
