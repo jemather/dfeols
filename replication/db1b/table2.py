@@ -20,7 +20,9 @@ dispersion, so all are negative.
 Instruments (p. 15, App. A): lnPASSRTE, GENSP and IRUTHERF. IRUTHERF (Borenstein and Rose 1994,
 App. A, XFLTHERF) is s_hat^2 + (HERF - s^2) / (1 - s)^2 * (1 - s_hat)^2, s the carrier's market share
 and s_hat its first-stage fitted value. The first stage is not given in either paper; here
-MKTSHARE ~ lnPASSRTE + GENSP + bankrupt | carrier_route + time (Claude's reading, for Ted).
+MKTSHARE ~ lnPASSRTE + GENSP + bankrupt | carrier_route + time. This is an assumption (Ted,
+2026-10-27): of the readings tried it gives the estimates closest to the published ones
+(docs/db1b.md, "IRUTHERF first stage").
 """
 
 from __future__ import annotations
