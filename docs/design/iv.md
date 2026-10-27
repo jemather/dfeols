@@ -1,6 +1,6 @@
 # Instrumental variables in dfeols
 
-Status: implemented, LIML's robust SEs still to check (2026-10-27). Decided by Ted: 2SLS and LIML (k-class) in the first version,
+Status: implemented and checked against pyfixest, fixest, linearmodels, ivreghdfe (2026-10-27). Decided by Ted: 2SLS and LIML (k-class) in the first version,
 any number of endogenous regressors, and a basic set of first-stage diagnostics computed in the
 existing two passes. Comparisons: pyfixest (one endogenous regressor), fixest in R (several),
 ivreghdfe in Stata (LIML, diagnostics), linearmodels (LIML on small data with FE dummies).
@@ -41,10 +41,10 @@ takes the maps (`A` for the residual, `H` for the scores) instead of β alone; O
 special case `A = [I; −β]`, `H = I`. The bread is [X'(I − κM_Z)X]⁻¹, the meat Σ X̂ᵢ'eᵢ²X̂ᵢ
 (hetero) or by cluster, and iid uses σ² = RSS / (N − K) with RSS from the actual X. For
 LIML the scores are X̂ too, as ivreg2 and linearmodels compute them (the k-class estimating
-equation's own X̃ = (1 − κ)X + κX̂ differs by O(1/N)). Claude's choice, 2026-10-27, to
-match the reference tools: ivreg2/ivreghdfe, linearmodels and Stata's `ivregress liml`
-all use X̂, and dfeols matches each to about 1e-11 (X̃ was off by 1e-7 to 1e-6). For Ted to
-confirm.
+equation's own X̃ = (1 − κ)X + κX̂ differs by O(1/N)). Decided (Ted, 2026-10-27): the
+convention every reference tool uses. ivreg2/ivreghdfe, linearmodels and Stata's
+`ivregress liml` all use X̂, and dfeols matches each to about 1e-11 (X̃ was off by 1e-7 to
+1e-6).
 On the sparse path, the dummy part of X̃ and e is partialled out by FWL as for OLS: the
 coordinator also passes the dummy coefficients of X₂ and of the non-dummy Z columns.
 
