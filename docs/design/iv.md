@@ -36,10 +36,13 @@ is a block of `Z'WZ`, `Z'WY` and `Y'WY`:
   Fuller: κ − a / (N − L).
 
 Round 2 builds, per outcome j, the residual e = y − Xβ (with the actual X₂) and the score
-regressors X̃ = (1 − κ)X + κX̂ = [X₁, (1 − κ)X₂ + κZΠ]. Both are linear maps of the shard's
-`[X₂, Z]` columns, so round 2 takes the maps (`c` for the residual, `H` for X̃) instead of β
-alone; OLS is the special case `c = β`, `H = I`. The bread is [X'(I − κM_Z)X]⁻¹, the meat
-Σ X̃ᵢ'eᵢ²X̃ᵢ (hetero) or by cluster, and iid uses σ² = RSS / (N − K) with RSS from the actual X.
+regressors X̂ = [X₁, ZΠ]. Both are linear maps of the shard's `[Y, Z]` columns, so round 2
+takes the maps (`A` for the residual, `H` for the scores) instead of β alone; OLS is the
+special case `A = [I; −β]`, `H = I`. The bread is [X'(I − κM_Z)X]⁻¹, the meat Σ X̂ᵢ'eᵢ²X̂ᵢ
+(hetero) or by cluster, and iid uses σ² = RSS / (N − K) with RSS from the actual X. For
+LIML the scores are X̂ too, as ivreg2 and linearmodels compute them (the k-class estimating
+equation's own X̃ = (1 − κ)X + κX̂ differs by O(1/N)). Claude's choice, 2026-10-27, to
+match the two reference tools; for Ted to confirm.
 On the sparse path, the dummy part of X̃ and e is partialled out by FWL as for OLS: the
 coordinator also passes the dummy coefficients of X₂ and of the non-dummy Z columns.
 
@@ -58,11 +61,14 @@ Per endogenous regressor, from the first-stage regression of X₂ₗ on Z:
   Z₂ block of the full sandwich);
 - `effective_f` (Montiel Olea-Pflueger), with one endogenous regressor only.
 
-Cheap from the same cross-products, proposed: Sargan's overidentification test for 2SLS
-(iid) and the Anderson-Rubin overidentification test for LIML, (N − L)(κ − 1).
+Overidentification (Ted, 2026-10-27), per outcome, from the same cross-products, as ivreg2
+defines them: Sargan's N e'P_Z e / e'e with the fit's residuals (2SLS or LIML; iid, no
+small-sample correction), and for LIML the Anderson-Rubin statistics N ln λ and N(λ − 1),
+λ before Fuller's adjustment; χ²(q − p). Omitted when the model is just identified.
 
 Not in the first version: Sanderson-Windmeijer and Angrist-Pischke conditional F,
-Cragg-Donald and Kleibergen-Paap rk statistics, Hansen J, endogeneity tests, GMM.
+Cragg-Donald and Kleibergen-Paap rk statistics, Hansen J (the robust overidentification
+test, which needs two-step GMM residuals), endogeneity tests, GMM.
 
 ## Collinearity and identification
 
@@ -94,8 +100,10 @@ maps for OLS too). `tests/test_iv.py`:
   endogenous regressor); sparse equals dense.
 - LIML κ and coefficients equal a direct computation; just-identified LIML equals 2SLS.
 - Records validate against `iv/0.1` with no warnings.
-- Waiting for packages (the tests skip): LIML and Fuller robust/clustered SEs against
-  linearmodels and ivreghdfe, Fuller's L, and ivreghdfe's first-stage F and partial R².
+- LIML and Fuller without FEs equal linearmodels: κ, coefficients, robust and clustered
+  SEs, Sargan, Anderson-Rubin. Sargan equals fixest's `iv_sargan`.
+- Waiting for ivreg2's `livreg2.mlib` in Stata (the tests skip on its load error): LIML,
+  Fuller (L with absorbed FEs) and `ffirst` against ivreghdfe.
 
 Open for Ted: fixest's iid `ivf` takes its denominator df from the clustered fit's K (an FE
 nested in the cluster counts once); dfeols's iid F counts every absorbed level, which is the

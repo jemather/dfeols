@@ -185,6 +185,7 @@ def test_record_claims_iv_and_validates(ds, tmp_path, fml, kw):
     assert main[-len(rec["specification"]["endogenous"]) :] == rec["specification"]["endogenous"]
     per = rec["structures"]["first_stage"]["per_endogenous"]
     assert all(e["f_stat"]["statistic"] > 0 for e in per)
+    assert {t["name"] for t in rec["structures"]["first_stage"]["overid"]} >= {"sargan"}
     if kw.get("estimator") == "liml":
         assert rec["meta"]["estimator"]["method"] == "fuller" and rec["metrics"]["fuller"] == 1.0
         assert rec["metrics"]["kappa"] > 1  # LIML's kappa >= 1; Fuller subtracts only 1 / (N - L)
@@ -236,7 +237,8 @@ def test_two_endogenous_match_fixest(ds, data, tmp_path):
     out <- list(names = rownames(ct), b = unname(ct[, 1]), se = unname(ct[, 2]), n = nobs(m),
                 ivf = lapply(fitstat(m, ~ivf), function(x) x$stat),
                 ivf_df2 = lapply(fitstat(m, ~ivf), function(x) x$df2),
-                ivwald = lapply(fitstat(m, ~ivwald), function(x) x$stat))
+                ivwald = lapply(fitstat(m, ~ivwald), function(x) x$stat),
+                sargan = fitstat(m, ~sargan)$sargan$stat)
     cat(toJSON(out, digits = NA, auto_unbox = TRUE))
     """
     p = subprocess.run([rscript, "-e", script], capture_output=True, text=True)
@@ -258,6 +260,9 @@ def test_two_endogenous_match_fixest(ds, data, tmp_path):
             fx["ivf"][key], rel=1e-7
         )
         assert f["wald_CRV1"] == pytest.approx(fx["ivwald"][wkey], rel=1e-7)
+    sargan = {t["name"]: t for t in r.outcomes["yiv"]["overid"]}["sargan"]
+    # small here (valid instruments): a difference of large sums, limited by fixest's FE tolerance
+    assert sargan["statistic"] == pytest.approx(fx["sargan"], rel=1e-5) and sargan["df"] == 1
 
 
 @pytest.mark.parametrize("fuller", [None, 1.0])
@@ -276,6 +281,10 @@ def test_liml_matches_linearmodels(ds, data, fuller, vcov, cluster):
     kw = {"cov_type": "robust"} if vcov == "hetero" else {"cov_type": "clustered", "clusters": pdf["id_a"]}
     res = mod.fit(debiased=True, **kw)
     assert r.outcomes["yiv"]["kappa"] == pytest.approx(res.kappa, rel=1e-9)
+    ov = {x["name"]: x["statistic"] for x in r.outcomes["yiv"]["overid"]}
+    assert ov["sargan"] == pytest.approx(res.sargan.stat, rel=1e-8)
+    if fuller is None:
+        assert ov["anderson_rubin"] == pytest.approx(res.anderson_rubin.stat, rel=1e-8)
     t = r.tidy()
     np.testing.assert_allclose(t["Estimate"], res.params[r.coefnames], rtol=1e-8)
     np.testing.assert_allclose(t["Std. Error"], res.std_errors[r.coefnames], rtol=1e-7)
@@ -328,10 +337,15 @@ def ivreghdfe(data, tmp_path_factory):
     out = tmp_path_factory.mktemp("ivreghdfe")
     data.write_csv(out / "d.csv")
     probe = out / "probe.do"
-    probe.write_text("which ivreghdfe\nwhich ivreg2\nwhich ranktest\n")
+    probe.write_text("sysuse auto, clear\nivreghdfe price (weight = length), absorb(turn)\n")
     subprocess.run([stata, "-b", "do", probe.name], cwd=out, capture_output=True, text=True)
-    if "r(111)" in (out / "probe.log").read_text():
-        pytest.skip("ivreghdfe, ivreg2 or ranktest not installed in Stata")
+    tail = (out / "probe.log").read_text().split("ivreghdfe price")[-1]
+    if "r(" in tail:
+        err = [ln for ln in tail.splitlines() if ln.strip() and not ln.startswith(("(", ".", ">"))]
+        pytest.skip(
+            f"ivreghdfe doesn't run in this Stata ({' / '.join(err[:2])}); "
+            "it needs ivreg2 (with livreg2.mlib), ranktest and reghdfe"
+        )
     lines = [f'import delimited using "{out / "d.csv"}", clear']
     for name, (_, cmd) in IVREGHDFE.items():
         lines += [
@@ -346,7 +360,7 @@ def ivreghdfe(data, tmp_path_factory):
             "  file write fh \"se `nm' \" %21.15g (sqrt(V[`i',`i'])) _n",
             "}",
             'file write fh "N " %21.15g (e(N)) _n',
-            "foreach s in lambda kclass fuller {",
+            "foreach s in lambda kclass fuller sargan arubin arubin_lin {",
             "  capture file write fh \"`s' \" %21.15g (e(`s')) _n",
             "}",
             "capture confirm matrix e(first)",
@@ -388,8 +402,12 @@ def test_matches_ivreghdfe(ds, ivreghdfe, name):
     for c in r.coefnames:
         assert t.loc[c, "Estimate"] == pytest.approx(st[f"b {c}"], rel=1e-7), c
         assert t.loc[c, "Std. Error"] == pytest.approx(st[f"se {c}"], rel=1e-6), c
+    ov = {x["name"]: x["statistic"] for x in r.outcomes["yiv"]["overid"]}
+    assert ov["sargan"] == pytest.approx(st["sargan"], rel=1e-7)
     if kw.get("estimator") == "liml":
         assert r.outcomes["yiv"]["kappa"] == pytest.approx(st["kclass"], rel=1e-9)
+        assert ov["anderson_rubin"] == pytest.approx(st["arubin"], rel=1e-7)
+        assert ov["anderson_rubin_linear"] == pytest.approx(st["arubin_lin"], rel=1e-7)
     if name == "2sls_first":
         e = r.iv["first_stage"]["per_endogenous"][0]
         f = {x["name"]: x["statistic"] for x in e["f_stat"]}

@@ -754,6 +754,8 @@ def to_estimation(
     structures["numerics"] = {k_: v for k_, v in numerics.items() if v is not None}
     if iv:
         structures["first_stage"] = _first_stage_structure(iv, r.vcov_default)
+        if o.get("overid"):
+            structures["first_stage"]["overid"] = o["overid"]
 
     # ---- specification
     sample = run.get("sample") or {}

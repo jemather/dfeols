@@ -111,6 +111,8 @@ def solve(plan, acc: dict, N: int, *, estimator: str = "2sls", fuller: float | N
             WMZW = WW - WZ.T @ Ainv @ WZ
             WMX1W = WW - WX1.T @ A11inv @ WX1
             kappa[j] = linalg.eigh(WMX1W, WMZW, eigvals_only=True)[0]
+    lam = kappa.copy()  # LIML's lambda, before Fuller's adjustment
+    if estimator == "liml":
         if fuller is not None:
             kappa -= fuller / (N - _n_instruments(plan, zc, acc))
 
@@ -124,13 +126,15 @@ def solve(plan, acc: dict, N: int, *, estimator: str = "2sls", fuller: float | N
         coef_x.append(b[:, 0])
         bread.append(Minv)
     coef_x = np.column_stack(coef_x)  # (|x1| + |ek|) x m, basis [X1, X2 kept]
+    # Z'e of each outcome's residuals (actual X), for Sargan's e'P_Z e
+    Ze = B[:, :m] - A[:, x1] @ coef_x[:nx1] - B[:, m + ek] @ coef_x[nx1:]
 
     # reported: exogenous columns of X1 (not dummies), then the kept endogenous
     rep_x1 = np.flatnonzero(zc[x1] < k_rep)
     coefnames = [plan.colnames[zc[x1[i]]] for i in rep_x1] + [plan.endog_names[i] for i in ek]
     rep = np.r_[rep_x1, nx1 + np.arange(len(ek))]
 
-    lin = _round2_maps(plan, m, p, zc, x1, z2, ek, Pi, coef_x, kappa, Ainv, A, B, A11)
+    lin = _round2_maps(plan, m, p, zc, x1, z2, ek, Pi, coef_x, A, B, A11)
     if plan.sparse_global:  # meat already has the dummies partialled out: reported basis only
         bread = [b_[np.ix_(rep, rep)] for b_ in bread]
         meat_idx = np.arange(len(rep))
@@ -146,6 +150,9 @@ def solve(plan, acc: dict, N: int, *, estimator: str = "2sls", fuller: float | N
             [C[m + l, m + l] - B1[:, m + l] @ np.linalg.solve(A11, B1[:, m + l]) for l in range(p)]
         ),
         "inst_names": [plan.inst_names[zc[i] - k_rep] for i in z2],
+        "ePZe": np.einsum("zj,zw,wj->j", Ze, Ainv, Ze),
+        "overid_df": q - len(ek),
+        "lambda": lam if estimator == "liml" else None,
     }
     return Solution(coefnames, coef_x[rep], bread, meat_idx, lin, dropped, kappa, fs)
 
@@ -157,11 +164,15 @@ def _n_instruments(plan, zc, acc) -> int:
     return len(zc) + fe
 
 
-def _round2_maps(plan, m, p, zc, x1, z2, ek, Pi, coef_x, kappa, Ainv, A, B, A11):
-    """Linear maps of T = [Y (m + p), Z[:, cols]] for worker.shard_round2: residuals and
-    score regressors X~ = [X1, (1 - k) X2 + k Z Pi] of each outcome, and the first stage's
+def _round2_maps(plan, m, p, zc, x1, z2, ek, Pi, coef_x, A, B, A11):
+    """Linear maps of T = [Y (m + p), Z[:, cols]] for worker.shard_round2: residuals
+    y - X beta and score regressors Xh = [X1, Z Pi] of each outcome, and the first stage's
     residuals v = X2 - Z Pi with score regressors Z2~ = M_X1 Z2 (FWL: the Z2 block of the
-    first stage's sandwich)."""
+    first stage's sandwich).
+
+    The scores are Xh for every k-class estimator, with the k-class bread, as ivreg2 and
+    linearmodels compute robust and clustered LIML vcovs. (X~ = (1 - k) X + k Xh, the
+    k-class estimating equation's own regressors, differs from Xh by O(1/N).)"""
     k_x = plan.k_x
     nT_y = m + p
     nx1 = len(x1)
@@ -187,17 +198,12 @@ def _round2_maps(plan, m, p, zc, x1, z2, ek, Pi, coef_x, kappa, Ainv, A, B, A11)
     Ares[m + ek] = -coef_x[nx1:]
     Ares -= zrows(beta_x1)
 
-    # score regressors, in the meat's basis: [X1 in T (all of X1 when dense), kept X2]
-    H = np.zeros((m, nT, kXr))
-    for j in range(m):
-        for c, i in enumerate(x1_t):
-            H[j, pos[x1[i]], c] = 1.0
-        for c, l in enumerate(ek):
-            col = len(x1_t) + c
-            H[j, m + l, col] = 1 - kappa[j]
-            H[j, :, col] += kappa[j] * zrows(Pi[:, l])
-    shared = np.allclose(kappa, kappa[0])
-    Hs = H[0] if shared else H
+    # score regressors, in the meat's basis: [X1 in T (all of X1 when dense), kept X2 fitted]
+    H = np.zeros((nT, kXr))
+    for c, i in enumerate(x1_t):
+        H[pos[x1[i]], c] = 1.0
+    for c, l in enumerate(ek):
+        H[:, len(x1_t) + c] = zrows(Pi[:, l])
 
     # first stage of each endogenous regressor
     Afs = np.zeros((nT, p))
@@ -209,7 +215,7 @@ def _round2_maps(plan, m, p, zc, x1, z2, ek, Pi, coef_x, kappa, Ainv, A, B, A11)
     Gz[x1] = -Gam
     Hfs = zrows(Gz)
 
-    lin = {"cols": zc[nd], "A": Ares, "H": Hs, "G": None, "GH": None}
+    lin = {"cols": zc[nd], "A": Ares, "H": H, "G": None, "GH": None}
     fs = {"A": Afs, "H": Hfs, "G": None, "GH": None}
     if sparse:
         dum = np.flatnonzero(zc >= k_x)
@@ -222,8 +228,7 @@ def _round2_maps(plan, m, p, zc, x1, z2, ek, Pi, coef_x, kappa, Ainv, A, B, A11)
         DT[:, nT_y:] = A[np.ix_(dum, nd)]
         piT = np.linalg.solve(Add, DT)
         lin["G"] = _levels(plan, zc[dum], P, beta_x1[dum])
-        GH = np.einsum("dt,jtk->jdk", piT, H)
-        lin["GH"] = _levels_3d(plan, zc[dum], P, GH[0] if shared else GH)
+        lin["GH"] = _levels(plan, zc[dum], P, piT @ H)
         fs["G"] = _levels(plan, zc[dum], P, Pi[dum])
         # M_D (Z2 - X1 Gam), which is M_X1 Z2 by FWL
         fs["GH"] = _levels(plan, zc[dum], P, piT @ Hfs)
@@ -235,12 +240,6 @@ def _layout(plan):
     from .worker import _global_layout
 
     return _global_layout(plan)
-
-
-def _levels_3d(plan, zc_dummy, P, coef):
-    if coef.ndim == 2:
-        return _levels(plan, zc_dummy, P, coef)
-    return np.array([_levels(plan, zc_dummy, P, c) for c in coef])
 
 
 def first_stage(plan, sol: Solution, acc: dict, acc2: dict, N: int, fe_levels, nested, G) -> dict:
@@ -291,6 +290,35 @@ def first_stage(plan, sol: Solution, acc: dict, acc2: dict, N: int, fe_levels, n
                 entry.setdefault("effective_f", []).append({"vcov": t, "statistic": eff})
         out.append(entry)
     return {"per_endogenous": out}
+
+
+def overid(sol: Solution, rss: np.ndarray, N: int) -> list[list[dict]]:
+    """Overidentification tests of each outcome, as ivreg2 defines them (none when the
+    model is just identified): Sargan's N e'P_Z e / e'e with the fit's residuals, and for
+    LIML the Anderson-Rubin statistics N ln(lambda) and N (lambda - 1); chi2(q - p)."""
+    fs = sol.fs
+    df = fs["overid_df"]
+    out = []
+    for j in range(len(rss)):
+        tests = []
+        if df > 0:
+            tests.append(_chi2("sargan", N * fs["ePZe"][j] / rss[j], df))
+            if fs["lambda"] is not None:
+                lam = fs["lambda"][j]
+                tests.append(_chi2("anderson_rubin", N * np.log(lam), df))
+                tests.append(_chi2("anderson_rubin_linear", N * (lam - 1), df))
+        out.append(tests)
+    return out
+
+
+def _chi2(name, stat, df) -> dict:
+    return {
+        "name": name,
+        "statistic": float(stat),
+        "df": int(df),
+        "p_value": float(stats.chi2.sf(stat, df)),
+        "distribution": "chi2",
+    }
 
 
 def _test(name, stat, df1, df2) -> dict:

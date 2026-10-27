@@ -460,13 +460,12 @@ def _apply(T: np.ndarray, H) -> np.ndarray:
     return T[:, H] if np.asarray(H).ndim == 1 else T @ H
 
 
-def _meat(plan: Plan, scores, E: np.ndarray, w: np.ndarray, cl, out: dict, prefix: str = "") -> None:
-    """RSS and the meats of the equations in E's columns; `scores(j)` gives equation j's
-    score regressors (n x k)."""
+def _meat(plan: Plan, X: np.ndarray, E: np.ndarray, w: np.ndarray, cl, out: dict, prefix: str = "") -> None:
+    """RSS and the meats of the equations in E's columns, with score regressors X (n x k)."""
     m = E.shape[1]
     out[prefix + "rss"] = np.einsum("ij,ij,i->j", E, E, w)
-    S = [scores(j) * (w * E[:, j])[:, None] for j in range(m)]
-    k = S[0].shape[1] if m else 0
+    S = [X * (w * E[:, j])[:, None] for j in range(m)]
+    k = X.shape[1]
     if "hetero" in plan.vcov_types:
         out[prefix + "meat_hetero"] = np.array([s.T @ s for s in S]).reshape(m, k, k)
     if "CRV1" in plan.vcov_types and plan.cluster:
@@ -487,12 +486,12 @@ def _meat(plan: Plan, scores, E: np.ndarray, w: np.ndarray, cl, out: dict, prefi
 def shard_round2(plan: Plan, shard_id: int, files: list[str], lin: dict) -> dict:
     """Residuals, RSS and meats from linear maps of the shard's columns
     T = [outcome block, Z[:, lin["cols"]]] (outcome block: outcomes, then IV's endogenous
-    regressors; built by estimate._ols_maps or iv.round2_maps).
+    regressors; built by estimate._ols_solve or iv._round2_maps).
 
     For each equation j of an equation group (lin itself: the outcomes; lin["fs"]: IV's
     first stages, one per endogenous regressor):
         residual            T @ A[:, j] - D~ G[:, j]
-        score regressors    T @ H_j - D~ GH_j      (H, GH shared, or one per equation)
+        score regressors    T @ H - D~ GH          (shared by the group's equations)
     D~ (the sparse crossing-FE path only) is the dummy block with the local FE partialled
     out, and G, GH are the dummies' coefficients, so the scores are the regressors with the
     dummies partialled out (Frisch-Waugh-Lovell: the reported block of the full sandwich).
@@ -516,38 +515,21 @@ def shard_round2(plan: Plan, shard_id: int, files: list[str], lin: dict) -> dict
         a, Dm = extra
         blocks = []
         for _, g in groups:
-            blocks.append(g["G"])
-            GH = g["GH"]
-            blocks.extend(list(GH) if GH.ndim == 3 else [GH])
+            blocks += [g["G"], g["GH"]]
         B = np.hstack(blocks)
         V = demean(Dm @ B, [a], w)[0] if len(a) else np.zeros((0, B.shape[1]))
         o = 0
         for prefix, g in groups:
-            ne = g["A"].shape[1]
-            dterms[prefix] = {"G": V[:, o : o + ne]}
-            o += ne
-            GH = g["GH"]
-            kk = GH.shape[-1]
-            parts = []
-            for _ in range(len(GH) if GH.ndim == 3 else 1):
-                parts.append(V[:, o : o + kk])
-                o += kk
-            dterms[prefix]["GH"] = parts
+            ne, kk = g["G"].shape[1], g["GH"].shape[1]
+            dterms[prefix] = (V[:, o : o + ne], V[:, o + ne : o + ne + kk])
+            o += ne + kk
     for prefix, g in groups:
         E = Tm @ g["A"]
-        d = dterms.get(prefix)
-        if d is not None:
-            E = E - d["G"]
-        H = g["H"]
-        per_eq = np.asarray(H).ndim == 3
-
-        def scores(j, H=H, d=d, per_eq=per_eq):
-            S = _apply(Tm, H[j] if per_eq else H)
-            if d is not None:
-                S = S - d["GH"][j if per_eq else 0]
-            return S
-
-        _meat(plan, scores, E, w, cl, out, prefix)
+        X = _apply(Tm, g["H"])
+        if prefix in dterms:
+            E = E - dterms[prefix][0]
+            X = X - dterms[prefix][1]
+        _meat(plan, X, E, w, cl, out, prefix)
     T["meat"] = time.perf_counter() - t
     T["total"] = time.perf_counter() - t0
     T["maxrss_gb"] = _maxrss_gb()

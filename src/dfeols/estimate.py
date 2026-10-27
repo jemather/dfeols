@@ -586,6 +586,7 @@ def fit(
 
     out = {}
     meat_idx = sol.meat_idx
+    overid = _iv.overid(sol, acc2["rss"], N) if f.iv else None
     for j, y in enumerate(f.depvars):
         b = sol.coef[:, j]
         bread_use = sol.bread[j]
@@ -609,6 +610,7 @@ def fit(
         }
         if f.iv:
             out[y]["kappa"] = float(sol.kappa[j])
+            out[y]["overid"] = overid[j]
     iv_info = {}
     if f.iv:
         iv_info = {

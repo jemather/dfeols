@@ -14,9 +14,10 @@ break the API).
   dense and sparse crossing FEs), from the same two passes over the shards. First-stage
   statistics per endogenous regressor (`Result.iv["first_stage"]`): coefficients on the
   instruments with their vcovs, R², partial R², the iid partial F, the Wald F under each vcov
-  and, with one endogenous regressor, the Montiel Olea-Pflueger effective F. Records claim
-  `iv/0.1`. Tested against pyfixest, fixest and a direct LIML computation
-  (docs/design/iv.md).
+  and, with one endogenous regressor, the Montiel Olea-Pflueger effective F. Per outcome,
+  Sargan's overidentification test and, for LIML, the Anderson-Rubin tests
+  (`Result.outcomes[y]["overid"]`). Records claim `iv/0.1`. Tested against pyfixest, fixest,
+  linearmodels and a direct LIML computation (docs/design/iv.md).
 - dfeols writes its own `estimation` records: `fit(..., record=True)` (the default) writes
   `<workdir>/result.estimation.json` (one record per response) with provenance (software and
   git commit, environment, invocation, SLURM job fields, Dask workers), the sample by drop
