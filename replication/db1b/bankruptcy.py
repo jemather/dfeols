@@ -43,6 +43,9 @@ END_WITHOUT_EXIT = {
 SUPPLEMENT = [
     # filed December 1990 (page prose); emerged Wednesday 1993-04-28 after 29 months (UPI, 1993-04-27)
     {"carrier": "CO", "filed": "1990-12", "exited": "1993-04-28", "source": "UPI 1993-04-27"},
+    # first filing 1992-01-31 (Wikipedia, Trans World Airlines); "When TWA emerged from bankruptcy in
+    # Nov. 1993, employees owned 45% of the company" (quote supplied by Ted, 2026-10-27)
+    {"carrier": "TW", "filed": "1992-01-31", "exited": "1993-11", "source": "Ted, 2026-10-27"},
     # second filing 1995-06-30, emerged August 1995 (NYT 1995-06-29; Wikipedia, Trans World Airlines)
     {"carrier": "TW", "filed": "1995-06-30", "exited": "1995-08", "source": "NYT 1995-06-29"},
     # filed March 2003, emerged 2005-06-02 (SEC filing, Hawaiian Holdings)
@@ -52,8 +55,8 @@ SUPPLEMENT = [
 ]
 # Still open (Ted)
 MISSING = [
-    "TW: first filing 1992-01-31; exit date not yet sourced (a deal was reached 1992-08-24)",
-    "SY: the 2002 involuntary filing may concern the pre-shutdown company (ceased 2001-12-07)",
+    "SY: the 2002 involuntary filing may concern the pre-shutdown company (ceased 2001-12-07); SY"
+    " flights resumed January 2002 (T-100) and continued through 2006",
 ]
 
 
