@@ -305,6 +305,22 @@ def steps(
     return {"counts": out, "merged": m, "filtered": f, "panel": o}
 
 
+def competition(collapsed):
+    """Route competition from every carrier in the collapsed DB1B data: (route, cities).
+    route: HERF of passenger shares and N carriers by quarter and directional airport pair.
+    cities: LEGN and LCCN by quarter and directional city-market pair (n. 24)."""
+    t = ["year", "quarter"]
+    route = collapsed.group_by(*t, *ROUTE).agg(
+        ((pl.col("passengers") / pl.col("passengers").sum()) ** 2).sum().alias("herf"),
+        pl.col("carrier").n_unique().alias("n_carriers"),
+    )
+    cities = collapsed.group_by(*t, "origin_city_market_id", "dest_city_market_id").agg(
+        pl.col("carrier").filter(pl.col("carrier").is_in(LEGACY)).n_unique().alias("legn"),
+        pl.col("carrier").filter(is_lcc()).n_unique().alias("lccn"),
+    )
+    return route, cities
+
+
 def variables(collapsed: pl.DataFrame, panel: pl.DataFrame, t100: pl.DataFrame) -> pl.DataFrame:
     """Table 2 variables (App. A) on the final panel.
 
@@ -317,10 +333,7 @@ def variables(collapsed: pl.DataFrame, panel: pl.DataFrame, t100: pl.DataFrame) 
     endpoint 1 in the quarter.
     """
     t = ["year", "quarter"]
-    route = collapsed.group_by(*t, *ROUTE).agg(
-        ((pl.col("passengers") / pl.col("passengers").sum()) ** 2).sum().alias("herf"),
-        pl.col("carrier").n_unique().alias("n_carriers"),
-    )
+    route, cities = competition(collapsed)
     share = collapsed.select(
         *t,
         "carrier",
@@ -342,10 +355,6 @@ def variables(collapsed: pl.DataFrame, panel: pl.DataFrame, t100: pl.DataFrame) 
         *t, "carrier", *ROUTE, "gensp"
     )
     city = ["origin_city_market_id", "dest_city_market_id"]
-    cities = collapsed.group_by(*t, *city).agg(
-        pl.col("carrier").filter(pl.col("carrier").is_in(LEGACY)).n_unique().alias("legn"),
-        pl.col("carrier").filter(is_lcc()).n_unique().alias("lccn"),
-    )
     passrte = t100.group_by(*t, *ROUTE).agg(pl.col("t100_passengers").sum().alias("passrte"))
     return (
         panel.join(route, on=[*t, *ROUTE], how="left")
