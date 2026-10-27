@@ -102,11 +102,17 @@ maps for OLS too). `tests/test_iv.py`:
 - Records validate against `iv/0.1` with no warnings.
 - LIML and Fuller without FEs equal linearmodels: κ, coefficients, robust and clustered
   SEs, Sargan, Anderson-Rubin. Sargan equals fixest's `iv_sargan`.
-- Waiting for ivreg2's `livreg2.mlib` in Stata (the tests skip on its load error): LIML,
-  Fuller (L with absorbed FEs) and `ffirst` against ivreghdfe.
+- With an absorbed FE, equal to ivreghdfe (`small`): LIML κ, coefficients, robust and
+  clustered SEs, Anderson-Rubin; Fuller (L = the kept instruments including exogenous
+  regressors, not FE levels: ivreghdfe implies L = 4 for `posts` + 3 instruments); 2SLS
+  `ffirst` F and partial R², Sargan.
 
-Open for Ted: fixest's iid `ivf` takes its denominator df from the clustered fit's K (an FE
-nested in the cluster counts once); dfeols's iid F counts every absorbed level, which is the
-iid convention and what pyfixest does for an iid fit. The record gives df2, and the test
+Open for Ted: fixest's iid `ivf` takes its denominator df from the fit's small-sample K,
+which under clustering counts an FE nested in the cluster once (`fixef.K = "nested"`), so
+the same iid statistic changes with the cluster variable (3,477.8 iid, 3,878.9 clustered by
+id_a, 3,482.0 by week, 3,477.8 with `fixef.K = "full"`). dfeols's iid F counts every
+absorbed level whatever the vcov: equal to fixest with iid errors or `fixef.K = "full"`, to
+pyfixest's iid fit and to ivreghdfe's `ffirst`. (pyfixest reports no iid F for a clustered
+fit: its `_f_stat_1st_stage` is then the clustered Wald F.) The record gives df2, and the test
 converts. The Wald F p-values use the vcov's t-test df (G − 1 under CRV1); fixest prints
 N − K.

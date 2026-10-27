@@ -114,7 +114,7 @@ def solve(plan, acc: dict, N: int, *, estimator: str = "2sls", fuller: float | N
     lam = kappa.copy()  # LIML's lambda, before Fuller's adjustment
     if estimator == "liml":
         if fuller is not None:
-            kappa -= fuller / (N - _n_instruments(plan, zc, acc))
+            kappa -= fuller / (N - _n_instruments(plan, zc))
 
     nx1 = len(x1)
     coef_x, bread = [], []
@@ -157,11 +157,11 @@ def solve(plan, acc: dict, N: int, *, estimator: str = "2sls", fuller: float | N
     return Solution(coefnames, coef_x[rep], bread, meat_idx, lin, dropped, kappa, fs)
 
 
-def _n_instruments(plan, zc, acc) -> int:
-    """L in Fuller's a / (N - L): every instrument, exogenous regressors included, plus the
-    absorbed FE levels (as ivreghdfe counts them; checked in tests/test_iv.py)."""
-    fe = int(acc["fe_levels"].sum()) - max(len(acc["fe_levels"]) - 1, 0) if len(acc["fe_levels"]) else 0
-    return len(zc) + fe
+def _n_instruments(plan, zc) -> int:
+    """L in Fuller's a / (N - L): the kept instruments, exogenous regressors included (the
+    intercept when there are no FEs), not the FE levels or crossing-FE dummies, as
+    ivreghdfe (absorbed FEs) and linearmodels (no FEs) count them."""
+    return int((zc < plan.k_x).sum())
 
 
 def _round2_maps(plan, m, p, zc, x1, z2, ek, Pi, coef_x, A, B, A11):

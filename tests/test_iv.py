@@ -387,7 +387,7 @@ def ivreghdfe(data, tmp_path_factory):
         d = {}
         for line in (out / f"{name}.txt").read_text().splitlines():
             *key, val = line.split()
-            d[" ".join(key)] = float(val)
+            d[" ".join(key)] = float("nan") if val == "." else float(val)  # . is Stata's missing
         res[name] = d
     return res
 
@@ -403,7 +403,8 @@ def test_matches_ivreghdfe(ds, ivreghdfe, name):
         assert t.loc[c, "Estimate"] == pytest.approx(st[f"b {c}"], rel=1e-7), c
         assert t.loc[c, "Std. Error"] == pytest.approx(st[f"se {c}"], rel=1e-6), c
     ov = {x["name"]: x["statistic"] for x in r.outcomes["yiv"]["overid"]}
-    assert ov["sargan"] == pytest.approx(st["sargan"], rel=1e-7)
+    if not np.isnan(st["sargan"]):  # ivreg2 reports Hansen's J instead under robust errors
+        assert ov["sargan"] == pytest.approx(st["sargan"], rel=1e-7)
     if kw.get("estimator") == "liml":
         assert r.outcomes["yiv"]["kappa"] == pytest.approx(st["kclass"], rel=1e-9)
         assert ov["anderson_rubin"] == pytest.approx(st["arubin"], rel=1e-7)
