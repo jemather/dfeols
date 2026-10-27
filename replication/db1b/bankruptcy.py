@@ -7,8 +7,8 @@ Only the Chapter 11 table is used: Chapter 7 is liquidation, so the carrier leav
 
 `chapter11(path)` parses the table; `periods(path)` maps the carriers in the 1993-2006 panel to
 their codes. A period with no exit date runs until the carrier ceased operating or was acquired
-(`END_WITHOUT_EXIT`). The page marks itself incomplete; known gaps are listed in MISSING and are
-not filled in until Ted chooses a source.
+(`END_WITHOUT_EXIT`). The page marks itself incomplete: SUPPLEMENT adds the in-panel cases it lacks,
+from sources Ted supplied (2026-10-27); MISSING lists what is still open.
 """
 
 from __future__ import annotations
@@ -35,15 +35,25 @@ CODES = {
 # Filings with no exit date that end inside the panel: the date operations ended (page notes)
 END_WITHOUT_EXIT = {
     ("N7", "2000-12-06"): "2002-11-06",  # "Ceased operations on November 6, 2002"
-    ("TW", "2001-01-10"): "2001-12-01",  # acquired by American; TWA flights ended 2001-12-01 (to verify)
+    # AMR bought TWA's assets in April 2001; TWA Airlines LLC (not in bankruptcy) flew the TW
+    # code until 2001-12-01 (Ted, 2026-10-27)
+    ("TW", "2001-01-10"): "2001-04",
 }
-# Known in-panel bankruptcies the page lacks or leaves undated (to source; Ted decides)
+# In-panel Chapter 11 periods the page lacks, from sources Ted supplied (docs/sources/db1b.md)
+SUPPLEMENT = [
+    # filed December 1990 (page prose); emerged Wednesday 1993-04-28 after 29 months (UPI, 1993-04-27)
+    {"carrier": "CO", "filed": "1990-12", "exited": "1993-04-28", "source": "UPI 1993-04-27"},
+    # second filing 1995-06-30, emerged August 1995 (NYT 1995-06-29; Wikipedia, Trans World Airlines)
+    {"carrier": "TW", "filed": "1995-06-30", "exited": "1995-08", "source": "NYT 1995-06-29"},
+    # filed March 2003, emerged 2005-06-02 (SEC filing, Hawaiian Holdings)
+    {"carrier": "HA", "filed": "2003-03", "exited": "2005-06-02", "source": "SEC EDGAR 1172222"},
+    # filed 2004-10-26, emerged 2006-02-28 (Wikipedia, ATA Airlines)
+    {"carrier": "TZ", "filed": "2004-10-26", "exited": "2006-02-28", "source": "Wikipedia, ATA Airlines"},
+]
+# Still open (Ted)
 MISSING = [
-    "CO: Chapter 11 from December 1990 (page prose only), exit date not given",
-    "TW: 1992 and 1995 filings mentioned without dates",
-    "SY: exit 2003, month not given",
-    "HA: Hawaiian Airlines 2003-2005 not listed",
-    "TZ: ATA 2004-2006 not listed (only the 2008 filing)",
+    "TW: first filing 1992-01-31; exit date not yet sourced (a deal was reached 1992-08-24)",
+    "SY: the 2002 involuntary filing may concern the pre-shutdown company (ceased 2001-12-07)",
 ]
 
 
@@ -103,4 +113,6 @@ def periods(path: Path = WIKITEXT) -> list[dict]:
             continue
         # partial exit dates ("2003") take the latest day they allow
         out.append({"carrier": code, "start": _day(r["filed"], False), "end": _day(end, True), **r})
+    for r in SUPPLEMENT:
+        out.append({**r, "start": _day(r["filed"], False), "end": _day(r["exited"], True)})
     return out
