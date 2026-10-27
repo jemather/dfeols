@@ -386,7 +386,7 @@ def main(argv=None) -> int:
         "--single-cabin", default=",".join(SINGLE_CABIN), help="carriers whose every fare is coach; 'none'"
     )
     ap.add_argument("--merge", default="operators", choices=["ticketing", "operators"])
-    ap.add_argument("--direction", default="fixed", choices=["per_quarter", "fixed", "pair"])
+    ap.add_argument("--direction", default="per_quarter", choices=["per_quarter", "fixed", "pair"])
     a = ap.parse_args(argv)
     a.out.mkdir(parents=True, exist_ok=True)
 
@@ -423,7 +423,7 @@ def main(argv=None) -> int:
     print_counts(r["counts"])
     if a.command == "panel":
         out = variables(collapsed, r["panel"], t100)
-        path = a.out / ("panel.parquet" if a.direction == "fixed" else f"panel_{a.direction}.parquet")
+        path = a.out / ("panel.parquet" if a.direction == "per_quarter" else f"panel_{a.direction}.parquet")
         out.write_parquet(path)
         print(f"wrote {path}: {out.height:,} rows")
     return 0
