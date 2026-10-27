@@ -8,6 +8,15 @@ break the API).
 ## [Unreleased]
 
 ### Added
+- Instrumental variables: `fit(ds, "y ~ x | fe | d1 + d2 ~ z1 + z2")` (fixest syntax) with
+  `estimator="2sls"` (default) or `"liml"`, and `fuller=` for Fuller's modified LIML; any number
+  of endogenous regressors; iid, hetero and CRV1 standard errors on every FE path (local,
+  dense and sparse crossing FEs), from the same two passes over the shards. First-stage
+  statistics per endogenous regressor (`Result.iv["first_stage"]`): coefficients on the
+  instruments with their vcovs, R², partial R², the iid partial F, the Wald F under each vcov
+  and, with one endogenous regressor, the Montiel Olea-Pflueger effective F. Records claim
+  `iv/0.1`. Tested against pyfixest, fixest and a direct LIML computation
+  (docs/design/iv.md).
 - dfeols writes its own `estimation` records: `fit(..., record=True)` (the default) writes
   `<workdir>/result.estimation.json` (one record per response) with provenance (software and
   git commit, environment, invocation, SLURM job fields, Dask workers), the sample by drop

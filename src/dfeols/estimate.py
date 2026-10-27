@@ -15,6 +15,7 @@ from pathlib import Path
 import numpy as np
 import polars as pl
 
+from . import iv as _iv
 from . import rowhash
 from .executors import SerialExecutor
 from .formula import fe_components, parse
@@ -24,7 +25,7 @@ from .progress import Progress, fmt_td
 from .results import Result
 from .vcov import df_k as _df_k
 from .vcov import vcov_crv1, vcov_hetero, vcov_iid
-from .worker import Plan, plan_columns, shard_round1, shard_round2, shard_singletons
+from .worker import Plan, plan_columns, shard_round1, shard_round2, shard_singletons, term_names
 
 log = logging.getLogger("dfeols")
 
@@ -153,7 +154,7 @@ def build_plan(
         if v == "CRV1" and not cluster:
             raise ValueError("CRV1 needs cluster=")
 
-    cats = sorted({t.cat for t in f.terms if t.cat})
+    cats = sorted({t.cat for t in (*f.terms, *f.endog, *f.instruments) if t.cat})
     missing_cats = set(cats) - set(ds.columns)
     if missing_cats:
         raise KeyError(f"Variables not in the prepared data: {sorted(missing_cats)}")
@@ -187,6 +188,8 @@ def build_plan(
         fe_method=fe_method,
         sparse_global=_use_sparse(crossing_fe, local, glob),
         row_key_cols=row_key_cols,
+        endog_names=term_names(f.endog, cat_levels),
+        inst_names=term_names(f.instruments, cat_levels),
     )
 
 
@@ -198,9 +201,8 @@ def estimate_worker_gb(plan: Plan, rows: int, n_cols: int) -> float:
     groups x levels block, instead). Calibrated on OSCER: 2M rows, 7 dense
     columns -> 2.8-3.4 GB observed (Polars read buffers, numpy temporaries,
     Dask worker overhead ~1 GB)."""
-    m = len(plan.formula.depvars)
-    k_rep = len(plan.colnames)
-    dense = m + k_rep + (0 if plan.sparse_global else plan.n_dummy)
+    m = len(plan.formula.depvars) + len(plan.endog_names)
+    dense = m + plan.k_x + (0 if plan.sparse_global else plan.n_dummy)
     gb = 1.5  # worker process, Dask, libraries
     gb += rows * n_cols * 8 * 1.5 / 1e9  # Parquet read and filtered copy
     gb += rows * dense * 8 * 4 / 1e9  # design, demeaned copy, products
@@ -296,6 +298,53 @@ def _drop_singletons(plan: Plan, ds: Dataset, executor, prog: Progress, rows: di
     return {"passes": p, "seconds": time.time() - t0}
 
 
+def _ols_solve(plan: Plan, acc: dict, collin_tol: float) -> _iv.Solution:
+    """OLS from the round-1 cross-products, and round 2's maps (worker.shard_round2):
+    residuals Y - Z beta, score regressors the kept columns (on the sparse path, the
+    reported ones with the dummies partialled out)."""
+    m = len(plan.formula.depvars)
+    k_rep = len(plan.colnames)
+    keep = collinear_keep(acc["ZtZ"], collin_tol)
+    beta_k, bread = solve_spd(acc["ZtZ"][np.ix_(keep, keep)], acc["ZtY"][keep])
+    dropped = [plan.colnames[i] for i in range(k_rep) if not keep[i]]
+    kept = np.flatnonzero(keep)
+    rep_idx = np.flatnonzero(keep[:k_rep])  # reported & kept, in Z order
+    pos_in_kept = np.cumsum(keep) - 1
+    rep_kept_pos = pos_in_kept[rep_idx]
+    if plan.sparse_global:
+        from .worker import _global_layout
+
+        _, zpos, P = _global_layout(plan)
+        dum_kept_pos = pos_in_kept[kept[kept >= k_rep]]
+        dum_z = kept[kept >= k_rep]
+        level_of_z = {int(z): i for i, z in enumerate(zpos) if z >= 0}
+        lv = np.array([level_of_z[int(z)] for z in dum_z], np.int64)
+        A = acc["ZtZ"][np.ix_(kept, kept)]
+        gamma = np.zeros((P, m))
+        gamma[lv] = beta_k[dum_kept_pos]
+        pi = np.zeros((P, len(rep_idx)))
+        if len(dum_kept_pos):
+            pi[lv] = np.linalg.solve(
+                A[np.ix_(dum_kept_pos, dum_kept_pos)], A[np.ix_(dum_kept_pos, rep_kept_pos)]
+            )
+        lin = {
+            "cols": rep_idx,
+            "A": np.vstack([np.eye(m), -beta_k[rep_kept_pos]]),
+            "H": m + np.arange(len(rep_idx)),
+            "G": gamma,
+            "GH": pi,
+        }
+        bread_use = bread[np.ix_(rep_kept_pos, rep_kept_pos)]
+        meat_idx = np.arange(len(rep_idx))  # meat is already reported-only
+    else:
+        lin = {"cols": kept, "A": np.vstack([np.eye(m), -beta_k]), "H": m + np.arange(len(kept))}
+        lin["G"] = lin["GH"] = None
+        bread_use = bread
+        meat_idx = rep_kept_pos
+    names = [plan.colnames[i] for i in rep_idx]
+    return _iv.Solution(names, beta_k[rep_kept_pos], [bread_use] * m, meat_idx, lin, dropped)
+
+
 def fit(
     ds: Dataset | str,
     formula: str,
@@ -318,8 +367,10 @@ def fit(
     record: bool | str | os.PathLike = True,
     publication: dict | None = None,
     redact: bool = False,
+    estimator: str = "2sls",
+    fuller: float | None = None,
 ) -> Result:
-    """Estimate an HDFE OLS model on a prepared, sharded dataset.
+    """Estimate an HDFE OLS or IV model on a prepared, sharded dataset.
 
     cluster    cluster variable (encoded in prep); default vcov is then CRV1
     vcov       "iid", "hetero", "CRV1" or a list of them (all computed in one pass)
@@ -331,6 +382,8 @@ def fit(
                several responses), a path puts them there, False skips them
     publication  `publication` block for the record (citation, locator, links)
     redact     leave identifying details (user, host, paths, job ids) out of the record
+    estimator  IV formulas (`y ~ x | fe | d ~ z`): "2sls" (default) or "liml"
+    fuller     Fuller's modified LIML with constant a (estimator="liml"); a=1 is common
     """
     if not isinstance(ds, Dataset):
         ds = Dataset.open(ds)
@@ -349,7 +402,10 @@ def fit(
         )
         cache = n_local >= 3 or (n_local == 2 and fe_method == "iterate")
     cache = bool(cache)
-    spec_id = probe.fingerprint(cluster=cluster, weights=weights, singletons=drop_singletons)
+    iv_opts = {"estimator": estimator, "fuller": fuller} if probe.iv else {}
+    if not probe.iv and (estimator != "2sls" or fuller is not None):
+        raise ValueError("estimator= and fuller= apply to IV formulas (y ~ x | fe | d ~ z)")
+    spec_id = probe.fingerprint(cluster=cluster, weights=weights, singletons=drop_singletons, **iv_opts)
     wd = Path(workdir) if workdir else ds.root / "runs" / spec_id
     wd.mkdir(parents=True, exist_ok=True)
     plan = build_plan(
@@ -372,8 +428,9 @@ def fit(
     f = plan.formula
     label = label or spec_id
     m = len(f.depvars)
+    mY = m + len(plan.endog_names)  # outcome block: outcomes, then IV's endogenous regressors
     k_rep = len(plan.colnames)
-    k_tot = k_rep + plan.n_dummy
+    k_tot = plan.k_x + plan.n_dummy
     log.info(
         "fit %s: %s | %d regressors + %d FE dummies, %d local FEs, %d shards, %s rows",
         label,
@@ -408,10 +465,10 @@ def fit(
     # ---------------- round 1 ----------------
     acc = {
         "ZtZ": np.zeros((k_tot, k_tot)),
-        "ZtY": np.zeros((k_tot, m)),
-        "YtY": np.zeros(m),
-        "sum_wy": np.zeros(m),
-        "sum_wy2": np.zeros(m),
+        "ZtY": np.zeros((k_tot, mY)),
+        "YtY": np.zeros((mY, mY)),
+        "sum_wy": np.zeros(mY),
+        "sum_wy2": np.zeros(mY),
         "n": 0,
         "rows_in": 0,
         "sumw": 0.0,
@@ -467,79 +524,57 @@ def fit(
         log.warning("fit %s: FE demeaning did not converge in some shards", label)
 
     N = acc["n"]
-    keep = collinear_keep(acc["ZtZ"], collin_tol)
-    beta_k, bread = solve_spd(acc["ZtZ"][np.ix_(keep, keep)], acc["ZtY"][keep])
-    dropped = [plan.colnames[i] for i in range(k_rep) if not keep[i]]
+    if f.iv:
+        sol = _iv.solve(plan, acc, N, estimator=estimator, fuller=fuller, collin_tol=collin_tol)
+    else:
+        sol = _ols_solve(plan, acc, collin_tol)
+    dropped = sol.dropped
     if dropped:
         log.info("fit %s: dropped collinear regressors: %s", label, dropped)
 
     # ---------------- round 2 ----------------
-    kept = np.flatnonzero(keep)
-    rep_idx = np.flatnonzero(keep[:k_rep])  # reported & kept, in Z order
-    pos_in_kept = np.cumsum(keep) - 1
-    rep_kept_pos = pos_in_kept[rep_idx]
-    fwl = None
-    if plan.sparse_global:
-        from .worker import _global_layout
-
-        _, zpos, P = _global_layout(plan)
-        dum_kept_pos = pos_in_kept[kept[kept >= k_rep]]
-        dum_z = kept[kept >= k_rep]
-        level_of_z = {int(z): i for i, z in enumerate(zpos) if z >= 0}
-        lv = np.array([level_of_z[int(z)] for z in dum_z], np.int64)
-        A = acc["ZtZ"][np.ix_(kept, kept)]
-        gamma = np.zeros((P, m))
-        gamma[lv] = beta_k[dum_kept_pos]
-        pi = np.zeros((P, len(rep_idx)))
-        if len(dum_kept_pos):
-            pi[lv] = np.linalg.solve(
-                A[np.ix_(dum_kept_pos, dum_kept_pos)], A[np.ix_(dum_kept_pos, rep_kept_pos)]
-            )
-        fwl = {"rep": rep_idx, "beta_x": beta_k[rep_kept_pos], "gamma": gamma, "pi": pi}
-        bread_use = bread[np.ix_(rep_kept_pos, rep_kept_pos)]
-        meat_idx = np.arange(len(rep_idx))  # meat is already reported-only
-    else:
-        bread_use = bread
-        meat_idx = rep_kept_pos
-    kk = len(rep_idx) if plan.sparse_global else int(keep.sum())
-    acc2 = {
-        "rss": np.zeros(m),
-        "hetero": np.zeros((m, kk, kk)) if "hetero" in plan.vcov_types else None,
-        "crv": np.zeros((m, kk, kk)) if ("CRV1" in plan.vcov_types) else None,
-    }
-    scores = None
+    acc2: dict = {}
+    kk = sol.bread[0].shape[0]
+    p_ = len(plan.endog_names)
+    shapes = {"": (m, kk)}
+    if f.iv:
+        shapes["fs_"] = (p_, sol.fs["q"])
+    for pre, (ne, k_) in shapes.items():
+        acc2[pre + "rss"] = np.zeros(ne)
+        acc2[pre + "hetero"] = np.zeros((ne, k_, k_)) if "hetero" in plan.vcov_types else None
+        acc2[pre + "crv"] = np.zeros((ne, k_, k_)) if "CRV1" in plan.vcov_types else None
+    scores: dict = {}
     if "CRV1" in plan.vcov_types and not plan.cluster_local:
         G_tot = plan.cluster[2]
-        need = G_tot * kk * m * 8
+        need = G_tot * sum(ne * k_ for ne, k_ in shapes.values()) * 8
         if need > 8e9:
             log.warning(
                 "fit %s: cluster-score accumulator needs %.1f GB on the coordinator", label, need / 1e9
             )
-        scores = np.zeros((m, G_tot, kk))
+        scores = {pre: np.zeros((ne, G_tot, k_)) for pre, (ne, k_) in shapes.items()}
 
     def on2(tid, r):
         peak["rss"] = max(peak["rss"], r["timing"].get("maxrss_gb", 0.0))
-        acc2["rss"] += r["rss"]
-        if acc2["hetero"] is not None:
-            acc2["hetero"] += r["meat_hetero"]
-        if "meat_crv" in r:
-            acc2["crv"] += r["meat_crv"]
-        if "cluster_scores" in r:
-            for j in range(m):
-                np.add.at(scores[j], r["cluster_codes"], r["cluster_scores"][j])
+        for pre in shapes:
+            acc2[pre + "rss"] += r[pre + "rss"]
+            if acc2[pre + "hetero"] is not None:
+                acc2[pre + "hetero"] += r[pre + "meat_hetero"]
+            if pre + "meat_crv" in r:
+                acc2[pre + "crv"] += r[pre + "meat_crv"]
+            if pre + "cluster_scores" in r:
+                for j in range(len(scores[pre])):
+                    np.add.at(scores[pre][j], r[pre + "cluster_codes"], r[pre + "cluster_scores"][j])
 
-    tasks2 = [
-        (s["id"], rows[s["id"]], (plan, s["id"], ds.shard_paths(s), beta_k, keep, fwl)) for s in ds.shards
-    ]
+    tasks2 = [(s["id"], rows[s["id"]], (plan, s["id"], ds.shard_paths(s), sol.lin)) for s in ds.shards]
     prog.start("round2")
     executor.run(shard_round2, tasks2, on2, prog, "round2")
-    if scores is not None:
-        for j in range(m):
-            acc2["crv"][j] = scores[j].T @ scores[j]
+    for pre, sc in scores.items():
+        for j in range(len(sc)):
+            acc2[pre + "crv"][j] = sc[j].T @ sc[j]
     prog.finish("round2")
 
     # ---------------- inference ----------------
-    k = len(rep_idx)
+    k = len(sol.coefnames)
     fe_levels = list(map(int, acc["fe_levels"]))
     nested = list(map(bool, acc["local_nested"])) if plan.cluster else []
     for i in range(len(plan.global_fes)):
@@ -550,8 +585,10 @@ def fit(
     G = (acc["G_local"] if plan.cluster_local else int(acc["cpresent"].sum())) if plan.cluster else None
 
     out = {}
+    meat_idx = sol.meat_idx
     for j, y in enumerate(f.depvars):
-        b = beta_k[rep_kept_pos, j]
+        b = sol.coef[:, j]
+        bread_use = sol.bread[j]
         V = {}
         dfk_plain = _df_k(k, fe_levels, None)
         if "iid" in plan.vcov_types:
@@ -562,13 +599,24 @@ def fit(
             dfk_cl = _df_k(k, fe_levels, nested)
             V["CRV1"] = (vcov_crv1(bread_use, acc2["crv"][j], N, dfk_cl, G), G - 1)
         V = {t: (v[np.ix_(meat_idx, meat_idx)], df) for t, (v, df) in V.items()}
-        tss = acc["YtY"][j] if plan.local_fes else acc["sum_wy2"][j] - acc["sum_wy"][j] ** 2 / acc["sumw"]
+        tss = acc["YtY"][j, j] if plan.local_fes else acc["sum_wy2"][j] - acc["sum_wy"][j] ** 2 / acc["sumw"]
         out[y] = {
             "coef": b,
             "vcov": V,
             "rss": float(acc2["rss"][j]),
             "tss": float(tss),
             "r2_within" if plan.local_fes else "r2": float(1 - acc2["rss"][j] / tss),
+        }
+        if f.iv:
+            out[y]["kappa"] = float(sol.kappa[j])
+    iv_info = {}
+    if f.iv:
+        iv_info = {
+            "estimator": "fuller" if fuller is not None else estimator,
+            "fuller": fuller,
+            "endogenous": list(plan.endog_names),
+            "instruments": list(plan.inst_names),
+            "first_stage": _iv.first_stage(plan, sol, acc, acc2, N, fe_levels, nested, G),
         }
 
     if cache and not keep_cache:
@@ -591,6 +639,7 @@ def fit(
         "max_dummy_levels": max_dummy_levels,
         "collin_tol": collin_tol,
         "cache": cache,
+        **iv_opts,
     }
     run = _record.run_info(
         ds,
@@ -636,7 +685,7 @@ def fit(
     res = Result(
         formula=f.text,
         label=label,
-        coefnames=[plan.colnames[i] for i in rep_idx],
+        coefnames=sol.coefnames,
         outcomes=out,
         N=N,
         N_dropped=acc["rows_in"] - N,
@@ -661,6 +710,7 @@ def fit(
         options=options,
         terms=_record.term_rows(f, plan.cat_levels, has_fe=bool(plan.local_fes or plan.global_fes)),
         run=run,
+        iv=iv_info,
     )
     res.save(wd / "result.json")
     if record:

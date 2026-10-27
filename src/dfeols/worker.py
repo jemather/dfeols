@@ -10,7 +10,13 @@ Round 1 (`shard_round1`): build the design for one shard, drop singletons,
 demean by FEs nested in the partition key, and return cross-products.
 The demeaned arrays are cached to disk for round 2.
 
-Round 2 (`shard_round2`): residuals, RSS and the meat of the sandwich.
+Round 2 (`shard_round2`): residuals, RSS and the meat of the sandwich, from linear
+maps of the round-1 columns that the coordinator passes (OLS and IV alike).
+
+IV (docs/design/iv.md): the endogenous regressors are built into the outcome block,
+after the outcomes, so they are demeaned (and partialled against crossing-FE dummies)
+like an outcome; the excluded instruments go into the regressor block after the
+reported regressors, before the dummies.
 """
 
 from __future__ import annotations
@@ -22,7 +28,7 @@ try:
     import resource
 except ImportError:  # pragma: no cover (Windows)
     resource = None
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -56,16 +62,26 @@ class Plan:
     sparse_global: bool = False  # crossing FEs via per-level sums, no dense dummies
     keep_dir: str | None = None  # per-shard singleton keep masks (when FEs cross the partition)
     row_key_cols: tuple[str, ...] = ()  # raw columns hashed into the record's row_key
+    endog_names: list[str] = field(default_factory=list)  # IV: endogenous columns (outcome block)
+    inst_names: list[str] = field(default_factory=list)  # IV: excluded instruments (regressor block)
+
+    @property
+    def k_x(self) -> int:
+        """Regressor-block columns before the crossing-FE dummies."""
+        return len(self.colnames) + len(self.inst_names)
 
 
 def plan_columns(f: Formula, cat_levels: dict[str, list], has_fe: bool):
     """Reported regressors. With any FE the constant is absorbed (with only
     dummy FEs it is kept as a hidden column after the dummies, standing in
     for their dropped first level, and is not reported)."""
+    return (["Intercept"] if f.intercept and not has_fe else []) + term_names(f.terms, cat_levels)
+
+
+def term_names(terms, cat_levels: dict[str, list]) -> list[str]:
+    """Column names of `terms`, one per column `_term_columns` builds."""
     names: list[str] = []
-    if f.intercept and not has_fe:
-        names.append("Intercept")
-    for t in f.terms:
+    for t in terms:
         if t.cat is None:
             names.append(":".join(t.conts))
             continue
@@ -129,6 +145,16 @@ def _load(plan: Plan, files: list[str], dropped: dict | None = None):
             {"rows": n[0], "missing": n[0] - n[1], "non_finite": n[1] - n[2], "zero_weights": n[2] - n[3]}
         )
     return df
+
+
+def _outcome_block(plan: Plan, df, n: int) -> np.ndarray:
+    """Outcomes, then (IV) the endogenous regressors' columns."""
+    f = plan.formula
+    cols = [df[y].to_numpy().astype(np.float64) for y in f.depvars] if n else []
+    for t in f.endog:
+        cols.extend(_term_columns(t, df, plan.cat_levels) if n else [])
+    width = len(f.depvars) + len(plan.endog_names)
+    return np.column_stack(cols) if n else np.zeros((0, width))
 
 
 def _maxrss_gb() -> float:
@@ -199,8 +225,7 @@ def shard_round1(plan: Plan, shard_id: int, files: list[str]) -> dict:
 def _global_layout(plan: Plan):
     """Combined level index over all global FEs, and each level's column in Z
     (-1 for the dropped first level of each FE)."""
-    k_rep = len(plan.colnames)
-    offs, zpos, o, zo = [], [], 0, k_rep
+    offs, zpos, o, zo = [], [], 0, plan.k_x
     for _, _, L in plan.global_fes:
         offs.append(o)
         zpos.append(np.r_[-1, zo + np.arange(L - 1)])
@@ -241,13 +266,9 @@ def _round1_sparse(plan: Plan, shard_id: int, df, n0: int, local_codes, w, T, t0
     n = df.height
     a = local_codes[0].astype(np.int64)
     nA = int(a.max()) + 1 if n else 0
-    Y = (
-        np.column_stack([df[y].to_numpy().astype(np.float64) for y in f.depvars])
-        if n
-        else np.zeros((0, len(f.depvars)))
-    )
+    Y = _outcome_block(plan, df, n)
     cols = []
-    for term in f.terms:
+    for term in (*f.terms, *f.instruments):
         cols.extend(_term_columns(term, df, plan.cat_levels))
     X = np.column_stack(cols) if cols else np.zeros((n, 0))
     Dm, gcodes = _global_matrix(df, plan, n)
@@ -342,7 +363,7 @@ def _round1(plan: Plan, shard_id: int, files: list[str], write_cache: bool):
         "sumw": float(w.sum()),
         "ZtZ": ZtZ,
         "ZtY": ZtY,
-        "YtY": np.einsum("ij,ij,i->j", Yt, Yt, w),
+        "YtY": (Yt * w[:, None]).T @ Yt,  # full: IV needs the endogenous columns' cross-products
         # raw sums for R2 when there are no fixed effects
         "sum_wy": (Y * w[:, None]).sum(0),
         "sum_wy2": (Y * Y * w[:, None]).sum(0),
@@ -356,15 +377,11 @@ def _round1(plan: Plan, shard_id: int, files: list[str], write_cache: bool):
 def _round1_dense(plan: Plan, df, n, local_codes, w, T):
     f = plan.formula
     t = time.perf_counter()
-    Y = (
-        np.column_stack([df[y].to_numpy().astype(np.float64) for y in f.depvars])
-        if n
-        else np.zeros((0, len(f.depvars)))
-    )
+    Y = _outcome_block(plan, df, n)
     cols: list[np.ndarray] = []
     if "Intercept" in plan.colnames:
         cols.append(np.ones(n))
-    for term in f.terms:
+    for term in (*f.terms, *f.instruments):
         cols.extend(_term_columns(term, df, plan.cat_levels))
     # Global (low-cardinality) FEs enter as dummies, first level dropped.
     for _, c, L in plan.global_fes:
@@ -438,16 +455,48 @@ def _round1_finish(plan, shard_id, df, local_codes, w, Yt, Zt, out, T, t, t0, wr
     return out, arrays
 
 
-def shard_round2(
-    plan: Plan, shard_id: int, files: list[str], beta: np.ndarray, keep: np.ndarray, fwl: dict | None = None
-) -> dict:
-    """beta: (k_kept x m) on the kept columns of Z.
+def _apply(T: np.ndarray, H) -> np.ndarray:
+    """T @ H, with H given as a matrix or as column indices of T."""
+    return T[:, H] if np.asarray(H).ndim == 1 else T @ H
 
-    fwl (sparse crossing-FE path): {"rep": kept reported columns, "beta_x",
-    "gamma": (P x m) dummy coefficients by level, "pi": (P x |rep|)}. The meat
-    is then formed for the reported coefficients only, from X~ with the dummies
-    partialled out (Frisch-Waugh-Lovell), which equals the corresponding block
-    of the full sandwich."""
+
+def _meat(plan: Plan, scores, E: np.ndarray, w: np.ndarray, cl, out: dict, prefix: str = "") -> None:
+    """RSS and the meats of the equations in E's columns; `scores(j)` gives equation j's
+    score regressors (n x k)."""
+    m = E.shape[1]
+    out[prefix + "rss"] = np.einsum("ij,ij,i->j", E, E, w)
+    S = [scores(j) * (w * E[:, j])[:, None] for j in range(m)]
+    k = S[0].shape[1] if m else 0
+    if "hetero" in plan.vcov_types:
+        out[prefix + "meat_hetero"] = np.array([s.T @ s for s in S]).reshape(m, k, k)
+    if "CRV1" in plan.vcov_types and plan.cluster:
+        order = np.argsort(cl, kind="stable")
+        cls = cl[order]
+        starts = np.flatnonzero(np.r_[True, cls[1:] != cls[:-1]])
+        codes = cls[starts]
+        Sg = np.empty((m, len(codes), k))
+        for j in range(m):
+            Sg[j] = np.add.reduceat(S[j][order], starts, axis=0) if len(cls) else np.zeros((0, k))
+        if plan.cluster_local:
+            out[prefix + "meat_crv"] = np.einsum("mgk,mgl->mkl", Sg, Sg)
+        else:
+            out[prefix + "cluster_codes"] = codes
+            out[prefix + "cluster_scores"] = Sg
+
+
+def shard_round2(plan: Plan, shard_id: int, files: list[str], lin: dict) -> dict:
+    """Residuals, RSS and meats from linear maps of the shard's columns
+    T = [outcome block, Z[:, lin["cols"]]] (outcome block: outcomes, then IV's endogenous
+    regressors; built by estimate._ols_maps or iv.round2_maps).
+
+    For each equation j of an equation group (lin itself: the outcomes; lin["fs"]: IV's
+    first stages, one per endogenous regressor):
+        residual            T @ A[:, j] - D~ G[:, j]
+        score regressors    T @ H_j - D~ GH_j      (H, GH shared, or one per equation)
+    D~ (the sparse crossing-FE path only) is the dummy block with the local FE partialled
+    out, and G, GH are the dummies' coefficients, so the scores are the regressors with the
+    dummies partialled out (Frisch-Waugh-Lovell: the reported block of the full sandwich).
+    Elsewhere the dummies are columns of Z and G, GH are None. H may be column indices."""
     t0 = time.perf_counter()
     T = {}
     if plan.cache_dir and _cache_path(plan, shard_id).exists():
@@ -459,42 +508,46 @@ def shard_round2(
     T["read"] = time.perf_counter() - t0
 
     t = time.perf_counter()
-    if fwl is not None:
+    Tm = np.hstack([Yt, Zt[:, lin["cols"]]])
+    groups = [("", lin)] + ([("fs_", lin["fs"])] if lin.get("fs") else [])
+    out = {"shard": shard_id, "n": len(w)}
+    dterms = {}
+    if lin.get("G") is not None:  # sparse path: one demeaning of every dummy term
         a, Dm = extra
-        Xr = Zt[:, fwl["rep"]]
-        if len(a):
-            V = demean(np.hstack([Dm @ fwl["gamma"], Dm @ fwl["pi"]]), [a], w)[0]
-        else:
-            V = np.zeros((0, fwl["gamma"].shape[1] + fwl["pi"].shape[1]))
-        m_ = fwl["gamma"].shape[1]
-        E = Yt - Xr @ fwl["beta_x"] - V[:, :m_]
-        Zk = Xr - V[:, m_:]  # X with dummies partialled out
-    else:
-        Zk = Zt[:, keep]
-        E = Yt - Zk @ beta  # n x m
-    m = E.shape[1]
-    out = {"shard": shard_id, "n": len(w), "rss": np.einsum("ij,ij,i->j", E, E, w)}
-    k = Zk.shape[1]
-    if "hetero" in plan.vcov_types:
-        H = np.empty((m, k, k))
-        for j in range(m):
-            S = Zk * (w * E[:, j])[:, None]
-            H[j] = S.T @ S
-        out["meat_hetero"] = H
-    if "CRV1" in plan.vcov_types and plan.cluster:
-        order = np.argsort(cl, kind="stable")
-        cls = cl[order]
-        starts = np.flatnonzero(np.r_[True, cls[1:] != cls[:-1]])
-        codes = cls[starts]
-        Sg = np.empty((m, len(codes), k))
-        for j in range(m):
-            S = (Zk * (w * E[:, j])[:, None])[order]
-            Sg[j] = np.add.reduceat(S, starts, axis=0) if len(S) else np.zeros((0, k))
-        if plan.cluster_local:
-            out["meat_crv"] = np.einsum("mgk,mgl->mkl", Sg, Sg)
-        else:
-            out["cluster_codes"] = codes
-            out["cluster_scores"] = Sg
+        blocks = []
+        for _, g in groups:
+            blocks.append(g["G"])
+            GH = g["GH"]
+            blocks.extend(list(GH) if GH.ndim == 3 else [GH])
+        B = np.hstack(blocks)
+        V = demean(Dm @ B, [a], w)[0] if len(a) else np.zeros((0, B.shape[1]))
+        o = 0
+        for prefix, g in groups:
+            ne = g["A"].shape[1]
+            dterms[prefix] = {"G": V[:, o : o + ne]}
+            o += ne
+            GH = g["GH"]
+            kk = GH.shape[-1]
+            parts = []
+            for _ in range(len(GH) if GH.ndim == 3 else 1):
+                parts.append(V[:, o : o + kk])
+                o += kk
+            dterms[prefix]["GH"] = parts
+    for prefix, g in groups:
+        E = Tm @ g["A"]
+        d = dterms.get(prefix)
+        if d is not None:
+            E = E - d["G"]
+        H = g["H"]
+        per_eq = np.asarray(H).ndim == 3
+
+        def scores(j, H=H, d=d, per_eq=per_eq):
+            S = _apply(Tm, H[j] if per_eq else H)
+            if d is not None:
+                S = S - d["GH"][j if per_eq else 0]
+            return S
+
+        _meat(plan, scores, E, w, cl, out, prefix)
     T["meat"] = time.perf_counter() - t
     T["total"] = time.perf_counter() - t0
     T["maxrss_gb"] = _maxrss_gb()

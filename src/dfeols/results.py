@@ -35,6 +35,7 @@ class Result:
     options: dict = field(default_factory=dict)  # fit() arguments, resolved
     terms: list = field(default_factory=list)  # every regressor, collinear ones too: {term, canonical}
     run: dict = field(default_factory=dict)  # sample counts, provenance, dfeols facts (record.run_info)
+    iv: dict = field(default_factory=dict)  # IV: estimator, endogenous, instruments, first_stage
 
     def coef(self, y: str | None = None) -> np.ndarray:
         return self.outcomes[y or next(iter(self.outcomes))]["coef"]

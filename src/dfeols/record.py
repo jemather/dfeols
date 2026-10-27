@@ -9,9 +9,9 @@
     write_estimation(result, path, y, ...), write_estimations(result, path, ...)
 
 A record claims inference/0.1, linear-fe/0.1 and dfeols/0.1 (a fit without FEs claims
-inference/0.1 only and keeps the dfeols block). A fit with several responses gives one
-record per response (Ted, 2026-10-24), as fixest and pyfixest return one model per
-response; the records share `extensions.dfeols.fit` (id and all responses).
+inference/0.1 only and keeps the dfeols block); an IV fit also claims iv/0.1. A fit
+with several responses gives one record per response (Ted, 2026-10-24), as fixest and
+pyfixest return one model per response; the records share `extensions.dfeols.fit` (id and all responses).
 
 Provenance is captured on the coordinator when the fit finishes. SLURM fields come
 from the job's environment variables (no sacct call), so End, Elapsed, MaxRSS and
@@ -125,12 +125,18 @@ def _level(v: Any) -> str:
 
 
 def term_rows(formula, cat_levels: dict[str, list], has_fe: bool) -> list[dict]:
-    """Every reported regressor in model order (as worker.plan_columns names them), with
-    its canonical form: R rendering, except factor x continuous in Stata form."""
+    """Every reported regressor in model order (as worker.plan_columns names them, then
+    IV's endogenous regressors), with its canonical form: R rendering, except factor x
+    continuous in Stata form."""
     rows: list[dict] = []
     if formula.intercept and not has_fe:
         rows.append({"term": "Intercept", "canonical": {"name": "(Intercept)", "factors": []}})
-    for t in formula.terms:
+    return rows + _term_rows((*formula.terms, *formula.endog), cat_levels)
+
+
+def _term_rows(terms, cat_levels: dict[str, list]) -> list[dict]:
+    rows: list[dict] = []
+    for t in terms:
         conts = [{"variable": v} for v in t.conts]
         if t.cat is None:
             name = ":".join(t.conts)
@@ -159,7 +165,7 @@ def factor_terms(formula, cat_levels: dict[str, list], max_levels: int = 1000) -
     """specification.factor_terms: each i() term's variable, levels (when at most
     `max_levels`) and reference level."""
     out, seen = [], set()
-    for t in formula.terms:
+    for t in (*formula.terms, *formula.endog, *formula.instruments):
         if t.cat is None:
             continue
         levels = list(cat_levels[t.cat])
@@ -458,10 +464,61 @@ def _call(result) -> str:
         "crossing_fe",
         "max_dummy_levels",
         "collin_tol",
+        "estimator",
+        "fuller",
     ):
-        if k in o:
+        if k in o and not (k == "fuller" and o[k] is None):
             args.append(f"{k}={o[k]!r}")
     return f"dfeols.fit(ds, {', '.join(args)})"
+
+
+def _first_stage_params(r, opts: dict) -> list[dict]:
+    """First-stage coefficients on the excluded instruments, one row per (endogenous,
+    instrument), under the default vcov (iv/0.1: component "first_stage", response = the
+    endogenous regressor)."""
+    vt = r.vcov_default
+    rows = []
+    for e in r.iv["first_stage"]["per_endogenous"]:
+        b = np.asarray(e["coef"], float)
+        se = np.sqrt(np.diag(np.asarray(e["vcov"][vt], float)))
+        test = next(t for t in e["f_stat"] if t["name"] == ("f_iid" if vt == "iid" else f"wald_{vt}"))
+        t, p, q = _t_stats(b, se, test["df2"])
+        for i, name in enumerate(e["instruments"]):
+            rows.append(
+                {
+                    "term": name,
+                    "component": "first_stage",
+                    "response": e["endogenous"],
+                    "estimate": b[i],
+                    "std_error": se[i],
+                    "statistic": t[i],
+                    "p_value": p[i],
+                    "conf_low": b[i] - q * se[i],
+                    "conf_high": b[i] + q * se[i],
+                }
+            )
+    return rows
+
+
+def _first_stage_structure(iv: dict, default_vcov: str) -> dict:
+    """structures.first_stage: per endogenous regressor, R², partial R², the first-stage F
+    under the default vcov (the iid partial F for iid) and the effective F; every F
+    version dfeols computed is kept in extensions.dfeols.first_stage."""
+    want = "f_iid" if default_vcov == "iid" else f"wald_{default_vcov}"
+    per = []
+    for e in iv["first_stage"]["per_endogenous"]:
+        f = next(t for t in e["f_stat"] if t["name"] == want)
+        d: dict[str, Any] = {
+            "endogenous": e["endogenous"],
+            "r2": e["r2"],
+            "partial_r2": e["partial_r2"],
+            "f_stat": {**f, "vcov": VCOV_TYPES.get(default_vcov, default_vcov)},
+        }
+        for eff in e.get("effective_f", []):
+            if eff["vcov"] == default_vcov:
+                d["effective_f"] = {"statistic": eff["statistic"], "name": "montiel_olea_pflueger"}
+        per.append(d)
+    return {"kind": "object", "per_endogenous": per}
 
 
 def _ssc(vtype: str, N: int, k: int, dfk: int, G: int | None, nested: list[bool]) -> dict:
@@ -566,12 +623,19 @@ def to_estimation(
             }
         )
 
+    iv = r.iv or {}
+    # linear-fe needs at least one FE; a fit without any is plain inference
+    profiles = list(PROFILES) if has_fe else ["inference/0.1"]
+    if iv:
+        profiles.insert(profiles.index("inference/0.1") + 1 + has_fe, "iv/0.1")
+        method = iv["estimator"]
+    else:
+        method = "wls" if opts.get("weights") else "ols"
     meta: dict[str, Any] = {
         "status": status,
-        "estimator": {"family": "linear", "method": "wls" if opts.get("weights") else "ols"},
+        "estimator": {"family": "linear", "method": method},
         "responses": [y],
-        # linear-fe needs at least one FE; a fit without any is plain inference
-        "profiles": list(PROFILES) if has_fe else ["inference/0.1"],
+        "profiles": profiles,
         "title": title or (r.label if len(r.outcomes) == 1 else f"{r.label} ({y})"),
     }
     if messages:
@@ -605,6 +669,7 @@ def to_estimation(
         else:
             continue
         params.append(out)
+    params += _first_stage_params(r, opts) if iv else []
     vcovs = []
     for vt in [v for v in opts.get("vcov", []) if v in o["vcov"]] or list(o["vcov"]):
         Vt, dft = o["vcov"][vt]
@@ -645,6 +710,10 @@ def to_estimation(
             "(dummy FEs are regressors in RSS, not in TSS)",
         }
     metrics["sigma"] = float(np.sqrt(o["rss"] / df_resid)) if df_resid > 0 else None
+    if iv:
+        metrics["kappa"] = o.get("kappa")
+        if iv.get("fuller") is not None:
+            metrics["fuller"] = iv["fuller"]
     metrics["conf_level"] = 0.95
 
     structures: dict[str, Any] = {"vcov": vcovs}
@@ -683,6 +752,8 @@ def to_estimation(
     if n_local != 2 or opts.get("fe_method") == "iterate":
         numerics["iterative"] = n_local >= 2
     structures["numerics"] = {k_: v for k_, v in numerics.items() if v is not None}
+    if iv:
+        structures["first_stage"] = _first_stage_structure(iv, r.vcov_default)
 
     # ---- specification
     sample = run.get("sample") or {}
@@ -706,6 +777,9 @@ def to_estimation(
     }
     if run.get("factor_terms"):
         spec["factor_terms"] = run["factor_terms"]
+    if iv:
+        spec["endogenous"] = list(iv["endogenous"])
+        spec["instruments"] = list(iv["instruments"])
 
     record = ef.new_record(params, meta=meta, specification=spec, metrics=metrics, structures=structures)
     if provenance and run.get("provenance"):
@@ -726,6 +800,8 @@ def to_estimation(
         ext["row_key"] = run["row_key"]
     if absorption:
         ext["absorption"] = absorption
+    if iv:
+        ext["first_stage"] = iv["first_stage"]
     if r.timing:
         ext["timing"] = r.timing
     src = dfeols_source() if provenance else {}

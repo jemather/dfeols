@@ -16,6 +16,9 @@ RHS   terms separated by '+':
         0            suppress the intercept (only matters without fixed effects)
 FE    absorbed fixed effects separated by '+'; a^b is the interaction of a and b.
       Every FE must have been encoded by prep().
+IV    a last part `endog ~ instruments` (docs/design/iv.md), with or without FEs:
+        y ~ x | fe1 + fe2 | d1 + d2 ~ z1 + z2 + z3      y ~ x | d ~ z      y ~ 1 | d ~ z
+      Endogenous regressors and instruments are terms like the others.
 """
 
 from __future__ import annotations
@@ -50,11 +53,17 @@ class Formula:
     terms: tuple[Term, ...]
     fes: tuple[str, ...]  # FE names, e.g. "spell", "id_a^week"
     intercept: bool = True
+    endog: tuple[Term, ...] = ()  # IV: endogenous regressors
+    instruments: tuple[Term, ...] = ()  # IV: excluded instruments
+
+    @property
+    def iv(self) -> bool:
+        return bool(self.endog)
 
     @property
     def variables(self) -> set[str]:
         out = set(self.depvars)
-        for t in self.terms:
+        for t in (*self.terms, *self.endog, *self.instruments):
             out.update(t.conts)
             if t.cat:
                 out.add(t.cat)
@@ -108,6 +117,24 @@ def _split_top(s: str, sep: str) -> list[str]:
     return [p.strip() for p in out if p.strip()]
 
 
+def _term(raw: str) -> Term:
+    conts, cat, ref, drop_first = [], None, None, False
+    for piece in _split_top(raw, ":"):
+        m = _I_RE.match(piece)
+        if m:
+            if cat is not None:
+                raise ValueError(f"Only one i() per term: {raw!r}")
+            cat = m.group(1)
+            ref = _parse_ref(m.group(2)) if m.group(2) else None
+        elif _NAME_RE.match(piece):
+            conts.append(piece)
+        else:
+            raise ValueError(f"Cannot parse term piece {piece!r} in {raw!r}")
+    if cat is not None and not conts and ref is None:
+        drop_first = True
+    return Term(tuple(conts), cat, ref, drop_first)
+
+
 def parse(text: str) -> Formula:
     if "~" not in text:
         raise ValueError("Formula needs '~'")
@@ -117,11 +144,21 @@ def parse(text: str) -> Formula:
         if not _NAME_RE.match(d):
             raise ValueError(f"Bad outcome name {d!r}")
 
-    fe_part = ""
-    if "|" in rhs:
-        rhs, fe_part = rhs.split("|", 1)
-        if "|" in fe_part:
-            raise ValueError("IV syntax is not supported yet")
+    parts = [p.strip() for p in rhs.split("|")]
+    endog: tuple[Term, ...] = ()
+    instruments: tuple[Term, ...] = ()
+    if len(parts) > 1 and "~" in parts[-1]:
+        en, inst = parts.pop().split("~", 1)
+        if "~" in inst:
+            raise ValueError("The IV part takes one '~': endogenous ~ instruments")
+        endog = tuple(_term(t) for t in _split_top(en, "+"))
+        instruments = tuple(_term(t) for t in _split_top(inst, "+"))
+        if not endog or not instruments:
+            raise ValueError("The IV part needs endogenous regressors and instruments: d ~ z")
+    if any("~" in p for p in parts) or len(parts) > 2:
+        raise ValueError("Formula is y ~ x | fe, with an optional last part endog ~ instruments")
+    rhs = parts[0]
+    fe_part = parts[1] if len(parts) == 2 else ""
     fes = tuple(_split_top(fe_part, "+")) if fe_part.strip() else ()
     for f in fes:
         fe_components(f)
@@ -134,25 +171,15 @@ def parse(text: str) -> Formula:
             continue
         if raw == "1":
             continue
-        conts, cat, ref, drop_first = [], None, None, False
-        for piece in _split_top(raw, ":"):
-            m = _I_RE.match(piece)
-            if m:
-                if cat is not None:
-                    raise ValueError(f"Only one i() per term: {raw!r}")
-                cat = m.group(1)
-                ref = _parse_ref(m.group(2)) if m.group(2) else None
-            elif _NAME_RE.match(piece):
-                conts.append(piece)
-            else:
-                raise ValueError(f"Cannot parse term piece {piece!r} in {raw!r}")
-        if cat is not None and not conts and ref is None:
-            drop_first = True
-        terms.append(Term(tuple(conts), cat, ref, drop_first))
+        terms.append(_term(raw))
 
-    if not terms:
+    if not terms and not endog:
         raise ValueError("No regressors")
-    return Formula(text.strip(), depvars, tuple(terms), fes, intercept)
+    labels = [t.label for t in (*terms, *endog, *instruments)]
+    dup = sorted({x for x in labels if labels.count(x) > 1})
+    if dup:
+        raise ValueError(f"Terms appear more than once among regressors and instruments: {dup}")
+    return Formula(text.strip(), depvars, tuple(terms), fes, intercept, endog, instruments)
 
 
 def pyfixest_tol_kwargs(tol: float, maxiter: int = 1_000_000) -> dict:
@@ -172,19 +199,23 @@ def to_pyfixest(text: str) -> str:
     """Translate a dfeols formula to pyfixest syntax (for validation).
     x:i(c) -> i(c, x); x:i(c, ref=r) -> i(c, x, ref=r); i(c) -> C(c)."""
     f = parse(text)
-    rhs = []
-    for t in f.terms:
+
+    def term(t: Term) -> str:
         base = ":".join(t.conts)
         if t.cat is None:
-            rhs.append(base)
-        elif not t.conts:
-            rhs.append(f"i({t.cat}, ref={t.ref!r})" if t.ref is not None else f"C({t.cat})")
-        else:
-            if len(t.conts) > 1:
-                raise ValueError("pyfixest i() takes one continuous variable")
-            ref = f", ref={t.ref!r}" if t.ref is not None else ""
-            rhs.append(f"i({t.cat}, {base}{ref})")
+            return base
+        if not t.conts:
+            return f"i({t.cat}, ref={t.ref!r})" if t.ref is not None else f"C({t.cat})"
+        if len(t.conts) > 1:
+            raise ValueError("pyfixest i() takes one continuous variable")
+        ref = f", ref={t.ref!r}" if t.ref is not None else ""
+        return f"i({t.cat}, {base}{ref})"
+
+    rhs = [term(t) for t in f.terms] or ["1"]
     if not f.intercept:
         rhs.append("0")
     out = f"{' + '.join(f.depvars)} ~ {' + '.join(rhs)}"
-    return out + (f" | {' + '.join(f.fes)}" if f.fes else "")
+    out += f" | {' + '.join(f.fes)}" if f.fes else ""
+    if f.iv:
+        out += f" | {' + '.join(map(term, f.endog))} ~ {' + '.join(map(term, f.instruments))}"
+    return out
