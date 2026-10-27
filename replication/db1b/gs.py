@@ -11,7 +11,8 @@ Ticket rules (App. B, pp. 33-34; docs/db1b.md):
   direct      every market has one coupon, at most two markets (one-way or round trip)
   credible    dollar_cred == 1; itin_fare > 0; fare > $20 round trip, > $10 one-way
   coach       the first coupon's fare class is X or Y, or any class for single-cabin carriers
-              (SINGLE_CABIN: Southwest and JetBlue code ~all fares F/G but have no first class)
+              (SINGLE_CABIN: Southwest to 2009Q1 and JetBlue to 2018Q3 code ~all fares F/G but
+              have no first class; both then code X/Y)
   code-share  ticketing != operating carrier on any coupon drops the ticket (App. B). The
               `regionals` exemption (operating carriers selling < 0.5% of direct tickets) is kept
               as an option, `--cs-exempt regionals`; it only fit while Southwest was missing
@@ -36,8 +37,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import sources as S
 
 COACH = ["X", "Y"]
-# Carriers coding >= 90% of direct tickets F/G with no premium cabin, 1993-2006 (docs/db1b.md)
-SINGLE_CABIN = ["WN", "B6"]
+# Carriers coding >= 90% of direct tickets F/G with no premium cabin, to the last such quarter
+# (1993Q1-2025Q2; docs/db1b.md). JetBlue's Mint (from 2014) is coded F too until 2018Q3
+SINGLE_CABIN = {"WN": (2009, 1), "B6": (2018, 3)}
 CS_EXEMPT_FROM = (1998, 1)
 REGIONAL_WINDOW = ((1998, 3), (2006, 3))
 REGIONAL_SHARE = 0.005
@@ -65,6 +67,17 @@ LCC = [
     "NJ",
     "W7",
 ]
+# The panel extension (Ted, 2026-10-27): G&S's lists through 2006Q3; from 2006Q4 these LCCs too.
+# Codes are reused (MX is Mexicana to 2010, Breeze from 2021), so each has a first quarter.
+# Virgin America (VX) is neither, like Hawaiian; merging carriers count by code, as in G&S
+EXTENSION_FROM = (2006, 4)
+LCC_FROM = {
+    "G4": EXTENSION_FROM,
+    "SX": EXTENSION_FROM,
+    "U5": EXTENSION_FROM,
+    "MX": (2021, 1),
+    "XP": (2021, 1),
+}
 KEY = ["year", "quarter", "carrier", "origin_airport_id", "dest_airport_id"]
 ROUTE = ["origin_airport_id", "dest_airport_id"]
 
@@ -123,8 +136,10 @@ def regionals(stage: Path, window=REGIONAL_WINDOW, share=REGIONAL_SHARE) -> list
 def observations(
     stage: Path, year: int, quarter: int, cs_exempt, exempt_from=CS_EXEMPT_FROM, single_cabin=SINGLE_CABIN
 ) -> pl.LazyFrame:
-    """Directional observations from one quarter's kept tickets."""
+    """Directional observations from one quarter's kept tickets. `single_cabin` maps each
+    single-cabin carrier to its last single-cabin quarter."""
     tickets, coupons = candidates(stage, year, quarter)
+    single = [c for c, last in single_cabin.items() if (year, quarter) <= last]
     exempt = cs_exempt if (year, quarter) >= exempt_from else []
     codeshare = (pl.col("ticket_carrier") != pl.col("operating_carrier")) & ~pl.col(
         "operating_carrier"
@@ -133,8 +148,7 @@ def observations(
         coupons.group_by("itin_id")
         .agg(
             (
-                pl.col("fare_class").first().is_in(COACH)
-                | pl.col("ticket_carrier").first().is_in(single_cabin)
+                pl.col("fare_class").first().is_in(COACH) | pl.col("ticket_carrier").first().is_in(single)
             ).alias("coach"),
             codeshare.any().alias("codeshare"),
         )
@@ -330,7 +344,7 @@ def variables(collapsed: pl.DataFrame, panel: pl.DataFrame, t100: pl.DataFrame) 
     city = ["origin_city_market_id", "dest_city_market_id"]
     cities = collapsed.group_by(*t, *city).agg(
         pl.col("carrier").filter(pl.col("carrier").is_in(LEGACY)).n_unique().alias("legn"),
-        pl.col("carrier").filter(pl.col("carrier").is_in(LCC)).n_unique().alias("lccn"),
+        pl.col("carrier").filter(is_lcc()).n_unique().alias("lccn"),
     )
     passrte = t100.group_by(*t, *ROUTE).agg(pl.col("t100_passengers").sum().alias("passrte"))
     return (
@@ -351,6 +365,22 @@ def variables(collapsed: pl.DataFrame, panel: pl.DataFrame, t100: pl.DataFrame) 
             carrier_route=pl.format("{}:{}-{}", "carrier", "origin_airport_id", "dest_airport_id"),
         )
     )
+
+
+def is_lcc() -> pl.Expr:
+    """Low-cost carrier in the row's quarter: G&S's list, plus LCC_FROM from each first quarter."""
+    yq = pl.col("year") * 10 + pl.col("quarter")
+    e = pl.col("carrier").is_in(LCC)
+    for c, (y, q) in LCC_FROM.items():
+        e = e | ((pl.col("carrier") == c) & (yq >= y * 10 + q))
+    return e
+
+
+def parse_single_cabin(s: str) -> dict:
+    """'WN:2009Q1,B6:2018Q3' -> {carrier: (year, quarter)}; 'none' -> {}."""
+    if s == "none":
+        return {}
+    return {c: parse_quarter(q) for c, q in (x.split(":") for x in s.split(","))}
 
 
 def print_counts(counts: dict) -> None:
@@ -383,7 +413,9 @@ def main(argv=None) -> int:
     )
     ap.add_argument("--cs-exempt-from", default="1998Q1", type=parse_quarter)
     ap.add_argument(
-        "--single-cabin", default=",".join(SINGLE_CABIN), help="carriers whose every fare is coach; 'none'"
+        "--single-cabin",
+        default=",".join(f"{c}:{y}Q{q}" for c, (y, q) in SINGLE_CABIN.items()),
+        help="carriers whose every fare is coach, to a last quarter (WN:2009Q1,...); 'none'",
     )
     ap.add_argument("--merge", default="operators", choices=["ticketing", "operators"])
     ap.add_argument("--direction", default="per_quarter", choices=["per_quarter", "fixed", "pair"])
@@ -403,8 +435,7 @@ def main(argv=None) -> int:
             exempt = [] if a.cs_exempt == "none" else a.cs_exempt.split(",")
         (a.out / "collapsed").mkdir(exist_ok=True)
         for y, q in S.quarters(a.first, a.last):
-            single = [] if a.single_cabin == "none" else a.single_cabin.split(",")
-            obs = observations(a.stage, y, q, exempt, a.cs_exempt_from, single)
+            obs = observations(a.stage, y, q, exempt, a.cs_exempt_from, parse_single_cabin(a.single_cabin))
             df = collapse(obs).collect(engine="streaming")
             df.write_parquet(a.out / "collapsed" / f"gs_{y}Q{q}.parquet")
             print(

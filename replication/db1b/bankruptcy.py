@@ -5,8 +5,8 @@ Source: Wikipedia, "List of airline bankruptcies in the United States", revision
 (2026-10-11), saved by Ted as raw/db1b/airline_bankruptcy/*.wikitext (docs/sources/db1b.md).
 Only the Chapter 11 table is used: Chapter 7 is liquidation, so the carrier leaves the data.
 
-`chapter11(path)` parses the table; `periods(path)` maps the carriers in the 1993-2006 panel to
-their codes. A period with no exit date runs until the carrier ceased operating or was acquired
+`chapter11(path)` parses the table; `periods(path)` maps the carriers in the 1993Q1-2025Q2 panel
+to their codes. A period with no exit date runs until the carrier ceased operating or was acquired
 (`END_WITHOUT_EXIT`). The page marks itself incomplete: SUPPLEMENT adds the in-panel cases it lacks,
 from sources Ted supplied (2026-10-27); MISSING lists what is still open.
 """
@@ -31,6 +31,19 @@ CODES = {
     "National Airlines (1999–2002)": "N7",
     "Sun Country Airlines": "SY",
     "Trans World Airlines": "TW",
+    # panel extension, 2006Q4-2025Q2 (carriers that ticket in DB1B; regionals don't enter)
+    "Frontier Airlines": "F9",
+    "American Airlines": "AA",
+    "Mesa Airlines": "YV",
+    "ATA Airlines": "TZ",
+    "Skybus Airlines": "SX",
+    "Island Air (Hawaii)": "WP",
+    "Spirit Airlines": "NK",
+}
+# Rows whose hidden sort key (the date the parser reads) is wrong; replaced in SUPPLEMENT
+BAD_ROWS = {
+    # shows "December 15, 2024", hides 2020-04-05, no exit; Spirit filed 2024-11-18 (Ted's quote)
+    ("Spirit Airlines", "2020-04-05"),
 }
 # Filings with no exit date that end inside the panel: the date operations ended (page notes)
 END_WITHOUT_EXIT = {
@@ -38,6 +51,11 @@ END_WITHOUT_EXIT = {
     # AMR bought TWA's assets in April 2001; TWA Airlines LLC (not in bankruptcy) flew the TW
     # code until 2001-12-01 (Ted, 2026-10-27)
     ("TW", "2001-01-10"): "2001-04",
+    ("AQ", "2008-03-31"): "2008-03-31",  # "ceased passenger operations"; T-100 ends 2008-03
+    ("TZ", "2008-04-02"): "2008-04-03",  # ATA has two rows; ceased operations 2008-04-03
+    ("TZ", "2008-04-03"): "2008-04-03",
+    ("SX", "2008-04-05"): "2008-04-05",  # "Ceased operations"; T-100 ends 2008-02
+    ("WP", "2017-10-16"): "2017-12",  # "Ceased operations" in 2017; T-100 ends 2017-09
 }
 # In-panel Chapter 11 periods the page lacks, from sources Ted supplied (docs/sources/db1b.md)
 SUPPLEMENT = [
@@ -52,6 +70,11 @@ SUPPLEMENT = [
     {"carrier": "HA", "filed": "2003-03", "exited": "2005-06-02", "source": "SEC EDGAR 1172222"},
     # filed 2004-10-26, emerged 2006-02-28 (Wikipedia, ATA Airlines)
     {"carrier": "TZ", "filed": "2004-10-26", "exited": "2006-02-28", "source": "Wikipedia, ATA Airlines"},
+    # filed 2024-11-18; "By the spring of 2025, Spirit had emerged ... plan approved in February"
+    # (Ted's quote, 2026-10-27). The day isn't given: March 2025 assumed (Claude: 2025-03-12)
+    {"carrier": "NK", "filed": "2024-11-18", "exited": "2025-03", "source": "Ted, 2026-10-27"},
+    # second filing 2025-08-29, ceased operations 2026-05-02 (Ted's quote); after the panel
+    {"carrier": "NK", "filed": "2025-08-29", "exited": "2026-05-02", "source": "Ted, 2026-10-27"},
 ]
 # Still open (Ted)
 MISSING = [
@@ -109,7 +132,7 @@ def periods(path: Path = WIKITEXT) -> list[dict]:
     out = []
     for r in chapter11(path):
         code = CODES.get(r["article"])
-        if code is None or r["filed"] is None:
+        if code is None or r["filed"] is None or (r["article"], r["filed"]) in BAD_ROWS:
             continue
         end = r["exited"] or END_WITHOUT_EXIT.get((code, r["filed"]))
         if end is None:
