@@ -258,6 +258,21 @@ def steps(
     if direction == "fixed":
         # one direction per airport pair throughout: origin id below destination id
         o = f.filter(pl.col("origin_airport_id") < pl.col("dest_airport_id"))
+    elif direction == "pair":
+        # drop a direction only where the airport pair survives the filters in both directions
+        # (in any quarter); then keep origin id below destination id
+        a, b = pl.min_horizontal(*ROUTE), pl.max_horizontal(*ROUTE)
+        both = (
+            f.with_columns(a=a, b=b)
+            .group_by("a", "b")
+            .agg(pl.col("origin_airport_id").n_unique().alias("dirs"))
+        )
+        o = (
+            f.with_columns(a=a, b=b)
+            .join(both, on=["a", "b"])
+            .filter((pl.col("dirs") == 1) | (pl.col("origin_airport_id") < pl.col("dest_airport_id")))
+            .drop("a", "b", "dirs")
+        )
     else:
         # one direction per carrier, airport pair and quarter: the lower origin id when both exist
         pair = [pl.min_horizontal(*ROUTE).alias("a"), pl.max_horizontal(*ROUTE).alias("b")]
@@ -371,7 +386,7 @@ def main(argv=None) -> int:
         "--single-cabin", default=",".join(SINGLE_CABIN), help="carriers whose every fare is coach; 'none'"
     )
     ap.add_argument("--merge", default="operators", choices=["ticketing", "operators"])
-    ap.add_argument("--direction", default="fixed", choices=["per_quarter", "fixed"])
+    ap.add_argument("--direction", default="fixed", choices=["per_quarter", "fixed", "pair"])
     a = ap.parse_args(argv)
     a.out.mkdir(parents=True, exist_ok=True)
 
@@ -408,8 +423,9 @@ def main(argv=None) -> int:
     print_counts(r["counts"])
     if a.command == "panel":
         out = variables(collapsed, r["panel"], t100)
-        out.write_parquet(a.out / "panel.parquet")
-        print(f"wrote {a.out / 'panel.parquet'}: {out.height:,} rows")
+        path = a.out / ("panel.parquet" if a.direction == "fixed" else f"panel_{a.direction}.parquet")
+        out.write_parquet(path)
+        print(f"wrote {path}: {out.height:,} rows")
     return 0
 
 

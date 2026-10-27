@@ -1,0 +1,43 @@
+# Gerardi & Shapiro (2009), online App. C, Table C3: big-city airports (supplied by Ted, 2026-10-27).
+# One row per airport; population = the MA's July 1, 2005 Census estimate; big_city = in the big-city sample.
+# SJC appears under both San Francisco/Oakland/Fremont and San Jose/Sunnyvale/Santa Clara in the table.
+airport,metro_area,population,big_city
+JFK,New York/Northern New Jersey/Long Island,18747320,Yes
+EWR,New York/Northern New Jersey/Long Island,18747320,Yes
+LGA,New York/Northern New Jersey/Long Island,18747320,Yes
+LAX,Los Angeles/Long Beach/Santa Ana,12923547,Yes
+SNA,Los Angeles/Long Beach/Santa Ana,12923547,Yes
+BUR,Los Angeles/Long Beach/Santa Ana,12923547,Yes
+ORD,Chicago/Naperville/Joliet,9443356,Yes
+MDW,Chicago/Naperville/Joliet,9443356,Yes
+PHL,Philadelphia/Camden/Wilmington,5823233,Yes
+DAL,Dallas/Fort Worth/Arlington,5819475,Yes
+DFW,Dallas/Fort Worth/Arlington,5819475,Yes
+FLL,Miami/Fort Lauderdale/Pompano Beach,5422200,No
+MIA,Miami/Fort Lauderdale/Pompano Beach,5422200,No
+IAH,Houston/Sugar Land/Baytown,5280077,Yes
+DCA,Washington/Arlington/Alexandria,5214666,Yes
+IAD,Washington/Arlington/Alexandria,5214666,Yes
+ATL,Atlanta/Sandy Springs/Marietta,4917717,Yes
+DTW,Detroit/Warren/Livonia,4488335,Yes
+BOS,Boston/Cambridge/Quincy,4411835,Yes
+SFO,San Francisco/Oakland/Fremont,4152688,Yes
+OAK,San Francisco/Oakland/Fremont,4152688,Yes
+SJC,San Francisco/Oakland/Fremont,4152688,Yes
+ONT,Riverside/San Bernardino/Ontario,3909954,Yes
+PHX,Phoenix/Mesa/Scottsdale,3865077,Yes
+SEA,Seattle/Tacoma/Bellevue,3203314,Yes
+MSP,Minneapolis/St. Paul/Bloomington,3142779,Yes
+SAN,San Diego/Carlsbad/San Marcos,2933462,No
+STL,St. Louis,2778518,Yes
+BWI,Baltimore/Towson,2655675,Yes
+TPA,Tampa/St. Petersburg/Clearwater,2647658,No
+PIT,Pittsburgh,2386074,Yes
+DEN,Denver/Aurora,2359994,Yes
+CLE,Cleveland/Elyria/Mentor,2126318,Yes
+PDX,Portland/Vancouver/Beaverton,2095861,Yes
+CVG,Cincinnati/Middletown,2070441,Yes
+SMF,Sacramento/Arden/Arcade/Roseville,2042283,Yes
+MCI,Kansas City,1947694,Yes
+MCO,Orlando/Kissimmee,1933255,No
+SAT,San Antonio,1889797,Yes

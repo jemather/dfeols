@@ -1,18 +1,18 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Gerardi & Shapiro (2009) Table 2, panel A (all routes), on build/db1b/gs/panel.parquet.
+"""Gerardi & Shapiro (2009) Tables 2 and 3 on build/db1b/gs/panel.parquet.
 
     python repo/replication/db1b/table2.py [--panel build/db1b/gs/panel.parquet] [--dfeols]
 
---dfeols also fits every model with dfeols, on the same sample sharded by route (the cluster;
-carrier-route FEs nest in it), and prints the differences from pyfixest.
+Samples: all routes; big-city routes (both endpoints big-city airports, App. C Table C3); leisure
+routes (an endpoint is a leisure airport, Table C2). Table 2: lodd(Gini) on all three samples.
+Table 3: ln P90 and ln P10 on big-city and leisure routes. Each with col. 1 (-lnHERF, IV), col. 2
+(lnN, IV), col. 3 (LEGN, LCCN, OLS); n. 32 gives OLS versions of cols. 1-2 for Table 2, all routes.
+
+--dfeols also fits the all-routes Table 2 models with dfeols, on the same sample sharded by route
+(the cluster; carrier-route FEs nest in it), and prints the differences from pyfixest.
 
 Model (eq. 1, p. 14): lodd(Gini) on competition, a bankruptcy dummy, time dummies and carrier-
 route fixed effects; SEs clustered by route. pyfixest throughout (dfeols has no IV yet).
-
-  col. 1   -lnHERF, instrumented          paper  -.121 (.022)
-  col. 2   lnN, instrumented              paper  -.177 (.029)
-  col. 3   LEGN, LCCN, not instrumented   paper  -.005 (.004), -.056 (.007)
-  n. 32    cols. 1-2 by OLS               paper  -.033 (.016), -.021 (.006)
 
 Signs: the PDF text loses minus signs; the paper reports -lnHERF and finds competition lowers
 dispersion, so all are negative.
@@ -36,13 +36,49 @@ import polars as pl
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import bankruptcy
 
+
+# {(sample, outcome): {model: {term: (b, se)}}}; Table 2 (p. 17) and Table 3 (p. 18)
+def _cols(herf, n, legn, lccn):
+    return {"col1": {"neg_ln_herf": herf}, "col2": {"ln_n": n}, "col3": {"legn": legn, "lccn": lccn}}
+
+
 PAPER = {
-    "col1": {"neg_ln_herf": (-0.121, 0.022)},
-    "col2": {"ln_n": (-0.177, 0.029)},
-    "col3": {"legn": (-0.005, 0.004), "lccn": (-0.056, 0.007)},
-    "n32_herf": {"neg_ln_herf": (-0.033, 0.016)},
-    "n32_n": {"ln_n": (-0.021, 0.006)},
+    ("all", "lodd"): _cols((-0.121, 0.022), (-0.177, 0.029), (-0.005, 0.004), (-0.056, 0.007))
+    | {"n32_herf": {"neg_ln_herf": (-0.033, 0.016)}, "n32_n": {"ln_n": (-0.021, 0.006)}},
+    ("big", "lodd"): _cols((-0.229, 0.038), (-0.357, 0.060), (-0.013, 0.006), (-0.089, 0.010)),
+    ("leisure", "lodd"): _cols((-0.076, 0.044), (-0.132, 0.058), (-0.006, 0.009), (-0.034, 0.012)),
+    ("big", "ln_p90"): _cols((-0.406, 0.041), (-0.652, 0.067), (-0.041, 0.005), (-0.156, 0.014)),
+    ("big", "ln_p10"): _cols((-0.166, 0.027), (-0.273, 0.039), (-0.025, 0.004), (-0.054, 0.007)),
+    ("leisure", "ln_p90"): _cols((-0.168, 0.028), (-0.259, 0.041), (-0.011, 0.008), (-0.090, 0.011)),
+    ("leisure", "ln_p10"): _cols((-0.119, 0.024), (-0.176, 0.036), (-0.008, 0.007), (-0.065, 0.009)),
 }
+PAPER_N = {"all": 112_499, "big": 32_188, "leisure": 24_555}
+HERE = Path(__file__).resolve().parent
+
+
+def samples(d):
+    """Boolean masks (pandas) for the all, big-city and leisure samples (App. C, Tables C2-C3)."""
+    c2 = pl.read_csv(HERE / "table_c2.csv", comment_prefix="#")
+    c3 = pl.read_csv(HERE / "table_c3.csv", comment_prefix="#")
+    leisure = c2.filter(leisure="Yes")["airport"].to_list()
+    big = c3.filter(big_city="Yes")["airport"].unique().to_list()
+    return {
+        "all": d["origin"].notna(),
+        "big": d["origin"].isin(big) & d["dest"].isin(big),
+        "leisure": d["origin"].isin(leisure) | d["dest"].isin(leisure),
+    }
+
+
+def formula(model: str, y: str) -> str:
+    return {
+        "col1": f"{y} ~ bankrupt | {FE} | neg_ln_herf ~ {INSTRUMENTS}",
+        "col2": f"{y} ~ bankrupt | {FE} | ln_n ~ {INSTRUMENTS}",
+        "col3": f"{y} ~ legn + lccn + bankrupt | {FE}",
+        "n32_herf": f"{y} ~ neg_ln_herf + bankrupt | {FE}",
+        "n32_n": f"{y} ~ ln_n + bankrupt | {FE}",
+    }[model]
+
+
 FE = "carrier_route + time"
 INSTRUMENTS = "ln_passrte + gensp + irutherf"
 
@@ -83,6 +119,8 @@ def add_irutherf(d, pf):
 
 COLUMNS = [
     "lodd",
+    "ln_p90",
+    "ln_p10",
     "neg_ln_herf",
     "ln_n",
     "legn",
@@ -134,39 +172,28 @@ def main(argv=None) -> int:
 
     d = estimation_sample(pl.read_parquet(a.panel)).to_pandas()
     first = add_irutherf(d, pf)
-    print(f"N = {len(d):,} (paper 112,499); bankrupt rows {int(d['bankrupt'].sum()):,}")
+    print(f"N = {len(d):,}; bankrupt rows {int(d['bankrupt'].sum()):,}")
     print("first stage for MKTSHARE:", first.tidy()[["Estimate", "Std. Error"]].round(4).to_dict("index"))
 
     vc = {"CRV1": "route"}
-    models = {
-        "col1": f"lodd ~ bankrupt | {FE} | neg_ln_herf ~ {INSTRUMENTS}",
-        "col2": f"lodd ~ bankrupt | {FE} | ln_n ~ {INSTRUMENTS}",
-        "col3": f"lodd ~ legn + lccn + bankrupt | {FE}",
-        "n32_herf": f"lodd ~ neg_ln_herf + bankrupt | {FE}",
-        "n32_n": f"lodd ~ ln_n + bankrupt | {FE}",
-    }
+    masks = samples(d)
+    print("samples:", {k: f"{int(m.sum()):,} (paper {PAPER_N[k]:,})" for k, m in masks.items()})
     ds = dfeols_dataset(d, a.work, a.target_rows) if a.dfeols else None
-    head = f"\n{'model':9s} {'term':12s} {'pyfixest':>18s} {'paper':>16s}"
+    head = f"\n{'sample':8s} {'y':7s} {'model':9s} {'term':12s} {'pyfixest':>18s} {'paper':>16s}"
     print(head + (f" {'dfeols':>18s} {'rel b':>8s} {'rel se':>8s}" if ds else ""))
-    for name, fml in models.items():
-        m = pf.feols(fml, data=d, vcov=vc)
-        t = m.tidy()
-        td = dfeols_fit(ds, fml, name) if ds else None
-        for term, (pb, pse) in PAPER[name].items():
-            b, se = t.loc[term, "Estimate"], t.loc[term, "Std. Error"]
-            line = f"{name:9s} {term:12s} {b:+9.4f} ({se:.4f}) {pb:+8.3f} ({pse:.3f})"
-            if td is not None:
-                db, dse = td.loc[term, "Estimate"], td.loc[term, "Std. Error"]
-                line += f" {db:+9.4f} ({dse:.4f}) {abs(db - b) / abs(b):8.1e} {abs(dse - se) / se:8.1e}"
-            print(line)
-        iv = fml.split("|")[-1]
-        if "~" in iv:
-            endog = iv.split("~")[0].strip()
-            ft = pf.feols(f"{endog} ~ {INSTRUMENTS} + bankrupt | {FE}", data=d, vcov=vc).tidy()
-            print(
-                f"{'':9s} first stage {endog}: "
-                + ", ".join(f"{k} {r['Estimate']:+.4f} (t {r['t value']:.1f})" for k, r in ft.iterrows())
-            )
+    for (sample, y), models in PAPER.items():
+        sub = d[masks[sample]]
+        for name, terms in models.items():
+            fml = formula(name, y)
+            t = pf.feols(fml, data=sub, vcov=vc).tidy()
+            td = dfeols_fit(ds, fml, name) if ds is not None and sample == "all" else None
+            for term, (pb, pse) in terms.items():
+                b, se = t.loc[term, "Estimate"], t.loc[term, "Std. Error"]
+                line = f"{sample:8s} {y:7s} {name:9s} {term:12s} {b:+9.4f} ({se:.4f}) {pb:+8.3f} ({pse:.3f})"
+                if td is not None:
+                    db, dse = td.loc[term, "Estimate"], td.loc[term, "Std. Error"]
+                    line += f" {db:+9.4f} ({dse:.4f}) {abs(db - b) / abs(b):8.1e} {abs(dse - se) / se:8.1e}"
+                print(line)
     return 0
 
 

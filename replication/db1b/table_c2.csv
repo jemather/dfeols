@@ -1,0 +1,33 @@
+# Gerardi & Shapiro (2009), online App. C, Table C2: leisure-route airports (supplied by Ted, 2026-10-27).
+# accommodation_share = median 2001-04 ratio of accommodation to nonfarm earnings in the airport's MA (BEA);
+# percentile marks where the 95th/90th/85th cutoffs fall; leisure = included in the leisure sample.
+airport,city,accommodation_share,percentile,leisure
+ACY,"Atlantic City, NJ",0.2612,,Yes
+LAS,"Las Vegas, NV",0.1702,,Yes
+OGG,"Kahului, HI",0.1665,,Yes
+MKK,"Kaunakakai, HI",0.1665,,Yes
+JHM,"Lahaina, HI",0.1665,,Yes
+LNY,"Lanai City, HI",0.1665,,Yes
+LIH,"Kapaa, HI",0.1293,,Yes
+ITO,"Hilo, HI",0.0974,,Yes
+KOA,"Kona, HI",0.0974,95,Yes
+RNO,"Reno, NV",0.0734,,Yes
+EGE,"Eagle County, CO",0.0605,,Yes
+MYR,"Myrtle Beach, SC",0.0539,,Yes
+FLG,"Flagstaff, AZ",0.0376,,Yes
+MCO,"Orlando, FL",0.0305,,Yes
+HNL,"Honolulu, HI",0.0283,,Yes
+SAV,"Hilton Head, SC",0.0276,,Yes
+BZN,"Bozeman, MT",0.0275,,Yes
+DSW,"Naples, FL",0.0264,90,Yes
+SAF,"Santa Fe, NM",0.0245,,Yes
+MEM,"Memphis, TN",0.0214,,No
+KTN,"Ketchikan, AK",0.0199,,Yes
+PFN,"Panama City, FL",0.0192,,Yes
+SBA,"Santa Barbara, CA",0.0161,,Yes
+MSY,"New Orleans, LA",0.0148,,Yes
+CHS,"Charleston, SC",0.0139,,Yes
+RAP,"Rapid City, SD",0.0132,85,Yes
+SJU,"San Juan, PR",,,Yes
+STX,"St. Croix, VI",,,Yes
+STT,"St. Thomas, VI",,,Yes
