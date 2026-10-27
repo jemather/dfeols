@@ -76,7 +76,7 @@ never span shards. Each FE is classified:
 | FE relative to the partition key | handled as |
 |---|---|
 | nested in it (e.g. `unit` when partitioning by unit) | demeaned inside each shard: exactly for one or two such FEs, iterated for three or more |
-| crossing, few levels (e.g. `time`, up to `max_dummy_levels`=2000) | dummy regressors; with one local FE their cross-products come from per-level sums, so no dummy columns are built |
+| crossing (e.g. `time`; `carrier^quarter`) | dummy regressors; with one local FE their cross-products come from per-level sums, so no dummy columns are built, and the coordinator solves the dummy block (practical to about 30,000 levels; 15,000 take under a minute and 11 GB). Otherwise dense dummy columns, up to `max_dummy_levels`=2000 |
 | crossing, many levels | not yet supported (see [Limitations](#limitations)) |
 
 A fit is two map/reduce rounds over shards: (1) demean and return `X'WX`,
@@ -229,10 +229,12 @@ of the time (iid: 85.8%, as expected with clustered errors).
 
 ## Limitations
 
-- **Not yet supported:** IV, two-way clustering, heterogeneous slopes
-  (`fe[x]`), and crossing FEs with more than `max_dummy_levels` levels (for
-  example a follower FE when partitioning by account). The executor design
-  allows adding alternating projections as extra map/reduce rounds.
+- **Not yet supported:** two-way clustering, heterogeneous slopes (`fe[x]`),
+  crossing FEs above `max_dummy_levels` levels without exactly one local FE,
+  and crossing FEs too large for the coordinator's dense solve (beyond about
+  30,000 levels, for example a follower FE when partitioning by account). The
+  executor design allows adding alternating projections as extra map/reduce
+  rounds.
 - **Two local FEs plus crossing FEs** build dense dummy columns (a warning is
   logged above 300 columns).
 - **Prep reads whole files per task.** A dataset stored as a few very large

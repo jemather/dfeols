@@ -128,14 +128,20 @@ def build_plan(
         m = ds.fes[key]
         if m["nested_in_partition"]:
             local.append((key, m["column"]))
-        elif m["n_levels"] <= max_dummy_levels:
-            glob.append((key, m["column"], m["n_levels"]))
         else:
-            raise NotImplementedError(
-                f"FE {name!r} crosses partitions and has {m['n_levels']:,} levels. "
-                "v0 handles FEs nested in the partition key or with few levels "
-                f"(<= max_dummy_levels={max_dummy_levels})."
-            )
+            glob.append((key, m["column"], m["n_levels"]))
+    # Dense dummies cost rows x levels x 8 bytes per shard; the sparse path keeps
+    # per-level sums instead, so only it takes crossing FEs above max_dummy_levels
+    big = [(k, L) for k, _, L in glob if L > max_dummy_levels]
+    if big and not (len(local) == 1 and crossing_fe != "dense"):
+        big_fe, big_L = big[0]
+        raise NotImplementedError(
+            f"FE {big_fe!r} crosses partitions and has {big_L:,} levels (> max_dummy_levels="
+            f"{max_dummy_levels}). Crossing FEs that large need the sparse path, which needs "
+            f"exactly one FE nested in the partition key (this spec has {len(local)}"
+            + (", and crossing_fe='dense'" if crossing_fe == "dense" else "")
+            + "). Dense dummies would need about rows x levels x 8 bytes per shard."
+        )
     cl = None
     cl_local = False
     if cluster:
@@ -207,9 +213,21 @@ def estimate_worker_gb(plan: Plan, rows: int, n_cols: int) -> float:
     gb += rows * n_cols * 8 * 1.5 / 1e9  # Parquet read and filtered copy
     gb += rows * dense * 8 * 4 / 1e9  # design, demeaned copy, products
     if plan.sparse_global:
+        from .worker import SPARSE_GRAM_LEVELS
+
         levels = sum(L for *_, L in plan.global_fes)
-        gb += rows * 0.05 * levels * 8 / 1e9 if levels > 200 else 0  # group x level block
+        if 200 < levels <= SPARSE_GRAM_LEVELS:
+            gb += rows * 0.05 * levels * 8 / 1e9  # group x level block
+        gb += (min(levels, SPARSE_GRAM_LEVELS) ** 2 + plan.k_x * levels) * 8 * 3 / 1e9  # Gram blocks
     return gb
+
+
+def estimate_coordinator_gb(plan: Plan) -> float:
+    """Rough coordinator memory for the dense Gram matrix of regressors and crossing-FE
+    dummies: the accumulator, its kept-column copy, the Cholesky factor, the inverse and
+    the dummy block solved for round 2's maps (about 6 copies)."""
+    k_tot = plan.k_x + plan.n_dummy
+    return k_tot**2 * 8 * 6 / 1e9
 
 
 def _check_worker_memory(executor, label: str, rows: int, need_gb: float) -> None:
@@ -452,6 +470,14 @@ def fit(
         ds.n_rows * (m + k_tot + 2) * 8 / 1e9 if cache else 0,
     )
     _check_worker_memory(executor, label, biggest, need_gb)
+    coord_gb = estimate_coordinator_gb(plan)
+    if coord_gb > 4:
+        log.warning(
+            "fit %s: %d crossing-FE dummies: the coordinator needs roughly %.0f GB for the Gram matrix",
+            label,
+            plan.n_dummy,
+            coord_gb,
+        )
 
     prog = Progress(wd, label=label, every=log_every, round2_recomputes=not cache)
     rows = {s["id"]: max(s["rows"], 1) for s in ds.shards}
@@ -489,7 +515,12 @@ def fit(
 
     def on1(tid, r):
         peak["rss"] = max(peak["rss"], r["timing"].get("maxrss_gb", 0.0))
-        for key in ("ZtZ", "ZtY", "YtY", "sum_wy", "sum_wy2"):
+        g = r["ZtZ"]
+        if hasattr(g, "row"):  # sparse path with many levels: unique (row, col) pairs
+            acc["ZtZ"][g.row, g.col] += g.data
+        else:
+            acc["ZtZ"] += g
+        for key in ("ZtY", "YtY", "sum_wy", "sum_wy2"):
             acc[key] += r[key]
         acc["n"] += r["n"]
         acc["rows_in"] += r["rows_in"]

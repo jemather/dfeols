@@ -37,6 +37,11 @@ break the API).
   from records that don't claim `dfeols/0.1` (fits without FEs).
 
 ### Changed
+- Crossing FEs above `max_dummy_levels` are fitted when the spec has exactly one FE nested in
+  the partition (the sparse path); `max_dummy_levels` now limits only dense dummy columns.
+  Above 2,000 levels shards return their Gram matrix sparse, and collinearity detection is
+  blocked (same columns kept; a fit with 3,000 dummies went from 26 s to 2 s). Coordinator
+  memory is logged above 4 GB (about 11 GB at 15,000 levels).
 - Singletons are dropped over all fixed effects, iterating across shards, as fixest and reghdfe
   do (previously only in the FE local to the partition, so N could depend on the partition).
 

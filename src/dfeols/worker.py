@@ -38,6 +38,9 @@ from .demean import demean, densify, drop_singletons
 from .formula import Formula, Term
 from .rowhash import rowset
 
+# Sparse path: above this many crossing-FE levels a shard returns its Gram matrix sparse
+SPARSE_GRAM_LEVELS = 2000
+
 
 @dataclass
 class Plan:
@@ -287,7 +290,10 @@ def _round1_sparse(plan: Plan, shard_id: int, df, n0: int, local_codes, w, T, t0
     Xw, Yw = Xt * w[:, None], Yt * w[:, None]
     DX = Dm.T @ Xw  # P x k
     DY = Dm.T @ Yw  # P x m
-    DWD = (Dm.T @ sp.diags(w) @ Dm).toarray()
+    sparse_out = P > SPARSE_GRAM_LEVELS
+    DWD = Dm.T @ sp.diags(w) @ Dm
+    if not sparse_out:
+        DWD = DWD.toarray()
     if n:
         C = sp.csr_matrix(
             (
@@ -298,7 +304,9 @@ def _round1_sparse(plan: Plan, shard_id: int, df, n0: int, local_codes, w, T, t0
         )
         C.sum_duplicates()
         WA = np.bincount(a, weights=w, minlength=nA)
-        if nA * P <= 50_000_000:
+        if sparse_out:  # many levels: a group spans few of them, so C'C stays sparse
+            DD = (DWD - C.T @ sp.diags(1.0 / WA) @ C).tocsr()
+        elif nA * P <= 50_000_000:
             # dense BLAS product: cost nA*P^2 but vectorised; the sparse product
             # costs sum over groups of (levels per group)^2 and is slow when
             # each group spans many levels (e.g. units observed in 1000 periods)
@@ -310,6 +318,19 @@ def _round1_sparse(plan: Plan, shard_id: int, df, n0: int, local_codes, w, T, t0
         DD = DWD
     sel = np.flatnonzero(zpos >= 0)
     zp = zpos[sel]
+    if sparse_out:
+        # a dense k_tot^2 Gram per shard is too much to ship (450 MB at 7,500 levels);
+        # the dummy block is sparse. Dummies follow the k regressors in Z (zp = k, k+1, ...)
+        DXs = sp.csr_matrix(DX[sel])
+        ZtZ = sp.bmat(
+            [[sp.csr_matrix(Xw.T @ Xt), DXs.T], [DXs, sp.csr_matrix(DD)[sel][:, sel]]], format="coo"
+        )
+        ZtZ.sum_duplicates()  # unique (row, col) pairs: the coordinator adds them in place
+        ZtY = np.zeros((k_tot, m))
+        ZtY[:k] = Xw.T @ Yt
+        ZtY[zp] = DY[sel]
+        T["crossprod"] = time.perf_counter() - t
+        return Y, Yt, Xt, ZtZ, ZtY, (a, Dm)
     ZtZ = np.zeros((k_tot, k_tot))
     ZtY = np.zeros((k_tot, m))
     ZtZ[:k, :k] = Xw.T @ Xt

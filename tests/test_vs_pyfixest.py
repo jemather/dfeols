@@ -150,6 +150,45 @@ def test_sparse_two_crossing_fes(data, tmp_path):
     np.testing.assert_allclose(a.coef(), m.coef().to_numpy(), **TOL)
 
 
+def test_sparse_crossing_fe_above_max_dummy_levels(data, tmp_path):
+    # a crossing FE with 3,000 levels (> max_dummy_levels and SPARSE_GRAM_LEVELS): the sparse
+    # path takes it and shards return their Gram matrices sparse (D4: carrier x quarter)
+    import polars as pl
+
+    from dfeols.worker import SPARSE_GRAM_LEVELS
+
+    d = data.with_columns(cw=(pl.col("id_f") % 100) * 100 + pl.col("week"))
+    assert d["cw"].n_unique() > SPARSE_GRAM_LEVELS
+    ds = dfeols.prep(
+        d,
+        shard_dir=tmp_path / "s",
+        partition="id_a",
+        fixed_effects=["spell", "week", "cw"],
+        clusters=["id_a"],
+        target_rows=3000,
+    )
+    f = "eng ~ feat + posts | spell + cw"
+    kw = dict(cluster="id_a", vcov=["CRV1", "hetero", "iid"], log_every=1e9)
+    a = dfeols.fit(ds, f, **kw)
+    assert a.options["crossing_fe"] == "sparse"
+    b = dfeols.fit(ds, f, crossing_fe="dense", max_dummy_levels=10_000, **kw)
+    assert a.N == b.N and a.fe_levels == b.fe_levels
+    np.testing.assert_allclose(a.coef(), b.coef(), rtol=1e-9, atol=1e-12)
+    for t in ("CRV1", "hetero", "iid"):
+        np.testing.assert_allclose(a.vcov(None, t), b.vcov(None, t), rtol=1e-8, atol=1e-15)
+    pdf = d.to_pandas()
+    for v in ("CRV1", "hetero"):
+        m = pf.feols(f, data=pdf, vcov=_pf_vcov(v, "id_a"), **pyfixest_tol_kwargs(1e-13))
+        assert a.N == m._N
+        np.testing.assert_allclose(a.coef(), m.coef().to_numpy(), **TOL)
+        np.testing.assert_allclose(np.sqrt(np.diag(a.vcov(None, v))), m.se().to_numpy(), rtol=1e-7)
+    # without exactly one FE nested in the partition, a crossing FE this large is refused
+    with pytest.raises(NotImplementedError, match="exactly one FE nested"):
+        dfeols.fit(ds, "eng ~ feat | cw", **kw)
+    with pytest.raises(NotImplementedError, match="crossing_fe='dense'"):
+        dfeols.fit(ds, f, crossing_fe="dense", **kw)
+
+
 @pytest.fixture(scope="module")
 def singleton_data(data):
     # a crossing FE with many one-row levels; dropping those rows leaves new singletons in

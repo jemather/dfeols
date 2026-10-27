@@ -70,7 +70,7 @@ Small-sample corrections follow fixest/pyfixest (`vcov.py`).
 | one local FE | exact, one pass |
 | two local FEs | exact Schur-complement solve per connected component (dense Cholesky, LAPACK); 37× faster than alternating projections on the influencer `shape` spec |
 | three or more local FEs | iterated (pyfixest's compiled alternating projections; NumPy fallback) |
-| crossing FEs with ≤ `max_dummy_levels` (2000) levels | dummies. With exactly one local FE they never materialize: cross-products come from per-level sums (`D'W Q D = D'WD − C'diag(1/W_a)C`), and the vcov uses Frisch–Waugh–Lovell on the reported coefficients. This makes T=1000 feasible |
+| crossing FEs | dummies. With exactly one local FE they never materialize: cross-products come from per-level sums (`D'W Q D = D'WD − C'diag(1/W_a)C`), and the vcov uses Frisch–Waugh–Lovell on the reported coefficients. This makes T=1000 feasible, and takes FEs of any size the coordinator can solve densely (above `SPARSE_GRAM_LEVELS`=2000 levels shards return their Gram matrix sparse). Without one local FE, dense dummy columns, up to `max_dummy_levels` (2000) |
 
 ### Robustness
 
