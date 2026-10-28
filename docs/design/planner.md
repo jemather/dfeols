@@ -147,7 +147,8 @@ additions:
 [profiles.oscer]
 max_walltime = "48:00:00"          # longest general job; drives checkpointing and the
                                    # demean-first threshold (50% of it). A class may override it
-billing = "cores"                  # what the site charges: cores | nodes | tres (weights below)
+billing = "none"                   # what the site charges: none | cores | nodes | tres
+                                   # (OSCER: none, Ted 2026-10-28)
 
 [profiles.oscer.nodes.haswell32]   # one table per node class
 partition = "32gb_20core"          # what selects it (partition, or constraint = "...")
@@ -182,10 +183,10 @@ nodes, 7-day limit). Three things in that output shape the design:
 
 - **Walltime is per class.** 2 days on general partitions, 7 days on `longjobs`; the planner
   weighs a 7-day class against checkpointing across 2-day jobs.
-- **Billing is by cores.** Slurm's `billing` TRES equals the CPU count on every partition and no
-  weights are set, so memory is free and a worker's cost is its cores × hours, whatever the
-  class. Memory-heavy, core-light workers on 256 GB nodes cost little; the constraint there is
-  availability (26 nodes), not price. Whether OSCER charges allocations at all is policy.
+- **No charge.** OSCER bills nothing per use (Ted, 2026-10-28); Slurm's `billing` TRES (the CPU
+  count, no weights) is bookkeeping. With `billing = "none"` the ranking drops the cost column
+  and orders options by fit, estimated wall time and availability; at a site that does charge,
+  `cores`, `nodes` or `tres` gives the cost of each option.
 - **Slurm can draft the profile.** Partitions, cores, memory caps, CPU and interconnect
   features, walltime and billing weights all come from `sinfo` and `scontrol`, so `dfeols
   config init --from-slurm` writes the node classes for any Slurm site (Ted, 2026-10-28) and
@@ -261,6 +262,5 @@ paths multiply by the iteration range.
 
 ## Open questions
 
-- Whether OSCER charges allocations against Slurm's `billing` (cores). `hep_killable` is unknown
-  and left out; the 11 unlabelled 256 GB nodes are taken as 64 cores / 256 GB, interconnect
-  unknown (`docs/oscer.md`).
+- None for OSCER. `hep_killable` is unknown and left out; the 11 unlabelled 256 GB nodes are
+  taken as 64 cores / 256 GB, interconnect unknown (`docs/oscer.md`).
