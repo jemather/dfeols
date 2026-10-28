@@ -241,8 +241,8 @@ paths multiply by the iteration range.
 1. Probe and report: levels, nesting, skew, the solver table and memory (no wall time yet).
    Delivers the pre-SLURM scale estimator Ted asked for (STATE.md, 2026-10-27). **Done**
    (`planner.py`): the group-bys run one at a time, since run together their hash tables
-   peaked at 31 GB on DB1B's market table (7.5 GB one at a time, 32 s against 19 s). Plan B
-   and plan C keys are reported as not built; "sparse direct or plan C" stays one row until
+   peaked at 31 GB on DB1B's market table (7.5 GB one at a time, 32 s against 19 s). Plan C
+   keys are reported as not built (plan B is now a path, b819291); "sparse direct or plan C" stays one row until
    step 2 measures fill.
 2. ... `config init --from-slurm` **done** (`slurm_site.py`): it runs `sinfo -h -e -o
    "%R|%D|%c|%m|%l|%f|%G|%T|%N"` and `scontrol show partition -o`, or reads saved output
