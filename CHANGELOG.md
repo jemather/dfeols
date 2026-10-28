@@ -69,6 +69,11 @@ break the API).
   from records that don't claim `dfeols/0.1` (fits without FEs).
 
 ### Fixed
+- Distributed prep into many shards ran workers out of memory: each encode task wrote every
+  shard it touched at once, and Polars keeps a buffer per open output (one 69M-row DB1B file
+  into 3,434 shards peaked at 23.5 GB; OSCER's 24 GB workers died). The two-level shuffle
+  through buckets now also starts when one task would open more than `max_open` (128) shards:
+  5.8 GB, and no slower.
 - A regressor that a crossing FE absorbs (e.g. a carrier x quarter variable with a
   `carrier^time` FE) is now dropped as collinear, as fixest does. The dense and sparse paths
   tested columns in Z order, so they kept the regressor, dropped a dummy, and reported a
