@@ -199,11 +199,19 @@ def node_classes(parts: dict[str, Partition], conf: dict[str, dict]) -> list[dic
         if c["excluded"] or not c["nodes"]:
             continue
         limit = _minutes(c["max_walltime"])
-        cover = [u for u in classes if u["nodes"] < c["nodes"] and _minutes(u["max_walltime"]) >= limit]
-        if set().union(*(u["nodes"] for u in cover)) >= c["nodes"]:
+        cover = [
+            u
+            for u in classes
+            if u["nodes"] and u["nodes"] < c["nodes"] and _minutes(u["max_walltime"]) >= limit
+        ]
+        left = c["nodes"] - set().union(*(u["nodes"] for u in cover))
+        if not left:
             names = [u["name"] for u in sorted(cover, key=lambda u: (-u["count"], u["name"]))]
             more = f" and {len(names) - 6} more" if len(names) > 6 else ""
             c["excluded"].append("spans " + ", ".join(names[:6]) + more)
+        elif cover and len(left) <= len(c["nodes"]) // 2:
+            # mostly covered: say which nodes only this partition reaches, so the user can judge
+            c["only_here"] = sorted(left)
     classes.sort(key=lambda c: (bool(c["excluded"]), c["mixed"], -c["count"], c["name"]))
     return classes
 
@@ -246,6 +254,13 @@ def draft_profile(sinfo: str, scontrol: str, name: str = "slurm", today: date | 
         lines.append(f"partition = {_toml_str(c['partition'])}")
         if c["aliases"]:
             lines.append(f"# same nodes and limits: {', '.join(c['aliases'])}")
+        if c.get("only_here"):
+            h = c["only_here"]
+            lines.append(
+                f"# {len(h)} of its nodes are in no smaller partition with its time limit: "
+                + ", ".join(h[:8])
+                + (" ..." if len(h) > 8 else "")
+            )
         lines.append(f"count = {c['count']}")
         lines.append(f"in_service = {c['in_service']}  # allocated, mixed or idle on {today}")
         lines.append(f"cores = {c['cores']}" + ("  # smallest; mixed nodes" if c["mixed"] else ""))

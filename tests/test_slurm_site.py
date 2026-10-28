@@ -24,6 +24,7 @@ NODES = {
     "c[301-303]": "64|128500|icelake,hdr100|(null)|mixed",
     "c[401-402]": "40|96000|cascadelake,fdr|(null)|down*",
     "g[01-02]": "64|257600|icelake|gpu:a100:2|idle",
+    "d01": "20|32000|haswell,fdr10|(null)|idle",
 }
 PARTS = {  # partition: (nodes, time limit, scontrol extras)
     "32gb_20core": (["c[001-008]", "c[009-010]"], "2-00:00:00", "MaxMemPerNode=31916"),
@@ -35,8 +36,10 @@ PARTS = {  # partition: (nodes, time limit, scontrol extras)
     "normal_avx2": (list(NODES)[:6], "2-00:00:00", "MaxMemPerNode=257442"),
     "largejobs": (list(NODES)[:6], "2-00:00:00", "MinNodes=13 MaxMemPerNode=257442"),
     "longjobs": (["c[001-008]", "c[201-203]"], "7-00:00:00", "MaxMemPerNode=UNLIMITED"),
-    "debug": (["c[001-008]"], "00:30:00", ""),
+    "debug": (["c[001-008]", "d01"], "00:30:00", ""),
+    "mixed2": (["c[101-104]", "d01"], "2-00:00:00", ""),  # d01 is otherwise only in debug
     "gpu": (["g[01-02]"], "2-00:00:00", ""),
+    "empty": ([""], "2-00:00:00", ""),  # sinfo's line for a partition with no nodes
 }
 
 
@@ -44,6 +47,9 @@ def _sinfo():
     lines = []
     for p, (nodes, limit, _) in PARTS.items():
         for n in nodes:
+            if not n:
+                lines.append(f"{p}|0|0|0|{limit}|(null)|(null)|n/a|")
+                continue
             cores, mem, feats, gres, state = NODES[n].split("|")
             k = len(expand_hostlist(n))
             lines.append(f"{p}|{k}|{cores}|{mem}|{limit}|{feats}|{gres}|{state}|{n}")
@@ -75,6 +81,10 @@ def test_node_classes():
     assert cls["largejobs"]["excluded"] == ["jobs need at least 13 nodes"]
     assert cls["debug"]["excluded"] == ["time limit 00:30:00"]
     assert cls["gpu"]["excluded"] == ["GPU nodes"]
+    # empty partitions cover nothing; a partition mostly covered names the nodes only it reaches
+    assert "empty" not in cls["normal"]["excluded"][0]
+    assert cls["mixed2"]["only_here"] == ["d01"] and not cls["mixed2"]["excluded"]
+    assert cls["empty"]["count"] == 0
     lj = cls["longjobs"]  # mixed, but its 7-day limit is its own
     assert lj["mixed"] and not lj["excluded"] and (lj["cores"], lj["memory"]) == (20, "32000MB")
 
