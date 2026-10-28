@@ -109,8 +109,11 @@ the profile's scratch (`<scratch>/dfeols/demeaned/`, as in `sessions.md`) unless
 (`dfeols demeaned list` / `dfeols demeaned rm <key>`). Whether storage is plentiful is a site
 fact: the profile can say so (`demeaned_storage = "plentiful"`, the default, as on OSCER where
 temporary storage is ample and free) or ask for confirmation above a size (`demeaned_confirm_gb
-= 500`) where scratch is scarce or charged. A site that purges scratch after N days says so in
-the profile too, so the planner can tell the user when a reuse key will have expired.
+= 500`) where scratch is scarce or charged. A site that purges scratch says so in the profile
+(`scratch_purge_days`; OSCER deletes scratch files after 14 days, Ted 2026-10-28). The manifest
+records when persisted data was written, `plan` and `dfeols demeaned list` show when each key
+will be purged, and `plan` budgets a re-demean when the key it would reuse expires before the
+job can start. dfeols never touches files to dodge a purge.
 
 ## Plan C on OSCER
 
@@ -185,8 +188,15 @@ nodes, 7-day limit). Three things in that output shape the design:
   availability (26 nodes), not price. Whether OSCER charges allocations at all is policy.
 - **Slurm can draft the profile.** Partitions, cores, memory caps, CPU and interconnect
   features, walltime and billing weights all come from `sinfo` and `scontrol`, so `dfeols
-  config init --from-slurm` could write the node classes for any Slurm site and leave only
-  policy (eligibility, preemption, purge) to the user.
+  config init --from-slurm` writes the node classes for any Slurm site (Ted, 2026-10-28) and
+  leaves only policy (eligibility, preemption, purge) to the user. Per class it records the
+  total nodes and the nodes in service (state alloc, mix or idle): on 2026-10-28 `normal` had
+  278 of 367 in service, `normal_hdr100` 34 of 54. Totals describe the class; nodes in service
+  bound what a job can get, so `plan` re-reads them (a cheap `sinfo`) rather than trusting the
+  profile. Groups of partitions over the same nodes (OSCER's `normal`, `normal_avx2`, `all`,
+  `sooner_test` ...) collapse to classes by node set and memory; policy partitions (`debug`,
+  `ood_*`, GPU, `largejobs` with its 13-node minimum) are listed but left out of worker choices
+  unless the user keeps them.
 
 The planner matches the job's needs to the classes: the coordinator on a class with enough
 memory for the dense solve (~43 GB at 30k levels); workers on the class that holds a shard (and,
@@ -228,7 +238,8 @@ paths multiply by the iteration range.
 1. Probe and report: levels, nesting, skew, the solver table and memory (no wall time yet).
    Delivers the pre-SLURM scale estimator Ted asked for (STATE.md, 2026-10-27).
 2. Crossing structure (fill, block structure, components); `partition="auto"` in prep; site
-   profile additions (`max_walltime`, node classes) and ranked node-class options.
+   profile additions (`max_walltime`, node classes, `scratch_purge_days`), `dfeols config init
+   --from-slurm`, and ranked node-class options.
 3. Wall-time ranges from recorded runs.
 4. One job vs demean-first, once sessions' persisted demeaned data exists.
 5. New paths as they are built (B, sparse direct, C), each added to the table with its own
@@ -246,10 +257,10 @@ paths multiply by the iteration range.
   threshold.
 - Demeaned data persists in scratch by default; deletion is explicit; storage policy (plentiful,
   confirm above a size, purge age) is a profile setting.
+- `dfeols config init --from-slurm` drafts the node classes from Slurm.
 
 ## Open questions
 
-- OSCER policy not in Slurm (`docs/oscer.md`): whether `hep_killable` jobs can be killed,
-  scratch purge age and quota, whether allocations are charged, and the 11 unlabelled 256 GB
-  nodes.
-- `dfeols config init --from-slurm`: worth building?
+- Whether OSCER charges allocations against Slurm's `billing` (cores). `hep_killable` is unknown
+  and left out; the 11 unlabelled 256 GB nodes are taken as 64 cores / 256 GB, interconnect
+  unknown (`docs/oscer.md`).
