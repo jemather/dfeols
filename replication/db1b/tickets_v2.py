@@ -7,13 +7,15 @@ Adds, per row of build/db1b/tickets (one Parquet file per quarter, rows and orde
 
 neg_ln_herf      -ln_herf
 post, period     post = from 2006Q4; period 1 1993-99, 2 2000-2006Q3, 3 2006Q4-2012, 4 2013-19, 5 2020-25
-est              the carrier-route-quarter cell is in the Table 2 estimation sample (`table2.estimation_sample`)
+est              the carrier-route-quarter cell is in the Table 2 estimation sample
+                 (`table2.estimation_sample`)
 ln_passrte, gensp, irutherf, irutherf_pp
                  Table 2 instruments for est cells (null otherwise); irutherf from the first stage on
                  the whole sample, irutherf_pp from first stages fit separately before and after 2006Q4
 tail             0 price <= the cell's p10, 2 price >= its p90, 1 between (panel cells; null otherwise).
                  p10/p90 are the panel's passenger-weighted cutoffs, so ties put >= 10% in each tail
-hubsh, hub       the carrier's largest share of T-100 passengers enplaned at either endpoint; hub = hubsh >= .5
+hubsh, hub       the carrier's largest share of T-100 passengers enplaned at either endpoint;
+                 hub = hubsh >= .5
 ln_lf            ln T-100 load factor on the airport pair, all carriers
 big_city, leisure
                  both endpoints big-city airports (App. C Table C3); an endpoint leisure (Table C2)
@@ -65,7 +67,9 @@ def hubs(t100: pl.DataFrame) -> pl.DataFrame:
     e = t100.group_by(*t, "carrier", pl.col("origin_airport_id").alias("airport")).agg(
         pl.col("t100_passengers").sum().alias("e")
     )
-    return e.select(*t, "carrier", "airport", (pl.col("e") / pl.col("e").sum().over(*t, "airport")).alias("sh"))
+    return e.select(
+        *t, "carrier", "airport", (pl.col("e") / pl.col("e").sum().over(*t, "airport")).alias("sh")
+    )
 
 
 def airport_flags(panel: pl.DataFrame) -> tuple[list[int], list[int]]:
@@ -79,7 +83,9 @@ def airport_flags(panel: pl.DataFrame) -> tuple[list[int], list[int]]:
         ]
     ).unique()
     leisure = ids.filter(pl.col("code").is_in(c2.filter(leisure="Yes")["airport"].to_list()))["id"].to_list()
-    big = ids.filter(pl.col("code").is_in(c3.filter(big_city="Yes")["airport"].unique().to_list()))["id"].to_list()
+    big = ids.filter(pl.col("code").is_in(c3.filter(big_city="Yes")["airport"].unique().to_list()))[
+        "id"
+    ].to_list()
     return big, leisure
 
 
@@ -108,7 +114,9 @@ def weights() -> list[pl.Expr]:
     return [(w * m.fill_null(False).cast(pl.Float64)).alias(k) for k, m in subs.items()]
 
 
-def quarter(path: Path, inst: pl.DataFrame, panel: pl.DataFrame, sh: pl.DataFrame, lf: pl.DataFrame, big, leisure):
+def quarter(
+    path: Path, inst: pl.DataFrame, panel: pl.DataFrame, sh: pl.DataFrame, lf: pl.DataFrame, big, leisure
+):
     t = pl.scan_parquet(path)
     y, q = t.select(pl.col("year", "quarter").first()).collect().row(0)
     yq = [pl.col("year") == y, pl.col("quarter") == q]
@@ -117,12 +125,26 @@ def quarter(path: Path, inst: pl.DataFrame, panel: pl.DataFrame, sh: pl.DataFram
     lfq = lf.filter(*yq).drop("year", "quarter").lazy()
     instq = inst.filter(*yq).drop("year", "quarter").lazy()
     cr = ["carrier", *gs.ROUTE]
-    tail = pl.when(pl.col("price") <= pl.col("p10")).then(0).when(pl.col("price") >= pl.col("p90")).then(2).otherwise(1)
+    tail = (
+        pl.when(pl.col("price") <= pl.col("p10"))
+        .then(0)
+        .when(pl.col("price") >= pl.col("p90"))
+        .then(2)
+        .otherwise(1)
+    )
     return (
         t.join(instq, on=cr, how="left")
         .join(cut.drop("year", "quarter"), on=cr, how="left")
-        .join(shq.rename({"airport": "origin_airport_id", "sh": "sh_o"}), on=["carrier", "origin_airport_id"], how="left")
-        .join(shq.rename({"airport": "dest_airport_id", "sh": "sh_d"}), on=["carrier", "dest_airport_id"], how="left")
+        .join(
+            shq.rename({"airport": "origin_airport_id", "sh": "sh_o"}),
+            on=["carrier", "origin_airport_id"],
+            how="left",
+        )
+        .join(
+            shq.rename({"airport": "dest_airport_id", "sh": "sh_d"}),
+            on=["carrier", "dest_airport_id"],
+            how="left",
+        )
         .join(lfq, on=gs.ROUTE, how="left")
         .with_columns(
             (-pl.col("ln_herf")).alias("neg_ln_herf"),
@@ -133,8 +155,12 @@ def quarter(path: Path, inst: pl.DataFrame, panel: pl.DataFrame, sh: pl.DataFram
             pl.max_horizontal(pl.col("sh_o").fill_null(0), pl.col("sh_d").fill_null(0)).alias("hubsh"),
             # T-100 reports zero seats on some pairs (2001 most of all): null, not inf/NaN
             pl.when(pl.col("lf").is_finite() & (pl.col("lf") > 0)).then(pl.col("lf").log()).alias("ln_lf"),
-            (pl.col("origin_airport_id").is_in(big) & pl.col("dest_airport_id").is_in(big)).cast(pl.Int8).alias("big_city"),
-            (pl.col("origin_airport_id").is_in(leisure) | pl.col("dest_airport_id").is_in(leisure)).cast(pl.Int8).alias("leisure"),
+            (pl.col("origin_airport_id").is_in(big) & pl.col("dest_airport_id").is_in(big))
+            .cast(pl.Int8)
+            .alias("big_city"),
+            (pl.col("origin_airport_id").is_in(leisure) | pl.col("dest_airport_id").is_in(leisure))
+            .cast(pl.Int8)
+            .alias("leisure"),
         )
         .with_columns((pl.col("hubsh") >= 0.5).cast(pl.Int8).alias("hub"), *weights())
         .drop("p10", "p90", "sh_o", "sh_d", "lf")

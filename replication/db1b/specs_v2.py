@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Specs for db1b_gs_tickets_v2 and their references (pyfixest; ivreghdfe for two endogenous) (STATE.md 2026-10-28).
+"""Specs for db1b_gs_tickets_v2 and their references (STATE.md 2026-10-28).
 
-    python repo/replication/db1b/specs_v2.py reference --data 'build/db1b/tickets_v2/*.parquet' --out reference.json
+References are pyfixest fits, or ivreghdfe where there are two endogenous regressors.
+
+    python repo/replication/db1b/specs_v2.py reference \
+        --data 'build/db1b/tickets_v2/*.parquet' --out reference.json
 
 Every spec: FEs carrier^route_id + time, CRV1 by route_id, passenger weights. The weight column
 picks the sample (zero outside it; dfeols and pyfixest drop zero weights). Instruments are the
@@ -37,18 +40,25 @@ def _ix(v):
 SPECS = {
     "tail": {
         "formula": f"ln_price ~ bankrupt | {FE} | {IV}",
-        "runs": {"top_pre": "w_top_pre", "top_post": "w_top_post", "bot_pre": "w_bot_pre", "bot_post": "w_bot_post"},
+        "runs": {
+            "top_pre": "w_top_pre",
+            "top_post": "w_top_post",
+            "bot_pre": "w_bot_pre",
+            "bot_post": "w_bot_post",
+        },
     },
     "period": {
         "formula": f"ln_price ~ neg_ln_herf:i(period) + bankrupt | {FE}",
         "runs": {"top": "w_top", "bot": "w_bot"},
     },
     "oneway": {
-        "formula": f"ln_price ~ bankrupt + roundtrip | {FE} | neg_ln_herf + neg_ln_herf:roundtrip ~ {' + '.join(Z)} + {_ix('roundtrip')}",
+        "formula": f"ln_price ~ bankrupt + roundtrip | {FE} | "
+        f"neg_ln_herf + neg_ln_herf:roundtrip ~ {' + '.join(Z)} + {_ix('roundtrip')}",
         "runs": {"pre": "w_pre", "post": "w_post"},
     },
     "hub": {
-        "formula": f"ln_price ~ bankrupt + hubsh | {FE} | neg_ln_herf + neg_ln_herf:hubsh ~ {' + '.join(Z)} + {_ix('hubsh')}",
+        "formula": f"ln_price ~ bankrupt + hubsh | {FE} | "
+        f"neg_ln_herf + neg_ln_herf:hubsh ~ {' + '.join(Z)} + {_ix('hubsh')}",
         "runs": {"top_post": "w_top_post", "bot_post": "w_bot_post"},
     },
     "v1_counts": {"formula": f"ln_price ~ legn + lccn + bankrupt | {FE}", "runs": {"all": None}},
@@ -115,7 +125,8 @@ def ivreghdfe(d: pl.DataFrame, fml: str, w: str, work: Path) -> dict:
     do = [
         f'import delimited using "{work / "d.csv"}", clear asdouble',  # default is float (single)
         "egen long cr = group(carrier route_id)",
-        f"ivreghdfe {lhs} {' '.join(ex)} ({' '.join(en)} = {' '.join(zz)}) [aw={w}], absorb(cr time) cluster(route_id) small",
+        f"ivreghdfe {lhs} {' '.join(ex)} ({' '.join(en)} = {' '.join(zz)}) [aw={w}], "
+        "absorb(cr time) cluster(route_id) small",
         f'file open fh using "{work / "out.txt"}", write replace',
         "matrix b = e(b)",
         "matrix V = e(V)",
@@ -165,16 +176,26 @@ def reference(data: str, work: Path, check: str | None = None) -> dict:
                 t = m.tidy()
                 out[label] = {
                     "N": int(m._N),
-                    "coef": {k: [float(t.loc[k, "Estimate"]), float(t.loc[k, "Std. Error"])] for k in t.index},
+                    "coef": {
+                        k: [float(t.loc[k, "Estimate"]), float(t.loc[k, "Std. Error"])] for k in t.index
+                    },
                     "tool": "pyfixest",
                 }
                 if label in check.split(","):
                     out[label]["ivreghdfe"] = ivreghdfe(d, fml, w, work / label)
             out[label]["subsample"] = sub
-            print(label, sub, out[label]["tool"], out[label]["N"],
-                  {k: [round(v, 5) for v in b] for k, b in out[label]["coef"].items()}, flush=True)
+            print(
+                label,
+                sub,
+                out[label]["tool"],
+                out[label]["N"],
+                {k: [round(v, 5) for v in b] for k, b in out[label]["coef"].items()},
+                flush=True,
+            )
             if "ivreghdfe" in out[label]:
-                print("   ivreghdfe", out[label]["ivreghdfe"]["N"], out[label]["ivreghdfe"]["coef"], flush=True)
+                print(
+                    "   ivreghdfe", out[label]["ivreghdfe"]["N"], out[label]["ivreghdfe"]["coef"], flush=True
+                )
     return out
 
 
@@ -184,7 +205,9 @@ def main(argv=None) -> int:
     ap.add_argument("--data", default="build/db1b/tickets_v2/*.parquet")
     ap.add_argument("--out", required=True)
     ap.add_argument("--work", default="tmp/specs_v2", type=Path, help="Stata scratch")
-    ap.add_argument("--check", default="tail_top_pre,tail_top_post", help="also fit these runs with ivreghdfe")
+    ap.add_argument(
+        "--check", default="tail_top_pre,tail_top_post", help="also fit these runs with ivreghdfe"
+    )
     a = ap.parse_args(argv)
     ref = {
         "prep": PREP,
