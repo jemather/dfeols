@@ -14,7 +14,7 @@ variable, a different vcov. At 1e10 rows a model should take tens of seconds to 
 ```text
 $ dfeols session start db1b --profile oscer --data /scratch/.../db1b_by_route \
       --fe "route + carrier^quarter" --vars lfare,hhi,lpax,dist --cluster route \
-      --hours 3 --persist
+      --hours 3
   dataset: 412,000,000 rows, 13,200 shards; FEs: route (local), carrier^quarter (crossing, 6,840 levels)
   demeaning 4 variables: estimated 25-60 min on 20 workers (from 3 earlier runs on this profile)
   persisted demeaned data: ~13 GB in /scratch/ted/dfeols/demeaned/... (quota: 4.1 TB free)
@@ -29,7 +29,7 @@ m1 = s.fit("lfare ~ hhi", vcov={"CRV1": "route"})          # "estimated 40 s" ->
 m2 = s.fit("lfare ~ hhi + lpax + dist")
 s.add_variable("lfare_x_hhi", "lfare_raw * hhi")           # built from raw columns, then demeaned
 m3 = s.refit(m2, vcov="hetero")                            # residual pass only
-s.persist()                                                 # if not --persist at start
+s.persist()                                                 # if started with --no-persist
 s.export([m1, m2, m3], "table2.tex")                       # also .docx, .md; JSON always written
 ```
 
@@ -96,9 +96,11 @@ fixed sample).
 variables), singleton rule, tolerance. `session start` with the same inputs finds it and skips
 demeaning; a different key never reuses it. `manifest.json` records those inputs in plain form,
 the per-variable list (with creation expressions), rows, absorbed-level counts per FE, dfeols
-version and commit, and creation time. Before writing, the session prints the size (rows x
-columns x 8 bytes, plus ids) and the scratch quota, and asks for confirmation above a
-threshold. Columns are float64 throughout (Ted, 2026-10-24).
+version and commit, and creation time. Persisting is the default (`--no-persist` to skip;
+Ted, 2026-10-28, see `planner.md`): the session prints the size (rows x columns x 8 bytes,
+plus ids) and the scratch quota, and asks for confirmation only where the site profile says
+scratch is scarce (`demeaned_confirm_gb`). Removal is explicit (`dfeols demeaned rm`). Columns
+are float64 throughout (Ted, 2026-10-24).
 
 The files are plain Parquet, so any tool can read them; correct SEs need the dof information in
 `manifest.json`.

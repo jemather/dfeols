@@ -95,7 +95,22 @@ are one or two cheap passes over those columns. Recommended when any of these ho
 - the estimate exceeds 50% of the site's walltime limit (Ted, 2026-10-28), so the work should
   checkpoint and be able to resume in a new job. The limit is the profile's `max_walltime`
   (48 h on OSCER), never a constant in the code;
-- many specifications share one FE set (the sessions use case, at any path).
+- several specifications share one FE set, sample and weights (the sessions use case, at any
+  path). The planner suggests demean-first when `plan` is given more than one specification
+  with the same FEs, and `fit` warns when it sees a second specification on FEs it has just
+  absorbed for the same sample (it compares the persisted-data key of `sessions.md`), naming
+  the demean-first command that would reuse the work. A suggestion, not a switch (Ted,
+  2026-10-28).
+
+**Demeaned data is kept by default** (Ted, 2026-10-28). Absorbing the FEs is the expensive part,
+so every run that demeans, a one-job `fit` included, writes the demeaned columns and manifest to
+the profile's scratch (`<scratch>/dfeols/demeaned/`, as in `sessions.md`) unless told not to
+(`persist=False`), and a later run with the same key reuses them. Removal is explicit
+(`dfeols demeaned list` / `dfeols demeaned rm <key>`). Whether storage is plentiful is a site
+fact: the profile can say so (`demeaned_storage = "plentiful"`, the default, as on OSCER where
+temporary storage is ample and free) or ask for confirmation above a size (`demeaned_confirm_gb
+= 500`) where scratch is scarce or charged. A site that purges scratch after N days says so in
+the profile too, so the planner can tell the user when a reuse key will have expired.
 
 ## Plan C on OSCER
 
@@ -208,10 +223,13 @@ paths multiply by the iteration range.
 - Demean-first above 50% of the site's walltime limit.
 - The probe tries every FE, interaction component and cluster variable as a key (specs have at
   most 3-4 FEs).
+- Several specifications on one FE set: suggest demean-first in `plan`, warn in `fit`; no hard
+  threshold.
+- Demeaned data persists in scratch by default; deletion is explicit; storage policy (plentiful,
+  confirm above a size, purge age) is a profile setting.
 
 ## Open questions
 
 - OSCER's class details for the profile: cores per node, the partition, constraint or QOS that
   selects each class, accounting charge, and how contended each class is.
-- A demean-first threshold on the number of specifications sharing one FE set, or leave that to
-  the user (sessions)?
+- OSCER's scratch purge policy, if any, for the profile.
