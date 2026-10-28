@@ -208,17 +208,25 @@ def estimate_worker_gb(plan: Plan, rows: int, n_cols: int) -> float:
     columns -> 2.8-3.4 GB observed (Polars read buffers, numpy temporaries,
     Dask worker overhead ~1 GB)."""
     m = len(plan.formula.depvars) + len(plan.endog_names)
-    dense = m + plan.k_x + (0 if plan.sparse_global else plan.n_dummy)
+    levels = sum(L for *_, L in plan.global_fes) if plan.sparse_global else 0
+    return worker_gb(rows, n_cols, m, plan.k_x, plan.n_dummy, levels)
+
+
+def worker_gb(rows: int, n_cols: int, m: int, k_x: int, n_dummy: int, sparse_levels: int = 0) -> float:
+    """estimate_worker_gb from counts alone (the planner has no Plan): `m` outcomes and
+    endogenous regressors, `k_x` regressor-block columns, `n_dummy` crossing-FE dummies,
+    and `sparse_levels` the crossing FEs' levels on the sparse path (0 = dense path)."""
+    dense = m + k_x + (0 if sparse_levels else n_dummy)
     gb = 1.5  # worker process, Dask, libraries
     gb += rows * n_cols * 8 * 1.5 / 1e9  # Parquet read and filtered copy
     gb += rows * dense * 8 * 4 / 1e9  # design, demeaned copy, products
-    if plan.sparse_global:
+    if sparse_levels:
         from .worker import SPARSE_GRAM_LEVELS
 
-        levels = sum(L for *_, L in plan.global_fes)
+        levels = sparse_levels
         if 200 < levels <= SPARSE_GRAM_LEVELS:
             gb += rows * 0.05 * levels * 8 / 1e9  # group x level block
-        gb += (min(levels, SPARSE_GRAM_LEVELS) ** 2 + plan.k_x * levels) * 8 * 3 / 1e9  # Gram blocks
+        gb += (min(levels, SPARSE_GRAM_LEVELS) ** 2 + k_x * levels) * 8 * 3 / 1e9  # Gram blocks
     return gb
 
 
@@ -226,7 +234,11 @@ def estimate_coordinator_gb(plan: Plan) -> float:
     """Rough coordinator memory for the dense Gram matrix of regressors and crossing-FE
     dummies: the accumulator, its kept-column copy, the Cholesky factor, the inverse and
     the dummy block solved for round 2's maps (about 6 copies)."""
-    k_tot = plan.k_x + plan.n_dummy
+    return coordinator_gb(plan.k_x + plan.n_dummy)
+
+
+def coordinator_gb(k_tot: int) -> float:
+    """estimate_coordinator_gb for a Gram matrix of `k_tot` columns."""
     return k_tot**2 * 8 * 6 / 1e9
 
 

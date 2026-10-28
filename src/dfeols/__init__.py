@@ -8,6 +8,7 @@ from .cluster import executor
 from .estimate import build_plan, fit
 from .executors import DaskExecutor, SerialExecutor
 from .lock import LockedError
+from .planner import plan
 from .prep import Dataset, prep
 from .results import Result
 from .site import profile
@@ -20,6 +21,7 @@ __all__ = [
     "SerialExecutor",
     "DaskExecutor",
     "build_plan",
+    "plan",
     "executor",
     "profile",
     "LockedError",

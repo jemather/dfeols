@@ -1,6 +1,7 @@
 # Design: `dfeols plan` (probe the FE structure, pick the path, size the job)
 
-Status: draft for review (2026-10-27; Ted's answers folded in 2026-10-28). Nothing here is implemented yet. Plan A (crossing FEs
+Status: draft for review (2026-10-27; Ted's answers folded in 2026-10-28). Build step 1 (probe
+and report) is implemented in `src/dfeols/planner.py` (2026-10-28); the rest is not. Plan A (crossing FEs
 above `max_dummy_levels` on the sparse path, 04ff7a7) is the only piece of the solver table
 below that exists beyond the paths dfeols already had.
 
@@ -237,7 +238,11 @@ paths multiply by the iteration range.
 ## Build order
 
 1. Probe and report: levels, nesting, skew, the solver table and memory (no wall time yet).
-   Delivers the pre-SLURM scale estimator Ted asked for (STATE.md, 2026-10-27).
+   Delivers the pre-SLURM scale estimator Ted asked for (STATE.md, 2026-10-27). **Done**
+   (`planner.py`): the group-bys run one at a time, since run together their hash tables
+   peaked at 31 GB on DB1B's market table (7.5 GB one at a time, 32 s against 19 s). Plan B
+   and plan C keys are reported as not built; "sparse direct or plan C" stays one row until
+   step 2 measures fill.
 2. Crossing structure (fill, block structure, components); `partition="auto"` in prep; site
    profile additions (`max_walltime`, node classes, `scratch_purge_days`), `dfeols config init
    --from-slurm`, and ranked node-class options.

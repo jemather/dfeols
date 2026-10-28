@@ -62,6 +62,10 @@ ds = dfeols.prep("/data/panel/*.parquet",                # Parquet files (or a f
 - Unit × time: partition by unit. The unit FE is then handled inside each shard, and time
   crosses shards.
 - `unit + group^time` with units nested in groups: partition by group, so both are local.
+- Before prep, `dfeols plan SOURCE --formula "y ~ x | a + b^c" --cluster a` probes the source
+  (streaming, seconds to a minute): levels and singletons of each FE, which FEs nest in each
+  candidate key, the largest group per key, and the solver path and rough worker and
+  coordinator memory each key would get. It recommends a key; `--json` for scripts.
 - Run `dfeols info <shard_dir>` to see how each FE was classified.
 
 Crossing FEs need up to `max_dummy_levels` (2000) levels; high-cardinality crossing FEs are

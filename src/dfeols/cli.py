@@ -5,6 +5,10 @@
   dfeols status RUN_DIR [--watch 30]   progress and ETA of a running fit
   dfeols status SHARD_DIR              all runs under <shard_dir>/runs
   dfeols info SHARD_DIR                summary of a prepared dataset
+  dfeols plan SOURCE --formula F [--cluster C] [--partition K1,K2] [--profile P] [--json]
+  dfeols plan SOURCE --fe A+B^C --vars Y,X1,X2 ...
+                                       probe the FE structure before prep: levels,
+                                       nesting, skew, solver path and memory per key
 
   dfeols config init [--force]         write a site config template
   dfeols config show [--profile P]     print the resolved profile
@@ -98,6 +102,27 @@ def info(path: str):
                 )
             where = "local (nested in partition)" if m["nested_in_partition"] else "crosses partitions"
             print(f"{kind:>7} {name:<20} {m['n_levels']:>12,} levels  {where}{extra}")
+
+
+def plan_cmd(args):
+    from .planner import format_report, plan
+
+    def split(s):
+        return [x.strip() for x in s.split(",") if x.strip()] if s else None
+
+    r = plan(
+        args.source,
+        args.formula,
+        fe=[x.strip() for x in args.fe.split("+")] if args.fe else None,
+        vars=split(args.vars),
+        cluster=args.cluster,
+        weights=args.weights,
+        partition=split(args.partition),
+        target_rows=args.target_rows,
+        max_dummy_levels=args.max_dummy_levels,
+        profile=args.profile,
+    )
+    print(json.dumps(r, indent=1) if args.json else format_report(r))
 
 
 def config_cmd(args):
@@ -310,6 +335,18 @@ def main(argv=None):
     a.add_argument("--watch", type=float, default=None, help="refresh every N seconds")
     b = sub.add_parser("info")
     b.add_argument("path")
+    pl_ = sub.add_parser("plan", help="probe the FE structure and scale of a specification")
+    pl_.add_argument("source", help="Parquet path or glob, or CSV")
+    pl_.add_argument("--formula", help='dfeols formula, e.g. "y ~ x | a + b^c"')
+    pl_.add_argument("--fe", help='FEs without a formula, e.g. "a + b^c"')
+    pl_.add_argument("--vars", help="with --fe: outcome first, then regressors, comma-separated")
+    pl_.add_argument("--cluster")
+    pl_.add_argument("--weights")
+    pl_.add_argument("--partition", help="candidate keys, comma-separated (a^b for a compound key)")
+    pl_.add_argument("--target-rows", type=int, default=1_000_000)
+    pl_.add_argument("--max-dummy-levels", type=int, default=2000)
+    pl_.add_argument("--profile", help="check memory against this site profile")
+    pl_.add_argument("--json", action="store_true", help="print the report as JSON")
     r = sub.add_parser("results", help="benchmark results table")
     r.add_argument("root", nargs="?")
     r.add_argument("--profile")
@@ -329,6 +366,7 @@ def main(argv=None):
         "results": lambda: results_cmd(args),
         "status": lambda: status(args.path, args.watch),
         "info": lambda: info(args.path),
+        "plan": lambda: plan_cmd(args),
         "config": lambda: config_cmd(args),
         "jobscript": lambda: jobscript_cmd(args),
         "submit": lambda: submit_cmd(args),

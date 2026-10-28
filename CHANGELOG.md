@@ -8,6 +8,14 @@ break the API).
 ## [Unreleased]
 
 ### Added
+- `dfeols plan SOURCE --formula ... [--cluster] [--partition K1,K2] [--profile P] [--json]` and
+  `dfeols.plan()`: probe a specification before prep (planner step 1, docs/design/planner.md).
+  Streaming aggregates on the source report rows and missingness, levels and singletons of
+  every FE, nesting of each FE and the cluster in each candidate key (default: every FE,
+  interaction component and the cluster), the largest groups per key, and for each key the
+  solver path fit would take (or the unbuilt plan B / C it needs), shard count and rough
+  worker and coordinator memory, checked against a profile; keys are ranked and one
+  recommended. 32 s and 7.5 GB peak on DB1B's 683M-row market table.
 - Instrumental variables: `fit(ds, "y ~ x | fe | d1 + d2 ~ z1 + z2")` (fixest syntax) with
   `estimator="2sls"` (default) or `"liml"`, and `fuller=` for Fuller's modified LIML; any number
   of endogenous regressors; iid, hetero and CRV1 standard errors on every FE path (local,
