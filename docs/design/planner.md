@@ -142,32 +142,51 @@ additions:
 
 ```toml
 [profiles.oscer]
-max_walltime = "48:00:00"          # longest job the site allows; drives checkpointing and
-                                   # the demean-first threshold (50% of it)
+max_walltime = "48:00:00"          # longest general job; drives checkpointing and the
+                                   # demean-first threshold (50% of it). A class may override it
+billing = "cores"                  # what the site charges: cores | nodes | tres (weights below)
 
-[profiles.oscer.nodes.normal]      # one table per node class
-count = 278
-memory = "250GB"                   # largest; a class with mixed sizes gives the smallest it can promise
-interconnect = ""                  # e.g. "FDR10", "HDR100"; empty if unknown
-cost = 1.0                         # relative accounting charge per node-hour (site's units)
-availability = "high"              # high | medium | low: how hard it is to get these nodes
-directives = []                    # what selects this class: partition, constraint, QOS ...
+[profiles.oscer.nodes.haswell32]   # one table per node class
+partition = "32gb_20core"          # what selects it (partition, or constraint = "...")
+count = 299
+cores = 20
+memory = "31916MB"                 # the most a job can request (MaxMemPerNode); a mixed class
+                                   # gives the smallest it can promise
+interconnect = "FDR10"             # "" if unknown
+availability = "high"              # high | medium | low; optional, the planner prefers measured
+                                   # queue waits from earlier runs when it has them
 
-[profiles.oscer.nodes.haswell64]
-count = 267
-memory = "64GB"
-interconnect = "FDR10"
-
-[profiles.oscer.nodes.hdr100]
-count = 34
-memory = "128GB"                   # 128-256 GB; Ice Lake / Sapphire Rapids
+[profiles.oscer.nodes.hdr256]
+partition = "256gb_64core"
+count = 26
+cores = 64
+memory = "257442MB"
 interconnect = "HDR100"
+
+[profiles.oscer.nodes.long]
+partition = "longjobs"
+count = 60
+cores = 20
+memory = "31894MB"
+max_walltime = "7-00:00:00"        # per-class override
 ```
 
-OSCER's classes as Ted described them (2026-10-27, 2026-10-28): 278 normal nodes with up to
-250 GB; 267 dual-Haswell nodes limited to 64 GB on FDR10 InfiniBand; 34 dual Ice Lake /
-Sapphire Rapids nodes with 128-256 GB on HDR100 InfiniBand. Cores, partitions or constraints
-that select each class, accounting charge and availability are still to fill in.
+OSCER's draft profile, from `sinfo`/`scontrol` output Ted pasted (2026-10-28), is in
+`/srv/dfeols/docs/oscer.md` (project notes, outside the repo): haswell32 (299 nodes, 20 cores,
+32 GB, FDR10), haswell64 (35, 24 cores, 64 GB, FDR10), hdr128 (40, 64 cores, 128 GB, Ice Lake /
+Rome, HDR100), hdr256 (26, 64 cores, 256 GB), largemem (3, 2-4 TB), and `longjobs` (60 mixed
+nodes, 7-day limit). Three things in that output shape the design:
+
+- **Walltime is per class.** 2 days on general partitions, 7 days on `longjobs`; the planner
+  weighs a 7-day class against checkpointing across 2-day jobs.
+- **Billing is by cores.** Slurm's `billing` TRES equals the CPU count on every partition and no
+  weights are set, so memory is free and a worker's cost is its cores × hours, whatever the
+  class. Memory-heavy, core-light workers on 256 GB nodes cost little; the constraint there is
+  availability (26 nodes), not price. Whether OSCER charges allocations at all is policy.
+- **Slurm can draft the profile.** Partitions, cores, memory caps, CPU and interconnect
+  features, walltime and billing weights all come from `sinfo` and `scontrol`, so `dfeols
+  config init --from-slurm` could write the node classes for any Slurm site and leave only
+  policy (eligibility, preemption, purge) to the user.
 
 The planner matches the job's needs to the classes: the coordinator on a class with enough
 memory for the dense solve (~43 GB at 30k levels); workers on the class that holds a shard (and,
@@ -177,10 +196,10 @@ It ranks the feasible options rather than picking one silently, since a class ca
 contended, or fast but expensive in the site's accounting:
 
 ```text
-  workers   option                     est. wall    node-hours x cost   availability
-  1 (rec.)  12 x haswell64 (FDR10)     3.5-6 h      42-72 x 1.0         high
-  2         4 x hdr100 (HDR100)        2.5-4 h      10-16 x 1.5         low
-  3         3 x normal                 5-9 h        15-27 x 1.0         high
+  workers   option                          est. wall    core-hours   availability
+  1 (rec.)  24 x haswell32 (8 cores, 28 GB) 3.5-6 h      670-1150     high
+  2         6 x hdr256 (16 cores, 120 GB)   2.5-4 h      240-380      low
+  3         12 x haswell64 (12 cores, 60 GB) 3-5 h       430-720      medium
 ```
 
 (Illustrative numbers.) The chosen option becomes the overrides for `dfeols.executor(profile,
@@ -230,6 +249,7 @@ paths multiply by the iteration range.
 
 ## Open questions
 
-- OSCER's class details for the profile: cores per node, the partition, constraint or QOS that
-  selects each class, accounting charge, and how contended each class is.
-- OSCER's scratch purge policy, if any, for the profile.
+- OSCER policy not in Slurm (`docs/oscer.md`): whether `hep_killable` jobs can be killed,
+  scratch purge age and quota, whether allocations are charged, and the 11 unlabelled 256 GB
+  nodes.
+- `dfeols config init --from-slurm`: worth building?
