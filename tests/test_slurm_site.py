@@ -18,7 +18,7 @@ from dfeols.slurm_site import (
 # sinfo -h -e -o "%R|%D|%c|%m|%l|%f|%G|%T|%N": partition x node type x state
 NODES = {
     "c[001-008]": "20|32000|haswell,fdr10|(null)|mixed",
-    "c[009-010]": "20|32000|haswell,fdr10|(null)|drained",
+    "c[009-010]": "20|27800|haswell,fdr10|(null)|drained",  # OSCER: a few report less memory
     "c[101-104]": "24|64200|haswell,fdr10|(null)|allocated",
     "c[201-203]": "64|257600|icelake,hdr100|(null)|idle",
     "c[301-303]": "64|128500|icelake,hdr100|(null)|mixed",
@@ -66,10 +66,12 @@ def test_hostlist_and_minutes():
 def test_node_classes():
     cls = {c["name"]: c for c in node_classes(parse_sinfo(_sinfo()), parse_scontrol(_scontrol()))}
     h = cls["32gb_20core"]
-    assert (h["count"], h["in_service"], h["cores"], h["memory"]) == (10, 8, 20, "31916MB")
-    assert h["interconnect"] == "fdr10" and h["features"] == ["haswell"] and not h["excluded"]
+    assert (h["count"], h["in_service"], h["cores"], h["memory"]) == (10, 8, 20, "27800MB")
+    assert h["mixed"] and h["interconnect"] == "fdr10" and h["features"] == ["haswell"] and not h["excluded"]
     assert cls["96gb_40core"]["excluded"] == ["no nodes in service"]
+    # normal spans the hardware partitions even though 32gb_20core's nodes differ in memory
     assert cls["normal"]["aliases"] == ["normal_avx2"] and cls["normal"]["excluded"][0].startswith("spans ")
+    assert "32gb_20core" in cls["normal"]["excluded"][0] and "debug" not in cls["normal"]["excluded"][0]
     assert cls["largejobs"]["excluded"] == ["jobs need at least 13 nodes"]
     assert cls["debug"]["excluded"] == ["time limit 00:30:00"]
     assert cls["gpu"]["excluded"] == ["GPU nodes"]

@@ -190,16 +190,20 @@ def node_classes(parts: dict[str, Partition], conf: dict[str, dict]) -> list[dic
                 "excluded": _excluded(rep),
             }
         )
-    # a mixed partition whose nodes all sit in uniform classes with at least its time limit
-    # adds nothing but a choice of node types Slurm makes (OSCER's normal). Excluded uniform
-    # classes count: their nodes are no more usable through the mixed partition
-    uniform = [c for c in classes if not c["mixed"]]
+    # a partition whose nodes all sit in smaller partitions with at least its time limit adds
+    # nothing but a choice of node types Slurm makes (OSCER's normal over 2650, 2670, ...).
+    # Not "uniform" classes: on OSCER a few nodes of each hardware partition report less
+    # memory, so none is uniform. Excluded smaller partitions count: their nodes are no more
+    # usable through the bigger one
     for c in classes:
-        if c["mixed"] and not c["excluded"]:
-            limit = _minutes(c["max_walltime"])
-            cover = [u for u in uniform if u["nodes"] <= c["nodes"] and _minutes(u["max_walltime"]) >= limit]
-            if set().union(*(u["nodes"] for u in cover)) >= c["nodes"]:
-                c["excluded"].append("spans " + ", ".join(sorted(u["name"] for u in cover)))
+        if c["excluded"] or not c["nodes"]:
+            continue
+        limit = _minutes(c["max_walltime"])
+        cover = [u for u in classes if u["nodes"] < c["nodes"] and _minutes(u["max_walltime"]) >= limit]
+        if set().union(*(u["nodes"] for u in cover)) >= c["nodes"]:
+            names = [u["name"] for u in sorted(cover, key=lambda u: (-u["count"], u["name"]))]
+            more = f" and {len(names) - 6} more" if len(names) > 6 else ""
+            c["excluded"].append("spans " + ", ".join(names[:6]) + more)
     classes.sort(key=lambda c: (bool(c["excluded"]), c["mixed"], -c["count"], c["name"]))
     return classes
 
