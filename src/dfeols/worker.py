@@ -255,20 +255,83 @@ def _global_matrix(df, plan: Plan, n: int):
     )
 
 
-def _round1_sparse(plan: Plan, shard_id: int, df, n0: int, local_codes, w, T, t0):
-    """One local FE plus crossing FEs, without dense dummies.
+def _projected_dummy_gram(local_codes, w, Dm, max_block: int = 20_000):
+    """D'W P_L D for the n x P dummy block D (sparse Dm) and P_L the W-orthogonal
+    projection on the local FEs' dummies, as a sparse P x P matrix.
 
-    With Q the within-local-FE residual maker (W-orthogonal), for the dummy
-    block D:  D~'W X~ = D'W X~ (per-level sums),  D~'W D~ = D'W D - C'diag(1/W_a) C
-    where C holds the weight in each (local group, level) cell.
+    One local FE A:  C_A' diag(1/W_A) C_A, with C_A = A'W D the weight in each
+    (local group, level) cell. Several: A is the one with most levels and B the others'
+    dummies stacked; P_L = P_A + projection on Q_A B, so add F' S^+ F with
+        S = B'W B - E' diag(1/W_A) E,   F = B'W D - E' diag(1/W_A) C_A,   E = A'W B.
+    S is block-diagonal over the connected components of the local FEs' graph and
+    singular where the FEs overlap (a FE nested in another, one level per component),
+    so each block is solved densely with a pseudo-inverse: F's range lies in S's.
+    Raises ValueError if a component has more than max_block levels of B."""
+    import scipy.sparse as sp
+    from scipy.sparse.csgraph import connected_components
+
+    n = len(w)
+    codes = sorted((c.astype(np.int64) for c in local_codes), key=lambda c: -(int(c.max()) + 1))
+    W = sp.diags(w)
+
+    def ind(c):
+        return sp.csr_matrix((np.ones(n), (np.arange(n), c)), shape=(n, int(c.max()) + 1))
+
+    A = ind(codes[0])
+    WA = np.bincount(codes[0], weights=w)
+    CA = (A.T @ W @ Dm).tocsr()
+    out = CA.T @ sp.diags(1.0 / WA) @ CA
+    if len(codes) == 1:
+        return out
+    B = sp.hstack([ind(c) for c in codes[1:]], format="csr")
+    E = (A.T @ W @ B).tocsr()
+    EA = sp.diags(1.0 / WA) @ E
+    S = (B.T @ W @ B - E.T @ EA).tocsr()
+    F = (B.T @ W @ Dm - EA.T @ CA).tocsr()
+    ncomp, lab = connected_components(S, directed=False)
+    sizes = np.bincount(lab, minlength=ncomp)
+    if sizes.max() > max_block:
+        raise ValueError(
+            f"a connected component of the local FEs has {int(sizes.max()):,} levels in its "
+            f"Schur block (> {max_block:,}); partition by a finer key"
+        )
+    order = np.argsort(lab, kind="stable")
+    starts = np.searchsorted(lab[order], np.arange(ncomp + 1))
+    rows, cols, vals = [], [], []
+    for c in range(ncomp):
+        bl = order[starts[c] : starts[c + 1]]
+        Fc = F[bl]
+        lv = np.unique(Fc.indices)
+        if not len(lv):
+            continue
+        Fd = Fc[:, lv].toarray()
+        Sc = S[bl][:, bl].toarray()
+        G = Fd.T @ np.linalg.pinv(Sc, rcond=1e-10, hermitian=True) @ Fd
+        r, q = np.meshgrid(lv, lv, indexing="ij")
+        rows.append(r.ravel())
+        cols.append(q.ravel())
+        vals.append(G.ravel())
+    if rows:
+        P = Dm.shape[1]
+        out = out + sp.csr_matrix(
+            (np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))), shape=(P, P)
+        )
+    return out
+
+
+def _round1_sparse(plan: Plan, shard_id: int, df, n0: int, local_codes, w, T, t0):
+    """Local FEs plus crossing FEs, without dense dummies.
+
+    With Q the within-local-FEs residual maker (W-orthogonal), for the dummy
+    block D:  D~'W X~ = D'W X~ (per-level sums),  D~'W D~ = D'W D - D'W P_L D
+    (_projected_dummy_gram; with one local FE, C'diag(1/W_a) C where C holds the
+    weight in each (local group, level) cell).
     """
     import scipy.sparse as sp
 
     f = plan.formula
     t = time.perf_counter()
     n = df.height
-    a = local_codes[0].astype(np.int64)
-    nA = int(a.max()) + 1 if n else 0
     Y = _outcome_block(plan, df, n)
     cols = []
     for term in (*f.terms, *f.instruments):
@@ -279,7 +342,13 @@ def _round1_sparse(plan: Plan, shard_id: int, df, n0: int, local_codes, w, T, t0
 
     t = time.perf_counter()
     m = Y.shape[1]
-    YX = demean(np.hstack([Y, X]), [a], w)[0] if n else np.zeros((0, m + X.shape[1]))
+    converged = True
+    if n:
+        YX, converged = demean(
+            np.hstack([Y, X]), local_codes, w, plan.fe_tol, plan.fe_maxiter, plan.fe_method
+        )
+    else:
+        YX = np.zeros((0, m + X.shape[1]))
     Yt, Xt = YX[:, :m], YX[:, m:]
     T["demean"] = time.perf_counter() - t
 
@@ -294,7 +363,12 @@ def _round1_sparse(plan: Plan, shard_id: int, df, n0: int, local_codes, w, T, t0
     DWD = Dm.T @ sp.diags(w) @ Dm
     if not sparse_out:
         DWD = DWD.toarray()
-    if n:
+    if n and len(local_codes) > 1:
+        PL = _projected_dummy_gram(local_codes, w, Dm)
+        DD = (DWD - PL).tocsr() if sparse_out else DWD - PL.toarray()
+    elif n:
+        a = local_codes[0].astype(np.int64)
+        nA = int(a.max()) + 1
         C = sp.csr_matrix(
             (
                 np.tile(w, len(plan.global_fes)),
@@ -330,7 +404,7 @@ def _round1_sparse(plan: Plan, shard_id: int, df, n0: int, local_codes, w, T, t0
         ZtY[:k] = Xw.T @ Yt
         ZtY[zp] = DY[sel]
         T["crossprod"] = time.perf_counter() - t
-        return Y, Yt, Xt, ZtZ, ZtY, (a, Dm)
+        return Y, Yt, Xt, ZtZ, ZtY, (local_codes, Dm), converged
     ZtZ = np.zeros((k_tot, k_tot))
     ZtY = np.zeros((k_tot, m))
     ZtZ[:k, :k] = Xw.T @ Xt
@@ -340,7 +414,7 @@ def _round1_sparse(plan: Plan, shard_id: int, df, n0: int, local_codes, w, T, t0
     ZtY[:k] = Xw.T @ Yt
     ZtY[zp] = DY[sel]
     T["crossprod"] = time.perf_counter() - t
-    return Y, Yt, Xt, ZtZ, ZtY, (a, Dm)
+    return Y, Yt, Xt, ZtZ, ZtY, (local_codes, Dm), converged
 
 
 def _round1(plan: Plan, shard_id: int, files: list[str], write_cache: bool):
@@ -369,8 +443,7 @@ def _round1(plan: Plan, shard_id: int, files: list[str], write_cache: bool):
     ]
 
     if plan.sparse_global:
-        Y, Yt, Zt, ZtZ, ZtY, extra = _round1_sparse(plan, shard_id, df, n0, local_codes, w, T, t0)
-        converged = True
+        Y, Yt, Zt, ZtZ, ZtY, extra, converged = _round1_sparse(plan, shard_id, df, n0, local_codes, w, T, t0)
         t = time.perf_counter() - T.pop("crossprod")  # keep timing the cluster bookkeeping
     else:
         Y, Yt, Zt, ZtZ, ZtY, converged, t = _round1_dense(plan, df, n, local_codes, w, T)
@@ -533,12 +606,15 @@ def shard_round2(plan: Plan, shard_id: int, files: list[str], lin: dict) -> dict
     out = {"shard": shard_id, "n": len(w)}
     dterms = {}
     if lin.get("G") is not None:  # sparse path: one demeaning of every dummy term
-        a, Dm = extra
+        local_codes, Dm = extra
         blocks = []
         for _, g in groups:
             blocks += [g["G"], g["GH"]]
         B = np.hstack(blocks)
-        V = demean(Dm @ B, [a], w)[0] if len(a) else np.zeros((0, B.shape[1]))
+        if len(w):
+            V = demean(Dm @ B, local_codes, w, plan.fe_tol, plan.fe_maxiter, plan.fe_method)[0]
+        else:
+            V = np.zeros((0, B.shape[1]))
         o = 0
         for prefix, g in groups:
             ne, kk = g["G"].shape[1], g["GH"].shape[1]

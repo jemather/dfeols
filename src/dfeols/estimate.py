@@ -133,12 +133,12 @@ def build_plan(
     # Dense dummies cost rows x levels x 8 bytes per shard; the sparse path keeps
     # per-level sums instead, so only it takes crossing FEs above max_dummy_levels
     big = [(k, L) for k, _, L in glob if L > max_dummy_levels]
-    if big and not (len(local) == 1 and crossing_fe != "dense"):
+    if big and not (local and crossing_fe != "dense"):
         big_fe, big_L = big[0]
         raise NotImplementedError(
             f"FE {big_fe!r} crosses partitions and has {big_L:,} levels (> max_dummy_levels="
             f"{max_dummy_levels}). Crossing FEs that large need the sparse path, which needs "
-            f"exactly one FE nested in the partition key (this spec has {len(local)}"
+            f"at least one FE nested in the partition key (this spec has {len(local)}"
             + (", and crossing_fe='dense'" if crossing_fe == "dense" else "")
             + "). Dense dummies would need about rows x levels x 8 bytes per shard."
         )
@@ -192,7 +192,7 @@ def build_plan(
         drop_singletons=drop_singletons,
         fe_tol=fe_tol,
         fe_method=fe_method,
-        sparse_global=_use_sparse(crossing_fe, local, glob),
+        sparse_global=_use_sparse(crossing_fe, local, glob, bool(big)),
         row_key_cols=row_key_cols,
         endog_names=term_names(f.endog, cat_levels),
         inst_names=term_names(f.instruments, cat_levels),
@@ -269,24 +269,26 @@ def _check_worker_memory(executor, label: str, rows: int, need_gb: float) -> Non
         log.warning("%s; workers may run out of memory", msg)
 
 
-def _use_sparse(crossing_fe: str, local, glob) -> bool:
-    """Crossing (dummy) FEs via per-level sums: needs exactly one local FE,
-    whose within-group projection is closed form."""
+def _use_sparse(crossing_fe: str, local, glob, big: bool = False) -> bool:
+    """Crossing (dummy) FEs via per-level sums. Needs a local FE; "auto" takes it with
+    exactly one (closed-form projection) or when a crossing FE exceeds max_dummy_levels
+    (several local FEs: per-component Schur solves, worker._projected_dummy_gram)."""
     if crossing_fe not in ("auto", "sparse", "dense"):
         raise ValueError("crossing_fe must be auto, sparse or dense")
-    ok = len(local) == 1 and len(glob) > 0
+    ok = len(local) >= 1 and len(glob) > 0
+    use = ok and (crossing_fe == "sparse" or (crossing_fe == "auto" and (len(local) == 1 or big)))
     n_dummy = sum(L - 1 for *_, L in glob)
-    if not ok and n_dummy > 300 and crossing_fe != "dense":
+    if not use and n_dummy > 300 and crossing_fe != "dense":
         log.warning(
-            "%d crossing-FE dummy columns will be built densely (the sparse path needs "
-            "exactly one FE nested in the partition); watch worker memory",
+            "%d crossing-FE dummy columns will be built densely (crossing_fe='sparse' takes "
+            "them as per-level sums when an FE is nested in the partition); watch worker memory",
             n_dummy,
         )
     if crossing_fe == "sparse" and not ok:
         raise ValueError(
-            "crossing_fe='sparse' needs exactly one FE nested in the partition and at least one crossing FE"
+            "crossing_fe='sparse' needs an FE nested in the partition and at least one crossing FE"
         )
-    return ok and crossing_fe != "dense"
+    return use
 
 
 def _drop_singletons(plan: Plan, ds: Dataset, executor, prog: Progress, rows: dict, label: str) -> dict:

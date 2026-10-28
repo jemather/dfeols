@@ -24,8 +24,10 @@ SPECS = [
     ("eng ~ feat + posts | spell + week", "id_a", 2000),
     # spell nested in id_f, so id_f has two local FEs and dense week dummies
     ("eng ~ feat | spell + id_f + week", "id_a", 2000),
-    # two local FEs and a crossing FE above max_dummy_levels: plan B, which fit refuses
+    # two local FEs and a crossing FE above max_dummy_levels: plan B
     ("eng ~ feat | spell + id_a + id_f", "id_a", 100),
+    # no FE nested in tbin, crossing FEs above max_dummy_levels: not built (fit refuses)
+    ("eng ~ feat | spell + week", "tbin", 20),
 ]
 
 
@@ -60,7 +62,7 @@ def test_plan_matches_prep_and_build_plan(data, tmp_path, formula, cluster, max_
         assert sorted(o["local_fes"]) == sorted(k for k, _ in p.local_fes)
         assert o["crossing_fes"] == {k: L for k, _, L in p.global_fes}
         assert o["n_dummy"] == p.n_dummy
-        assert p.sparse_global == (o["path"] == "sparse")
+        assert p.sparse_global == (o["path"] in ("sparse", "B"))
         assert o["coordinator_gb"] == round(estimate_coordinator_gb(p), 1)
 
 
@@ -72,6 +74,7 @@ def test_plan_paths(data):
     assert paths[SPECS[0][0]] == {"spell": "sparse", "week": "sparse", "id_a": "sparse"}
     assert paths[SPECS[1][0]]["id_f"] == "dense"
     assert paths[SPECS[2][0]]["id_a"] == "B"
+    assert paths[SPECS[3][0]]["tbin"] == "C"
 
 
 def test_plan_missing_and_recommendation(data):

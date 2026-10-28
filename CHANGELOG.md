@@ -16,6 +16,12 @@ break the API).
   solver path fit would take (or the unbuilt plan B / C it needs), shard count and rough
   worker and coordinator memory, checked against a profile; keys are ranked and one
   recommended. 32 s and 7.5 GB peak on DB1B's 683M-row market table.
+- Plan B: crossing FEs on the sparse path with several FEs nested in the partition. The
+  dummy block's projection on the local FEs is a Schur complement solved per connected
+  component (pseudo-inverse, so redundant local FEs are fine); round 2 demeans the dummy
+  terms with all local FEs. `crossing_fe="auto"` takes it when a crossing FE exceeds
+  `max_dummy_levels` (below that, several local FEs keep dense dummies); `"sparse"` forces it.
+  Equal to dense dummies and pyfixest (OLS, 2SLS, LIML; iid, hetero, CRV1).
 - `dfeols config init --from-slurm [--profile NAME] [--write] [--sinfo F --scontrol F]`: draft a
   profile's node classes from `sinfo` and `scontrol show partition` (on a login node, or saved
   output). Partitions over the same nodes, limits and policy collapse to one class; each

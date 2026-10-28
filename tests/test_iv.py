@@ -144,6 +144,21 @@ def test_sparse_equals_dense_two_endogenous(ds):
             assert ta["statistic"] == pytest.approx(tb["statistic"], rel=1e-8)
 
 
+@pytest.mark.parametrize("estimator", ["2sls", "liml"])
+def test_sparse_several_local_fes_equals_dense(ds, estimator):
+    # plan B: spell and id_a both nested in the partition, week by per-level sums
+    fml = "yiv ~ posts | spell + id_a + week | d + d2 ~ z1 + z2 + z3"
+    kw = dict(vcov=["iid", "hetero", "CRV1"], cluster="id_a", estimator=estimator, log_every=1e9)
+    a = dfeols.fit(ds, fml, crossing_fe="dense", **kw)
+    b = dfeols.fit(ds, fml, crossing_fe="sparse", **kw)
+    assert b.options["crossing_fe"] == "sparse"
+    for v in ("iid", "hetero", "CRV1"):
+        np.testing.assert_allclose(a.tidy(None, v).to_numpy(), b.tidy(None, v).to_numpy(), rtol=1e-8)
+    for fa, fb in zip(a.iv["first_stage"]["per_endogenous"], b.iv["first_stage"]["per_endogenous"]):
+        for ta, tb in zip(fa["f_stat"], fb["f_stat"]):
+            assert ta["statistic"] == pytest.approx(tb["statistic"], rel=1e-8)
+
+
 def test_liml_just_identified_equals_2sls(ds):
     fml = "yiv ~ posts | spell | d ~ z1"
     a = dfeols.fit(ds, fml, vcov="hetero", log_every=1e9)

@@ -34,7 +34,7 @@ PATHS = {
     "local": ("local demeaning in each shard", "exists"),
     "dense": ("dense dummy columns for the crossing FEs", "exists"),
     "sparse": ("sparse path, dense solve on the coordinator", "exists"),
-    "B": ("sparse path, several nested FEs projected in the shard (plan B)", "to build"),
+    "B": ("sparse path, several nested FEs projected in the shard (plan B)", "exists"),
     "C": ("sparse direct solve or alternating projections across shards (plan C)", "to build"),
 }
 
@@ -207,13 +207,16 @@ def plan(
         g_levels = {a: levels[a]["levels"] for a in glob}
         n_dummy = sum(L - 1 for L in g_levels.values()) + (1 if glob and not local else 0)
         big = [a for a, L in g_levels.items() if L > max_dummy_levels]
+        # as estimate._use_sparse with crossing_fe="auto"
         if not glob:
             path = "local"
+        elif n_dummy > DENSE_SOLVE_LEVELS and (local or big):
+            path = "C"
         elif len(local) == 1:
-            path = "sparse" if n_dummy <= DENSE_SOLVE_LEVELS else "C"
+            path = "sparse"
         elif not big:
             path = "dense"
-        elif len(local) > 1 and n_dummy <= DENSE_SOLVE_LEVELS:
+        elif local:
             path = "B"
         else:
             path = "C"

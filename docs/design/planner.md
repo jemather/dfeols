@@ -74,7 +74,7 @@ For each candidate key the planner picks the first path that applies:
 | every FE nested | local demeaning in each shard | 2 | exists |
 | crossing FEs ≤ 2,000 levels, any nested FEs | dense dummy columns | 2 | exists |
 | one nested FE, crossing block ≤ ~30k levels | sparse path, dense solve on the coordinator | 2 | plan A, done |
-| several nested FEs, crossing block ≤ ~30k | sparse path, nested FEs projected in the shard | 2 | plan B |
+| several nested FEs, crossing block ≤ ~30k | sparse path, nested FEs projected in the shard | 2 | plan B, done |
 | crossing block large but sparse with little fill | sparse direct solve on the coordinator | 2 | to build |
 | anything else | alternating projections across shards | 2 + iterations | plan C |
 

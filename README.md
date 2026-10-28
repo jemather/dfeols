@@ -76,7 +76,7 @@ never span shards. Each FE is classified:
 | FE relative to the partition key | handled as |
 |---|---|
 | nested in it (e.g. `unit` when partitioning by unit) | demeaned inside each shard: exactly for one or two such FEs, iterated for three or more |
-| crossing (e.g. `time`; `carrier^quarter`) | dummy regressors; with one local FE their cross-products come from per-level sums, so no dummy columns are built, and the coordinator solves the dummy block (practical to about 30,000 levels; 15,000 take under a minute and 11 GB). Otherwise dense dummy columns, up to `max_dummy_levels`=2000 |
+| crossing (e.g. `time`; `carrier^quarter`) | dummy regressors; with one local FE (or several, when a crossing FE exceeds `max_dummy_levels`) their cross-products come from per-level sums, so no dummy columns are built, and the coordinator solves the dummy block (practical to about 30,000 levels; 15,000 take under a minute and 11 GB). Otherwise dense dummy columns, up to `max_dummy_levels`=2000 |
 | crossing, many levels | not yet supported (see [Limitations](#limitations)) |
 
 A fit is two map/reduce rounds over shards: (1) demean and return `X'WX`,
@@ -222,7 +222,9 @@ of the time (iid: 85.8%, as expected with clustered errors).
 - Crossing FEs (e.g. time in unit × time, partitioned by unit) never build
   dummy columns when there is one local FE: their blocks of X'WX come from
   per-level sums, and the vcov uses Frisch–Waugh–Lovell on the reported
-  coefficients. At T=1000 the dense path ran out of memory on a 2M-row panel;
+  coefficients. With several local FEs the dummy block's projection is solved
+  per connected component of the local FEs (a Schur complement, as for exact
+  two-way demeaning); `crossing_fe="auto"` uses it above `max_dummy_levels`. At T=1000 the dense path ran out of memory on a 2M-row panel;
   the sparse path took 5 s.
 - Keep `fe_tol` tight (default 1e-10). At pyfixest's default 1e-6 a two-FE
   within-account model stopped early and was off by up to 2.2 in testing.
@@ -230,13 +232,16 @@ of the time (iid: 85.8%, as expected with clustered errors).
 ## Limitations
 
 - **Not yet supported:** two-way clustering, heterogeneous slopes (`fe[x]`),
-  crossing FEs above `max_dummy_levels` levels without exactly one local FE,
-  and crossing FEs too large for the coordinator's dense solve (beyond about
+  crossing FEs above `max_dummy_levels` levels with no FE nested in the
+  partition, and crossing FEs too large for the coordinator's dense solve (beyond about
   30,000 levels, for example a follower FE when partitioning by account). The
   executor design allows adding alternating projections as extra map/reduce
   rounds.
-- **Two local FEs plus crossing FEs** build dense dummy columns (a warning is
-  logged above 300 columns).
+- **Two local FEs plus crossing FEs** build dense dummy columns up to
+  `max_dummy_levels` (a warning is logged above 300 columns; `crossing_fe="sparse"`
+  avoids them). Above it they take the sparse path, which needs each connected
+  component of the local FEs within a shard to have at most 20,000 levels outside
+  its largest FE.
 - **Prep reads whole files per task.** A dataset stored as a few very large
   Parquet files should be split into many smaller files (say 1–5 GB each)
   first, so prep can spread over the workers.
