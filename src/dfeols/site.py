@@ -39,7 +39,7 @@ from __future__ import annotations
 
 import copy
 import os
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 try:
@@ -70,6 +70,12 @@ DEFAULTS = {
         "local_directory": None,
     },
     "coordinator": {"cores": 4, "memory": "16GB", "walltime": "7-00:00:00"},
+    # site facts for `dfeols plan` (docs/design/planner.md); `dfeols config init --from-slurm`
+    # drafts them
+    "max_walltime": None,  # longest general job; a node class may override it
+    "billing": None,  # none | cores | nodes | tres
+    "scratch_purge_days": None,
+    "nodes": {},  # node classes: {name: {partition, count, in_service, cores, memory, ...}}
 }
 
 TEMPLATE = """# dfeols site configuration. One [profiles.<name>] table per HPC system.
@@ -165,6 +171,10 @@ class Profile:
     env: dict
     worker: dict
     coordinator: dict
+    max_walltime: str | None = None
+    billing: str | None = None
+    scratch_purge_days: int | None = None
+    nodes: dict = field(default_factory=dict)
     source: str = ""
 
     def scratch_dir(self, *parts) -> Path:

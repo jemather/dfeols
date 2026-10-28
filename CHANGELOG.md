@@ -16,6 +16,15 @@ break the API).
   solver path fit would take (or the unbuilt plan B / C it needs), shard count and rough
   worker and coordinator memory, checked against a profile; keys are ranked and one
   recommended. 32 s and 7.5 GB peak on DB1B's 683M-row market table.
+- `dfeols config init --from-slurm [--profile NAME] [--write] [--sinfo F --scontrol F]`: draft a
+  profile's node classes from `sinfo` and `scontrol show partition` (on a login node, or saved
+  output). Partitions over the same nodes, limits and policy collapse to one class; each
+  records partition, total nodes, nodes in service, cores, memory (MaxMemPerNode or the
+  smallest node), interconnect and CPU features, and its walltime when it differs from the
+  default partition's. GPU, node-minimum, short-limit, down or hidden partitions, and mixed
+  partitions that only span other classes, get `use = false` with the reason. Prints by
+  default; `--write` appends to the config and never replaces a profile. Profiles now load
+  `max_walltime`, `billing`, `scratch_purge_days` and `nodes`.
 - Instrumental variables: `fit(ds, "y ~ x | fe | d1 + d2 ~ z1 + z2")` (fixest syntax) with
   `estimator="2sls"` (default) or `"liml"`, and `fuller=` for Fuller's modified LIML; any number
   of endogenous regressors; iid, hetero and CRV1 standard errors on every FE path (local,

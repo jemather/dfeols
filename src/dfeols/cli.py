@@ -11,6 +11,8 @@
                                        nesting, skew, solver path and memory per key
 
   dfeols config init [--force]         write a site config template
+  dfeols config init --from-slurm [--profile NAME] [--write] [--sinfo F --scontrol F]
+                                       draft a profile's node classes from sinfo/scontrol
   dfeols config show [--profile P]     print the resolved profile
   dfeols jobscript "CMD" [--profile P] print a coordinator job script for CMD
   dfeols submit SCRIPT.py [--profile P] [--name N] [-- ARGS]
@@ -128,6 +130,8 @@ def plan_cmd(args):
 def config_cmd(args):
     from .site import config_path, init_config, profile
 
+    if args.action == "init" and args.from_slurm:
+        return slurm_init(args)
     if args.action == "init":
         cp = config_path()
         if cp.exists() and args.force:
@@ -143,6 +147,35 @@ def config_cmd(args):
         import pprint
 
         pprint.pprint(dataclasses.asdict(profile(args.profile)), sort_dicts=False)
+
+
+def slurm_init(args):
+    """Draft a profile's node classes from sinfo and scontrol (this machine's, or saved output)."""
+    from .site import config_path, init_config, load_config
+    from .slurm_site import draft_profile, read_slurm
+
+    if bool(args.sinfo) != bool(args.scontrol):
+        sys.exit("--sinfo and --scontrol go together")
+    if args.sinfo:
+        sinfo, scontrol = Path(args.sinfo).read_text(), Path(args.scontrol).read_text()
+    else:
+        try:
+            sinfo, scontrol = read_slurm()
+        except RuntimeError as e:
+            sys.exit(str(e))
+    name = args.profile or "slurm"
+    text = draft_profile(sinfo, scontrol, name)
+    if not args.write:
+        print(text)
+        return
+    cp = config_path()
+    if name in load_config().get("profiles", {}):
+        sys.exit(f"profile {name!r} is already in {cp}; print the draft (no --write) and merge it by hand")
+    if not cp.exists():
+        init_config()
+    with open(cp, "a") as fh:
+        fh.write("\n" + text)
+    print(f"added profile {name!r} to {cp}; set its scratch and prologue, and check the policy lines")
 
 
 def jobscript_cmd(args):
@@ -314,6 +347,12 @@ def main(argv=None):
     c.add_argument("action", choices=["init", "show", "path"])
     c.add_argument("--profile")
     c.add_argument("--force", action="store_true")
+    c.add_argument(
+        "--from-slurm", action="store_true", help="init: draft a profile's node classes from Slurm"
+    )
+    c.add_argument("--sinfo", help="--from-slurm: saved sinfo output instead of running it")
+    c.add_argument("--scontrol", help="--from-slurm: saved `scontrol show partition -o` output")
+    c.add_argument("--write", action="store_true", help="--from-slurm: add the draft to the config file")
     j = sub.add_parser("jobscript", help="print a coordinator job script")
     j.add_argument("command")
     j.add_argument("--profile")

@@ -1,7 +1,8 @@
 # Design: `dfeols plan` (probe the FE structure, pick the path, size the job)
 
 Status: draft for review (2026-10-27; Ted's answers folded in 2026-10-28). Build step 1 (probe
-and report) is implemented in `src/dfeols/planner.py` (2026-10-28); the rest is not. Plan A (crossing FEs
+and report) is implemented in `src/dfeols/planner.py`, and `config init --from-slurm` in
+`src/dfeols/slurm_site.py` (2026-10-28); the rest is not. Plan A (crossing FEs
 above `max_dummy_levels` on the sparse path, 04ff7a7) is the only piece of the solver table
 below that exists beyond the paths dfeols already had.
 
@@ -243,6 +244,12 @@ paths multiply by the iteration range.
    peaked at 31 GB on DB1B's market table (7.5 GB one at a time, 32 s against 19 s). Plan B
    and plan C keys are reported as not built; "sparse direct or plan C" stays one row until
    step 2 measures fill.
+2. ... `config init --from-slurm` **done** (`slurm_site.py`): it runs `sinfo -h -e -o
+   "%R|%D|%c|%m|%l|%f|%G|%T|%N"` and `scontrol show partition -o`, or reads saved output
+   (`--sinfo`, `--scontrol`). Classes are named after their partition (rename freely); the
+   mixed `normal` and `normal_hdr100` come out as `use = false`, spanning the uniform
+   classes, while `longjobs` stays usable for its 7-day limit. Tested on a fixture shaped
+   like OSCER, not yet on OSCER's own output.
 2. Crossing structure (fill, block structure, components); `partition="auto"` in prep; site
    profile additions (`max_walltime`, node classes, `scratch_purge_days`), `dfeols config init
    --from-slurm`, and ranked node-class options.
