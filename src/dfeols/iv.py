@@ -67,9 +67,9 @@ def solve(plan, acc: dict, N: int, *, estimator: str = "2sls", fuller: float | N
     ZtZ, ZtY, C = acc["ZtZ"], acc["ZtY"], acc["YtY"]
     k_tot = ZtZ.shape[0]
 
-    # collinearity: X1 (exogenous, then dummies) before the instruments, so an instrument
-    # collinear with the exogenous columns is the one dropped
-    order = np.r_[np.arange(k_rep), np.arange(k_x, k_tot), np.arange(k_rep, k_x)]
+    # collinearity: dummies, then the exogenous regressors, then the instruments, so a
+    # regressor the crossing FEs absorb, or an instrument collinear with X1, is the one dropped
+    order = np.r_[np.arange(k_x, k_tot), np.arange(k_rep), np.arange(k_rep, k_x)]
     keep = np.zeros(k_tot, bool)
     keep[order[collinear_keep(ZtZ[np.ix_(order, order)], collin_tol)]] = True
     zc = np.flatnonzero(keep)  # kept Z columns, in Z order

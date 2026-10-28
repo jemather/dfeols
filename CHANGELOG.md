@@ -68,6 +68,12 @@ break the API).
   re-exports it, deprecated. `redact=True` also removes the dfeols block's identifying fields
   from records that don't claim `dfeols/0.1` (fits without FEs).
 
+### Fixed
+- A regressor that a crossing FE absorbs (e.g. a carrier x quarter variable with a
+  `carrier^time` FE) is now dropped as collinear, as fixest does. The dense and sparse paths
+  tested columns in Z order, so they kept the regressor, dropped a dummy, and reported a
+  coefficient that is not identified. Dummies are now tested first (OLS and IV).
+
 ### Changed
 - Crossing FEs above `max_dummy_levels` are fitted when the spec has exactly one FE nested in
   the partition (the sparse path); `max_dummy_levels` now limits only dense dummy columns.

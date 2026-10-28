@@ -305,6 +305,32 @@ def test_iterate_on_dask_equals_serial(ds_cw):
     np.testing.assert_allclose(a.vcov(), b.vcov(), rtol=1e-9)
 
 
+@pytest.mark.parametrize("crossing_fe", ["dense", "sparse", "iterate"])
+def test_regressor_absorbed_by_crossing_fe_is_dropped(ds_cw, crossing_fe):
+    # wk depends only on week, a crossing FE: fixest drops wk; the direct solves used to keep
+    # it (dropping a dummy) and report an unidentified coefficient
+    import polars as pl
+
+    d, _ = ds_cw
+    d = d.with_columns(wk=(pl.col("week") * 0.1) ** 2)
+    ds = dfeols.prep(
+        d,
+        shard_dir=ds_cw[1].root.parent / f"wk_{crossing_fe}",
+        partition="id_a",
+        fixed_effects=["spell", "week"],
+        clusters=["id_a"],
+        target_rows=3000,
+    )
+    f = "eng ~ feat + wk + posts | spell + week"
+    a = dfeols.fit(ds, f, cluster="id_a", crossing_fe=crossing_fe, log_every=1e9)
+    assert a.collinear == ["wk"] and a.coefnames == ["feat", "posts"]
+    m = pf.feols(
+        f, data=d.to_pandas().dropna(subset=["eng"]), vcov={"CRV1": "id_a"}, **pyfixest_tol_kwargs(1e-13)
+    )
+    np.testing.assert_allclose(a.coef(), m.coef().to_numpy(), rtol=1e-8, atol=1e-10)
+    np.testing.assert_allclose(np.sqrt(np.diag(a.vcov())), m.se().to_numpy(), rtol=1e-7)
+
+
 def test_iterate_auto_and_limits(ds_cw):
     _, ds = ds_cw
     kw = dict(cluster="id_a", log_every=1e9)

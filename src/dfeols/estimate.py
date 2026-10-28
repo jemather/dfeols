@@ -376,7 +376,12 @@ def _ols_solve(plan: Plan, acc: dict, collin_tol: float) -> _iv.Solution:
     k_rep = len(plan.colnames)
     if plan.crossing_iterate:
         return _ols_solve_iterate(plan, acc, collin_tol)
-    keep = collinear_keep(acc["ZtZ"], collin_tol)
+    # dummies first, so a regressor the crossing FEs absorb is the column dropped (as fixest
+    # does); in Z order it was kept and a dummy dropped, which reports an unidentified b
+    k_x, k_tot = plan.k_x, acc["ZtZ"].shape[0]
+    order = np.r_[np.arange(k_x, k_tot), np.arange(k_x)]
+    keep = np.zeros(k_tot, bool)
+    keep[order[collinear_keep(acc["ZtZ"][np.ix_(order, order)], collin_tol)]] = True
     beta_k, bread = solve_spd(acc["ZtZ"][np.ix_(keep, keep)], acc["ZtY"][keep])
     dropped = [plan.colnames[i] for i in range(k_rep) if not keep[i]]
     kept = np.flatnonzero(keep)
