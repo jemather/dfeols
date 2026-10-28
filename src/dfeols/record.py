@@ -464,6 +464,8 @@ def _call(result) -> str:
         "crossing_fe",
         "max_dummy_levels",
         "collin_tol",
+        "iter_tol",
+        "iter_maxiter",
         "estimator",
         "fuller",
     ):

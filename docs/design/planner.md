@@ -76,7 +76,7 @@ For each candidate key the planner picks the first path that applies:
 | one nested FE, crossing block ≤ ~30k levels | sparse path, dense solve on the coordinator | 2 | plan A, done |
 | several nested FEs, crossing block ≤ ~30k | sparse path, nested FEs projected in the shard | 2 | plan B, done |
 | crossing block large but sparse with little fill | sparse direct solve on the coordinator | 2 | to build |
-| anything else | alternating projections across shards | 2 + iterations | plan C |
+| anything else | conjugate gradient across shards | 2 + iterations | plan C, done |
 
 Every row except the last is a fixed number of passes. Iterations of the last depend on the
 structure; the probe's connectivity statistics give a range, not a number.
@@ -118,6 +118,21 @@ will be purged, and `plan` budgets a re-demean when the key it would reuse expir
 job can start. dfeols never touches files to dodge a purge.
 
 ## Plan C on OSCER
+
+**As built (2026-10-28, `crossing_fe="iterate"`).** Not alternating projections on the data
+but conjugate gradient on the crossing-FE coefficients, which needs less resident state and
+fewer rounds. Round 1 returns D'W[X~ Y~] (per-level sums of the locally demeaned columns) and a
+Jacobi diagonal; the coordinator solves (D~'W D~) Gamma = D~'W[X~ Y~], one column per regressor
+and outcome, where each step broadcasts a levels x columns block p and every shard returns
+D'W Q D p (Q its exact local demeaning: one FE closed form, two Schur, more iterate). Shards
+keep their codes and weights, not the data, in worker memory between steps (`DFEOLS_ITER_CACHE_GB`,
+default 8; a worker without them re-reads the shard), and the Dask executor scatters p once
+per step instead of once per task. beta follows by Frisch-Waugh-Lovell on the coordinator, and
+round 2 is the sparse path's, so every vcov works. Equal to pyfixest and to the dense-solve
+path; on a 1M-row worker panel with 8,000 firms it took 13 steps (5 s, against 11 s for plan
+A's dense solve). Not built yet: IV on this path, a tree reduction for the per-step sums, and
+checkpoints (a step's state is the coordinator's few P x c blocks, so resuming is cheap to
+add). The sketch below was the starting point.
 
 Alternating projections distribute as map/reduce rounds: nested FEs are demeaned inside each
 shard with no communication; for a crossing FE each shard returns per-level sums and counts,

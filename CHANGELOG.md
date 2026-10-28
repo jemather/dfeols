@@ -22,6 +22,15 @@ break the API).
   terms with all local FEs. `crossing_fe="auto"` takes it when a crossing FE exceeds
   `max_dummy_levels` (below that, several local FEs keep dense dummies); `"sparse"` forces it.
   Equal to dense dummies and pyfixest (OLS, 2SLS, LIML; iid, hetero, CRV1).
+- Plan C: `crossing_fe="iterate"`, crossing-FE coefficients by Jacobi-preconditioned conjugate
+  gradient across shards (one map/reduce round per step, levels x columns blocks only;
+  `shard_matvec`), then OLS by Frisch-Waugh-Lovell and the sparse path's round 2. Works with
+  any number of local FEs, including none. `"auto"` takes it above 30,000 crossing-FE dummies
+  or for a crossing FE above `max_dummy_levels` with no FE nested in the partition. Options
+  `iter_tol`, `iter_maxiter`; `Result.options["crossing_cg"]` has the steps. Workers keep shard
+  codes between steps (`DFEOLS_ITER_CACHE_GB`). Not for IV yet.
+- `DaskExecutor` scatters large arrays that every task takes (once per round, broadcast)
+  instead of sending them with each task.
 - `dfeols config init --from-slurm [--profile NAME] [--write] [--sinfo F --scontrol F]`: draft a
   profile's node classes from `sinfo` and `scontrol show partition` (on a login node, or saved
   output). Partitions over the same nodes, limits and policy collapse to one class; each

@@ -21,13 +21,10 @@ import time
 
 import polars as pl
 
-from .estimate import coordinator_gb, worker_gb
+from .estimate import DENSE_SOLVE_LEVELS, coordinator_gb, worker_gb
 from .formula import Formula, fe_components, parse
 
 log = logging.getLogger("dfeols")
-
-# Plan A's coordinator dense solve: about 43 GB at 30k crossing levels (coordinator_gb)
-DENSE_SOLVE_LEVELS = 30_000
 
 # The solver table (planner.md), in the order a path is tried
 PATHS = {
@@ -35,7 +32,7 @@ PATHS = {
     "dense": ("dense dummy columns for the crossing FEs", "exists"),
     "sparse": ("sparse path, dense solve on the coordinator", "exists"),
     "B": ("sparse path, several nested FEs projected in the shard (plan B)", "exists"),
-    "C": ("sparse direct solve or alternating projections across shards (plan C)", "to build"),
+    "C": ("conjugate gradient across shards (plan C; 2 passes + one round per step)", "exists"),
 }
 
 
@@ -207,27 +204,25 @@ def plan(
         g_levels = {a: levels[a]["levels"] for a in glob}
         n_dummy = sum(L - 1 for L in g_levels.values()) + (1 if glob and not local else 0)
         big = [a for a, L in g_levels.items() if L > max_dummy_levels]
-        # as estimate._use_sparse with crossing_fe="auto"
+        # as estimate._use_iterate and _use_sparse with crossing_fe="auto"
         if not glob:
             path = "local"
-        elif n_dummy > DENSE_SOLVE_LEVELS and (local or big):
+        elif n_dummy > DENSE_SOLVE_LEVELS or (big and not local):
             path = "C"
         elif len(local) == 1:
             path = "sparse"
         elif not big:
             path = "dense"
-        elif local:
-            path = "B"
         else:
-            path = "C"
+            path = "B"
         kst = levels[k]
         n_bins = max(1, math.ceil(n / target_rows))
         shard_rows = max(kst["largest"] or 0, min(target_rows, n))
         if path == "C":
-            # no dummy columns or dense solve: shards hold the data, the coordinator per-level
-            # sums of every column (a reduction's worth, twice)
-            w_gb = worker_gb(shard_rows, n_cols, m, k_x, 0)
-            c_gb = coordinator_gb(k_x) + sum(g_levels.values()) * (m + k_x) * 8 * 2 / 1e9
+            # as estimate_worker_gb / estimate_coordinator_gb: no dummy columns or dense
+            # solve; shards hold a CG block, the coordinator level x column blocks
+            w_gb = worker_gb(shard_rows, n_cols, m, k_x, 0) + shard_rows * (m + k_x) * 8 * 2 / 1e9
+            c_gb = coordinator_gb(k_x) + sum(g_levels.values()) * (m + k_x) * 8 * 8 / 1e9
         else:
             sparse_levels = sum(g_levels.values()) if path in ("sparse", "B") else 0
             w_gb = worker_gb(shard_rows, n_cols, m, k_x, n_dummy, sparse_levels)

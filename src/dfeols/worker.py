@@ -13,6 +13,11 @@ The demeaned arrays are cached to disk for round 2.
 Round 2 (`shard_round2`): residuals, RSS and the meat of the sandwich, from linear
 maps of the round-1 columns that the coordinator passes (OLS and IV alike).
 
+Plan C (`shard_matvec`, crossing_fe="iterate"): one conjugate-gradient step for the
+crossing-FE coefficients, M p = D'W Q D p with Q the within-local-FEs residual maker,
+for a block p the coordinator broadcasts. A shard keeps its codes and weights in
+process memory between steps (_ITER_CACHE), so a step reads nothing from disk.
+
 IV (docs/design/iv.md): the endogenous regressors are built into the outcome block,
 after the outcomes, so they are demeaned (and partialled against crossing-FE dummies)
 like an outcome; the excluded instruments go into the regressor block after the
@@ -23,6 +28,7 @@ from __future__ import annotations
 
 import os
 import time
+from collections import OrderedDict
 
 try:
     import resource
@@ -40,6 +46,10 @@ from .rowhash import rowset
 
 # Sparse path: above this many crossing-FE levels a shard returns its Gram matrix sparse
 SPARSE_GRAM_LEVELS = 2000
+
+# Plan C: shard state kept between conjugate-gradient steps, least recently used first out
+_ITER_CACHE: OrderedDict = OrderedDict()
+ITER_CACHE_GB = float(os.environ.get("DFEOLS_ITER_CACHE_GB", "8"))
 
 
 @dataclass
@@ -63,6 +73,8 @@ class Plan:
     fe_maxiter: int = 100_000
     fe_method: str = "auto"  # auto | exact | iterate
     sparse_global: bool = False  # crossing FEs via per-level sums, no dense dummies
+    crossing_iterate: bool = False  # plan C: crossing-FE coefficients by distributed CG
+    iter_token: str | None = None  # plan C: names this fit's shard state in _ITER_CACHE
     keep_dir: str | None = None  # per-shard singleton keep masks (when FEs cross the partition)
     row_key_cols: tuple[str, ...] = ()  # raw columns hashed into the record's row_key
     endog_names: list[str] = field(default_factory=list)  # IV: endogenous columns (outcome block)
@@ -359,6 +371,20 @@ def _round1_sparse(plan: Plan, shard_id: int, df, n0: int, local_codes, w, T, t0
     Xw, Yw = Xt * w[:, None], Yt * w[:, None]
     DX = Dm.T @ Xw  # P x k
     DY = Dm.T @ Yw  # P x m
+    if plan.crossing_iterate:
+        # no dummy block: the coordinator solves D'WQD G = D'W [X~ Y~] by CG, with
+        # diag(D'W Q_A D) (A the largest local FE; exact with one) as the preconditioner
+        sw = Dm.T @ w
+        idx = np.flatnonzero(sw > 0)
+        d = sw.copy()
+        if n and local_codes:
+            a = max(local_codes, key=lambda c: int(c.max())).astype(np.int64)
+            WA = np.bincount(a, weights=w)
+            CA = sp.csr_matrix((w, (a, np.arange(n))), shape=(len(WA), n)) @ Dm
+            d -= np.asarray(CA.multiply(CA).T @ (1.0 / WA)).ravel()
+        aux = {"idx": idx, "DR": np.hstack([DX, DY])[idx], "ddiag": d[idx]}
+        T["crossprod"] = time.perf_counter() - t
+        return Y, Yt, Xt, Xw.T @ Xt, Xw.T @ Yt, (local_codes, Dm), converged, aux
     sparse_out = P > SPARSE_GRAM_LEVELS
     DWD = Dm.T @ sp.diags(w) @ Dm
     if not sparse_out:
@@ -404,7 +430,7 @@ def _round1_sparse(plan: Plan, shard_id: int, df, n0: int, local_codes, w, T, t0
         ZtY[:k] = Xw.T @ Yt
         ZtY[zp] = DY[sel]
         T["crossprod"] = time.perf_counter() - t
-        return Y, Yt, Xt, ZtZ, ZtY, (local_codes, Dm), converged
+        return Y, Yt, Xt, ZtZ, ZtY, (local_codes, Dm), converged, None
     ZtZ = np.zeros((k_tot, k_tot))
     ZtY = np.zeros((k_tot, m))
     ZtZ[:k, :k] = Xw.T @ Xt
@@ -414,17 +440,12 @@ def _round1_sparse(plan: Plan, shard_id: int, df, n0: int, local_codes, w, T, t0
     ZtY[:k] = Xw.T @ Yt
     ZtY[zp] = DY[sel]
     T["crossprod"] = time.perf_counter() - t
-    return Y, Yt, Xt, ZtZ, ZtY, (local_codes, Dm), converged
+    return Y, Yt, Xt, ZtZ, ZtY, (local_codes, Dm), converged, None
 
 
-def _round1(plan: Plan, shard_id: int, files: list[str], write_cache: bool):
-    t0 = time.perf_counter()
-    T = {}
-    loaded: dict = {}
+def _prepare(plan: Plan, shard_id: int, files: list[str], loaded: dict | None = None):
+    """The shard's estimation sample: rows, local FE codes (dense) and weights."""
     df = _load(plan, files, loaded)
-    T["read"] = time.perf_counter() - t0
-
-    t = time.perf_counter()
     n0 = df.height
     if plan.keep_dir:  # singletons over all FEs, found in the passes before round 1
         keep = np.load(_keep_path(plan, shard_id))
@@ -436,18 +457,29 @@ def _round1(plan: Plan, shard_id: int, files: list[str], write_cache: bool):
         if not keep.all():
             df = df.filter(pl.Series(keep))
             local_codes = [densify(c[keep])[0] for c in local_codes]
+    w = df[plan.weights].to_numpy().astype(np.float64) if plan.weights else np.ones(df.height)
+    return df, n0, local_codes, w
+
+
+def _round1(plan: Plan, shard_id: int, files: list[str], write_cache: bool):
+    t0 = time.perf_counter()
+    T = {}
+    loaded: dict = {}
+    df, n0, local_codes, w = _prepare(plan, shard_id, files, loaded)
+    T["read"] = time.perf_counter() - t0
     n = df.height
-    w = df[plan.weights].to_numpy().astype(np.float64) if plan.weights else np.ones(n)
     gpresent = [
         np.bincount(df[c].to_numpy().astype(np.int64), minlength=L) > 0 for _, c, L in plan.global_fes
     ]
 
     if plan.sparse_global:
-        Y, Yt, Zt, ZtZ, ZtY, extra, converged = _round1_sparse(plan, shard_id, df, n0, local_codes, w, T, t0)
+        Y, Yt, Zt, ZtZ, ZtY, extra, converged, aux = _round1_sparse(
+            plan, shard_id, df, n0, local_codes, w, T, t0
+        )
         t = time.perf_counter() - T.pop("crossprod")  # keep timing the cluster bookkeeping
     else:
         Y, Yt, Zt, ZtZ, ZtY, converged, t = _round1_dense(plan, df, n, local_codes, w, T)
-        extra = None
+        extra = aux = None
     out = {
         "shard": shard_id,
         "rows_in": n0,
@@ -465,6 +497,9 @@ def _round1(plan: Plan, shard_id: int, files: list[str], write_cache: bool):
         "global_present": gpresent,
         "converged": converged,
     }
+    if aux is not None:
+        out["crossing"] = aux
+        _iter_store(plan, shard_id, extra[0], extra[1], w)
     return _round1_finish(plan, shard_id, df, local_codes, w, Yt, Zt, out, T, t, t0, write_cache, extra)
 
 
@@ -547,6 +582,49 @@ def _round1_finish(plan, shard_id, df, local_codes, w, Yt, Zt, out, T, t, t0, wr
     out["timing"] = T
     arrays = (Yt, Zt, w, cl if cl is not None else np.zeros(0, np.int64), extra)
     return out, arrays
+
+
+def _iter_store(plan: Plan, shard_id: int, local_codes, Dm, w) -> tuple:
+    idx = np.unique(Dm.indices)  # levels present in the shard
+    nbytes = sum(c.nbytes for c in local_codes) + Dm.data.nbytes + Dm.indices.nbytes + w.nbytes
+    entry = (local_codes, Dm, w, idx, nbytes)
+    if plan.iter_token:
+        _ITER_CACHE[(plan.iter_token, shard_id)] = entry
+        used = sum(v[-1] for v in _ITER_CACHE.values())
+        while _ITER_CACHE and used > ITER_CACHE_GB * 1e9:
+            used -= _ITER_CACHE.popitem(last=False)[1][-1]
+    return entry
+
+
+def shard_matvec(plan: Plan, shard_id: int, files: list[str], p: np.ndarray) -> dict:
+    """One CG step on this shard: D'W Q D p (P x c) for the broadcast block p,
+    returned on the levels the shard has (idx)."""
+    t0 = time.perf_counter()
+    key = (plan.iter_token, shard_id)
+    hit = key in _ITER_CACHE
+    if hit:
+        _ITER_CACHE.move_to_end(key)
+        entry = _ITER_CACHE[key]
+    else:  # a worker that has not seen this shard (new, or the cache was full)
+        df, _, local_codes, w = _prepare(plan, shard_id, files)
+        entry = _iter_store(plan, shard_id, local_codes, _global_matrix(df, plan, df.height)[0], w)
+    local_codes, Dm, w, idx, _ = entry
+    t_read = time.perf_counter() - t0
+    U = Dm @ p
+    if local_codes and len(w):
+        U = demean(U, local_codes, w, plan.fe_tol, plan.fe_maxiter, plan.fe_method)[0]
+    S = Dm.T @ (U * w[:, None])
+    return {
+        "shard": shard_id,
+        "idx": idx,
+        "S": S[idx],
+        "timing": {
+            "read": t_read,
+            "total": time.perf_counter() - t0,
+            "cache_hit": hit,
+            "maxrss_gb": _maxrss_gb(),
+        },
+    }
 
 
 def _apply(T: np.ndarray, H) -> np.ndarray:

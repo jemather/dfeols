@@ -25,7 +25,15 @@ from .progress import Progress, fmt_td
 from .results import Result
 from .vcov import df_k as _df_k
 from .vcov import vcov_crv1, vcov_hetero, vcov_iid
-from .worker import Plan, plan_columns, shard_round1, shard_round2, shard_singletons, term_names
+from .worker import (
+    Plan,
+    plan_columns,
+    shard_matvec,
+    shard_round1,
+    shard_round2,
+    shard_singletons,
+    term_names,
+)
 
 log = logging.getLogger("dfeols")
 
@@ -133,7 +141,14 @@ def build_plan(
     # Dense dummies cost rows x levels x 8 bytes per shard; the sparse path keeps
     # per-level sums instead, so only it takes crossing FEs above max_dummy_levels
     big = [(k, L) for k, _, L in glob if L > max_dummy_levels]
-    if big and not (local and crossing_fe != "dense"):
+    n_dum = sum(L - 1 for *_, L in glob)
+    iterate = _use_iterate(crossing_fe, local, glob, bool(big), n_dum)
+    if iterate and parse(formula).iv:
+        raise NotImplementedError(
+            "IV with crossing_fe='iterate' (plan C) is not built yet; crossing FEs this large "
+            "need it" + ("" if crossing_fe == "iterate" else f" ({n_dum:,} crossing-FE dummies)")
+        )
+    if big and not iterate and not (local and crossing_fe != "dense"):
         big_fe, big_L = big[0]
         raise NotImplementedError(
             f"FE {big_fe!r} crosses partitions and has {big_L:,} levels (> max_dummy_levels="
@@ -192,7 +207,8 @@ def build_plan(
         drop_singletons=drop_singletons,
         fe_tol=fe_tol,
         fe_method=fe_method,
-        sparse_global=_use_sparse(crossing_fe, local, glob, bool(big)),
+        sparse_global=iterate or _use_sparse(crossing_fe, local, glob, bool(big)),
+        crossing_iterate=iterate,
         row_key_cols=row_key_cols,
         endog_names=term_names(f.endog, cat_levels),
         inst_names=term_names(f.instruments, cat_levels),
@@ -208,6 +224,8 @@ def estimate_worker_gb(plan: Plan, rows: int, n_cols: int) -> float:
     columns -> 2.8-3.4 GB observed (Polars read buffers, numpy temporaries,
     Dask worker overhead ~1 GB)."""
     m = len(plan.formula.depvars) + len(plan.endog_names)
+    if plan.crossing_iterate:
+        return worker_gb(rows, n_cols, m, plan.k_x, 0) + rows * (m + plan.k_x) * 8 * 2 / 1e9
     levels = sum(L for *_, L in plan.global_fes) if plan.sparse_global else 0
     return worker_gb(rows, n_cols, m, plan.k_x, plan.n_dummy, levels)
 
@@ -233,7 +251,11 @@ def worker_gb(rows: int, n_cols: int, m: int, k_x: int, n_dummy: int, sparse_lev
 def estimate_coordinator_gb(plan: Plan) -> float:
     """Rough coordinator memory for the dense Gram matrix of regressors and crossing-FE
     dummies: the accumulator, its kept-column copy, the Cholesky factor, the inverse and
-    the dummy block solved for round 2's maps (about 6 copies)."""
+    the dummy block solved for round 2's maps (about 6 copies). Plan C keeps only
+    level x column blocks (CG's iterate, residual, direction and product)."""
+    if plan.crossing_iterate:
+        P = sum(L for *_, L in plan.global_fes)
+        return coordinator_gb(plan.k_x) + P * (plan.k_x + len(plan.formula.depvars)) * 8 * 8 / 1e9
     return coordinator_gb(plan.k_x + plan.n_dummy)
 
 
@@ -269,12 +291,28 @@ def _check_worker_memory(executor, label: str, rows: int, need_gb: float) -> Non
         log.warning("%s; workers may run out of memory", msg)
 
 
+# Above this many crossing-FE dummies the coordinator's dense solve (about 43 GB at 30k)
+# gives way to conjugate gradient across shards (plan C)
+DENSE_SOLVE_LEVELS = 30_000
+
+
+def _use_iterate(crossing_fe: str, local, glob, big: bool, n_dummy: int) -> bool:
+    """Plan C: the crossing-FE coefficients by distributed conjugate gradient. "auto" takes
+    it when no direct path fits: more than DENSE_SOLVE_LEVELS dummies, or a crossing FE
+    above max_dummy_levels with no FE nested in the partition."""
+    if crossing_fe == "iterate":
+        if not glob:
+            raise ValueError("crossing_fe='iterate' needs a crossing FE")
+        return True
+    return crossing_fe == "auto" and bool(glob) and (n_dummy > DENSE_SOLVE_LEVELS or (big and not local))
+
+
 def _use_sparse(crossing_fe: str, local, glob, big: bool = False) -> bool:
     """Crossing (dummy) FEs via per-level sums. Needs a local FE; "auto" takes it with
     exactly one (closed-form projection) or when a crossing FE exceeds max_dummy_levels
     (several local FEs: per-component Schur solves, worker._projected_dummy_gram)."""
-    if crossing_fe not in ("auto", "sparse", "dense"):
-        raise ValueError("crossing_fe must be auto, sparse or dense")
+    if crossing_fe not in ("auto", "sparse", "dense", "iterate"):
+        raise ValueError("crossing_fe must be auto, sparse, dense or iterate")
     ok = len(local) >= 1 and len(glob) > 0
     use = ok and (crossing_fe == "sparse" or (crossing_fe == "auto" and (len(local) == 1 or big)))
     n_dummy = sum(L - 1 for *_, L in glob)
@@ -336,6 +374,8 @@ def _ols_solve(plan: Plan, acc: dict, collin_tol: float) -> _iv.Solution:
     reported ones with the dummies partialled out)."""
     m = len(plan.formula.depvars)
     k_rep = len(plan.colnames)
+    if plan.crossing_iterate:
+        return _ols_solve_iterate(plan, acc, collin_tol)
     keep = collinear_keep(acc["ZtZ"], collin_tol)
     beta_k, bread = solve_spd(acc["ZtZ"][np.ix_(keep, keep)], acc["ZtY"][keep])
     dropped = [plan.colnames[i] for i in range(k_rep) if not keep[i]]
@@ -377,6 +417,101 @@ def _ols_solve(plan: Plan, acc: dict, collin_tol: float) -> _iv.Solution:
     return _iv.Solution(names, beta_k[rep_kept_pos], [bread_use] * m, meat_idx, lin, dropped)
 
 
+def _ols_solve_iterate(plan: Plan, acc: dict, collin_tol: float) -> _iv.Solution:
+    """Plan C: OLS by Frisch-Waugh-Lovell from the CG solution Gamma of
+    (D~'W D~) Gamma = D~'W [X~ Y~]: the regressors and outcomes net of the dummies
+    are X~ - D~ Gamma_X and Y~ - D~ Gamma_Y, so
+        X^'W X^ = X~'W X~ - (D~'W X~)' Gamma_X,   X^'W Y^ = X~'W Y~ - (D~'W X~)' Gamma_Y
+    and round 2 subtracts D~ (Gamma_Y - Gamma_X beta) from the residuals and D~ Gamma_X
+    from the scores (lin["G"], lin["GH"]), as on the sparse path."""
+    m = len(plan.formula.depvars)
+    k = plan.k_x
+    Gam, R = acc["Gamma"], acc["DR"]
+    XX = acc["ZtZ"] - R[:, :k].T @ Gam[:, :k]
+    XX = (XX + XX.T) / 2
+    XY = acc["ZtY"] - R[:, :k].T @ Gam[:, k:]
+    keep = collinear_keep(XX, collin_tol)
+    kept = np.flatnonzero(keep)
+    beta, bread = solve_spd(XX[np.ix_(kept, kept)], XY[kept])
+    lin = {
+        "cols": kept,
+        "A": np.vstack([np.eye(m), -beta]),
+        "H": m + np.arange(len(kept)),
+        "G": Gam[:, k:] - Gam[:, kept] @ beta,
+        "GH": Gam[:, kept],
+    }
+    dropped = [plan.colnames[i] for i in range(k) if not keep[i]]
+    names = [plan.colnames[i] for i in kept]
+    return _iv.Solution(names, beta, [bread] * m, np.arange(len(kept)), lin, dropped)
+
+
+def _crossing_cg(
+    plan: Plan,
+    ds: Dataset,
+    executor,
+    prog: Progress,
+    rows: dict,
+    acc: dict,
+    label: str,
+    tol: float,
+    maxiter: int,
+) -> np.ndarray:
+    """Plan C: solve (D~'W D~) Gamma = D~'W [X~ Y~] by Jacobi-preconditioned conjugate
+    gradient, one column per regressor and outcome, each step one map/reduce round
+    (worker.shard_matvec). The matrix is singular (one redundant level per connected
+    component of the FEs) but the system is consistent, so CG converges to a solution
+    whose D~ Gamma, the only part used, is unique. Stops when every column's residual
+    is below tol relative to its right-hand side."""
+    t0 = time.time()
+    R = acc["DR"]
+    P, c = R.shape
+    d = acc["ddiag"]
+    act = d > 1e-12 * max(float(d.max(initial=0.0)), 1.0)
+    dinv = np.where(act, 1.0 / np.where(act, d, 1.0), 0.0)
+    X = np.zeros((P, c))
+    r = R * act[:, None]
+    bnorm = np.linalg.norm(r, axis=0)
+    bnorm[bnorm == 0] = 1.0
+    z = r * dinv[:, None]
+    p = z.copy()
+    rz = (r * z).sum(0)
+    it, rel = 0, np.linalg.norm(r, axis=0) / bnorm
+    while rel.max() > tol:
+        if it >= maxiter:
+            raise RuntimeError(
+                f"fit {label}: crossing-FE CG did not converge in {maxiter} steps (largest relative "
+                f"residual {rel.max():.1e} > {tol:g}); raise iter_maxiter, or partition so more FEs "
+                "are nested in the key"
+            )
+        it += 1
+        Ap = np.zeros((P, c))
+
+        def on(tid, res, Ap=Ap):
+            Ap[res["idx"]] += res["S"]
+
+        name = f"cg{it}"
+        tasks = [(s["id"], rows[s["id"]], (plan, s["id"], ds.shard_paths(s), p)) for s in ds.shards]
+        prog.add_stage(name, rows)
+        prog.start(name)
+        executor.run(shard_matvec, tasks, on, prog, name)
+        prog.finish(name)
+        pAp = (p * Ap).sum(0)
+        alpha = np.divide(rz, pAp, out=np.zeros(c), where=pAp > 0)
+        X += alpha * p
+        r -= alpha * Ap
+        z = r * dinv[:, None]
+        rz_new = (r * z).sum(0)
+        beta = np.divide(rz_new, rz, out=np.zeros(c), where=rz > 0)
+        p = z + beta * p
+        rz = rz_new
+        rel = np.linalg.norm(r, axis=0) / bnorm
+        if it == 1 or it % 10 == 0:
+            log.info("fit %s: crossing-FE CG step %d, largest relative residual %.1e", label, it, rel.max())
+    log.info("fit %s: crossing-FE CG converged in %d steps (%s)", label, it, fmt_td(time.time() - t0))
+    acc["cg"] = {"steps": it, "seconds": time.time() - t0, "max_relative_residual": float(rel.max())}
+    return X
+
+
 def fit(
     ds: Dataset | str,
     formula: str,
@@ -394,6 +529,8 @@ def fit(
     fe_method: str = "auto",
     crossing_fe: str = "auto",
     collin_tol: float = 1e-9,
+    iter_tol: float = 1e-10,
+    iter_maxiter: int = 5_000,
     label: str | None = None,
     log_every: float = 30.0,
     record: bool | str | os.PathLike = True,
@@ -416,6 +553,10 @@ def fit(
     redact     leave identifying details (user, host, paths, job ids) out of the record
     estimator  IV formulas (`y ~ x | fe | d ~ z`): "2sls" (default) or "liml"
     fuller     Fuller's modified LIML with constant a (estimator="liml"); a=1 is common
+    crossing_fe  how FEs that cross the partition are absorbed: "dense" dummy columns,
+               "sparse" per-level sums with a dense solve on the coordinator, "iterate"
+               conjugate gradient across shards (plan C; iter_tol, iter_maxiter), or
+               "auto" (the default) to pick from the FE structure
     """
     if not isinstance(ds, Dataset):
         ds = Dataset.open(ds)
@@ -457,12 +598,14 @@ def fit(
     if plan.sparse_global and plan.cache_dir:
         plan.cache_dir = None  # recomputing is cheap on this path
         cache = False
+    if plan.crossing_iterate:
+        plan.iter_token = f"{wd}:{uuid.uuid4().hex}"
     f = plan.formula
     label = label or spec_id
     m = len(f.depvars)
     mY = m + len(plan.endog_names)  # outcome block: outcomes, then IV's endogenous regressors
     k_rep = len(plan.colnames)
-    k_tot = plan.k_x + plan.n_dummy
+    k_tot = plan.k_x + (0 if plan.crossing_iterate else plan.n_dummy)
     log.info(
         "fit %s: %s | %d regressors + %d FE dummies, %d local FEs, %d shards, %s rows",
         label,
@@ -524,6 +667,10 @@ def fit(
         "load": {"rows": 0, "missing": 0, "non_finite": 0, "zero_weights": 0},
         "row_key": [],
     }
+    if plan.crossing_iterate:
+        P_lev = sum(L for *_, L in plan.global_fes)
+        acc["DR"] = np.zeros((P_lev, k_tot + mY))
+        acc["ddiag"] = np.zeros(P_lev)
 
     peak = {"rss": 0.0}
 
@@ -543,6 +690,10 @@ def fit(
         if r.get("row_key"):
             acc["row_key"].append(r["row_key"])
         acc["sumw"] += r["sumw"]
+        if "crossing" in r:
+            cr = r["crossing"]
+            acc["DR"][cr["idx"]] += cr["DR"]
+            acc["ddiag"][cr["idx"]] += cr["ddiag"]
         acc["row_n"][tid] = r["n"]
         acc["converged"] &= r["converged"]
         acc["fe_levels"] += np.asarray(r["fe_levels"], np.int64)
@@ -569,6 +720,8 @@ def fit(
         log.warning("fit %s: FE demeaning did not converge in some shards", label)
 
     N = acc["n"]
+    if plan.crossing_iterate:
+        acc["Gamma"] = _crossing_cg(plan, ds, executor, prog, rows, acc, label, iter_tol, iter_maxiter)
     if f.iv:
         sol = _iv.solve(plan, acc, N, estimator=estimator, fuller=fuller, collin_tol=collin_tol)
     else:
@@ -682,12 +835,16 @@ def fit(
         "fe_tol": fe_tol,
         "fe_maxiter": plan.fe_maxiter,
         "fe_method": fe_method,
-        "crossing_fe": "sparse" if plan.sparse_global else ("dense" if plan.global_fes else None),
+        "crossing_fe": "iterate"
+        if plan.crossing_iterate
+        else ("sparse" if plan.sparse_global else ("dense" if plan.global_fes else None)),
         "max_dummy_levels": max_dummy_levels,
         "collin_tol": collin_tol,
         "cache": cache,
         **iv_opts,
     }
+    if plan.crossing_iterate:
+        options.update(iter_tol=iter_tol, iter_maxiter=iter_maxiter, crossing_cg=acc["cg"])
     run = _record.run_info(
         ds,
         executor,
@@ -720,7 +877,9 @@ def fit(
         **{n: {"method": "local", "nested_in_partition": True} for n, _ in plan.local_fes},
         **{
             n: {
-                "method": "crossing_sparse" if plan.sparse_global else "crossing_dense",
+                "method": "crossing_iterate"
+                if plan.crossing_iterate
+                else ("crossing_sparse" if plan.sparse_global else "crossing_dense"),
                 "nested_in_partition": False,
             }
             for n, *_ in plan.global_fes

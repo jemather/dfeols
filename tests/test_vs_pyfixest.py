@@ -182,9 +182,7 @@ def test_sparse_crossing_fe_above_max_dummy_levels(data, tmp_path):
         assert a.N == m._N
         np.testing.assert_allclose(a.coef(), m.coef().to_numpy(), **TOL)
         np.testing.assert_allclose(np.sqrt(np.diag(a.vcov(None, v))), m.se().to_numpy(), rtol=1e-7)
-    # without an FE nested in the partition, a crossing FE this large is refused
-    with pytest.raises(NotImplementedError, match="at least one FE nested"):
-        dfeols.fit(ds, "eng ~ feat | cw", **kw)
+    # with crossing_fe="dense", a crossing FE this large is refused
     with pytest.raises(NotImplementedError, match="crossing_fe='dense'"):
         dfeols.fit(ds, f, crossing_fe="dense", **kw)
 
@@ -230,6 +228,92 @@ def test_sparse_several_local_fes(data, tmp_path, f):
     np.testing.assert_allclose(np.sqrt(np.diag(a.vcov(None, "CRV1"))), m.se().to_numpy(), rtol=1e-7)
     if "cw" in f:  # above max_dummy_levels, auto takes the sparse path
         assert dfeols.fit(ds, f, **kw).options["crossing_fe"] == "sparse"
+
+
+@pytest.fixture(scope="module")
+def ds_cw(data, tmp_path_factory):
+    import polars as pl
+
+    d = data.with_columns(cw=(pl.col("id_f") % 100) * 100 + pl.col("week"))
+    ds = dfeols.prep(
+        d,
+        shard_dir=tmp_path_factory.mktemp("cw"),
+        partition="id_a",
+        fixed_effects=["spell", "id_a^week", "week", "cw", "id_f"],
+        clusters=["id_a"],
+        target_rows=3000,
+    )
+    return d, ds
+
+
+@pytest.mark.parametrize(
+    "f",
+    [
+        "eng ~ feat + posts | spell + cw",  # one local FE
+        "eng ~ feat + posts | spell + id_a^week + cw",  # two local FEs
+        "eng ~ feat + posts | cw + id_f",  # no local FE: 5,300 crossing levels
+        "eng ~ feat:i(tbin) + posts | spell + week + id_f",  # two crossing FEs
+    ],
+)
+def test_iterate_crossing_fes(ds_cw, f):
+    # plan C: crossing-FE coefficients by conjugate gradient across shards, against pyfixest
+    d, ds = ds_cw
+    kw = dict(cluster="id_a", vcov=["CRV1", "hetero", "iid"], log_every=1e9)
+    a = dfeols.fit(ds, f, crossing_fe="iterate", **kw)
+    assert a.options["crossing_fe"] == "iterate"
+    pdf = d.to_pandas().dropna(subset=["eng"])
+    for v in ("CRV1", "hetero"):
+        m = pf.feols(
+            f.replace("feat:i(tbin)", "i(tbin, feat)"),
+            data=pdf,
+            vcov=_pf_vcov(v, "id_a"),
+            **pyfixest_tol_kwargs(1e-13),
+        )
+        assert a.N == m._N
+        np.testing.assert_allclose(a.coef(), m.coef().to_numpy(), rtol=1e-8, atol=1e-10)
+        np.testing.assert_allclose(np.sqrt(np.diag(a.vcov(None, v))), m.se().to_numpy(), rtol=1e-7)
+
+
+def test_iterate_equals_sparse_two_outcomes(ds_cw):
+    _, ds = ds_cw
+    f = "eng + eng2 ~ feat + posts | spell + week + id_f"
+    kw = dict(cluster="id_a", vcov=["CRV1", "hetero", "iid"], weights="wt", log_every=1e9)
+    a = dfeols.fit(ds, f, crossing_fe="iterate", **kw)
+    b = dfeols.fit(ds, f, crossing_fe="sparse", **kw)
+    assert a.N == b.N and a.fe_levels == b.fe_levels
+    for y in ("eng", "eng2"):
+        np.testing.assert_allclose(a.coef(y), b.coef(y), rtol=1e-8, atol=1e-10)
+        for t in ("CRV1", "hetero", "iid"):
+            np.testing.assert_allclose(a.vcov(y, t), b.vcov(y, t), rtol=1e-7, atol=1e-14)
+        assert a.outcomes[y]["rss"] == pytest.approx(b.outcomes[y]["rss"], rel=1e-9)
+
+
+def test_iterate_on_dask_equals_serial(ds_cw):
+    # CG blocks go to the workers by scatter, shard state stays in each worker's cache
+    distributed = pytest.importorskip("distributed")
+    _, ds = ds_cw
+    f = "eng ~ feat + posts | cw + id_f"
+    kw = dict(cluster="id_a", crossing_fe="iterate", log_every=1e9)
+    a = dfeols.fit(ds, f, **kw)
+    with distributed.LocalCluster(n_workers=2, threads_per_worker=1, processes=False) as lc:
+        with distributed.Client(lc) as client:
+            ex = dfeols.DaskExecutor(client, tick=0.2)
+            ex.scatter_min_bytes = 1  # scatter even this test's small blocks
+            b = dfeols.fit(ds, f, executor=ex, workdir=str(ds.root / "runs" / "dask"), **kw)
+    assert b.options["crossing_cg"]["steps"] == a.options["crossing_cg"]["steps"]
+    np.testing.assert_allclose(a.coef(), b.coef(), rtol=1e-10)
+    np.testing.assert_allclose(a.vcov(), b.vcov(), rtol=1e-9)
+
+
+def test_iterate_auto_and_limits(ds_cw):
+    _, ds = ds_cw
+    kw = dict(cluster="id_a", log_every=1e9)
+    # no FE nested in the partition and a crossing FE above max_dummy_levels: auto iterates
+    assert dfeols.fit(ds, "eng ~ feat | cw", **kw).options["crossing_fe"] == "iterate"
+    with pytest.raises(NotImplementedError, match="IV with crossing_fe='iterate'"):
+        dfeols.fit(ds, "eng ~ posts | cw | feat ~ eng2", **kw)
+    with pytest.raises(RuntimeError, match="did not converge in 2 steps"):
+        dfeols.fit(ds, "eng ~ feat | cw + id_f", crossing_fe="iterate", iter_maxiter=2, **kw)
 
 
 @pytest.fixture(scope="module")

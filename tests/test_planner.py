@@ -26,7 +26,7 @@ SPECS = [
     ("eng ~ feat | spell + id_f + week", "id_a", 2000),
     # two local FEs and a crossing FE above max_dummy_levels: plan B
     ("eng ~ feat | spell + id_a + id_f", "id_a", 100),
-    # no FE nested in tbin, crossing FEs above max_dummy_levels: not built (fit refuses)
+    # no FE nested in tbin, crossing FEs above max_dummy_levels: plan C
     ("eng ~ feat | spell + week", "tbin", 20),
 ]
 
@@ -62,7 +62,8 @@ def test_plan_matches_prep_and_build_plan(data, tmp_path, formula, cluster, max_
         assert sorted(o["local_fes"]) == sorted(k for k, _ in p.local_fes)
         assert o["crossing_fes"] == {k: L for k, _, L in p.global_fes}
         assert o["n_dummy"] == p.n_dummy
-        assert p.sparse_global == (o["path"] in ("sparse", "B"))
+        assert p.sparse_global == (o["path"] in ("sparse", "B", "C"))
+        assert p.crossing_iterate == (o["path"] == "C")
         assert o["coordinator_gb"] == round(estimate_coordinator_gb(p), 1)
 
 

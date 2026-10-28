@@ -67,6 +67,7 @@ class DaskExecutor:
         self.max_workers = max_workers
         self.tick_s = tick
         self.retries = retries
+        self.scatter_min_bytes = 1 << 20  # arrays this large shared by every task are scattered
 
     def slots(self):
         try:
@@ -83,6 +84,22 @@ class DaskExecutor:
         except Exception:
             return set()
 
+    def _scatter_shared(self, tasks) -> dict:
+        """Large arrays passed to every task (plan C's CG block) go to the workers once,
+        not once per task: {id(array): future}."""
+        import numpy as np
+
+        if not tasks:
+            return {}
+        ids = None
+        for _tid, _rows, args in tasks:
+            mine = {id(a) for a in args if isinstance(a, np.ndarray) and a.nbytes >= self.scatter_min_bytes}
+            ids = mine if ids is None else ids & mine
+        if not ids:
+            return {}
+        arrays = {id(a): a for a in tasks[0][2] if id(a) in ids}
+        return {i: self.client.scatter(a, broadcast=True, hash=False) for i, a in arrays.items()}
+
     def run(self, fn: Callable, tasks, on_result, progress, stage: str, local_help: bool = False):
         """local_help: while no workers are connected, the coordinator runs
         queued tasks itself (lowest priority first). Only for tasks without
@@ -94,9 +111,11 @@ class DaskExecutor:
         futs, fargs = {}, {}
         n = len(ordered)
         run_id = uuid.uuid4().hex[:8]  # task keys must never repeat across runs (e.g. two preps)
+        shared = self._scatter_shared(ordered)
         for i, (tid, _rows, args) in enumerate(ordered):
             key = f"dfeols-{stage}-{progress.label}-{run_id}-{tid}"
-            f = self.client.submit(fn, *args, key=key, priority=n - i, retries=self.retries, pure=False)
+            sargs = [shared.get(id(a), a) for a in args]
+            f = self.client.submit(fn, *sargs, key=key, priority=n - i, retries=self.retries, pure=False)
             futs[f] = tid
             fargs[f] = args
         order = list(futs)  # submission order = priority order

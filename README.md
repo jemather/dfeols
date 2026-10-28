@@ -231,12 +231,14 @@ of the time (iid: 85.8%, as expected with clustered errors).
 
 ## Limitations
 
-- **Not yet supported:** two-way clustering, heterogeneous slopes (`fe[x]`),
-  crossing FEs above `max_dummy_levels` levels with no FE nested in the
-  partition, and crossing FEs too large for the coordinator's dense solve (beyond about
-  30,000 levels, for example a follower FE when partitioning by account). The
-  executor design allows adding alternating projections as extra map/reduce
-  rounds.
+- **Not yet supported:** two-way clustering, heterogeneous slopes (`fe[x]`), and
+  IV with crossing FEs that need the iterative path.
+- **Crossing FEs too large for a direct solve** (more than 30,000 dummies, or above
+  `max_dummy_levels` with no FE nested in the partition) are absorbed by conjugate
+  gradient across shards (`crossing_fe="iterate"`, plan C): one extra map/reduce round
+  per step, with only levels x columns blocks moving. Steps depend on how well the FEs
+  connect; `iter_tol` (1e-10) and `iter_maxiter` (5,000) control it, and the step count
+  is in `Result.options["crossing_cg"]`. `dfeols plan` shows which path a key gets.
 - **Two local FEs plus crossing FEs** build dense dummy columns up to
   `max_dummy_levels` (a warning is logged above 300 columns; `crossing_fe="sparse"`
   avoids them). Above it they take the sparse path, which needs each connected
