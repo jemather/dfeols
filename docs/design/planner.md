@@ -1,6 +1,6 @@
 # Design: `dfeols plan` (probe the FE structure, pick the path, size the job)
 
-Status: draft for review (2026-10-27). Nothing here is implemented yet. Plan A (crossing FEs
+Status: draft for review (2026-10-27; Ted's answers folded in 2026-10-28). Nothing here is implemented yet. Plan A (crossing FEs
 above `max_dummy_levels` on the sparse path, 04ff7a7) is the only piece of the solver table
 below that exists beyond the paths dfeols already had.
 
@@ -58,7 +58,10 @@ All from streaming aggregates on the raw (or prepped) data; nothing is sharded.
    how many iterations an iterative path needs).
 6. **Singletons**, one pass's worth (enough to say whether they matter).
 
-Candidate keys: the ones the user lists, else every FE component and cluster variable.
+Candidate keys: the ones the user lists, else every FE, every component of an interaction, and
+every cluster variable. Specifications rarely have more than 3 or 4 FEs, some with interactions
+or nesting (Ted, 2026-10-28), so that is a handful of keys and the probe tries them all: the
+nesting counts for every FE × key pair share one pass over the data.
 
 ## The solver table
 
@@ -89,8 +92,9 @@ are one or two cheap passes over those columns. Recommended when any of these ho
 
 - the path is iterative (plan C), so the expensive part is the demeaning, and it should be done
   once for all specifications that share the FEs, sample and weights;
-- the estimate approaches the walltime (48 h on OSCER), so the work has to checkpoint and resume
-  across jobs;
+- the estimate exceeds 50% of the site's walltime limit (Ted, 2026-10-28), so the work should
+  checkpoint and be able to resume in a new job. The limit is the profile's `max_walltime`
+  (48 h on OSCER), never a constant in the code;
 - many specifications share one FE set (the sessions use case, at any path).
 
 ## Plan C on OSCER
@@ -114,14 +118,58 @@ all variables go through it together.
   as fixest, or conjugate gradient; each step is still one pass), and a checkpoint of the
   demeaned columns every N cycles so a run can resume in a new job.
 
-## Node classes come from the profile
+## Site facts come from the profile
 
-The planner never hard-codes a cluster. The site profile describes node classes; for OSCER (Ted,
-2026-10-27): 278 normal nodes with up to 250 GB RAM, 267 dual-Haswell nodes limited to 64 GB on
-an FDR10 InfiniBand switch, and a 48-hour walltime limit. The recommendation names a class for
-the coordinator (a big node when the dense solve needs tens of GB, e.g. ~43 GB at 30k levels)
-and for workers (many 64 GB nodes when shards are small; 250 GB nodes when one partition group is
-large), plus the walltime to request.
+The planner never hard-codes a cluster: the walltime limit, the node classes and what each costs
+are site facts, so they live in the site profile (`site.py`), next to today's single `worker`
+and `coordinator` specs, which stay the defaults when a profile declares no classes. Proposed
+additions:
+
+```toml
+[profiles.oscer]
+max_walltime = "48:00:00"          # longest job the site allows; drives checkpointing and
+                                   # the demean-first threshold (50% of it)
+
+[profiles.oscer.nodes.normal]      # one table per node class
+count = 278
+memory = "250GB"                   # largest; a class with mixed sizes gives the smallest it can promise
+interconnect = ""                  # e.g. "FDR10", "HDR100"; empty if unknown
+cost = 1.0                         # relative accounting charge per node-hour (site's units)
+availability = "high"              # high | medium | low: how hard it is to get these nodes
+directives = []                    # what selects this class: partition, constraint, QOS ...
+
+[profiles.oscer.nodes.haswell64]
+count = 267
+memory = "64GB"
+interconnect = "FDR10"
+
+[profiles.oscer.nodes.hdr100]
+count = 34
+memory = "128GB"                   # 128-256 GB; Ice Lake / Sapphire Rapids
+interconnect = "HDR100"
+```
+
+OSCER's classes as Ted described them (2026-10-27, 2026-10-28): 278 normal nodes with up to
+250 GB; 267 dual-Haswell nodes limited to 64 GB on FDR10 InfiniBand; 34 dual Ice Lake /
+Sapphire Rapids nodes with 128-256 GB on HDR100 InfiniBand. Cores, partitions or constraints
+that select each class, accounting charge and availability are still to fill in.
+
+The planner matches the job's needs to the classes: the coordinator on a class with enough
+memory for the dense solve (~43 GB at 30k levels); workers on the class that holds a shard (and,
+for plan C, the resident data) at the lowest cost, preferring fast interconnect when the path
+moves data between workers every cycle (plan C's reductions; HDR100 nodes may suit those best).
+It ranks the feasible options rather than picking one silently, since a class can be cheap but
+contended, or fast but expensive in the site's accounting:
+
+```text
+  workers   option                     est. wall    node-hours x cost   availability
+  1 (rec.)  12 x haswell64 (FDR10)     3.5-6 h      42-72 x 1.0         high
+  2         4 x hdr100 (HDR100)        2.5-4 h      10-16 x 1.5         low
+  3         3 x normal                 5-9 h        15-27 x 1.0         high
+```
+
+(Illustrative numbers.) The chosen option becomes the overrides for `dfeols.executor(profile,
+...)`, so a recommendation can be run as printed.
 
 ## Wall-time estimates
 
@@ -136,6 +184,8 @@ paths multiply by the iteration range.
   prints the report; `--json` writes it for scripts. Runs on a login or interactive node
   (streaming, bounded memory), or as a short job for very large sources.
 - `dfeols.plan(source, formula, ...)` returns the same as a dict.
+- `prep(..., partition="auto")` runs the probe and uses the recommended key (Ted, 2026-10-28);
+  it logs the alternatives with their trade-offs, and an explicit key still wins.
 - `prep` and `fit` log the planner's verdict for the spec they were given, and `fit` refuses
   early, with the planner's explanation, where it now raises deep inside a run.
 
@@ -143,16 +193,25 @@ paths multiply by the iteration range.
 
 1. Probe and report: levels, nesting, skew, the solver table and memory (no wall time yet).
    Delivers the pre-SLURM scale estimator Ted asked for (STATE.md, 2026-10-27).
-2. Crossing structure (fill, block structure, components) and node-class recommendations from
-   the profile.
+2. Crossing structure (fill, block structure, components); `partition="auto"` in prep; site
+   profile additions (`max_walltime`, node classes) and ranked node-class options.
 3. Wall-time ranges from recorded runs.
 4. One job vs demean-first, once sessions' persisted demeaned data exists.
 5. New paths as they are built (B, sparse direct, C), each added to the table with its own
    estimate.
 
+## Decided (Ted, 2026-10-28)
+
+- Walltime limit and node classes (memory, interconnect, cost, availability) are site profile
+  settings, not code.
+- `prep` takes `partition="auto"`; the planner recommends and lists the other options.
+- Demean-first above 50% of the site's walltime limit.
+- The probe tries every FE, interaction component and cluster variable as a key (specs have at
+  most 3-4 FEs).
+
 ## Open questions
 
-- Should `prep` take `partition="auto"` and use the planner's pick, or only report it?
-- How far should the probe go on its own for candidate keys when none are listed (every FE
-  component can be many queries on a large source)?
-- Thresholds for recommending demean-first: number of specifications, fraction of walltime.
+- OSCER's class details for the profile: cores per node, the partition, constraint or QOS that
+  selects each class, accounting charge, and how contended each class is.
+- A demean-first threshold on the number of specifications sharing one FE set, or leave that to
+  the user (sessions)?
