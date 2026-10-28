@@ -105,19 +105,21 @@ class Progress:
         self.max_slots: int | None = None
         self.running: dict[str, set[int]] = {}
         self.history: list[dict] = []  # (time, progress, ETA) per tick
+        self.note = ""  # appended to the log line, e.g. the CG step and residual
+        self.extra_eta: float | None = None  # seconds of work no stage holds yet (CG steps to come)
 
     # --- bookkeeping -----------------------------------------------------
-    def add_stage(self, name: str, rows: dict[int, int]):
+    def add_stage(self, name: str, rows: dict[int, int], before: str | None = None):
         self.stages[name] = StageProgress(name, dict(rows))
-        self.order.append(name)
+        self.order.insert(self.order.index(before) if before in self.order else len(self.order), name)
         self.running[name] = set()
 
     def start(self, name: str):
         self.stages[name].started = time.time()
 
-    def finish(self, name: str):
+    def finish(self, name: str, log: bool = True):
         self.stages[name].finished = time.time()
-        self.tick(force=True)
+        self.tick(force=log)
 
     def task_done(self, stage: str, tid: int, seconds: float, timing: dict | None = None):
         self.stages[stage].done[tid] = seconds
@@ -201,6 +203,8 @@ class Progress:
                     "finished": bool(st.finished),
                 }
             )
+        if self.extra_eta is not None:
+            total_eta += self.extra_eta
         return {
             "label": self.label,
             "updated": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -233,6 +237,8 @@ class Progress:
             parts.append(f"total ETA {fmt_td(snap['eta_total_seconds'])} -> {snap['finish_time']}")
         if cur.get("eta_seconds_at_max_workers") is not None:
             parts.append(f"({fmt_td(cur['eta_seconds_at_max_workers'])} if all workers start)")
+        if self.note:
+            parts.append(self.note)
         return " | ".join(parts)
 
     def tick(self, force: bool = False):

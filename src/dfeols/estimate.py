@@ -450,6 +450,17 @@ def _ols_solve_iterate(plan: Plan, acc: dict, collin_tol: float) -> _iv.Solution
     return _iv.Solution(names, beta, [bread] * m, np.arange(len(kept)), lin, dropped)
 
 
+def _cg_steps_left(hist: list[float], tol: float, window: int = 30) -> int | None:
+    """Steps until the residual reaches tol at its average rate of fall over the last
+    `window` steps (CG residuals stall and drop, so this is rough); None before 3 steps
+    or while the residual is not falling."""
+    if len(hist) < 4:
+        return None
+    h = np.log(hist[-window - 1 :])
+    fall = (h[0] - h[-1]) / (len(h) - 1)
+    return max(int(np.ceil((h[-1] - np.log(tol)) / fall - 1e-9)), 0) if fall > 0 else None
+
+
 def _crossing_cg(
     plan: Plan,
     ds: Dataset,
@@ -481,6 +492,7 @@ def _crossing_cg(
     p = z.copy()
     rz = (r * z).sum(0)
     it, rel = 0, np.linalg.norm(r, axis=0) / bnorm
+    hist = [float(rel.max())]
     while rel.max() > tol:
         if it >= maxiter:
             raise RuntimeError(
@@ -496,10 +508,11 @@ def _crossing_cg(
 
         name = f"cg{it}"
         tasks = [(s["id"], rows[s["id"]], (plan, s["id"], ds.shard_paths(s), p)) for s in ds.shards]
-        prog.add_stage(name, rows)
+        prog.add_stage(name, rows, before="round2")
         prog.start(name)
+        ts = time.time()
         executor.run(shard_matvec, tasks, on, prog, name)
-        prog.finish(name)
+        prog.finish(name, log=False)
         pAp = (p * Ap).sum(0)
         alpha = np.divide(rz, pAp, out=np.zeros(c), where=pAp > 0)
         X += alpha * p
@@ -510,8 +523,15 @@ def _crossing_cg(
         p = z + beta * p
         rz = rz_new
         rel = np.linalg.norm(r, axis=0) / bnorm
+        hist.append(float(rel.max()))
+        left = _cg_steps_left(hist, tol)
+        prog.extra_eta = None if left is None else left * (time.time() - ts)
+        prog.note = f"CG step {it}, residual {rel.max():.1e} (tol {tol:g})" + (
+            f", about {left} more steps" if left is not None else ""
+        )
         if it == 1 or it % 10 == 0:
             log.info("fit %s: crossing-FE CG step %d, largest relative residual %.1e", label, it, rel.max())
+    prog.note, prog.extra_eta = "", None
     log.info("fit %s: crossing-FE CG converged in %d steps (%s)", label, it, fmt_td(time.time() - t0))
     acc["cg"] = {"steps": it, "seconds": time.time() - t0, "max_relative_residual": float(rel.max())}
     return X

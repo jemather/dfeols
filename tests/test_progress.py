@@ -59,3 +59,27 @@ def test_fit_round2_still_projected_from_round1(tmp_path):
     prog.set_slots(2, 2)
     r2 = prog.snapshot()["stages"][1]
     assert r2["rate_projected"] and r2["eta_seconds"] is not None
+
+
+def test_cg_steps_show_in_the_line(tmp_path):
+    """CG step stages go before round 2, so the log line names the step and its note
+    (regression: OSCER showed 'round2 0/342 shards ... ETA 0:00:06' for 90 minutes of CG)."""
+    from dfeols.estimate import _cg_steps_left
+
+    prog = Progress(tmp_path, label="fit", every=1e9)
+    prog.add_stage("round1", {0: 1000})
+    prog.add_stage("round2", {0: 1000})
+    prog.start("round1")
+    prog.task_done("round1", 0, 1.0, {"total": 1.0})
+    prog.finish("round1")
+    prog.add_stage("cg1", {0: 1000}, before="round2")
+    assert prog.order == ["round1", "cg1", "round2"]
+    prog.start("cg1")
+    prog.task_done("cg1", 0, 0.5)
+    prog.note, prog.extra_eta = "CG step 1, residual 3.1e-01 (tol 1e-10)", 600.0
+    line = prog.line(prog.snapshot())
+    assert "[fit cg1]" in line and line.endswith("CG step 1, residual 3.1e-01 (tol 1e-10)")
+    assert prog.snapshot()["eta_total_seconds"] >= 600
+    assert _cg_steps_left([1.0, 0.5, 0.2], 1e-10) is None  # too few steps
+    assert _cg_steps_left([1e-1, 1e-2, 1e-3, 1e-4], 1e-10) == 6  # a decade a step
+    assert _cg_steps_left([1e-4, 2e-4, 1e-4, 1e-4], 1e-10) is None  # stalled
