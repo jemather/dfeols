@@ -462,6 +462,7 @@ def prep_distributed(
     hash_levels: float = 2e6,
     range_groups: float = 5e6,
     max_files: float = 5e4,
+    max_open: int = 128,
     source_meta: dict | None = None,
 ):
     """rows_per_task  rows per encode task (default: ~4 tasks per worker, 1M-10M
@@ -477,7 +478,12 @@ def prep_distributed(
                    instead of an LPT assignment table joined on every row
     max_files      if writing one piece per (encode task, shard) would create
                    more files than this (partition groups scattered across the
-                   input files), use a two-level shuffle through buckets"""
+                   input files), use a two-level shuffle through buckets
+    max_open       likewise when one encode task would write more shards than this:
+                   Polars keeps a buffer per open output. Prep of one 69M-row DB1B
+                   file into 3,434 shards peaked at 23.5 GB (OSCER workers with 24 GB
+                   died on it, 2026-10-28); through 512 buckets 14.7 GB, 128 buckets
+                   5.8 GB and 32 buckets 4.3 GB, and no slower"""
     from . import __version__
     from .executors import SerialExecutor
     from .prep import META, Dataset, _lpt_bins, clear_incomplete, remove_dir
@@ -705,12 +711,21 @@ def prep_distributed(
     )
     n_shards = len(rows_by)
     n_buckets = 0
-    if pieces_est > max_files:
-        n_buckets = int(min(max(max_files // max(len(batches), 1), 2), n_shards))
+    per_task = (
+        file_shards.with_columns(pl.col("__file").replace_strict(batch_of).alias("__b"))
+        .group_by("__b")
+        .agg(pl.col("__shard").n_unique())
+        .get_column("__shard")
+        .max()
+        or 0
+    )
+    if pieces_est > max_files or per_task > max_open:
+        n_buckets = int(min(max(max_files // max(len(batches), 1), 2), n_shards, max_open))
         log.info(
-            "prep: one piece per task and shard would be %s files; using a two-level shuffle "
-            "through %d buckets (%s files)",
+            "prep: one piece per task and shard would be %s files, up to %s shards open in one "
+            "task; using a two-level shuffle through %d buckets (%s files)",
             f"{pieces_est:,}",
+            f"{per_task:,}",
             n_buckets,
             f"{len(batches) * n_buckets + n_shards:,}",
         )

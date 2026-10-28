@@ -266,8 +266,8 @@ class _ZombieExecutor(dfeols.SerialExecutor):
 
 @pytest.mark.parametrize(
     "opts",
-    [dict(), dict(max_pieces=0), dict(max_files=0)],
-    ids=["direct", "merge", "two-level"],
+    [dict(), dict(max_pieces=0), dict(max_files=0), dict(max_open=2)],
+    ids=["direct", "merge", "two-level", "two-level-open"],
 )
 def test_duplicate_task_attempts_are_ignored(tmp_path, opts):
     """Files from task attempts whose result was not accepted never enter the
@@ -347,8 +347,8 @@ class _DuplicatingExecutor(dfeols.SerialExecutor):
 
 @pytest.mark.parametrize(
     "opts",
-    [{}, {"max_files": 0}, {"max_pieces": 0}, {"range_groups": 0}],
-    ids=["direct", "two-level", "merge", "range"],
+    [{}, {"max_files": 0}, {"max_pieces": 0}, {"range_groups": 0}, {"max_open": 2}],
+    ids=["direct", "two-level", "merge", "range", "two-level-open"],
 )
 def test_task_results_delivered_twice(tmp_path, opts):
     d = PanelDGP(n_units=2000, units_per_chunk=250, T=15, n_groups=30)
