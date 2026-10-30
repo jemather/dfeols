@@ -219,12 +219,13 @@ block-Jacobi CG. At 0.5% mobility AP needed 3,114 passes to 1e-4 SE; Jacobi CG 3
 (4 on OSCER: 60 of 80 idle); the record labels plan C's numerics `one-pass group demeaning`,
 `Cholesky`, `iterative: false`.
 
-**Open: fitting from cells.** Every FE and the cluster are constant within a cell (a distinct
+**Fitting from cells.** Every FE and the cluster are constant within a cell (a distinct
 combination of their keys), so the fit, CRV1 included, can run on per-cell sums and
 cross-products. DB1B's 669M rows are 21.3M cells; the whole fit took 2.5 min on one machine
 (one streaming pass 58 s, system 81 s, solve 14 s; peak 15 GB). The gain is data-dependent:
 NFIP compresses 3-14x, the worker-firm panels not at all. The probe could report the cell count
-(one group-by) and recommend it when the ratio is large. For Ted: whether to pursue it.
+(one group-by) and recommend it when the ratio is large. *Decided:* pursue it, with CRV1 at a
+cluster in the cell key; HC1 is not needed (users of large FE fits cluster).
 
 ## Site facts come from the profile
 
@@ -363,6 +364,10 @@ paths multiply by the iteration range.
 Added 2026-10-28/29: crossing-FE tolerance 1e-8 by default; the partition key that makes the
 crossing system smallest, subject to shard balance; the per-pass fallback warns that it may
 converge slowly.
+
+Added 2026-10-30: level space (A built in round 1, CG on the coordinator) with the preconditioner
+chosen by block structure, as proposed above; AP not added; a cell path for data that compresses,
+CRV1 only.
 
 ## Open questions
 
