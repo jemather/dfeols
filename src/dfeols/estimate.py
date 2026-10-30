@@ -594,6 +594,7 @@ def _crossing_cg(
         "preconditioner": method,
         "passes": 0 if level else it,
         "A_nnz": int(A.nnz) if level else None,
+        "parts_nnz": int(gram.parts_nnz) if gram is not None else None,  # shipped by the shards
         "block_nnz": [int(b.nnz) for b in blocks] if blocks is not None else None,
         "fallback_reason": None if level else (gram.reason if gram is not None else "level_space_gb=0"),
     }
