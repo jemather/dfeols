@@ -117,6 +117,26 @@ def test_default_record_fe_cluster(ds, tmp_path):
     assert rec["history"][0]["by"]["name"] == "dfeols"
 
 
+@pytest.mark.parametrize("level_space_gb", [None, 0])
+def test_crossing_iterate_numerics(ds, tmp_path, level_space_gb):
+    # plan C's record says how the crossing FE was solved (it used to claim one-pass demeaning,
+    # Cholesky, not iterative)
+    r, rec = _fit(
+        ds,
+        tmp_path,
+        "eng ~ feat + posts | spell + week",
+        cluster="id_a",
+        crossing_fe="iterate",
+        level_space_gb=level_space_gb,
+    )
+    num = rec["structures"]["numerics"]
+    cg = r.options["crossing_cg"]
+    assert num["iterative"] is True and num["converged"] is True
+    assert num["iterations"] == cg["steps"] and num["tolerance"] == 1e-8
+    assert "conjugate gradient" in num["algorithm"] and "Frisch-Waugh-Lovell" in num["solver"]
+    assert ("level space" in num["algorithm"]) == (level_space_gb is None)
+
+
 def test_fe_nested_in_cluster(ds, tmp_path):
     r, rec = _fit(ds, tmp_path, "eng ~ feat + posts | id_a + week", cluster="id_a")
     fe = {f["name"]: f for f in rec["structures"]["fixed_effects"]}

@@ -75,6 +75,7 @@ class Plan:
     sparse_global: bool = False  # crossing FEs via per-level sums, no dense dummies
     crossing_iterate: bool = False  # plan C: crossing-FE coefficients by distributed CG
     iter_token: str | None = None  # plan C: names this fit's shard state in _ITER_CACHE
+    level_nnz: int = 0  # plan C: most nonzeros of A a shard returns (0: no level space)
     keep_dir: str | None = None  # per-shard singleton keep masks (when FEs cross the partition)
     row_key_cols: tuple[str, ...] = ()  # raw columns hashed into the record's row_key
     endog_names: list[str] = field(default_factory=list)  # IV: endogenous columns (outcome block)
@@ -331,6 +332,42 @@ def _projected_dummy_gram(local_codes, w, Dm, max_block: int = 20_000):
     return out
 
 
+def _dummy_gram(plan: Plan, local_codes, w, Dm, gcodes, P: int, sparse_out: bool):
+    """D~'W D~ = D'W D - D'W P_L D over all P crossing levels, sparse (csr) or dense; with no
+    local FE, D'W D. Raises ValueError where _projected_dummy_gram does."""
+    import scipy.sparse as sp
+
+    n = len(w)
+    DWD = Dm.T @ sp.diags(w) @ Dm
+    if not sparse_out:
+        DWD = DWD.toarray()
+    if n and len(local_codes) > 1:
+        PL = _projected_dummy_gram(local_codes, w, Dm)
+        return (DWD - PL).tocsr() if sparse_out else DWD - PL.toarray()
+    if not n or not local_codes:
+        return DWD.tocsr() if sparse_out else DWD
+    a = local_codes[0].astype(np.int64)
+    nA = int(a.max()) + 1
+    C = sp.csr_matrix(
+        (
+            np.tile(w, len(plan.global_fes)),
+            (np.tile(a, len(plan.global_fes)), gcodes.ravel()),  # gcodes carry the offsets
+        ),
+        shape=(nA, P),
+    )
+    C.sum_duplicates()
+    WA = np.bincount(a, weights=w, minlength=nA)
+    if sparse_out:  # many levels: a group spans few of them, so C'C stays sparse
+        return (DWD - C.T @ sp.diags(1.0 / WA) @ C).tocsr()
+    if nA * P <= 50_000_000:
+        # dense BLAS product: cost nA*P^2 but vectorised; the sparse product
+        # costs sum over groups of (levels per group)^2 and is slow when
+        # each group spans many levels (e.g. units observed in 1000 periods)
+        Cd = C.toarray()
+        return DWD - (Cd / WA[:, None]).T @ Cd
+    return DWD - (C.T @ sp.diags(1.0 / WA) @ C).toarray()
+
+
 def _round1_sparse(plan: Plan, shard_id: int, df, n0: int, local_codes, w, T, t0):
     """Local FEs plus crossing FEs, without dense dummies.
 
@@ -372,50 +409,46 @@ def _round1_sparse(plan: Plan, shard_id: int, df, n0: int, local_codes, w, T, t0
     DX = Dm.T @ Xw  # P x k
     DY = Dm.T @ Yw  # P x m
     if plan.crossing_iterate:
-        # no dummy block: the coordinator solves D'WQD G = D'W [X~ Y~] by CG, with
-        # diag(D'W Q_A D) (A the largest local FE; exact with one) as the preconditioner
+        # no dummy block: the coordinator solves D~'W D~ G = D'W [X~ Y~] by CG. With
+        # plan.level_nnz the shard also returns its part of A = D~'W D~ (crossing.LevelGram):
+        # all of it up to level_nnz nonzeros, else the crossing FEs' own blocks, else none
         sw = Dm.T @ w
         idx = np.flatnonzero(sw > 0)
-        d = sw.copy()
-        if n and local_codes:
-            a = max(local_codes, key=lambda c: int(c.max())).astype(np.int64)
-            WA = np.bincount(a, weights=w)
-            CA = sp.csr_matrix((w, (a, np.arange(n))), shape=(len(WA), n)) @ Dm
-            d -= np.asarray(CA.multiply(CA).T @ (1.0 / WA)).ravel()
-        aux = {"idx": idx, "DR": np.hstack([DX, DY])[idx], "ddiag": d[idx]}
+        aux = {"idx": idx, "DR": np.hstack([DX, DY])[idx]}
+        part = None
+        if plan.level_nnz:
+            try:
+                DD = _dummy_gram(plan, local_codes, w, Dm, gcodes, P, sparse_out=True).tocoo()
+            except ValueError:  # a local FE component too large for the Schur solve
+                DD = None
+            if DD is not None:
+                DD.sum_duplicates()
+                d = DD.diagonal()
+                r, c, v = DD.row, DD.col, DD.data
+                part = {"full": len(v) <= plan.level_nnz, "blocks": True, "nnz": int(len(v))}
+                if not part["full"]:
+                    fe_of = np.repeat(np.arange(len(plan.global_fes)), [L for *_, L in plan.global_fes])
+                    keep = fe_of[r] == fe_of[c]
+                    r, c, v = r[keep], c[keep], v[keep]
+                    part["blocks"] = len(v) <= plan.level_nnz
+                    part["block_nnz"] = int(len(v))
+                if part["blocks"]:
+                    it = np.int32 if P < 2**31 else np.int64
+                    part.update(r=r.astype(it), c=c.astype(it), v=v)
+            aux["part"] = part
+        if part is None:
+            # diag(D'W Q_A D), A the largest local FE (exact with one): Jacobi
+            d = sw.copy()
+            if n and local_codes:
+                a = max(local_codes, key=lambda c: int(c.max())).astype(np.int64)
+                WA = np.bincount(a, weights=w)
+                CA = sp.csr_matrix((w, (a, np.arange(n))), shape=(len(WA), n)) @ Dm
+                d -= np.asarray(CA.multiply(CA).T @ (1.0 / WA)).ravel()
+        aux["ddiag"] = d[idx]
         T["crossprod"] = time.perf_counter() - t
         return Y, Yt, Xt, Xw.T @ Xt, Xw.T @ Yt, (local_codes, Dm), converged, aux
     sparse_out = P > SPARSE_GRAM_LEVELS
-    DWD = Dm.T @ sp.diags(w) @ Dm
-    if not sparse_out:
-        DWD = DWD.toarray()
-    if n and len(local_codes) > 1:
-        PL = _projected_dummy_gram(local_codes, w, Dm)
-        DD = (DWD - PL).tocsr() if sparse_out else DWD - PL.toarray()
-    elif n:
-        a = local_codes[0].astype(np.int64)
-        nA = int(a.max()) + 1
-        C = sp.csr_matrix(
-            (
-                np.tile(w, len(plan.global_fes)),
-                (np.tile(a, len(plan.global_fes)), gcodes.ravel()),  # gcodes carry the offsets
-            ),
-            shape=(nA, P),
-        )
-        C.sum_duplicates()
-        WA = np.bincount(a, weights=w, minlength=nA)
-        if sparse_out:  # many levels: a group spans few of them, so C'C stays sparse
-            DD = (DWD - C.T @ sp.diags(1.0 / WA) @ C).tocsr()
-        elif nA * P <= 50_000_000:
-            # dense BLAS product: cost nA*P^2 but vectorised; the sparse product
-            # costs sum over groups of (levels per group)^2 and is slow when
-            # each group spans many levels (e.g. units observed in 1000 periods)
-            Cd = C.toarray()
-            DD = DWD - (Cd / WA[:, None]).T @ Cd
-        else:
-            DD = DWD - (C.T @ sp.diags(1.0 / WA) @ C).toarray()
-    else:
-        DD = DWD
+    DD = _dummy_gram(plan, local_codes, w, Dm, gcodes, P, sparse_out)
     sel = np.flatnonzero(zpos >= 0)
     zp = zpos[sel]
     if sparse_out:

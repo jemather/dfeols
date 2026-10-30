@@ -8,6 +8,19 @@ break the API).
 ## [Unreleased]
 
 ### Added
+- Plan C in level space (planner.md, "Crossing-FE solver"; decided 2026-10-30): round 1 also
+  returns each shard's part of A = D~'W D~ (`crossing.LevelGram` sums them within a budget),
+  and CG runs on the coordinator with no further passes. The preconditioner follows the
+  connected components of each crossing FE's own block: exact pinned or pseudo-inverse solves
+  (AP-sweep, i.e. symmetric block Gauss-Seidel, when all are exact), AMG V-cycles with plain
+  aggregation on large sparse components (block-Jacobi; optional `dfeols[amg]`, pyamg), else
+  Jacobi. Options `level_space_gb` (default a quarter of the coordinator's memory; 0 is the old
+  per-pass path) and `crossing_precond`. Above the budget each step is a pass over the shards,
+  with block-Jacobi from the diagonal blocks if those fit, and dfeols warns that convergence may
+  be slow (`crossing.SlowConvergenceWarning`, also logged), naming what made A too large.
+  DB1B 2005Q2-Q3 (10.3M rows): 7 steps in 0.14 s against 16 passes in 23 s; b within 8e-12 of
+  the dense solve. `Result.options["crossing_cg"]` gives the mode, preconditioner, passes and
+  sizes.
 - `dfeols plan SOURCE --formula ... [--cluster] [--partition K1,K2] [--profile P] [--json]` and
   `dfeols.plan()`: probe a specification before prep (planner step 1, docs/design/planner.md).
   Streaming aggregates on the source report rows and missingness, levels and singletons of
@@ -84,6 +97,11 @@ break the API).
   coefficient that is not identified. Dummies are now tested first (OLS and IV).
 
 ### Changed
+- Plan C's default `iter_tol` is 1e-8 (was 1e-10, next to the floating-point floor; Ted,
+  2026-10-28).
+- Records of plan C fits describe its numerics (CG, preconditioner, mode, steps, tolerance);
+  they said one-pass demeaning, Cholesky and not iterative. Their `absorption` method
+  `crossing_iterate` needs estimation-format at 20a640c or later (the dfeols/0.1 profile's enum).
 - Crossing FEs above `max_dummy_levels` are fitted when the spec has exactly one FE nested in
   the partition (the sparse path); `max_dummy_levels` now limits only dense dummy columns.
   Above 2,000 levels shards return their Gram matrix sparse, and collinearity detection is

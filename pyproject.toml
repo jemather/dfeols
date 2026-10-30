@@ -53,8 +53,10 @@ dependencies = [
 dask = ["dask>=2024.1", "distributed>=2024.1", "dask-jobqueue>=0.8"]
 # JSON Schema validation of estimation records; without it estimation_format uses built-in checks
 estimation = ["jsonschema>=4.18"]
+# AMG block solves for plan C's preconditioner on large sparse crossing-FE components
+amg = ["pyamg>=5"]
 test = ["pytest>=7", "jsonschema>=4.18"]
-dev = ["dfeols[dask,test]", "ruff>=0.6", "mypy>=1.10", "build", "twine", "pre-commit"]
+dev = ["dfeols[dask,test,amg]", "ruff>=0.6", "mypy>=1.10", "build", "twine", "pre-commit"]
 
 [project.urls]
 Homepage = "https://github.com/jemather/dfeols"

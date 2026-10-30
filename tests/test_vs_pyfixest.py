@@ -234,12 +234,14 @@ def test_sparse_several_local_fes(data, tmp_path, f):
 def ds_cw(data, tmp_path_factory):
     import polars as pl
 
-    d = data.with_columns(cw=(pl.col("id_f") % 100) * 100 + pl.col("week"))
+    d = data.with_columns(
+        cw=(pl.col("id_f") % 100) * 100 + pl.col("week"), fw=(pl.col("id_f") % 37) * 100 + pl.col("week")
+    )
     ds = dfeols.prep(
         d,
         shard_dir=tmp_path_factory.mktemp("cw"),
         partition="id_a",
-        fixed_effects=["spell", "id_a^week", "week", "cw", "id_f"],
+        fixed_effects=["spell", "id_a^week", "week", "cw", "fw", "id_f"],
         clusters=["id_a"],
         target_rows=3000,
     )
@@ -272,6 +274,52 @@ def test_iterate_crossing_fes(ds_cw, f):
         assert a.N == m._N
         np.testing.assert_allclose(a.coef(), m.coef().to_numpy(), rtol=1e-8, atol=1e-10)
         np.testing.assert_allclose(np.sqrt(np.diag(a.vcov(None, v))), m.se().to_numpy(), rtol=1e-7)
+
+
+@pytest.mark.parametrize(
+    "f", ["eng ~ feat + posts | spell + fw + cw", "eng + eng2 ~ feat + posts | id_a^week + fw + cw"]
+)
+def test_iterate_level_space_and_fallback(ds_cw, f):
+    # plan C's two modes: A = D~'W D~ summed in round 1 and CG on the coordinator (level space),
+    # or a pass per step when A is over level_space_gb (with A's diagonal blocks as block-Jacobi
+    # if those fit, else Jacobi), which warns; every mode and preconditioner equals pyfixest
+    from dfeols.crossing import NNZ_BYTES, SlowConvergenceWarning
+
+    d, ds = ds_cw
+    kw = dict(cluster="id_a", crossing_fe="iterate", log_every=1e9)
+    a = dfeols.fit(ds, f, **kw)
+    cg = a.options["crossing_cg"]
+    assert (cg["mode"], cg["preconditioner"], cg["passes"]) == ("level", "sgs", 0)
+    assert sum(cg["block_nnz"]) < cg["A_nnz"]
+    mid = (sum(cg["block_nnz"]) + cg["A_nnz"]) // 2 * NNZ_BYTES / 1e9  # blocks fit, A does not
+    runs = {"level": a}
+    for name, opt, want in [
+        ("bjacobi", dict(crossing_precond="bjacobi"), ("level", "bjacobi")),
+        ("jacobi", dict(crossing_precond="jacobi"), ("level", "jacobi")),
+        ("blocks", dict(level_space_gb=mid), ("pass", "bjacobi")),
+        ("off", dict(level_space_gb=0), ("pass", "jacobi")),
+    ]:
+        if want[0] == "pass":
+            with pytest.warns(SlowConvergenceWarning, match="convergence may be slow"):
+                runs[name] = dfeols.fit(ds, f, **kw, **opt)
+        else:
+            runs[name] = dfeols.fit(ds, f, **kw, **opt)
+        c2 = runs[name].options["crossing_cg"]
+        assert (c2["mode"], c2["preconditioner"]) == want
+        assert c2["passes"] == (c2["steps"] if want[0] == "pass" else 0)
+    assert "nonzeros" in runs["blocks"].options["crossing_cg"]["fallback_reason"]
+    # block-Jacobi beats Jacobi on the same passes
+    assert runs["blocks"].options["crossing_cg"]["steps"] < runs["off"].options["crossing_cg"]["steps"]
+    pdf = d.to_pandas().dropna(subset=["eng"])
+    for y in f.split("~")[0].split("+"):
+        y = y.strip()
+        m = pf.feols(
+            f"{y} ~ {f.split('~')[1]}", data=pdf, vcov={"CRV1": "id_a"}, **pyfixest_tol_kwargs(1e-13)
+        )
+        for r in runs.values():
+            assert r.N == m._N
+            np.testing.assert_allclose(r.coef(y), m.coef().to_numpy(), rtol=1e-8, atol=1e-10)
+            np.testing.assert_allclose(np.sqrt(np.diag(r.vcov(y))), m.se().to_numpy(), rtol=1e-7)
 
 
 def test_iterate_equals_sparse_two_outcomes(ds_cw):

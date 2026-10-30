@@ -753,6 +753,30 @@ def to_estimation(
     # two FEs with fe_method auto/exact may fall back to iterating, so leave it unsaid
     if n_local != 2 or opts.get("fe_method") == "iterate":
         numerics["iterative"] = n_local >= 2
+    cg = opts.get("crossing_cg")
+    if cg:  # plan C: the crossing FEs by conjugate gradient, the regressors by FWL on its solution
+        pre = {
+            "jacobi": "Jacobi",
+            "bjacobi": "block-Jacobi",
+            "sgs": "AP-sweep (symmetric block Gauss-Seidel)",
+        }
+        numerics.update(
+            algorithm=f"{numerics['algorithm']} within shards (local FEs); crossing FEs by "
+            f"{pre.get(cg.get('preconditioner', 'jacobi'), cg.get('preconditioner'))}-preconditioned "
+            "conjugate gradient "
+            + (
+                "on the coordinator (level space)"
+                if cg.get("mode", "pass") == "level"
+                else "with a pass per step"
+            ),
+            solver="Cholesky on the normal equations net of the crossing FEs (Frisch-Waugh-Lovell)",
+            iterative=True,
+            tolerance=opts.get("iter_tol"),
+            max_iterations=opts.get("iter_maxiter"),
+            iterations=cg.get("steps"),
+            converged=bool(run.get("converged", True))
+            and cg.get("max_relative_residual", 0) <= opts.get("iter_tol", np.inf),
+        )
     structures["numerics"] = {k_: v for k_, v in numerics.items() if v is not None}
     if iv:
         structures["first_stage"] = _first_stage_structure(iv, r.vcov_default)

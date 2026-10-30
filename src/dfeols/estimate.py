@@ -10,6 +10,7 @@ import os
 import shutil
 import time
 import uuid
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -471,69 +472,110 @@ def _crossing_cg(
     label: str,
     tol: float,
     maxiter: int,
+    precond: str = "auto",
 ) -> np.ndarray:
-    """Plan C: solve (D~'W D~) Gamma = D~'W [X~ Y~] by Jacobi-preconditioned conjugate
-    gradient, one column per regressor and outcome, each step one map/reduce round
-    (worker.shard_matvec). The matrix is singular (one redundant level per connected
-    component of the FEs) but the system is consistent, so CG converges to a solution
-    whose D~ Gamma, the only part used, is unique. Stops when every column's residual
-    is below tol relative to its right-hand side."""
+    """Plan C: solve A Gamma = D~'W [X~ Y~], A = D~'W D~, by preconditioned conjugate gradient,
+    one column per regressor and outcome (crossing.pcg). In level space (A summed from the
+    shards' parts in round 1, acc["gram"]) every step is a product on the coordinator; otherwise
+    each step is one map/reduce round (worker.shard_matvec), and dfeols warns that convergence
+    may be slow. The preconditioner follows A's block structure (crossing.choose_method)."""
+    from . import crossing as cx
+
     t0 = time.time()
     R = acc["DR"]
     P, c = R.shape
-    d = acc["ddiag"]
-    act = d > 1e-12 * max(float(d.max(initial=0.0)), 1.0)
-    dinv = np.where(act, 1.0 / np.where(act, d, 1.0), 0.0)
-    X = np.zeros((P, c))
-    r = R * act[:, None]
-    bnorm = np.linalg.norm(r, axis=0)
-    bnorm[bnorm == 0] = 1.0
-    z = r * dinv[:, None]
-    p = z.copy()
-    rz = (r * z).sum(0)
-    it, rel = 0, np.linalg.norm(r, axis=0) / bnorm
-    hist = [float(rel.max())]
-    while rel.max() > tol:
-        if it >= maxiter:
-            raise RuntimeError(
-                f"fit {label}: crossing-FE CG did not converge in {maxiter} steps (largest relative "
-                f"residual {rel.max():.1e} > {tol:g}); raise iter_maxiter, or partition so more FEs "
-                "are nested in the key"
-            )
-        it += 1
+    offs = np.r_[0, np.cumsum([L for *_, L in plan.global_fes])].astype(np.int64)
+    names = [n for n, *_ in plan.global_fes]
+    gram = acc.get("gram")
+    A, blocks = gram.finish() if gram is not None else (None, None)
+    level = A is not None
+    if not level:
+        why = gram.reason if gram is not None else "level space is off (level_space_gb=0)"
+        if gram is not None and gram.blocks_reason:
+            why += "; without its diagonal blocks the preconditioner is Jacobi"
+        msg = (
+            f"fit {label}: the crossing-FE system is too large to solve on the coordinator ({why}), "
+            "so each conjugate-gradient step is a pass over the shards and convergence may be slow. "
+            "A partition key that nests the largest crossing FE makes the system smaller "
+            "(`dfeols plan` compares keys); level_space_gb raises the budget"
+        )
+        log.warning(msg)
+        warnings.warn(msg, cx.SlowConvergenceWarning, stacklevel=3)
+    if level:
+        diag = A.diagonal()
+    elif blocks is not None:
+        diag = np.concatenate([b.diagonal() for b in blocks])
+    else:
+        diag = acc["ddiag"]
+    solvers = None
+    if blocks is not None and precond != "jacobi":
+        singular = bool(plan.local_fes)
+        solvers = [cx.BlockSolve(b, singular, n) for b, n in zip(blocks, names)]
+    method = cx.choose_method(solvers, level, precond)
+    M = cx.make_precond(method, diag, offs, solvers, A)
+    act = diag > 1e-12 * max(float(diag.max(initial=0.0)), 1.0)
+    t_setup = time.time() - t0
+    log.info(
+        "fit %s: crossing-FE CG %s, %s preconditioner%s (setup %s)",
+        label,
+        "in level space" if level else "with a pass per step",
+        {"jacobi": "Jacobi", "bjacobi": "block-Jacobi", "sgs": "AP-sweep"}[method],
+        f"; A {A.nnz:,} nonzeros over {P:,} levels" if level else "",
+        fmt_td(t_setup),
+    )
+
+    step = {"it": 0, "t": time.time()}
+
+    def matvec_pass(p):
         Ap = np.zeros((P, c))
 
         def on(tid, res, Ap=Ap):
             Ap[res["idx"]] += res["S"]
 
-        name = f"cg{it}"
+        name = f"cg{step['it'] + 1}"
         tasks = [(s["id"], rows[s["id"]], (plan, s["id"], ds.shard_paths(s), p)) for s in ds.shards]
         prog.add_stage(name, rows, before="round2")
         prog.start(name)
-        ts = time.time()
         executor.run(shard_matvec, tasks, on, prog, name)
         prog.finish(name, log=False)
-        pAp = (p * Ap).sum(0)
-        alpha = np.divide(rz, pAp, out=np.zeros(c), where=pAp > 0)
-        X += alpha * p
-        r -= alpha * Ap
-        z = r * dinv[:, None]
-        rz_new = (r * z).sum(0)
-        beta = np.divide(rz_new, rz, out=np.zeros(c), where=rz > 0)
-        p = z + beta * p
-        rz = rz_new
-        rel = np.linalg.norm(r, axis=0) / bnorm
+        return Ap
+
+    hist = [1.0]  # relative residuals, starting from the right-hand side
+
+    def on_step(it, rel):
+        step["it"] = it
         hist.append(float(rel.max()))
         left = _cg_steps_left(hist, tol)
-        prog.extra_eta = None if left is None else left * (time.time() - ts)
+        dt = time.time() - step["t"]
+        step["t"] = time.time()
+        prog.extra_eta = None if left is None else left * dt
         prog.note = f"CG step {it}, residual {rel.max():.1e} (tol {tol:g})" + (
             f", about {left} more steps" if left is not None else ""
         )
-        if it == 1 or it % 10 == 0:
+        if it == 1 or it % (100 if level else 10) == 0:
             log.info("fit %s: crossing-FE CG step %d, largest relative residual %.1e", label, it, rel.max())
+
+    X, it, rel = cx.pcg((lambda p: A @ p) if level else matvec_pass, R, M, act, tol, maxiter, on_step)
     prog.note, prog.extra_eta = "", None
+    if rel > tol:
+        raise RuntimeError(
+            f"fit {label}: crossing-FE CG did not converge in {maxiter} steps (largest relative "
+            f"residual {rel:.1e} > {tol:g}); raise iter_maxiter, or partition so more FEs "
+            "are nested in the key"
+        )
     log.info("fit %s: crossing-FE CG converged in %d steps (%s)", label, it, fmt_td(time.time() - t0))
-    acc["cg"] = {"steps": it, "seconds": time.time() - t0, "max_relative_residual": float(rel.max())}
+    acc["cg"] = {
+        "steps": it,
+        "seconds": time.time() - t0,
+        "setup_seconds": t_setup,
+        "max_relative_residual": rel,
+        "mode": "level" if level else "pass",
+        "preconditioner": method,
+        "passes": 0 if level else it,
+        "A_nnz": int(A.nnz) if level else None,
+        "block_nnz": [int(b.nnz) for b in blocks] if blocks is not None else None,
+        "fallback_reason": None if level else (gram.reason if gram is not None else "level_space_gb=0"),
+    }
     return X
 
 
@@ -554,8 +596,10 @@ def fit(
     fe_method: str = "auto",
     crossing_fe: str = "auto",
     collin_tol: float = 1e-9,
-    iter_tol: float = 1e-10,
+    iter_tol: float = 1e-8,
     iter_maxiter: int = 5_000,
+    level_space_gb: float | None = None,
+    crossing_precond: str = "auto",
     label: str | None = None,
     log_every: float = 30.0,
     record: bool | str | os.PathLike = True,
@@ -582,6 +626,14 @@ def fit(
                "sparse" per-level sums with a dense solve on the coordinator, "iterate"
                conjugate gradient across shards (plan C; iter_tol, iter_maxiter), or
                "auto" (the default) to pick from the FE structure
+    iter_tol   plan C: CG stops when every column's residual is below this, relative to its
+               right-hand side (default 1e-8)
+    level_space_gb  plan C: coordinator memory for A = D~'W D~, built in round 1 so CG runs
+               with no further passes (default: a quarter of the profile's coordinator memory,
+               or of this machine's; 0 turns it off). Above it each CG step is a pass over the
+               shards, and dfeols warns (crossing.SlowConvergenceWarning)
+    crossing_precond  plan C: "auto" (from A's block structure), "jacobi", "bjacobi" or "sgs"
+               (AP-sweep, level space only)
     """
     if not isinstance(ds, Dataset):
         ds = Dataset.open(ds)
@@ -624,7 +676,10 @@ def fit(
         plan.cache_dir = None  # recomputing is cheap on this path
         cache = False
     if plan.crossing_iterate:
+        from .crossing import level_space_budget
+
         plan.iter_token = f"{wd}:{uuid.uuid4().hex}"
+        plan.level_nnz = level_space_budget(executor, level_space_gb)
     f = plan.formula
     label = label or spec_id
     m = len(f.depvars)
@@ -696,6 +751,11 @@ def fit(
         P_lev = sum(L for *_, L in plan.global_fes)
         acc["DR"] = np.zeros((P_lev, k_tot + mY))
         acc["ddiag"] = np.zeros(P_lev)
+        if plan.level_nnz:
+            from .crossing import LevelGram
+
+            offs = np.r_[0, np.cumsum([L for *_, L in plan.global_fes])].astype(np.int64)
+            acc["gram"] = LevelGram(offs, [n for n, *_ in plan.global_fes], plan.level_nnz)
 
     peak = {"rss": 0.0}
 
@@ -719,6 +779,8 @@ def fit(
             cr = r["crossing"]
             acc["DR"][cr["idx"]] += cr["DR"]
             acc["ddiag"][cr["idx"]] += cr["ddiag"]
+            if "gram" in acc:
+                acc["gram"].add(cr.get("part"), tid)
         acc["row_n"][tid] = r["n"]
         acc["converged"] &= r["converged"]
         acc["fe_levels"] += np.asarray(r["fe_levels"], np.int64)
@@ -746,7 +808,9 @@ def fit(
 
     N = acc["n"]
     if plan.crossing_iterate:
-        acc["Gamma"] = _crossing_cg(plan, ds, executor, prog, rows, acc, label, iter_tol, iter_maxiter)
+        acc["Gamma"] = _crossing_cg(
+            plan, ds, executor, prog, rows, acc, label, iter_tol, iter_maxiter, crossing_precond
+        )
     if f.iv:
         sol = _iv.solve(plan, acc, N, estimator=estimator, fuller=fuller, collin_tol=collin_tol)
     else:
@@ -869,7 +933,13 @@ def fit(
         **iv_opts,
     }
     if plan.crossing_iterate:
-        options.update(iter_tol=iter_tol, iter_maxiter=iter_maxiter, crossing_cg=acc["cg"])
+        options.update(
+            iter_tol=iter_tol,
+            iter_maxiter=iter_maxiter,
+            level_space_gb=level_space_gb,
+            crossing_precond=crossing_precond,
+            crossing_cg=acc["cg"],
+        )
     run = _record.run_info(
         ds,
         executor,
