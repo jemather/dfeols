@@ -109,6 +109,12 @@ break the API).
   tests each pivot against the column's diagonal before the crossing FEs.
 
 ### Changed
+- `r2_within` (and `tss`) take y net of all the FEs, as fixest does, on every path. With a
+  crossing FE they were net of the FEs local to the partition only, so the same spec reported
+  a different within R2 under a different partition. Fits whose FEs all cross the partition
+  report `r2_within` instead of `r2` (about the mean).
+- The estimation-format pin is cdda37c (the dfeols/0.1 profile's `crossing_iterate` and
+  `cells`).
 - Plan C's default `iter_tol` is 1e-8 (was 1e-10, next to the floating-point floor; Ted,
   2026-10-28).
 - Records of plan C fits describe its numerics (CG, preconditioner, mode, steps, tolerance);

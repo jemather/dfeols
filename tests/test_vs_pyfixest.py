@@ -648,3 +648,31 @@ def test_category_levels_on_workers_and_cached(tmp_path):
     r = dfeols.fit(ds, "eng ~ feat:i(tbin) | spell + week", executor=Counting(), log_every=1e9)
     assert calls[1:] and all(stage != "levels" for stage, _ in calls[1:])  # fit reused the cache
     assert len(r.coefnames) == len(lv["tbin"])
+
+
+@pytest.mark.parametrize(
+    "f, kw",
+    [
+        ("eng ~ feat + posts | spell + fw", {"crossing_fe": "dense"}),
+        ("eng ~ feat + posts | spell + fw + week", {"crossing_fe": "sparse"}),
+        ("eng + eng2 ~ feat + posts | id_a^week + fw + cw", {"crossing_fe": "iterate", "weights": "wt"}),
+        ("eng ~ feat + posts | cw + id_f", {"crossing_fe": "iterate"}),  # no local FE
+        ("eng ~ feat + posts | week + fw", {}),  # no local FE, dense dummies
+        ("eng ~ feat + posts | spell + fw + cw", {"cells": True}),
+    ],
+)
+def test_r2_within_nets_all_fes(ds_cw, f, kw):
+    # r2_within is y net of every FE, as fixest, whichever FEs the partition makes local
+    d, ds = ds_cw
+    a = dfeols.fit(ds, f, cluster="id_a", vcov="CRV1", log_every=1e9, **kw)
+    pdf = d.to_pandas().dropna(subset=["eng"])
+    lhs, rhs = f.split("~", 1)
+    for y in [v.strip() for v in lhs.split("+")]:
+        m = pf.feols(f"{y} ~{rhs}", data=pdf, weights=kw.get("weights"), **pyfixest_tol_kwargs(1e-13))
+        assert a.outcomes[y]["r2_within"] == pytest.approx(m._r2_within, rel=1e-8)
+    if "cells" in kw or kw.get("crossing_fe") == "iterate":
+        return  # no IV there
+    # IV: pyfixest reports no within R2; the tss is the OLS fit's
+    iv = dfeols.fit(ds, f"{lhs}~ posts |{rhs.split('|')[1]}| feat ~ eng2", log_every=1e9, **kw)
+    for y in iv.outcomes:
+        assert iv.outcomes[y]["tss"] == pytest.approx(a.outcomes[y]["tss"], rel=1e-10)

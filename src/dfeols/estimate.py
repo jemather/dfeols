@@ -15,6 +15,7 @@ from pathlib import Path
 
 import numpy as np
 import polars as pl
+from scipy.linalg import cho_factor, cho_solve
 
 from . import iv as _iv
 from . import rowhash
@@ -450,6 +451,25 @@ def _ols_solve_iterate(plan: Plan, acc: dict, collin_tol: float) -> _iv.Solution
     dropped = [plan.colnames[i] for i in range(k) if not keep[i]]
     names = [plan.colnames[i] for i in kept]
     return _iv.Solution(names, beta, [bread] * m, np.arange(len(kept)), lin, dropped)
+
+
+def _tss(plan: Plan, acc: dict, m: int, collin_tol: float) -> np.ndarray:
+    """Each outcome's weighted sum of squares net of all the FEs (as fixest's within R2,
+    and the cell path's), so it does not depend on which FEs the partition makes local:
+    Y~'W Y~ less its projection on the crossing-FE dummies D~ (from the CG solution on
+    plan C, else from the dummy block of Z'WZ). With no FEs, about the weighted mean."""
+    if not (plan.local_fes or plan.global_fes):
+        return acc["sum_wy2"][:m] - acc["sum_wy"][:m] ** 2 / acc["sumw"]
+    yy = np.diag(acc["YtY"])[:m].copy()
+    if not plan.global_fes:
+        return yy
+    k = plan.k_x
+    if plan.crossing_iterate:
+        return yy - np.einsum("ij,ij->j", acc["DR"][:, k : k + m], acc["Gamma"][:, k : k + m])
+    DD, DY = acc["ZtZ"][k:, k:], acc["ZtY"][k:, :m]
+    d = collinear_keep(DD, collin_tol)
+    g = cho_solve(cho_factor(DD[np.ix_(d, d)], lower=True), DY[d])
+    return yy - np.einsum("ij,ij->j", DY[d], g)
 
 
 def _cg_steps_left(hist: list[float], tol: float, window: int = 30) -> int | None:
@@ -1016,6 +1036,8 @@ def fit(
         G = (acc["G_local"] if plan.cluster_local else int(acc["cpresent"].sum())) if plan.cluster else None
 
         out = {}
+        has_fe = bool(plan.local_fes or plan.global_fes)
+        tss_all = _tss(plan, acc, len(f.depvars), collin_tol)
         meat_idx = sol.meat_idx
         overid = _iv.overid(sol, acc2["rss"], N) if f.iv else None
         for j, y in enumerate(f.depvars):
@@ -1031,17 +1053,13 @@ def fit(
                 dfk_cl = _df_k(k, fe_levels, nested)
                 V["CRV1"] = (vcov_crv1(bread_use, acc2["crv"][j], N, dfk_cl, G), G - 1)
             V = {t: (v[np.ix_(meat_idx, meat_idx)], df) for t, (v, df) in V.items()}
-            tss = (
-                acc["YtY"][j, j]
-                if plan.local_fes
-                else acc["sum_wy2"][j] - acc["sum_wy"][j] ** 2 / acc["sumw"]
-            )
+            tss = tss_all[j]
             out[y] = {
                 "coef": b,
                 "vcov": V,
                 "rss": float(acc2["rss"][j]),
                 "tss": float(tss),
-                "r2_within" if plan.local_fes else "r2": float(1 - acc2["rss"][j] / tss),
+                "r2_within" if has_fe else "r2": float(1 - acc2["rss"][j] / tss),
             }
             if f.iv:
                 out[y]["kappa"] = float(sol.kappa[j])
