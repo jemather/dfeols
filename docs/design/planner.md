@@ -225,6 +225,18 @@ singular); and the fallback warning is issued by `fit` after round 1, since `pla
 bound A (it needs the (key, crossing level) pairs, part of the partition rule's step). The cell
 path is `fit(cells=True)` (`cells.py`).
 
+**Partition rule and pre-run warning (built 2026-10-30).** `plan` ranks keys by the size of the
+crossing system (crossing levels; on plan C, level space before the fallback), after memory fit
+and shard balance (largest group within `target_rows` or 5% of the sample: proposed, for Ted).
+On plan C keys it bounds A's nonzeros by min(sum_g t_ga t_gb, L_a L_b) over local groups g
+(exact with no local FE: the (a, b) pairs), and above the budget counts A's pattern exactly as
+B'B for the group x level incidence, in chunks, stopped at the budget, so the fallback warning
+comes before the run. Unbalanced keys get the bound only (counting near the budget took 45 s on
+DB1B 2005Q2-Q3). The report also gives the cell count and recommends the cell path from 10 rows
+per cell (proposed). DB1B 2005Q2-Q3 (10.4M rows, `| carrier^route + carrier^time +
+origin^time`): 373,730 cells (28 rows each); recommended key origin, 138 crossing levels on
+dense dummies; probe 3 s.
+
 **Separate fixes the bench found.** Workers use one Dask thread of the cores they are given
 (4 on OSCER: 60 of 80 idle); the record labels plan C's numerics `one-pass group demeaning`,
 `Cholesky`, `iterative: false`.

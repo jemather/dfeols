@@ -122,6 +122,7 @@ def plan_cmd(args):
         partition=split(args.partition),
         target_rows=args.target_rows,
         max_dummy_levels=args.max_dummy_levels,
+        level_space_gb=args.level_space_gb,
         profile=args.profile,
     )
     print(json.dumps(r, indent=1) if args.json else format_report(r))
@@ -384,6 +385,7 @@ def main(argv=None):
     pl_.add_argument("--partition", help="candidate keys, comma-separated (a^b for a compound key)")
     pl_.add_argument("--target-rows", type=int, default=1_000_000)
     pl_.add_argument("--max-dummy-levels", type=int, default=2000)
+    pl_.add_argument("--level-space-gb", type=float, default=None, help="plan C's budget for A")
     pl_.add_argument("--profile", help="check memory against this site profile")
     pl_.add_argument("--json", action="store_true", help="print the report as JSON")
     r = sub.add_parser("results", help="benchmark results table")

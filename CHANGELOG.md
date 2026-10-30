@@ -8,6 +8,16 @@ break the API).
 ## [Unreleased]
 
 ### Added
+- `dfeols plan` applies the partition rule (Ted, 2026-10-29): it recommends the key that makes
+  the crossing system smallest (fewest crossing levels; on plan C, level space before the
+  per-pass fallback) among keys whose largest group is within `target_rows` or 5% of the
+  sample. On plan C keys it sizes A = D~'W D~ against fit's level-space budget
+  (`--level-space-gb`, default a quarter of the profile's coordinator memory): a bound from
+  each local group's crossing levels, and above the budget an exact count of A's pattern,
+  stopped at the budget. Where A is over it, the report warns before the run that fit falls
+  back to a pass per CG step and may converge slowly, naming the crossing FEs and largest
+  blocks. It also counts the cells (every FE and the cluster constant) and recommends
+  `fit(cells=True)` at 10 or more rows per cell.
 - `fit(..., cells=True)`: the fit from per-cell sums (`dfeols.cells`; planner.md, decided
   2026-10-30). One pass groups each shard's rows by every FE key and the cluster
   (`worker.shard_cells`: rows, weight, means and cross-products about the cell means); the
@@ -90,6 +100,9 @@ break the API).
   from records that don't claim `dfeols/0.1` (fits without FEs).
 
 ### Fixed
+- `dfeols plan` crashed when a candidate key shared a column with an FE (key `carrier`, FE
+  `carrier^route`), and counted NaN outcomes in its sample, which fit drops; its rows and
+  levels are now fit's sample.
 - Distributed prep into many shards ran workers out of memory: each encode task wrote every
   shard it touched at once, and Polars keeps a buffer per open output (one 69M-row DB1B file
   into 3,434 shards peaked at 23.5 GB; OSCER's 24 GB workers died). The two-level shuffle

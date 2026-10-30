@@ -41,8 +41,12 @@ class SlowConvergenceWarning(UserWarning):
 def level_space_budget(executor, level_space_gb: float | None) -> int:
     """Most nonzeros of A the coordinator holds: `level_space_gb` if given (0 turns level space
     off), else LEVEL_SPACE_SHARE of the profile's coordinator memory, or of this machine's."""
+    return profile_budget(getattr(executor, "profile", None), level_space_gb)
+
+
+def profile_budget(prof, level_space_gb: float | None) -> int:
+    """level_space_budget from a site profile (or None: this machine), for the planner too."""
     if level_space_gb is None:
-        prof = getattr(executor, "profile", None)
         mem = (getattr(prof, "coordinator", None) or {}).get("memory") if prof is not None else None
         if mem:
             from .cluster import _memory_bytes
