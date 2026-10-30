@@ -75,11 +75,13 @@ For each candidate key the planner picks the first path that applies:
 | crossing FEs ≤ 2,000 levels, any nested FEs | dense dummy columns | 2 | exists |
 | one nested FE, crossing block ≤ ~30k levels | sparse path, dense solve on the coordinator | 2 | plan A, done |
 | several nested FEs, crossing block ≤ ~30k | sparse path, nested FEs projected in the shard | 2 | plan B, done |
-| crossing block large but sparse with little fill | sparse direct solve on the coordinator | 2 | to build |
-| anything else | conjugate gradient across shards | 2 + iterations | plan C, done |
+| crossing block too large to solve directly, A fits the coordinator | level space: A built in round 1, preconditioned CG on the coordinator | 2 | proposed (below) |
+| anything else | conjugate gradient across shards, with a slow-convergence warning | 2 + iterations | plan C, done; warning to build |
 
 Every row except the last is a fixed number of passes. Iterations of the last depend on the
-structure; the probe's connectivity statistics give a range, not a number.
+structure; the probe's connectivity statistics give a range, not a number. Level space
+replaces the earlier "sparse direct solve on the coordinator" row: preconditioned CG on A took
+seconds wherever A fit, without a factorisation's fill (see Crossing-FE solver).
 
 ## One job or demean-first
 
@@ -152,6 +154,77 @@ all variables go through it together.
   coordinator each cycle, a cap on cycles with a clear message, an acceleration step (Irons-Tuck
   as fixest, or conjugate gradient; each step is still one pass), and a checkpoint of the
   demeaned columns every N cycles so a run can resume in a new job.
+
+## Crossing-FE solver (proposal, 2026-10-30)
+
+From a bench of plan C's solve against alternating projections and other preconditioners on
+DB1B's market fit, NFIP (two specs) and synthetic worker-firm panels (0.5/2/10% mobility).
+The bench solves each spec exactly on its cells and reproduces OSCER job 35564818 to 2e-12 in
+beta; results and code are in the project notes (`/srv/dfeols/docs/cgbench.md`,
+`scripts/cgbench.py`), outside the repo. Parts marked *decided* are Ted's; the rest is for review.
+
+**Two modes.** Plan C as built makes one pass over the shards per CG step: 293 steps, 90 of the
+job's 94 minutes on 20 workers.
+
+- *Level space* (to build): build A = D~'W D~ once and run CG on the coordinator with no further
+  passes. Each shard returns its part, a sum over its local groups g of
+  D_g'W_g D_g - (D_g'w_g)(w_g'D_g)/N_g (one nested FE; Q's other cases as plan C's matvec), and
+  can do so in round 1, next to D'W[X~ Y~], so the path stays at two passes. DB1B: A is 66,821
+  levels with 57M nonzeros (652 MB), and the solve takes 12 s instead of 90 min.
+- *Fallback* (plan C as built): one pass per step, used when A would exceed the coordinator's
+  memory budget. *Decided:* it warns, before the run and in the log, that convergence may be
+  slow and names what made A too large.
+
+**Size of A.** The probe's bound, the sum over local groups of (crossing levels the group
+touches)^2, overstates A by about 110x on DB1B (6.4e9 against 57M), so it can only rule level
+space in, not out. Above the budget by the bound, the build counts A's nonzeros exactly in row
+chunks and stops at the budget, falling back with the warning.
+
+**Partition.** *Decided:* the planner picks the partition key that makes the crossing system
+smallest, subject to shard balance. NFIP B (`| tract + zone^month + community^month`) has 1.72M
+crossing levels and A of ~3e9 nonzeros when sharded by tract; no fallback method reached 1e-8 in
+2,000 passes. Sharded by community (largest group 3% of rows), community^month is nested, the
+crossing system is tract + zone^month (235k levels, A 226M nonzeros), and it solves in level
+space: the same beta, SEs and RSS.
+
+**Preconditioner.** Chosen from the structure of each crossing FE's own block A_kk, which the
+build has in hand: the sizes of its connected components (levels linked through local groups).
+
+| A_kk components | Level space | Fallback (passes per step) |
+|---|---|---|
+| all small (<= ~400 levels), or few and dense | AP-sweep: symmetric block Gauss-Seidel | block-Jacobi (1; the AP-sweep costs 3) |
+| some large and sparse (worker-firm graphs, NFIP's tract block) | block-Jacobi or AP-sweep, AMG on the large components | block-Jacobi with AMG blocks |
+| neither affordable | Jacobi (as built) | Jacobi |
+
+Steps to 1e-10: DB1B Jacobi 294, block-Jacobi 40, AP-sweep 19; NFIP A 537, 17, 8; synthetic
+(0.5% mobility) 91, 22 and 18 with AMG blocks. Two rules from the bench:
+
+- *Block solves are pseudo-inverses, never regularised.* Each A_kk is singular, one constant per
+  component, absorbed by the local FE. Pin one level per component and remove the component mean
+  before and after the solve. A + 1e-10 I stalled CG near 1e-6 on NFIP A.
+- *AMG blocks use plain aggregation* (pyamg `smooth=None`, one V-cycle). The default smoothed
+  aggregation filled in 293x on the 0.5%-mobility firm block (4 s a cycle, against 13 ms).
+  Exact sparse LU of such blocks took over 185 s to set up; AMG setup is under a second.
+
+**Tolerance.** *Decided:* default 1e-8 on the relative residual (was 1e-10, next to the
+floating-point floor of ~1e-11 on DB1B). beta settles well before: within 1e-4 SE after 3 to 9
+steps of the AP-sweep or block-Jacobi on DB1B and NFIP A.
+
+**Alternating projections are not adopted.** In passes, AP and Irons-Tuck reach 1e-2 SE as fast
+as anything (about 8 on DB1B and NFIP A) but crawl after: never within 1e-4 SE in 6,000 passes
+on NFIP A and B, and 1,724 passes for 1e-6 SE on DB1B with Irons-Tuck against 24 for
+block-Jacobi CG. At 0.5% mobility AP needed 3,114 passes to 1e-4 SE; Jacobi CG 37.
+
+**Separate fixes the bench found.** Workers use one Dask thread of the cores they are given
+(4 on OSCER: 60 of 80 idle); the record labels plan C's numerics `one-pass group demeaning`,
+`Cholesky`, `iterative: false`.
+
+**Open: fitting from cells.** Every FE and the cluster are constant within a cell (a distinct
+combination of their keys), so the fit, CRV1 included, can run on per-cell sums and
+cross-products. DB1B's 669M rows are 21.3M cells; the whole fit took 2.5 min on one machine
+(one streaming pass 58 s, system 81 s, solve 14 s; peak 15 GB). The gain is data-dependent:
+NFIP compresses 3-14x, the worker-firm panels not at all. The probe could report the cell count
+(one group-by) and recommend it when the ratio is large. For Ted: whether to pursue it.
 
 ## Site facts come from the profile
 
@@ -286,6 +359,10 @@ paths multiply by the iteration range.
 - Demeaned data persists in scratch by default; deletion is explicit; storage policy (plentiful,
   confirm above a size, purge age) is a profile setting.
 - `dfeols config init --from-slurm` drafts the node classes from Slurm.
+
+Added 2026-10-28/29: crossing-FE tolerance 1e-8 by default; the partition key that makes the
+crossing system smallest, subject to shard balance; the per-pass fallback warns that it may
+converge slowly.
 
 ## Open questions
 
