@@ -29,6 +29,7 @@ from .vcov import vcov_crv1, vcov_hetero, vcov_iid
 from .worker import (
     Plan,
     plan_columns,
+    shard_cells,
     shard_matvec,
     shard_round1,
     shard_round2,
@@ -436,7 +437,7 @@ def _ols_solve_iterate(plan: Plan, acc: dict, collin_tol: float) -> _iv.Solution
     XX = acc["ZtZ"] - R[:, :k].T @ Gam[:, :k]
     XX = (XX + XX.T) / 2
     XY = acc["ZtY"] - R[:, :k].T @ Gam[:, k:]
-    keep = collinear_keep(XX, collin_tol)
+    keep = collinear_keep(XX, collin_tol, ref_diag=np.diag(acc["ZtZ"]))
     kept = np.flatnonzero(keep)
     beta, bread = solve_spd(XX[np.ix_(kept, kept)], XY[kept])
     lin = {
@@ -579,6 +580,101 @@ def _crossing_cg(
     return X
 
 
+def _fit_cells(
+    plan: Plan,
+    ds: Dataset,
+    executor,
+    prog: Progress,
+    rows: dict,
+    label: str,
+    *,
+    cluster_local: bool,
+    collin_tol: float,
+    tol: float,
+    maxiter: int,
+    level_space_gb: float | None,
+    precond: str,
+) -> dict:
+    """fit(cells=True): one pass of worker.shard_cells, then dfeols.cells on the coordinator."""
+    from . import cells as _cells
+    from .crossing import level_space_budget
+
+    parts: list = []
+    acc = {
+        "rows_in": 0,
+        "load": {"rows": 0, "missing": 0, "non_finite": 0, "zero_weights": 0},
+        "row_key": [],
+        "converged": True,
+    }
+    peak = {"rss": 0.0}
+
+    def on(tid, r):
+        peak["rss"] = max(peak["rss"], r["timing"].get("maxrss_gb", 0.0))
+        parts.append(r)
+        acc["rows_in"] += r["rows_in"]
+        for key, v in r.get("load", {}).items():
+            acc["load"][key] += v
+        if r.get("row_key"):
+            acc["row_key"].append(r["row_key"])
+
+    prog.add_stage("cells", rows)
+    tasks = [(s["id"], rows[s["id"]], (plan, s["id"], ds.shard_paths(s))) for s in ds.shards]
+    prog.start("cells")
+    executor.run(shard_cells, tasks, on, prog, "cells")
+    prog.finish("cells")
+    t1 = time.time()
+    df = _cells.combine(parts, len(plan.local_fes), bool(plan.cluster and cluster_local))
+    parts.clear()  # the cells live in df now
+    nl = len(plan.local_fes)
+    fe_cols = [["shard", f"l{i}"] for i in range(nl)] + [[f"g{i}"] for i in range(len(plan.global_fes))]
+    cl_cols = (["shard", "cl"] if cluster_local else ["cl"]) if plan.cluster else None
+    f = plan.formula
+    r = _cells.solve(
+        df,
+        fe_names=[n for n, _ in plan.local_fes] + [n for n, *_ in plan.global_fes],
+        fe_cols=fe_cols,
+        cluster_cols=cl_cols,
+        m=len(f.depvars),
+        k=len(plan.colnames),
+        colnames=plan.colnames,
+        depvars=list(f.depvars),
+        vcov_types=plan.vcov_types,
+        drop_singletons=plan.drop_singletons,
+        collin_tol=collin_tol,
+        tol=tol,
+        maxiter=maxiter,
+        max_nnz=level_space_budget(executor, level_space_gb),
+        precond=precond,
+        label=label,
+    )
+    acc["sumw"] = float(df["W"].sum())
+    acc["rows_in"] = r["rows"]
+    info = r["info"]
+    log.info(
+        "fit %s: %s rows in %s cells; %s absorbed, crossing %s (%s, %s steps); solve %s",
+        label,
+        f"{r['N']:,}",
+        f"{info['cells']:,}",
+        info["absorbed"],
+        ", ".join(info["crossing"]) or "none",
+        info["mode"],
+        info["steps"],
+        fmt_td(time.time() - t1),
+    )
+    st = prog.stages["cells"]
+    return {
+        **r,
+        "acc": acc,
+        "peak_rss": peak["rss"],
+        "timing": {
+            "cells_seconds": st.finished - st.started,
+            "solve_seconds": time.time() - t1,
+            "singleton_passes": info["singleton_passes"],
+            "singleton_seconds": 0.0,
+        },
+    }
+
+
 def fit(
     ds: Dataset | str,
     formula: str,
@@ -600,6 +696,7 @@ def fit(
     iter_maxiter: int = 5_000,
     level_space_gb: float | None = None,
     crossing_precond: str = "auto",
+    cells: bool = False,
     label: str | None = None,
     log_every: float = 30.0,
     record: bool | str | os.PathLike = True,
@@ -634,6 +731,9 @@ def fit(
                shards, and dfeols warns (crossing.SlowConvergenceWarning)
     crossing_precond  plan C: "auto" (from A's block structure), "jacobi", "bjacobi" or "sgs"
                (AP-sweep, level space only)
+    cells      fit from per-cell sums (dfeols.cells): one pass groups each shard's rows by every
+               FE key and the cluster, and the coordinator solves on the cells, exactly. Pays
+               when the data compress (DB1B's market table: 32x). OLS; vcov CRV1 and iid
     """
     if not isinstance(ds, Dataset):
         ds = Dataset.open(ds)
@@ -672,6 +772,22 @@ def fit(
         crossing_fe=crossing_fe,
         executor=executor,
     )
+    if cells:
+        from . import cells as _cells
+
+        if f_iv := plan.formula.iv:
+            raise NotImplementedError(f"cells=True is OLS only ({f_iv})")
+        bad = [v for v in plan.vcov_types if v not in _cells.VCOV]
+        if bad:
+            raise ValueError(
+                f"cells=True computes vcov {', '.join(_cells.VCOV)}; not {', '.join(bad)} "
+                "(HC1 needs each row's residual)"
+            )
+        if not (plan.local_fes or plan.global_fes):
+            raise ValueError("cells=True needs at least one fixed effect")
+        plan.crossing_iterate = plan.sparse_global = False
+        plan.cache_dir = None
+        cache = False
     if plan.sparse_global and plan.cache_dir:
         plan.cache_dir = None  # recomputing is cheap on this path
         cache = False
@@ -719,193 +835,233 @@ def fit(
     prog = Progress(wd, label=label, every=log_every, round2_recomputes=not cache)
     rows = {s["id"]: max(s["rows"], 1) for s in ds.shards}
     sing = {"passes": 0, "seconds": 0.0}
-    if plan.drop_singletons and plan.global_fes:
-        plan.keep_dir = str(wd / "singletons")
-        sing = _drop_singletons(plan, ds, executor, prog, rows, label)
-    prog.add_stage("round1", rows)
-    prog.add_stage("round2", rows)
-
-    # ---------------- round 1 ----------------
-    acc = {
-        "ZtZ": np.zeros((k_tot, k_tot)),
-        "ZtY": np.zeros((k_tot, mY)),
-        "YtY": np.zeros((mY, mY)),
-        "sum_wy": np.zeros(mY),
-        "sum_wy2": np.zeros(mY),
-        "n": 0,
-        "rows_in": 0,
-        "sumw": 0.0,
-        "converged": True,
-        "fe_levels": np.zeros(len(plan.local_fes), np.int64),
-        "local_nested": np.ones(len(plan.local_fes), bool),
-        "gpresent": [np.zeros(L, bool) for *_, L in plan.global_fes],
-        "glo": [np.full(L, np.iinfo(np.int64).max) for *_, L in plan.global_fes],
-        "ghi": [np.full(L, np.iinfo(np.int64).min, np.int64) for *_, L in plan.global_fes],
-        "cpresent": (np.zeros(plan.cluster[2], bool) if plan.cluster and not plan.cluster_local else None),
-        "G_local": 0,
-        "row_n": {},
-        "load": {"rows": 0, "missing": 0, "non_finite": 0, "zero_weights": 0},
-        "row_key": [],
-    }
-    if plan.crossing_iterate:
-        P_lev = sum(L for *_, L in plan.global_fes)
-        acc["DR"] = np.zeros((P_lev, k_tot + mY))
-        acc["ddiag"] = np.zeros(P_lev)
-        if plan.level_nnz:
-            from .crossing import LevelGram
-
-            offs = np.r_[0, np.cumsum([L for *_, L in plan.global_fes])].astype(np.int64)
-            acc["gram"] = LevelGram(offs, [n for n, *_ in plan.global_fes], plan.level_nnz)
-
-    peak = {"rss": 0.0}
-
-    def on1(tid, r):
-        peak["rss"] = max(peak["rss"], r["timing"].get("maxrss_gb", 0.0))
-        g = r["ZtZ"]
-        if hasattr(g, "row"):  # sparse path with many levels: unique (row, col) pairs
-            acc["ZtZ"][g.row, g.col] += g.data
-        else:
-            acc["ZtZ"] += g
-        for key in ("ZtY", "YtY", "sum_wy", "sum_wy2"):
-            acc[key] += r[key]
-        acc["n"] += r["n"]
-        acc["rows_in"] += r["rows_in"]
-        for key, v in r.get("load", {}).items():
-            acc["load"][key] += v
-        if r.get("row_key"):
-            acc["row_key"].append(r["row_key"])
-        acc["sumw"] += r["sumw"]
-        if "crossing" in r:
-            cr = r["crossing"]
-            acc["DR"][cr["idx"]] += cr["DR"]
-            acc["ddiag"][cr["idx"]] += cr["ddiag"]
-            if "gram" in acc:
-                acc["gram"].add(cr.get("part"), tid)
-        acc["row_n"][tid] = r["n"]
-        acc["converged"] &= r["converged"]
-        acc["fe_levels"] += np.asarray(r["fe_levels"], np.int64)
-        for i, p in enumerate(r["global_present"]):
-            acc["gpresent"][i] |= p
-        if plan.cluster:
-            if plan.cluster_local:
-                # nested in the partition key: each cluster lives in one shard,
-                # so counts add up (ids may be hashes, not dense codes)
-                acc["G_local"] += len(r["cluster_present"])
-            else:
-                acc["cpresent"][r["cluster_present"]] = True
-            if r["n"]:
-                acc["local_nested"] &= np.asarray(r["local_fe_nested_in_cluster"], bool)
-            for i, (lo, hi) in enumerate(r["global_cluster_minmax"]):
-                acc["glo"][i] = np.minimum(acc["glo"][i], lo)
-                acc["ghi"][i] = np.maximum(acc["ghi"][i], hi)
-
-    tasks = [(s["id"], rows[s["id"]], (plan, s["id"], ds.shard_paths(s))) for s in ds.shards]
-    prog.start("round1")
-    executor.run(shard_round1, tasks, on1, prog, "round1")
-    prog.finish("round1")
-    if not acc["converged"]:
-        log.warning("fit %s: FE demeaning did not converge in some shards", label)
-
-    N = acc["n"]
-    if plan.crossing_iterate:
-        acc["Gamma"] = _crossing_cg(
-            plan, ds, executor, prog, rows, acc, label, iter_tol, iter_maxiter, crossing_precond
+    if cells:
+        cres = _fit_cells(
+            plan,
+            ds,
+            executor,
+            prog,
+            rows,
+            label,
+            cluster_local=plan.cluster_local,
+            collin_tol=collin_tol,
+            tol=iter_tol,
+            maxiter=iter_maxiter,
+            level_space_gb=level_space_gb,
+            precond=crossing_precond,
         )
-    if f.iv:
-        sol = _iv.solve(plan, acc, N, estimator=estimator, fuller=fuller, collin_tol=collin_tol)
+        acc, out, N, G = cres["acc"], cres["out"], cres["N"], cres["G"]
+        fe_levels, nested, dropped, coefnames = (
+            cres["fe_levels"],
+            cres["nested"],
+            cres["dropped"],
+            cres["coefnames"],
+        )
+        iv_info = {}
+        peak = {"rss": cres["peak_rss"]}
+        timing = cres["timing"]
     else:
-        sol = _ols_solve(plan, acc, collin_tol)
-    dropped = sol.dropped
-    if dropped:
-        log.info("fit %s: dropped collinear regressors: %s", label, dropped)
+        if plan.drop_singletons and plan.global_fes:
+            plan.keep_dir = str(wd / "singletons")
+            sing = _drop_singletons(plan, ds, executor, prog, rows, label)
+        prog.add_stage("round1", rows)
+        prog.add_stage("round2", rows)
 
-    # ---------------- round 2 ----------------
-    acc2: dict = {}
-    kk = sol.bread[0].shape[0]
-    p_ = len(plan.endog_names)
-    shapes = {"": (m, kk)}
-    if f.iv:
-        shapes["fs_"] = (p_, sol.fs["q"])
-    for pre, (ne, k_) in shapes.items():
-        acc2[pre + "rss"] = np.zeros(ne)
-        acc2[pre + "hetero"] = np.zeros((ne, k_, k_)) if "hetero" in plan.vcov_types else None
-        acc2[pre + "crv"] = np.zeros((ne, k_, k_)) if "CRV1" in plan.vcov_types else None
-    scores: dict = {}
-    if "CRV1" in plan.vcov_types and not plan.cluster_local:
-        G_tot = plan.cluster[2]
-        need = G_tot * sum(ne * k_ for ne, k_ in shapes.values()) * 8
-        if need > 8e9:
-            log.warning(
-                "fit %s: cluster-score accumulator needs %.1f GB on the coordinator", label, need / 1e9
-            )
-        scores = {pre: np.zeros((ne, G_tot, k_)) for pre, (ne, k_) in shapes.items()}
-
-    def on2(tid, r):
-        peak["rss"] = max(peak["rss"], r["timing"].get("maxrss_gb", 0.0))
-        for pre in shapes:
-            acc2[pre + "rss"] += r[pre + "rss"]
-            if acc2[pre + "hetero"] is not None:
-                acc2[pre + "hetero"] += r[pre + "meat_hetero"]
-            if pre + "meat_crv" in r:
-                acc2[pre + "crv"] += r[pre + "meat_crv"]
-            if pre + "cluster_scores" in r:
-                for j in range(len(scores[pre])):
-                    np.add.at(scores[pre][j], r[pre + "cluster_codes"], r[pre + "cluster_scores"][j])
-
-    tasks2 = [(s["id"], rows[s["id"]], (plan, s["id"], ds.shard_paths(s), sol.lin)) for s in ds.shards]
-    prog.start("round2")
-    executor.run(shard_round2, tasks2, on2, prog, "round2")
-    for pre, sc in scores.items():
-        for j in range(len(sc)):
-            acc2[pre + "crv"][j] = sc[j].T @ sc[j]
-    prog.finish("round2")
-
-    # ---------------- inference ----------------
-    k = len(sol.coefnames)
-    fe_levels = list(map(int, acc["fe_levels"]))
-    nested = list(map(bool, acc["local_nested"])) if plan.cluster else []
-    for i in range(len(plan.global_fes)):
-        pres = acc["gpresent"][i]
-        fe_levels.append(int(pres.sum()))
-        if plan.cluster:
-            nested.append(bool((acc["glo"][i][pres] == acc["ghi"][i][pres]).all()))
-    G = (acc["G_local"] if plan.cluster_local else int(acc["cpresent"].sum())) if plan.cluster else None
-
-    out = {}
-    meat_idx = sol.meat_idx
-    overid = _iv.overid(sol, acc2["rss"], N) if f.iv else None
-    for j, y in enumerate(f.depvars):
-        b = sol.coef[:, j]
-        bread_use = sol.bread[j]
-        V = {}
-        dfk_plain = _df_k(k, fe_levels, None)
-        if "iid" in plan.vcov_types:
-            V["iid"] = (vcov_iid(bread_use, acc2["rss"][j], N, dfk_plain), N - dfk_plain)
-        if "hetero" in plan.vcov_types:
-            V["hetero"] = (vcov_hetero(bread_use, acc2["hetero"][j], N, dfk_plain), N - dfk_plain)
-        if "CRV1" in plan.vcov_types:
-            dfk_cl = _df_k(k, fe_levels, nested)
-            V["CRV1"] = (vcov_crv1(bread_use, acc2["crv"][j], N, dfk_cl, G), G - 1)
-        V = {t: (v[np.ix_(meat_idx, meat_idx)], df) for t, (v, df) in V.items()}
-        tss = acc["YtY"][j, j] if plan.local_fes else acc["sum_wy2"][j] - acc["sum_wy"][j] ** 2 / acc["sumw"]
-        out[y] = {
-            "coef": b,
-            "vcov": V,
-            "rss": float(acc2["rss"][j]),
-            "tss": float(tss),
-            "r2_within" if plan.local_fes else "r2": float(1 - acc2["rss"][j] / tss),
+        # ---------------- round 1 ----------------
+        acc = {
+            "ZtZ": np.zeros((k_tot, k_tot)),
+            "ZtY": np.zeros((k_tot, mY)),
+            "YtY": np.zeros((mY, mY)),
+            "sum_wy": np.zeros(mY),
+            "sum_wy2": np.zeros(mY),
+            "n": 0,
+            "rows_in": 0,
+            "sumw": 0.0,
+            "converged": True,
+            "fe_levels": np.zeros(len(plan.local_fes), np.int64),
+            "local_nested": np.ones(len(plan.local_fes), bool),
+            "gpresent": [np.zeros(L, bool) for *_, L in plan.global_fes],
+            "glo": [np.full(L, np.iinfo(np.int64).max) for *_, L in plan.global_fes],
+            "ghi": [np.full(L, np.iinfo(np.int64).min, np.int64) for *_, L in plan.global_fes],
+            "cpresent": (
+                np.zeros(plan.cluster[2], bool) if plan.cluster and not plan.cluster_local else None
+            ),
+            "G_local": 0,
+            "row_n": {},
+            "load": {"rows": 0, "missing": 0, "non_finite": 0, "zero_weights": 0},
+            "row_key": [],
         }
+        if plan.crossing_iterate:
+            P_lev = sum(L for *_, L in plan.global_fes)
+            acc["DR"] = np.zeros((P_lev, k_tot + mY))
+            acc["ddiag"] = np.zeros(P_lev)
+            if plan.level_nnz:
+                from .crossing import LevelGram
+
+                offs = np.r_[0, np.cumsum([L for *_, L in plan.global_fes])].astype(np.int64)
+                acc["gram"] = LevelGram(offs, [n for n, *_ in plan.global_fes], plan.level_nnz)
+
+        peak = {"rss": 0.0}
+
+        def on1(tid, r):
+            peak["rss"] = max(peak["rss"], r["timing"].get("maxrss_gb", 0.0))
+            g = r["ZtZ"]
+            if hasattr(g, "row"):  # sparse path with many levels: unique (row, col) pairs
+                acc["ZtZ"][g.row, g.col] += g.data
+            else:
+                acc["ZtZ"] += g
+            for key in ("ZtY", "YtY", "sum_wy", "sum_wy2"):
+                acc[key] += r[key]
+            acc["n"] += r["n"]
+            acc["rows_in"] += r["rows_in"]
+            for key, v in r.get("load", {}).items():
+                acc["load"][key] += v
+            if r.get("row_key"):
+                acc["row_key"].append(r["row_key"])
+            acc["sumw"] += r["sumw"]
+            if "crossing" in r:
+                cr = r["crossing"]
+                acc["DR"][cr["idx"]] += cr["DR"]
+                acc["ddiag"][cr["idx"]] += cr["ddiag"]
+                if "gram" in acc:
+                    acc["gram"].add(cr.get("part"), tid)
+            acc["row_n"][tid] = r["n"]
+            acc["converged"] &= r["converged"]
+            acc["fe_levels"] += np.asarray(r["fe_levels"], np.int64)
+            for i, p in enumerate(r["global_present"]):
+                acc["gpresent"][i] |= p
+            if plan.cluster:
+                if plan.cluster_local:
+                    # nested in the partition key: each cluster lives in one shard,
+                    # so counts add up (ids may be hashes, not dense codes)
+                    acc["G_local"] += len(r["cluster_present"])
+                else:
+                    acc["cpresent"][r["cluster_present"]] = True
+                if r["n"]:
+                    acc["local_nested"] &= np.asarray(r["local_fe_nested_in_cluster"], bool)
+                for i, (lo, hi) in enumerate(r["global_cluster_minmax"]):
+                    acc["glo"][i] = np.minimum(acc["glo"][i], lo)
+                    acc["ghi"][i] = np.maximum(acc["ghi"][i], hi)
+
+        tasks = [(s["id"], rows[s["id"]], (plan, s["id"], ds.shard_paths(s))) for s in ds.shards]
+        prog.start("round1")
+        executor.run(shard_round1, tasks, on1, prog, "round1")
+        prog.finish("round1")
+        if not acc["converged"]:
+            log.warning("fit %s: FE demeaning did not converge in some shards", label)
+
+        N = acc["n"]
+        if plan.crossing_iterate:
+            acc["Gamma"] = _crossing_cg(
+                plan, ds, executor, prog, rows, acc, label, iter_tol, iter_maxiter, crossing_precond
+            )
         if f.iv:
-            out[y]["kappa"] = float(sol.kappa[j])
-            out[y]["overid"] = overid[j]
-    iv_info = {}
-    if f.iv:
-        iv_info = {
-            "estimator": "fuller" if fuller is not None else estimator,
-            "fuller": fuller,
-            "endogenous": list(plan.endog_names),
-            "instruments": list(plan.inst_names),
-            "first_stage": _iv.first_stage(plan, sol, acc, acc2, N, fe_levels, nested, G),
+            sol = _iv.solve(plan, acc, N, estimator=estimator, fuller=fuller, collin_tol=collin_tol)
+        else:
+            sol = _ols_solve(plan, acc, collin_tol)
+        dropped = sol.dropped
+        if dropped:
+            log.info("fit %s: dropped collinear regressors: %s", label, dropped)
+
+        # ---------------- round 2 ----------------
+        acc2: dict = {}
+        kk = sol.bread[0].shape[0]
+        p_ = len(plan.endog_names)
+        shapes = {"": (m, kk)}
+        if f.iv:
+            shapes["fs_"] = (p_, sol.fs["q"])
+        for pre, (ne, k_) in shapes.items():
+            acc2[pre + "rss"] = np.zeros(ne)
+            acc2[pre + "hetero"] = np.zeros((ne, k_, k_)) if "hetero" in plan.vcov_types else None
+            acc2[pre + "crv"] = np.zeros((ne, k_, k_)) if "CRV1" in plan.vcov_types else None
+        scores: dict = {}
+        if "CRV1" in plan.vcov_types and not plan.cluster_local:
+            G_tot = plan.cluster[2]
+            need = G_tot * sum(ne * k_ for ne, k_ in shapes.values()) * 8
+            if need > 8e9:
+                log.warning(
+                    "fit %s: cluster-score accumulator needs %.1f GB on the coordinator", label, need / 1e9
+                )
+            scores = {pre: np.zeros((ne, G_tot, k_)) for pre, (ne, k_) in shapes.items()}
+
+        def on2(tid, r):
+            peak["rss"] = max(peak["rss"], r["timing"].get("maxrss_gb", 0.0))
+            for pre in shapes:
+                acc2[pre + "rss"] += r[pre + "rss"]
+                if acc2[pre + "hetero"] is not None:
+                    acc2[pre + "hetero"] += r[pre + "meat_hetero"]
+                if pre + "meat_crv" in r:
+                    acc2[pre + "crv"] += r[pre + "meat_crv"]
+                if pre + "cluster_scores" in r:
+                    for j in range(len(scores[pre])):
+                        np.add.at(scores[pre][j], r[pre + "cluster_codes"], r[pre + "cluster_scores"][j])
+
+        tasks2 = [(s["id"], rows[s["id"]], (plan, s["id"], ds.shard_paths(s), sol.lin)) for s in ds.shards]
+        prog.start("round2")
+        executor.run(shard_round2, tasks2, on2, prog, "round2")
+        for pre, sc in scores.items():
+            for j in range(len(sc)):
+                acc2[pre + "crv"][j] = sc[j].T @ sc[j]
+        prog.finish("round2")
+
+        # ---------------- inference ----------------
+        k = len(sol.coefnames)
+        fe_levels = list(map(int, acc["fe_levels"]))
+        nested = list(map(bool, acc["local_nested"])) if plan.cluster else []
+        for i in range(len(plan.global_fes)):
+            pres = acc["gpresent"][i]
+            fe_levels.append(int(pres.sum()))
+            if plan.cluster:
+                nested.append(bool((acc["glo"][i][pres] == acc["ghi"][i][pres]).all()))
+        G = (acc["G_local"] if plan.cluster_local else int(acc["cpresent"].sum())) if plan.cluster else None
+
+        out = {}
+        meat_idx = sol.meat_idx
+        overid = _iv.overid(sol, acc2["rss"], N) if f.iv else None
+        for j, y in enumerate(f.depvars):
+            b = sol.coef[:, j]
+            bread_use = sol.bread[j]
+            V = {}
+            dfk_plain = _df_k(k, fe_levels, None)
+            if "iid" in plan.vcov_types:
+                V["iid"] = (vcov_iid(bread_use, acc2["rss"][j], N, dfk_plain), N - dfk_plain)
+            if "hetero" in plan.vcov_types:
+                V["hetero"] = (vcov_hetero(bread_use, acc2["hetero"][j], N, dfk_plain), N - dfk_plain)
+            if "CRV1" in plan.vcov_types:
+                dfk_cl = _df_k(k, fe_levels, nested)
+                V["CRV1"] = (vcov_crv1(bread_use, acc2["crv"][j], N, dfk_cl, G), G - 1)
+            V = {t: (v[np.ix_(meat_idx, meat_idx)], df) for t, (v, df) in V.items()}
+            tss = (
+                acc["YtY"][j, j]
+                if plan.local_fes
+                else acc["sum_wy2"][j] - acc["sum_wy"][j] ** 2 / acc["sumw"]
+            )
+            out[y] = {
+                "coef": b,
+                "vcov": V,
+                "rss": float(acc2["rss"][j]),
+                "tss": float(tss),
+                "r2_within" if plan.local_fes else "r2": float(1 - acc2["rss"][j] / tss),
+            }
+            if f.iv:
+                out[y]["kappa"] = float(sol.kappa[j])
+                out[y]["overid"] = overid[j]
+        iv_info = {}
+        if f.iv:
+            iv_info = {
+                "estimator": "fuller" if fuller is not None else estimator,
+                "fuller": fuller,
+                "endogenous": list(plan.endog_names),
+                "instruments": list(plan.inst_names),
+                "first_stage": _iv.first_stage(plan, sol, acc, acc2, N, fe_levels, nested, G),
+            }
+        coefnames = sol.coefnames
+        timing = {
+            "round1_seconds": prog.stages["round1"].finished - prog.stages["round1"].started,
+            "round2_seconds": prog.stages["round2"].finished - prog.stages["round2"].started,
+            "solve_seconds": prog.stages["round2"].started - prog.stages["round1"].finished,
+            "singleton_passes": sing["passes"],
+            "singleton_seconds": sing["seconds"],
         }
 
     if cache and not keep_cache:
@@ -924,7 +1080,9 @@ def fit(
         "fe_tol": fe_tol,
         "fe_maxiter": plan.fe_maxiter,
         "fe_method": fe_method,
-        "crossing_fe": "iterate"
+        "crossing_fe": "cells"
+        if cells
+        else "iterate"
         if plan.crossing_iterate
         else ("sparse" if plan.sparse_global else ("dense" if plan.global_fes else None)),
         "max_dummy_levels": max_dummy_levels,
@@ -932,6 +1090,15 @@ def fit(
         "cache": cache,
         **iv_opts,
     }
+    if cells:
+        options.update(
+            cells=True,
+            iter_tol=iter_tol,
+            iter_maxiter=iter_maxiter,
+            level_space_gb=level_space_gb,
+            crossing_precond=crossing_precond,
+            cells_solve=cres["info"],
+        )
     if plan.crossing_iterate:
         options.update(
             iter_tol=iter_tol,
@@ -969,10 +1136,15 @@ def fit(
     run["fe_nested_in_cluster"] = nested
     run["n_local_fes"] = len(plan.local_fes)
     run["absorption"] = {
-        **{n: {"method": "local", "nested_in_partition": True} for n, _ in plan.local_fes},
+        **{
+            n: {"method": "cells" if cells else "local", "nested_in_partition": True}
+            for n, _ in plan.local_fes
+        },
         **{
             n: {
-                "method": "crossing_iterate"
+                "method": "cells"
+                if cells
+                else "crossing_iterate"
                 if plan.crossing_iterate
                 else ("crossing_sparse" if plan.sparse_global else "crossing_dense"),
                 "nested_in_partition": False,
@@ -986,7 +1158,7 @@ def fit(
     res = Result(
         formula=f.text,
         label=label,
-        coefnames=sol.coefnames,
+        coefnames=coefnames,
         outcomes=out,
         N=N,
         N_dropped=acc["rows_in"] - N,
@@ -999,11 +1171,7 @@ def fit(
         seconds=time.time() - t_start,
         workdir=str(wd),
         timing={
-            "round1_seconds": prog.stages["round1"].finished - prog.stages["round1"].started,
-            "round2_seconds": prog.stages["round2"].finished - prog.stages["round2"].started,
-            "solve_seconds": prog.stages["round2"].started - prog.stages["round1"].finished,
-            "singleton_passes": sing["passes"],
-            "singleton_seconds": sing["seconds"],
+            **timing,
             "max_worker_rss_gb": peak["rss"],
             "n_shards": len(ds.shards),
             "worker_seconds": sum(sum(st.done.values()) for st in prog.stages.values()),

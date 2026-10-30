@@ -137,6 +137,13 @@ def test_crossing_iterate_numerics(ds, tmp_path, level_space_gb):
     assert ("level space" in num["algorithm"]) == (level_space_gb is None)
 
 
+def test_cells_record(ds, tmp_path):
+    r, rec = _fit(ds, tmp_path, "eng ~ feat + posts | spell + week", cluster="id_a", cells=True)
+    num = rec["structures"]["numerics"]
+    assert "cells" in num["algorithm"] and num["iterations"] == r.options["cells_solve"]["steps"]
+    assert {a["method"] for a in rec["extensions"]["dfeols"]["absorption"].values()} == {"cells"}
+
+
 def test_fe_nested_in_cluster(ds, tmp_path):
     r, rec = _fit(ds, tmp_path, "eng ~ feat + posts | id_a + week", cluster="id_a")
     fe = {f["name"]: f for f in rec["structures"]["fixed_effects"]}

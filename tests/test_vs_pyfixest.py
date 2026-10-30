@@ -241,8 +241,8 @@ def ds_cw(data, tmp_path_factory):
         d,
         shard_dir=tmp_path_factory.mktemp("cw"),
         partition="id_a",
-        fixed_effects=["spell", "id_a^week", "week", "cw", "fw", "id_f"],
-        clusters=["id_a"],
+        fixed_effects=["spell", "id_a", "id_a^week", "week", "cw", "fw", "id_f"],
+        clusters=["id_a", "week"],
         target_rows=3000,
     )
     return d, ds
@@ -320,6 +320,53 @@ def test_iterate_level_space_and_fallback(ds_cw, f):
             assert r.N == m._N
             np.testing.assert_allclose(r.coef(y), m.coef().to_numpy(), rtol=1e-8, atol=1e-10)
             np.testing.assert_allclose(np.sqrt(np.diag(r.vcov(y))), m.se().to_numpy(), rtol=1e-7)
+
+
+@pytest.mark.parametrize(
+    "f, cl, kw",
+    [
+        ("eng ~ feat + posts | spell + fw + cw", "id_a", {}),  # crossing FEs coupled, CG in level space
+        ("eng ~ feat + posts | id_a + week", "id_a", {}),  # compresses: id_a x week cells
+        ("eng ~ feat + posts | week + fw", "week", {}),  # no local FE: cells span shards, merged
+        ("eng ~ feat:i(tbin) + posts | spell + week", "week", {}),
+        ("eng ~ feat + posts | spell + fw + cw", "id_a", {"level_space_gb": 0}),  # products on the cells
+        ("eng + eng2 ~ feat + posts | id_a^week + week + cw", "id_a", {"weights": "wt"}),
+    ],
+)
+def test_cells_against_pyfixest(ds_cw, f, cl, kw):
+    # fit(cells=True): the fit from per-cell sums is exact, CRV1 and iid included
+    d, ds = ds_cw
+    kw = dict(kw)
+    if kw.get("level_space_gb") == 0:
+        from dfeols.crossing import SlowConvergenceWarning
+
+        with pytest.warns(SlowConvergenceWarning):
+            a = dfeols.fit(ds, f, cluster=cl, vcov=["CRV1", "iid"], cells=True, log_every=1e9, **kw)
+        assert a.options["cells_solve"]["mode"] == "cells"
+    else:
+        a = dfeols.fit(ds, f, cluster=cl, vcov=["CRV1", "iid"], cells=True, log_every=1e9, **kw)
+    assert a.options["crossing_fe"] == "cells"
+    if "id_a + week" in f:
+        assert a.options["cells_solve"]["cells"] < a.N / 10
+    pdf = d.to_pandas().dropna(subset=["eng"])
+    w = kw.get("weights")
+    for y in [v.strip() for v in f.split("~")[0].split("+")]:
+        rhs = f.split("~")[1].replace("feat:i(tbin)", "i(tbin, feat)")
+        for v, pv in [("CRV1", {"CRV1": cl}), ("iid", "iid")]:
+            m = pf.feols(f"{y} ~ {rhs}", data=pdf, vcov=pv, weights=w, **pyfixest_tol_kwargs(1e-13))
+            assert a.N == m._N
+            np.testing.assert_allclose(a.coef(y), m.coef().to_numpy(), rtol=1e-8, atol=1e-10)
+            np.testing.assert_allclose(np.sqrt(np.diag(a.vcov(y, v))), m.se().to_numpy(), rtol=1e-7)
+        b = dfeols.fit(ds, f, cluster=cl, vcov=["CRV1", "iid"], log_every=1e9, weights=w)
+        assert a.outcomes[y]["rss"] == pytest.approx(b.outcomes[y]["rss"], rel=1e-9)
+
+
+def test_cells_limits(ds_cw):
+    _, ds = ds_cw
+    with pytest.raises(ValueError, match="HC1 needs each row"):
+        dfeols.fit(ds, "eng ~ feat | spell + week", vcov="hetero", cells=True, log_every=1e9)
+    with pytest.raises(NotImplementedError, match="OLS only"):
+        dfeols.fit(ds, "eng ~ posts | spell + week | feat ~ eng2", cluster="id_a", cells=True, log_every=1e9)
 
 
 def test_iterate_equals_sparse_two_outcomes(ds_cw):

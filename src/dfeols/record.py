@@ -753,6 +753,30 @@ def to_estimation(
     # two FEs with fe_method auto/exact may fall back to iterating, so leave it unsaid
     if n_local != 2 or opts.get("fe_method") == "iterate":
         numerics["iterative"] = n_local >= 2
+    cs = opts.get("cells_solve")
+    if cs:  # fit(cells=True): exact, from per-cell sums
+        pre = {
+            "jacobi": "Jacobi",
+            "bjacobi": "block-Jacobi",
+            "sgs": "AP-sweep (symmetric block Gauss-Seidel)",
+        }
+        alg = f"fit from {cs['cells']:,} cells (per-cell sums); {cs['absorbed']} absorbed by group means"
+        if cs.get("crossing"):
+            alg += (
+                f"; {', '.join(cs['crossing'])} by "
+                f"{pre.get(cs.get('preconditioner'), cs.get('preconditioner'))}-preconditioned conjugate "
+                "gradient " + ("in level space" if cs["mode"] == "level" else "with products on the cells")
+            )
+        numerics.update(
+            algorithm=alg,
+            solver="Cholesky on the normal equations net of the FEs (Frisch-Waugh-Lovell)",
+            iterative=bool(cs.get("crossing")),
+            tolerance=opts.get("iter_tol") if cs.get("crossing") else None,
+            max_iterations=opts.get("iter_maxiter") if cs.get("crossing") else None,
+            iterations=cs.get("steps"),
+            converged=True,
+        )
+        numerics = {k_: v for k_, v in numerics.items() if v is not None}
     cg = opts.get("crossing_cg")
     if cg:  # plan C: the crossing FEs by conjugate gradient, the regressors by FWL on its solution
         pre = {

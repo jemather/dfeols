@@ -8,6 +8,14 @@ break the API).
 ## [Unreleased]
 
 ### Added
+- `fit(..., cells=True)`: the fit from per-cell sums (`dfeols.cells`; planner.md, decided
+  2026-10-30). One pass groups each shard's rows by every FE key and the cluster
+  (`worker.shard_cells`: rows, weight, means and cross-products about the cell means); the
+  coordinator drops singletons on the cells, absorbs the FE with most levels by group means and
+  solves the others with plan C's level-space CG, then b by Frisch-Waugh-Lovell, RSS and CRV1
+  scores from the cell moments. Exact. OLS; vcov CRV1 and iid. Equal to pyfixest (CRV1, iid,
+  weights, several outcomes, cells spanning shards). DB1B 2005Q2-Q3: 10.3M rows in 329k cells,
+  9.8 s against 27 s (level space) and 43 s (dense solve); b within 1e-11.
 - Plan C in level space (planner.md, "Crossing-FE solver"; decided 2026-10-30): round 1 also
   returns each shard's part of A = D~'W D~ (`crossing.LevelGram` sums them within a budget),
   and CG runs on the coordinator with no further passes. The preconditioner follows the
@@ -95,6 +103,10 @@ break the API).
   `carrier^time` FE) is now dropped as collinear, as fixest does. The dense and sparse paths
   tested columns in Z order, so they kept the regressor, dropped a dummy, and reported a
   coefficient that is not identified. Dummies are now tested first (OLS and IV).
+- Plan C no longer keeps a regressor the crossing FEs absorb when its diagonal net of them is a
+  tiny positive rounding error (the CI failure of
+  `test_regressor_absorbed_by_crossing_fe_is_dropped[iterate]`): `collinear_keep(ref_diag=)`
+  tests each pivot against the column's diagonal before the crossing FEs.
 
 ### Changed
 - Plan C's default `iter_tol` is 1e-8 (was 1e-10, next to the floating-point floor; Ted,

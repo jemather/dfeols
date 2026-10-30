@@ -215,6 +215,16 @@ as anything (about 8 on DB1B and NFIP A) but crawl after: never within 1e-4 SE i
 on NFIP A and B, and 1,724 passes for 1e-6 SE on DB1B with Irons-Tuck against 24 for
 block-Jacobi CG. At 0.5% mobility AP needed 3,114 passes to 1e-4 SE; Jacobi CG 37.
 
+**Built (2026-10-30).** Level space, the block-structure preconditioner and the fallback's
+warning are in `crossing.py` (`fit(level_space_gb=, crossing_precond=)`); a shard that cannot
+send its part, or whose part alone is over the budget, sends the diagonal blocks or nothing.
+Two departures from the proposal: small components use eigh pseudo-inverses, and dense ones
+pinned Cholesky with a pseudo-inverse fallback, because with several local FEs a crossing FE's
+block has more null directions than one constant per component (pinning alone left it
+singular); and the fallback warning is issued by `fit` after round 1, since `plan` cannot yet
+bound A (it needs the (key, crossing level) pairs, part of the partition rule's step). The cell
+path is `fit(cells=True)` (`cells.py`).
+
 **Separate fixes the bench found.** Workers use one Dask thread of the cores they are given
 (4 on OSCER: 60 of 80 idle); the record labels plan C's numerics `one-pass group demeaning`,
 `Cholesky`, `iterative: false`.
