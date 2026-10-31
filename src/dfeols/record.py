@@ -502,25 +502,31 @@ def _first_stage_params(r, opts: dict) -> list[dict]:
     return rows
 
 
-def _first_stage_structure(iv: dict, default_vcov: str) -> dict:
-    """structures.first_stage: per endogenous regressor, R², partial R², the first-stage F
-    under the default vcov (the iid partial F for iid) and the effective F; every F
-    version dfeols computed is kept in extensions.dfeols.first_stage."""
+def _first_stage(iv: dict, default_vcov: str, overid: list | None) -> tuple[dict, list[dict]]:
+    """structures.first_stage (per endogenous regressor: R², partial R²) and the IV tests
+    (iv/0.1): per endogenous regressor the first-stage F under the default vcov (the iid
+    partial F for iid) and the effective F; the overidentification tests. Every F version
+    dfeols computed is kept in extensions.dfeols.first_stage."""
     want = "f_iid" if default_vcov == "iid" else f"wald_{default_vcov}"
-    per = []
+    vtype = VCOV_TYPES.get(default_vcov, default_vcov)
+    per, tests = [], []
     for e in iv["first_stage"]["per_endogenous"]:
         f = next(t for t in e["f_stat"] if t["name"] == want)
-        d: dict[str, Any] = {
-            "endogenous": e["endogenous"],
-            "r2": e["r2"],
-            "partial_r2": e["partial_r2"],
-            "f_stat": {**f, "vcov": VCOV_TYPES.get(default_vcov, default_vcov)},
+        per.append({"endogenous": e["endogenous"], "r2": e["r2"], "partial_r2": e["partial_r2"]})
+        where = {
+            "category": "first_stage",
+            "component": "first_stage",
+            "response": e["endogenous"],
+            "origin": "estimation",
+            "vcov": vtype,
         }
+        tests.append({**where, **f, "name": "f" if default_vcov == "iid" else "wald"})
         for eff in e.get("effective_f", []):
             if eff["vcov"] == default_vcov:
-                d["effective_f"] = {"statistic": eff["statistic"], "name": "montiel_olea_pflueger"}
-        per.append(d)
-    return {"kind": "object", "per_endogenous": per}
+                tests.append({**where, "name": "effective_f", "statistic": eff["statistic"]})
+    for t in overid or []:
+        tests.append({"category": "overidentification", **t, "origin": "estimation"})
+    return {"kind": "object", "per_endogenous": per}, tests
 
 
 def _ssc(vtype: str, N: int, k: int, dfk: int, G: int | None, nested: list[bool]) -> dict:
@@ -802,10 +808,9 @@ def to_estimation(
             and cg.get("max_relative_residual", 0) <= opts.get("iter_tol", np.inf),
         )
     structures["numerics"] = {k_: v for k_, v in numerics.items() if v is not None}
+    tests: list[dict] = []
     if iv:
-        structures["first_stage"] = _first_stage_structure(iv, r.vcov_default)
-        if o.get("overid"):
-            structures["first_stage"]["overid"] = o["overid"]
+        structures["first_stage"], tests = _first_stage(iv, r.vcov_default, o.get("overid"))
 
     # ---- specification
     sample = run.get("sample") or {}
@@ -834,6 +839,8 @@ def to_estimation(
         spec["instruments"] = list(iv["instruments"])
 
     record = ef.new_record(params, meta=meta, specification=spec, metrics=metrics, structures=structures)
+    if tests:
+        record["tests"] = [{"id": f"t{i + 1}", **t} for i, t in enumerate(tests)]
     if provenance and run.get("provenance"):
         record["provenance"] = run["provenance"]
     if publication:

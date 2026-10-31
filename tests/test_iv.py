@@ -198,9 +198,11 @@ def test_record_claims_iv_and_validates(ds, tmp_path, fml, kw):
     assert {p["response"] for p in fs} == set(rec["specification"]["endogenous"])
     main = [p["term"] for p in rec["parameters"] if "component" not in p]
     assert main[-len(rec["specification"]["endogenous"]) :] == rec["specification"]["endogenous"]
-    per = rec["structures"]["first_stage"]["per_endogenous"]
-    assert all(e["f_stat"]["statistic"] > 0 for e in per)
-    assert {t["name"] for t in rec["structures"]["first_stage"]["overid"]} >= {"sargan"}
+    first = [t for t in rec["tests"] if t["category"] == "first_stage" and t["name"] in ("f", "wald")]
+    assert {t["response"] for t in first} == set(rec["specification"]["endogenous"])
+    assert all(t["statistic"] > 0 for t in first)
+    assert {t["name"] for t in rec["tests"] if t["category"] == "overidentification"} >= {"sargan"}
+    assert all("r2" in e for e in rec["structures"]["first_stage"]["per_endogenous"])
     if kw.get("estimator") == "liml":
         assert rec["meta"]["estimator"]["method"] == "fuller" and rec["metrics"]["fuller"] == 1.0
         assert rec["metrics"]["kappa"] > 1  # LIML's kappa >= 1; Fuller subtracts only 1 / (N - L)
