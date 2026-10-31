@@ -676,3 +676,17 @@ def test_r2_within_nets_all_fes(ds_cw, f, kw):
     iv = dfeols.fit(ds, f"{lhs}~ posts |{rhs.split('|')[1]}| feat ~ eng2", log_every=1e9, **kw)
     for y in iv.outcomes:
         assert iv.outcomes[y]["tss"] == pytest.approx(a.outcomes[y]["tss"], rel=1e-10)
+
+
+def test_cells_worker_memory_has_no_dummies(ds_cw):
+    # the cell path never builds dummy columns: on OSCER, 2M-row shards with 71,908 crossing
+    # dummies were refused at "4601 GB" (job 35624287) for a task that uses about 2 GB
+    from dfeols.estimate import estimate_worker_gb
+
+    _, ds = ds_cw
+    p = dfeols.build_plan(ds, "eng ~ feat + posts | spell + fw", cluster="id_a", crossing_fe="dense")
+    assert p.n_dummy > 0 and not p.sparse_global
+    cells = estimate_worker_gb(p, 2_000_000, len(ds.columns), cells=True)
+    assert cells < 3 < estimate_worker_gb(p, 2_000_000, len(ds.columns))
+    p.n_dummy = 71_908
+    assert estimate_worker_gb(p, 2_000_000, len(ds.columns), cells=True) == cells

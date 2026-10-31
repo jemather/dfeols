@@ -218,7 +218,7 @@ def build_plan(
     )
 
 
-def estimate_worker_gb(plan: Plan, rows: int, n_cols: int) -> float:
+def estimate_worker_gb(plan: Plan, rows: int, n_cols: int, cells: bool = False) -> float:
     """Rough peak worker memory for one shard of `rows` rows.
 
     Columns held densely: outcomes and reported regressors always; crossing-FE
@@ -227,6 +227,8 @@ def estimate_worker_gb(plan: Plan, rows: int, n_cols: int) -> float:
     columns -> 2.8-3.4 GB observed (Polars read buffers, numpy temporaries,
     Dask worker overhead ~1 GB)."""
     m = len(plan.formula.depvars) + len(plan.endog_names)
+    if cells:
+        return cells_worker_gb(rows, n_cols, m + plan.k_x, len(plan.local_fes) + len(plan.global_fes) + 1)
     if plan.crossing_iterate:
         return worker_gb(rows, n_cols, m, plan.k_x, 0) + rows * (m + plan.k_x) * 8 * 2 / 1e9
     levels = sum(L for *_, L in plan.global_fes) if plan.sparse_global else 0
@@ -248,6 +250,17 @@ def worker_gb(rows: int, n_cols: int, m: int, k_x: int, n_dummy: int, sparse_lev
         if 200 < levels <= SPARSE_GRAM_LEVELS:
             gb += rows * 0.05 * levels * 8 / 1e9  # group x level block
         gb += (min(levels, SPARSE_GRAM_LEVELS) ** 2 + k_x * levels) * 8 * 3 / 1e9  # Gram blocks
+    return gb
+
+
+def cells_worker_gb(rows: int, n_cols: int, p: int, n_keys: int) -> float:
+    """Peak worker memory for worker.shard_cells: no dummies, just the `p` outcome and
+    regressor columns, their deviations from the cell means and `n_keys` key columns per
+    row, then per cell (at most one per row) the means and p(p+1)/2 cross-products. On
+    OSCER: 494k rows, p 4, 4 keys -> 1.1 GB observed (job 35624287)."""
+    gb = 1.5 + rows * n_cols * 8 * 1.5 / 1e9
+    gb += rows * (n_keys + 1 + 2 * p) * 8 * 2 / 1e9  # frame and the deviations
+    gb += rows * (2 + p + p * (p + 1) // 2 + n_keys) * 8 / 1e9  # the cells
     return gb
 
 
@@ -835,7 +848,7 @@ def fit(
     )
 
     biggest = max(s["rows"] for s in ds.shards)
-    need_gb = estimate_worker_gb(plan, biggest, len(ds.columns))
+    need_gb = estimate_worker_gb(plan, biggest, len(ds.columns), cells=cells)
     log.info(
         "fit %s: largest shard %s rows -> peak worker memory roughly %.1f GB; cache on disk roughly %.1f GB",
         label,

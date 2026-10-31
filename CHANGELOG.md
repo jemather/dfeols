@@ -100,6 +100,10 @@ break the API).
   from records that don't claim `dfeols/0.1` (fits without FEs).
 
 ### Fixed
+- `fit(cells=True)` sized each worker as if it built the dense dummy columns, which the cell
+  path never does: on OSCER (job 35624287) the full DB1B fit was refused at "4601 GB" per
+  2M-row shard. The cell path now has its own estimate (`cells_worker_gb`: key, value and
+  deviation columns per row, then per cell the means and cross-products).
 - `dfeols plan` crashed when a candidate key shared a column with an FE (key `carrier`, FE
   `carrier^route`), and counted NaN outcomes in its sample, which fit drops; its rows and
   levels are now fit's sample.
