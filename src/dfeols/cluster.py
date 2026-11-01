@@ -41,6 +41,7 @@ THREAD_VARS = (
     "RAYON_NUM_THREADS",
     "POLARS_MAX_THREADS",
 )
+TASK_THREAD_VARS = {"OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMBA_NUM_THREADS"}
 
 
 # --------------------------------------------------------------- utilities
@@ -115,8 +116,10 @@ def _memory_bytes(mem: str) -> int:
     return int(parse_bytes(mem))
 
 
-def _env_lines(p: Profile, cores: int, memory: str | None = None) -> list[str]:
-    lines = [f"export {v}={cores}" for v in THREAD_VARS]
+def _env_lines(p: Profile, cores: int, memory: str | None = None, worker: bool = False) -> list[str]:
+    # a worker runs several tasks at once, a thread each: BLAS and OpenMP get one thread per
+    # task (no oversubscription); Polars and Rayon share one pool of the job's cores
+    lines = [f"export {v}={1 if worker and v in TASK_THREAD_VARS else cores}" for v in THREAD_VARS]
     # Polars sizes its memory budget from the node's RAM, not the job's limit,
     # and spills to /var/tmp, which is small on many compute nodes. Pin both.
     if memory:
@@ -129,11 +132,12 @@ def _env_lines(p: Profile, cores: int, memory: str | None = None) -> list[str]:
 
 # ------------------------------------------------- per-scheduler job kwargs
 def _job_kwargs(p: Profile, cores: int, memory: str, walltime: str, *, worker: bool) -> dict:
-    """dask-jobqueue keyword arguments that book `cores` CPUs and `memory`
-    for one job, with a single Dask task slot (one shard at a time)."""
+    """dask-jobqueue keyword arguments that book `cores` CPUs and `memory` for one job: a
+    worker gets a Dask thread per core (tasks ask for memory; see DaskExecutor), the
+    coordinator job one."""
     s = p.scheduler
     kw = dict(
-        cores=1,
+        cores=cores if worker else 1,
         processes=1,
         memory=memory,
         walltime=native_walltime(walltime, s),
@@ -180,8 +184,14 @@ def make_cluster(p: Profile, log_directory: str | None = None):
         from distributed import LocalCluster
 
         for v in THREAD_VARS:  # workers inherit the parent's environment
-            os.environ.setdefault(v, str(w["cores"]))
-        return LocalCluster(n_workers=0, threads_per_worker=1, processes=True, dashboard_address=None)
+            os.environ.setdefault(v, "1" if v in TASK_THREAD_VARS else str(w["cores"]))
+        return LocalCluster(
+            n_workers=0,
+            threads_per_worker=int(w["cores"]),
+            processes=True,
+            dashboard_address=None,
+            resources={"MEMORY": _memory_bytes(w["memory"])},
+        )
 
     import dask_jobqueue
 
@@ -202,8 +212,15 @@ def make_cluster(p: Profile, log_directory: str | None = None):
     return cls(
         job_name="dfeols-worker",
         local_directory=w.get("local_directory") or "${TMPDIR:-/tmp}",
-        job_script_prologue=list(p.prologue) + _env_lines(p, w["cores"], w["memory"]),
-        worker_extra_args=["--lifetime", f"{life}s", "--lifetime-stagger", "5m"],
+        job_script_prologue=list(p.prologue) + _env_lines(p, w["cores"], w["memory"], worker=True),
+        worker_extra_args=[
+            "--lifetime",
+            f"{life}s",
+            "--lifetime-stagger",
+            "5m",
+            "--resources",
+            f"MEMORY={_memory_bytes(w['memory'])}",
+        ],
         **kw,
     )
 
@@ -244,7 +261,7 @@ def executor(
             wait_count=wait,
         )
     client = Client(cl)
-    ex = DaskExecutor(client, max_workers=w["max_workers"], tick=tick)
+    ex = DaskExecutor(client, max_workers=w["max_workers"], tick=tick, worker_memory=_memory_bytes(w["memory"]))
     ex.cluster = cl
     ex.profile = p
     log.info(

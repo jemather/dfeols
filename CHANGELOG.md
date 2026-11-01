@@ -8,6 +8,18 @@ break the API).
 ## [Unreleased]
 
 ### Added
+- Workers run several shards at once when they fit (Crossing-FE build, "workers using all
+  their cores"): a worker job gets a Dask thread per core and declares its memory as the
+  resource MEMORY, and each fit task asks for its worker-memory estimate (x1.25), so a 24 GB,
+  4-core OSCER worker runs up to 4 cells or round-2 tasks together. The tasks are mostly
+  single-threaded (DB1B 2005Q2-Q3: 4 threads made a task at most 15% faster while using
+  1.3-3 cores). Plan C's round 1 in level space, whose part of A the estimate leaves out, and
+  every prep task still take a whole worker. BLAS and OpenMP get one thread per task;
+  Polars and Rayon share the job's cores. A `DaskExecutor` on a plain Client (no
+  `worker_memory`) runs as before. Its slot count is now workers, not threads.
+- fit logs which dfeols runs at the start: version, commit (with uncommitted changes
+  flagged) and the folder it was imported from (OSCER job 35625064 ran a stale copy from a
+  venv while the reinstall had gone to ~/.local).
 - `dfeols plan` applies the partition rule (Ted, 2026-10-29): it recommends the key that makes
   the crossing system smallest (fewest crossing levels; on plan C, level space before the
   per-pass fallback) among keys whose largest group is within `target_rows` or 5% of the
@@ -128,6 +140,14 @@ break the API).
   tests each pivot against the column's diagonal before the crossing FEs.
 
 ### Changed
+- `dfeols plan` sizes A faster: each key's (group, level) pairs come from the distinct
+  cells (every FE and cluster column), collected once, not from a scan of all rows per key
+  and crossing FE (DB1B: 12 scans of 683M rows were 3 column sets); each FE's pairs are
+  computed once for both the bound and the count; and the count covers A's upper
+  triangle, busiest levels first, so a key over the budget reaches it sooner. DB1B
+  2005-2008 (82M rows): A's sizes 42 s to 19 s, still exact. The cells line's coordinator
+  memory is now 6 copies of the cells, not 3 (OSCER job 35625881: 19.4 GB on 21.2M cells
+  against 10.2 estimated).
 - `r2_within` (and `tss`) take y net of all the FEs, as fixest does, on every path. With a
   crossing FE they were net of the FEs local to the partition only, so the same spec reported
   a different within R2 under a different partition. Fits whose FEs all cross the partition

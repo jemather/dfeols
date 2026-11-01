@@ -123,16 +123,13 @@ def _a_size(sample: pl.LazyFrame, gcols, cross: dict, L: dict, budget: int, coun
         out["blocks"] = blocks
         return out
     g = list(gcols)
-    ts = []
+    # each crossing FE's distinct (group, level) pairs, once: t below, and B for the count
+    pairs, ts, kept = [], [], 0
     for i, a in enumerate(names):
-        cols = list(dict.fromkeys(g + list(cross[a])))
-        ts.append(
-            sample.group_by(cols)
-            .agg()
-            .group_by(g)
-            .agg(pl.len().cast(pl.Int64).alias(f"t{i}"))
-            .collect(engine="streaming")
-        )
+        pr = sample.select(list(dict.fromkeys(g + list(cross[a])))).unique().collect(engine="streaming")
+        ts.append(pr.group_by(g).agg(pl.len().cast(pl.Int64).alias(f"t{i}")))
+        kept += pr.height
+        pairs.append(pr if count and kept <= EXACT_PAIRS else None)
     t = ts[0]
     for x in ts[1:]:
         t = t.join(x, on=g, how="full", coalesce=True)
@@ -150,23 +147,27 @@ def _a_size(sample: pl.LazyFrame, gcols, cross: dict, L: dict, budget: int, coun
     # exact count: codes for the groups and levels, then B'B by chunks of levels
     gidx = t.select(g).with_row_index("_g")
     rows, cols_, off = [], [], 0
-    for a in names:
+    for a, pr in zip(names, pairs):
         ac = list(cross[a])
-        pairs = sample.select(list(dict.fromkeys(g + ac))).unique().collect(engine="streaming")
-        lv = pairs.select(ac).unique().with_row_index("_l")
-        pairs = pairs.join(gidx, on=g).join(lv, on=ac)
-        rows.append(pairs["_g"].to_numpy().astype(np.int64))
-        cols_.append(pairs["_l"].to_numpy().astype(np.int64) + off)
-        off += L[a]
+        lv = pr.select(ac).unique().with_row_index("_l")
+        pr = pr.join(gidx, on=g).join(lv, on=ac)
+        rows.append(pr["_g"].to_numpy().astype(np.int64))
+        cols_.append(pr["_l"].to_numpy().astype(np.int64) + off)
+        off += lv.height
+    del pairs
     r, c = np.concatenate(rows), np.concatenate(cols_)
     B = sp.csr_matrix((np.ones(len(r), np.float32), (r, c)), shape=(len(gidx), off))
-    Bc = B.tocsc()
-    cw = np.cumsum(Bc.T @ np.diff(B.indptr).astype(np.float64))  # products, by level column
+    # A is symmetric: count its upper triangle, the busiest levels first so a key over the
+    # budget reaches it soonest; nnz = 2 x (strictly upper) + diagonal (every level is in A)
+    work = B.T @ np.diff(B.indptr).astype(np.float64)  # products per level column
+    Bc = B[:, np.argsort(-work, kind="stable")].tocsc()
+    cw = np.cumsum(np.sort(work)[::-1] * np.linspace(1, 0, off, endpoint=False))  # ~upper share
     steps = np.arange(1, int(cw[-1] // CHUNK_FLOPS) + 1) * CHUNK_FLOPS
     cuts = np.unique(np.r_[0, np.searchsorted(cw, steps), off])
-    nnz = 0
+    nnz = off
     for c0, c1 in zip(cuts[:-1], cuts[1:]):
-        nnz += (Bc[:, c0:c1].T @ B).nnz
+        blk = (Bc[:, c0:c1].T @ Bc[:, c0:]).tocoo()  # rows c0:c1, columns c0: (offset by c0)
+        nnz += 2 * int(np.count_nonzero(blk.col > blk.row))
         if nnz > budget:
             out.update(over=True, nnz=nnz)
             return out
@@ -317,6 +318,18 @@ def plan(
         coord_mem = _memory_bytes(profile.coordinator["memory"]) / 1e9
 
     budget = profile_budget(profile, level_space_gb)
+    # A's sizes need each key's distinct (group, level) pairs: take them from the distinct
+    # cells (every FE and cluster column), collected once, not from a scan of all rows per
+    # key and crossing FE (DB1B, 683M rows: 21M cells; 12 scans were 3 column sets)
+    cell_frame = {}
+
+    def pair_source(cols) -> pl.LazyFrame:
+        if not (set(cols) <= set(cell_cols) and st(cell_cols)["levels"] <= EXACT_PAIRS):
+            return sample
+        if "f" not in cell_frame:
+            cell_frame["f"] = sample.select(list(cell_cols)).unique().collect(engine="streaming")
+        return cell_frame["f"].lazy()
+
     options = []
     for k in keys:
         local = [a for a in fes if nested(a, k)]
@@ -347,7 +360,8 @@ def plan(
             c_gb = coordinator_gb(k_x) + sum(g_levels.values()) * (m + k_x) * 8 * 8 / 1e9
             gcols = specs[local[0]] if len(local) == 1 else (specs[k] if local else ())
             # counting A takes a while near the budget: not for keys the rule passes over
-            a_size = _a_size(sample, gcols, {a: specs[a] for a in glob}, g_levels, budget, count=balanced)
+            src = pair_source({*gcols, *(c for a in glob for c in specs[a])})
+            a_size = _a_size(src, gcols, {a: specs[a] for a in glob}, g_levels, budget, count=balanced)
             if a_size["bound"] <= budget or (a_size["exact"] and not a_size["over"]):
                 solve = "level"
                 c_gb += min(a_size["nnz"] or a_size["bound"], budget) * NNZ_BYTES / 1e9
@@ -451,7 +465,9 @@ def plan(
             "key": list(cell_cols),
             "cells": n_cells,
             "rows_per_cell": round(n / max(n_cells, 1), 1),
-            "coordinator_gb": round(n_cells * floats * 8 * 3 / 1e9, 1),
+            # the shards' cells, their concatenation, the merged frame and the solve's copies:
+            # 6 copies (OSCER job 35625881: 21.2M cells, 20 floats each -> 19.4 GB peak)
+            "coordinator_gb": round(n_cells * floats * 8 * 6 / 1e9, 1),
             "eligible": ok,
             "recommended": ok and n >= CELLS_RATIO * n_cells,
         }

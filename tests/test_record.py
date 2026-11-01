@@ -505,3 +505,16 @@ def test_source_checksum_files_and_prep_drops(data, tmp_path):
         raw, shard_dir=tmp_path / "s0", partition="id_a", fixed_effects=["spell"], checksum=False
     )
     assert "checksum" not in off.meta["source"] and "sha256" not in off.meta["source"]["files"][0]
+
+
+def test_fit_logs_which_dfeols(ds, tmp_path, caplog):
+    # the first fit line names the version, commit and install path (a stale install shows)
+    import logging
+
+    import dfeols
+    from dfeols.record import dfeols_source
+
+    with caplog.at_level(logging.INFO, logger="dfeols"):
+        dfeols.fit(ds, "eng ~ feat | spell + week", workdir=str(tmp_path), log_every=1e9)
+    (line,) = [r.getMessage() for r in caplog.records if f"dfeols {dfeols.__version__}" in r.getMessage()]
+    assert dfeols_source()["commit"][:7] in line and str(Path(dfeols.__file__).parent) in line

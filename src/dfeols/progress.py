@@ -106,6 +106,9 @@ class Progress:
         self.running: dict[str, set[int]] = {}
         self.history: list[dict] = []  # (time, progress, ETA) per tick
         self.note = ""  # appended to the log line, e.g. the CG step and residual
+        # GB each task asks of its worker (DaskExecutor runs as many at once as fit its memory);
+        # None: a whole worker, one task at a time (prep, and stages without an estimate)
+        self.task_gb: float | None = None
         self.extra_eta: float | None = None  # seconds of work no stage holds yet (CG steps to come)
 
     # --- bookkeeping -----------------------------------------------------

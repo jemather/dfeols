@@ -57,14 +57,27 @@ class SerialExecutor:
 class DaskExecutor:
     """Run tasks on a dask.distributed Client.
 
-    Each worker should run one task at a time (nthreads=1, processes=1 per
-    Slurm job); numpy/BLAS and the Rust demeaner use the job's cores inside
-    the task. That keeps memory per worker predictable: one shard at a time.
+    With `worker_memory` (bytes; dfeols.cluster's workers declare it as the Dask resource
+    MEMORY, with a thread per core), each task asks for `progress.task_gb` of it, so a
+    worker runs as many shards at once as fit its memory: the tasks are mostly
+    single-threaded numpy and scipy (DB1B 2005Q2-Q3: 4 threads made a task 0-15% faster).
+    Without an estimate, or with a plain Client (no worker_memory), one task per worker
+    (nthreads=1 per job), which keeps memory predictable.
     """
 
-    def __init__(self, client, max_workers: int | None = None, tick: float = 5.0, retries: int = 3):
+    MARGIN = 1.25  # on the worker-memory estimate
+
+    def __init__(
+        self,
+        client,
+        max_workers: int | None = None,
+        tick: float = 5.0,
+        retries: int = 3,
+        worker_memory: int | None = None,
+    ):
         self.client = client
         self.max_workers = max_workers
+        self.worker_memory = worker_memory
         self.tick_s = tick
         self.retries = retries
         self.scatter_min_bytes = 1 << 20  # arrays this large shared by every task are scattered
@@ -75,7 +88,7 @@ class DaskExecutor:
         except TypeError:
             info = self.client.scheduler_info()
         workers = info.get("workers", {})
-        return sum(int(w.get("nthreads", 1)) for w in workers.values()), self.max_workers
+        return len(workers), self.max_workers  # workers (jobs), as max_workers counts them
 
     def _running_keys(self):
         try:
@@ -112,10 +125,15 @@ class DaskExecutor:
         n = len(ordered)
         run_id = uuid.uuid4().hex[:8]  # task keys must never repeat across runs (e.g. two preps)
         shared = self._scatter_shared(ordered)
+        kw = {}
+        if self.worker_memory:
+            gb = getattr(progress, "task_gb", None)
+            need = self.worker_memory if gb is None else min(gb * 1e9 * self.MARGIN, self.worker_memory)
+            kw["resources"] = {"MEMORY": int(need)}
         for i, (tid, _rows, args) in enumerate(ordered):
             key = f"dfeols-{stage}-{progress.label}-{run_id}-{tid}"
             sargs = [shared.get(id(a), a) for a in args]
-            f = self.client.submit(fn, *sargs, key=key, priority=n - i, retries=self.retries, pure=False)
+            f = self.client.submit(fn, *sargs, key=key, priority=n - i, retries=self.retries, pure=False, **kw)
             futs[f] = tid
             fargs[f] = args
         order = list(futs)  # submission order = priority order

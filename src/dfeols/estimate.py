@@ -218,6 +218,18 @@ def build_plan(
     )
 
 
+def _build_text() -> str:
+    """Which dfeols this is: version, commit and where it was imported from, so a log shows a
+    stale install (OSCER job 35625064 ran an older copy from a venv, not the reinstall)."""
+    from . import __version__
+    from .record import dfeols_source
+
+    src = dfeols_source()
+    commit = src.get("commit", "")[:7] or "commit unknown"
+    dirty = " (uncommitted changes)" if src.get("dirty") else ""
+    return f"dfeols {__version__} {commit}{dirty} from {Path(__file__).resolve().parent}"
+
+
 def estimate_worker_gb(plan: Plan, rows: int, n_cols: int, cells: bool = False) -> float:
     """Rough peak worker memory for one shard of `rows` rows.
 
@@ -836,6 +848,7 @@ def fit(
     mY = m + len(plan.endog_names)  # outcome block: outcomes, then IV's endogenous regressors
     k_rep = len(plan.colnames)
     k_tot = plan.k_x + (0 if plan.crossing_iterate else plan.n_dummy)
+    log.info("fit %s: %s", label, _build_text())
     log.info(
         "fit %s: %s | %d regressors + %d FE dummies, %d local FEs, %d shards, %s rows",
         label,
@@ -867,6 +880,7 @@ def fit(
         )
 
     prog = Progress(wd, label=label, every=log_every, round2_recomputes=not cache)
+    prog.task_gb = need_gb  # workers run as many shards at once as this fits
     rows = {s["id"]: max(s["rows"], 1) for s in ds.shards}
     sing = {"passes": 0, "seconds": 0.0}
     if cells:
@@ -979,7 +993,10 @@ def fit(
 
         tasks = [(s["id"], rows[s["id"]], (plan, s["id"], ds.shard_paths(s))) for s in ds.shards]
         prog.start("round1")
+        if plan.crossing_iterate and plan.level_nnz:
+            prog.task_gb = None  # each shard's part of A is not in the estimate: a whole worker
         executor.run(shard_round1, tasks, on1, prog, "round1")
+        prog.task_gb = need_gb
         prog.finish("round1")
         if not acc["converged"]:
             log.warning("fit %s: FE demeaning did not converge in some shards", label)
