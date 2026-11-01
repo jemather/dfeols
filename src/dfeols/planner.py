@@ -85,15 +85,17 @@ def _candidates(f: Formula, cluster: str | None, partition) -> list[str]:
     return out
 
 
-def _group_stats(lf: pl.LazyFrame, cols: tuple[str, ...]) -> pl.LazyFrame:
+def _group_stats(lf: pl.LazyFrame, cols: tuple[str, ...], rows: str | None = None) -> pl.LazyFrame:
+    """Levels, largest group, singletons and the 5 largest groups of `cols`; with `rows`, lf
+    holds cells and that column their row counts."""
     return (
         lf.group_by(list(cols))
-        .agg(pl.len().alias("_n"))
+        .agg((pl.len() if rows is None else pl.col(rows).sum()).alias("_n"))
         .select(
             pl.len().alias("levels"),
             pl.col("_n").max().alias("largest"),
             (pl.col("_n") == 1).sum().alias("singletons"),
-            pl.col("_n").top_k(5).alias("top"),
+            pl.col("_n").top_k(5).sort(descending=True).alias("top"),
         )
     )
 
@@ -157,17 +159,28 @@ def _a_size(sample: pl.LazyFrame, gcols, cross: dict, L: dict, budget: int, coun
     del pairs
     r, c = np.concatenate(rows), np.concatenate(cols_)
     B = sp.csr_matrix((np.ones(len(r), np.float32), (r, c)), shape=(len(gidx), off))
-    # A is symmetric: count its upper triangle, the busiest levels first so a key over the
-    # budget reaches it soonest; nnz = 2 x (strictly upper) + diagonal (every level is in A)
-    work = B.T @ np.diff(B.indptr).astype(np.float64)  # products per level column
-    Bc = B[:, np.argsort(-work, kind="stable")].tocsc()
-    cw = np.cumsum(np.sort(work)[::-1] * np.linspace(1, 0, off, endpoint=False))  # ~upper share
+    # A is symmetric: count its upper triangle by chunks of rows of B'B, busiest levels first
+    # so a key over the budget reaches it soonest; nnz = 2 x (strictly upper) + diagonal
+    # (every level is in A). Row slices of the CSR B' are cheap (column slices copy the rest)
+    deg = np.diff(B.indptr)
+    work = B.T @ deg.astype(np.float64)  # products per level row
+    Bt = B.T.tocsr()
+    # lower bound: row l of A holds at least the levels of the largest group touching l
+    lower = int(np.maximum.reduceat(deg[Bt.indices], Bt.indptr[:-1]).sum()) if off else 0
+    out["lower"] = lower
+    if lower > budget:
+        out.update(over=True, nnz=lower)
+        return out
+    order = np.argsort(-work, kind="stable")
+    B = B[:, order].tocsr()
+    Bt = B.T.tocsr()
+    cw = np.cumsum(work[order])
     steps = np.arange(1, int(cw[-1] // CHUNK_FLOPS) + 1) * CHUNK_FLOPS
     cuts = np.unique(np.r_[0, np.searchsorted(cw, steps), off])
     nnz = off
     for c0, c1 in zip(cuts[:-1], cuts[1:]):
-        blk = (Bc[:, c0:c1].T @ Bc[:, c0:]).tocoo()  # rows c0:c1, columns c0: (offset by c0)
-        nnz += 2 * int(np.count_nonzero(blk.col > blk.row))
+        blk = (Bt[c0:c1] @ B).tocoo()  # rows c0:c1 of A, all columns
+        nnz += 2 * int(np.count_nonzero(blk.col > blk.row + c0))
         if nnz > budget:
             out.update(over=True, nnz=nnz)
             return out
@@ -266,6 +279,16 @@ def plan(
         want(cell_cols)
 
     order = list(sets)
+    # every column set inside the cell key is answered from the cells (rows per cell): one
+    # scan, not one per set (DB1B, 683M rows: 16 scans of ~5 s; 21M cells in 7.5 s), if the
+    # cells are few enough to hold (HyperLogLog estimate first)
+    cells_df = None
+    inside = [s for s in order if s <= set(cell_cols)]
+    if len(inside) > 1:
+        est = sample.select(pl.struct(list(cell_cols)).hash().approx_n_unique()).collect(engine="streaming").item()
+        if est <= EXACT_PAIRS:
+            cells_df = sample.group_by(list(cell_cols)).agg(pl.len().alias("_w")).collect(engine="streaming")
+    from_cells = set(inside) if cells_df is not None else set()
     frames = [
         raw.select(
             pl.len().alias("rows"),
@@ -276,8 +299,13 @@ def plan(
                 for c in cols
             ],
         ),
-        sample.select(pl.len().alias("rows")),
-        *[_group_stats(sample, sets[s]) for s in order],
+        sample.select(pl.len().alias("rows")) if cells_df is None else cells_df.lazy().select(
+            pl.col("_w").sum().alias("rows")
+        ),
+        *[
+            _group_stats(cells_df.lazy(), sets[s], "_w") if s in from_cells else _group_stats(sample, sets[s])
+            for s in order
+        ],
     ]
     # one query at a time: run together, every group-by's hash table is live at once
     # (DB1B market table, 683M rows: 31 GB peak RSS and 19 s together, 7.5 GB and 32 s apart)
@@ -321,11 +349,13 @@ def plan(
     # A's sizes need each key's distinct (group, level) pairs: take them from the distinct
     # cells (every FE and cluster column), collected once, not from a scan of all rows per
     # key and crossing FE (DB1B, 683M rows: 21M cells; 12 scans were 3 column sets)
-    cell_frame = {}
+    cell_frame, a_sizes = {}, {}
 
     def pair_source(cols) -> pl.LazyFrame:
         if not (set(cols) <= set(cell_cols) and st(cell_cols)["levels"] <= EXACT_PAIRS):
             return sample
+        if cells_df is not None:
+            return cells_df.lazy()
         if "f" not in cell_frame:
             cell_frame["f"] = sample.select(list(cell_cols)).unique().collect(engine="streaming")
         return cell_frame["f"].lazy()
@@ -360,8 +390,11 @@ def plan(
             c_gb = coordinator_gb(k_x) + sum(g_levels.values()) * (m + k_x) * 8 * 8 / 1e9
             gcols = specs[local[0]] if len(local) == 1 else (specs[k] if local else ())
             # counting A takes a while near the budget: not for keys the rule passes over
-            src = pair_source({*gcols, *(c for a in glob for c in specs[a])})
-            a_size = _a_size(src, gcols, {a: specs[a] for a in glob}, g_levels, budget, count=balanced)
+            memo = (tuple(gcols), tuple(sorted(glob)), balanced)  # keys with the same groups
+            if memo not in a_sizes:  # and crossing FEs (DB1B: route, carrier^route) share A
+                src = pair_source({*gcols, *(c for a in glob for c in specs[a])})
+                a_sizes[memo] = _a_size(src, gcols, {a: specs[a] for a in glob}, g_levels, budget, count=balanced)
+            a_size = a_sizes[memo]
             if a_size["bound"] <= budget or (a_size["exact"] and not a_size["over"]):
                 solve = "level"
                 c_gb += min(a_size["nnz"] or a_size["bound"], budget) * NNZ_BYTES / 1e9
@@ -425,6 +458,7 @@ def plan(
                         "bound": a_size["bound"],
                         "nnz": a_size["nnz"],
                         "exact": a_size["exact"],
+                        "lower": a_size.get("lower"),
                         "budget": budget,
                     }
                     if a_size
@@ -535,7 +569,8 @@ def format_report(r: dict) -> str:
             a = o["A"]
             size = f"{a['nnz']:,} nonzeros" if a["exact"] else f"at most {a['bound']:,} nonzeros (bound)"
             if a["nnz"] and not a["exact"]:
-                size = f"over {a['nnz']:,} nonzeros (counted to the budget)"
+                how = "lower bound" if a.get("lower") == a["nnz"] else "counted to the budget"
+                size = f"at least {a['nnz']:,} nonzeros ({how})"
             out.append(f"  {'':<{w}} A: {size}; budget {a['budget']:,}")
         for msg in o["warnings"]:
             out.append(f"  {'':<{w}} ! {msg}")

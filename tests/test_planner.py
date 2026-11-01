@@ -132,6 +132,7 @@ def test_a_size_against_fit(data, tmp_path, formula, key, gcols, exact):
     else:
         counted = big
     assert counted["exact"] and not counted["over"]
+    assert counted.get("lower", 0) <= counted["nnz"]  # the shortcut's bound never overstates
     assert counted["nnz"] == fit_nnz if exact else counted["nnz"] >= fit_nnz
     over = _a_size(sample, gcols, cross, L, budget=fit_nnz // 2)
     assert over["over"] and over["nnz"] > fit_nnz // 2
@@ -176,3 +177,22 @@ def test_plan_cells(data):
     assert c["key"] == ["id_a", "week"] and c["cells"] == cells
     assert c["recommended"] == (r["sample_rows"] >= 10 * c["cells"]) and "cells" in format_report(r)
     assert not dfeols.plan(data, "eng ~ posts | spell | feat ~ eng2")["cells"]["eligible"]
+
+
+def test_stats_from_cells_equal_scans(data, monkeypatch):
+    # the probe answers column sets inside the cell key from the cells (one scan); with too
+    # many cells it scans per set. Both give the same report
+    import dfeols.planner as P
+
+    f, c, m = SPECS[2]
+    a = dfeols.plan(data, f, cluster=c, max_dummy_levels=m, target_rows=3000)
+    monkeypatch.setattr(P, "EXACT_PAIRS", 0)
+    b = dfeols.plan(data, f, cluster=c, max_dummy_levels=m, target_rows=3000)
+    for r in (a, b):
+        r.pop("seconds", None)
+        for o in r["options"]:
+            o.pop("A", None)  # not counted with EXACT_PAIRS 0
+    assert a["fes"] == b["fes"] and a["sample_rows"] == b["sample_rows"] and a["cells"] == b["cells"]
+    assert [{k: v for k, v in o.items() if k not in ("solve", "path_text", "warnings")} for o in a["options"]] == [
+        {k: v for k, v in o.items() if k not in ("solve", "path_text", "warnings")} for o in b["options"]
+    ]

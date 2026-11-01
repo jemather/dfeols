@@ -140,14 +140,17 @@ break the API).
   tests each pivot against the column's diagonal before the crossing FEs.
 
 ### Changed
-- `dfeols plan` sizes A faster: each key's (group, level) pairs come from the distinct
-  cells (every FE and cluster column), collected once, not from a scan of all rows per key
-  and crossing FE (DB1B: 12 scans of 683M rows were 3 column sets); each FE's pairs are
-  computed once for both the bound and the count; and the count covers A's upper
-  triangle, busiest levels first, so a key over the budget reaches it sooner. DB1B
-  2005-2008 (82M rows): A's sizes 42 s to 19 s, still exact. The cells line's coordinator
-  memory is now 6 copies of the cells, not 3 (OSCER job 35625881: 19.4 GB on 21.2M cells
-  against 10.2 estimated).
+- `dfeols plan` is faster on large tables: DB1B's 683M rows probe in 72 s, not 475 s
+  (OSCER: 468 s), with the same report and peak memory (8.8 GB). Every column set inside
+  the cell key (every FE and cluster column) is answered from one scan's rows per cell,
+  not one scan per set (16 scans of ~5 s; a HyperLogLog estimate first, so a table that
+  does not compress keeps the scans). A's sizes take each key's (group, level) pairs from
+  those cells, once per FE, and are shared by keys with the same groups and crossing FEs;
+  a lower bound (each level's row of A holds at least its largest group's levels) settles
+  keys far over the budget without counting; the count itself covers A's upper triangle,
+  busiest levels first, by cheap row slices. The cells line's coordinator memory is now 6
+  copies of the cells, not 3 (OSCER job 35625881: 19.4 GB on 21.2M cells against 10.2
+  estimated). Top groups are listed largest first.
 - `r2_within` (and `tss`) take y net of all the FEs, as fixest does, on every path. With a
   crossing FE they were net of the FEs local to the partition only, so the same spec reported
   a different within R2 under a different partition. Fits whose FEs all cross the partition
