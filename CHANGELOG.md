@@ -8,6 +8,17 @@ break the API).
 ## [Unreleased]
 
 ### Added
+- Plan C in level space sums the shards' parts of A on the workers (Crossing-FE build): a
+  balanced tree of combine tasks (`crossing.combine_parts`, four parts at a time, CSR sums,
+  LevelGram's budget rules) runs as parts arrive, ahead of the shards still queued, and the
+  coordinator fetches only the root. On OSCER (job 35624287, 342 route shards) the shards
+  shipped 3.4e9 nonzeros for an A of 5.7e7 and round 1 took 755 s, most of it the
+  coordinator taking parts one at a time while finished results waited in worker memory
+  (15.8 GB). 21 realistic DB1B route shards on 4 local workers: the coordinator receives A
+  once (43M nonzeros, not 207M) and peaks at 2.5 GB, not 6.7; round 1 22 s against 20 s;
+  coefficients equal. Lost parts are recomputed by Dask from their tasks. Executors take an
+  optional `reduce` (`executors.Reduce`); fit uses the per-shard path with an executor
+  whose `run` does not. `crossing_cg.shipped_nnz` is what reached the coordinator.
 - Workers run several shards at once when they fit (Crossing-FE build, "workers using all
   their cores"): a worker job gets a Dask thread per core and declares its memory as the
   resource MEMORY, and each fit task asks for its worker-memory estimate (x1.25), so a 24 GB,

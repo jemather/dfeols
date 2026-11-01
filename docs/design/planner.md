@@ -241,6 +241,16 @@ dense dummies; probe 3 s.
 (4 on OSCER: 60 of 80 idle); the record labels plan C's numerics `one-pass group demeaning`,
 `Cholesky`, `iterative: false`.
 
+*Built (2026-11-01).* Worker tasks are mostly single-threaded (DB1B 2005Q2-Q3: 4 threads
+made a task at most 15% faster), so a worker now gets a Dask thread per core and declares
+its memory as the resource MEMORY, and each fit task asks for its memory estimate: a worker
+runs as many shards at once as fit. Level-space round 1, prep and the combines below still
+take a whole worker. On the full DB1B run (job 35624287) round 1 took 755 s of the 18 min
+fit: the 342 shards shipped 3.4e9 nonzeros for an A of 5.7e7, taken one at a time by the
+coordinator while finished results waited in worker memory (15.8 GB). The parts are now
+summed on the workers in a balanced tree (four at a time, CSR), and the coordinator fetches
+A once. The record labels were fixed with the level-space build.
+
 **Fitting from cells.** Every FE and the cluster are constant within a cell (a distinct
 combination of their keys), so the fit, CRV1 included, can run on per-cell sums and
 cross-products. DB1B's 669M rows are 21.3M cells; the whole fit took 2.5 min on one machine

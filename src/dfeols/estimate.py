@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import os
@@ -619,7 +620,8 @@ def _crossing_cg(
         "preconditioner": method,
         "passes": 0 if level else it,
         "A_nnz": int(A.nnz) if level else None,
-        "parts_nnz": int(gram.parts_nnz) if gram is not None else None,  # shipped by the shards
+        "parts_nnz": int(gram.parts_nnz) if gram is not None else None,  # the shards' parts, summed
+        "shipped_nnz": int(gram.shipped_nnz) if gram is not None else None,  # what reached the coordinator
         "block_nnz": [int(b.nnz) for b in blocks] if blocks is not None else None,
         "fallback_reason": None if level else (gram.reason if gram is not None else "level_space_gb=0"),
     }
@@ -971,8 +973,8 @@ def fit(
                 cr = r["crossing"]
                 acc["DR"][cr["idx"]] += cr["DR"]
                 acc["ddiag"][cr["idx"]] += cr["ddiag"]
-                if "gram" in acc:
-                    acc["gram"].add(cr.get("part"), tid)
+                if "gram" in acc and "part" in cr:  # else summed on the workers (reduce below)
+                    acc["gram"].add(cr["part"], tid)
             acc["row_n"][tid] = r["n"]
             acc["converged"] &= r["converged"]
             acc["fe_levels"] += np.asarray(r["fe_levels"], np.int64)
@@ -993,9 +995,25 @@ def fit(
 
         tasks = [(s["id"], rows[s["id"]], (plan, s["id"], ds.shard_paths(s))) for s in ds.shards]
         prog.start("round1")
+        reduce = None
         if plan.crossing_iterate and plan.level_nnz:
+            import functools
+
+            from .crossing import combine_parts, part_of, without_part
+            from .executors import Reduce
+
             prog.task_gb = None  # each shard's part of A is not in the estimate: a whole worker
-        executor.run(shard_round1, tasks, on1, prog, "round1")
+            gram = acc["gram"]
+            reduce = Reduce(
+                get=part_of,
+                strip=without_part,
+                combine=functools.partial(combine_parts, offs=gram.offs, max_nnz=plan.level_nnz),
+                done=lambda part: gram.add(part, None),  # None: a shard could not form its part
+            )
+        if reduce and "reduce" in inspect.signature(executor.run).parameters:
+            executor.run(shard_round1, tasks, on1, prog, "round1", reduce=reduce)
+        else:  # an executor without reduce: each shard's part reaches on1
+            executor.run(shard_round1, tasks, on1, prog, "round1")
         prog.task_gb = need_gb
         prog.finish("round1")
         if not acc["converged"]:

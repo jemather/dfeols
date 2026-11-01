@@ -109,3 +109,33 @@ def test_pcg_solves_a_consistent_singular_system():
     X, it, rel = cx.pcg(lambda p: B @ p, R, M, act, 1e-10, 500)
     assert rel <= 1e-10 and it < 500
     np.testing.assert_allclose(B @ X, R, atol=1e-8)
+
+
+@pytest.mark.parametrize("max_nnz", [10**6, 1000, 800, 400, 20])  # A; A; blocks only; none; none
+def test_combine_parts_as_level_gram(max_nnz):
+    # summing parts on the workers keeps LevelGram's rules: A within the budget, else its
+    # diagonal blocks, else nothing; the coordinator then ends with the same A and blocks
+    from dfeols.crossing import LevelGram, combine_parts
+
+    rng = np.random.default_rng(0)
+    offs = np.array([0, 30, 50])
+    parts = []
+    for _ in range(9):
+        r, c = rng.integers(0, 50, 60), rng.integers(0, 50, 60)
+        S = sp.csr_matrix((rng.random(60), (r, c)), shape=(50, 50))
+        S = (S + S.T).tocoo()
+        parts.append({"full": True, "blocks": True, "nnz": S.nnz, "r": S.row.astype(np.int32), "c": S.col.astype(np.int32), "v": S.data})
+    one = LevelGram(offs, ["a", "b"], max_nnz)
+    for i, p in enumerate(parts):
+        one.add(p, i)
+    tree = LevelGram(offs, ["a", "b"], max_nnz)
+    kw = dict(offs=offs, max_nnz=max_nnz)
+    tree.add(combine_parts(combine_parts(*parts[:4], **kw), combine_parts(*parts[4:], **kw), **kw), None)
+    (A1, B1), (A2, B2) = one.finish(), tree.finish()
+    assert one.full == tree.full and one.blocks_ok == tree.blocks_ok
+    for x, y in [(A1, A2)] + list(zip(B1 or [], B2 or [])):
+        assert (x is None) == (y is None)
+        if x is not None:
+            assert abs(x - y).max() < 1e-12
+    if not one.blocks_ok:
+        assert B1 is None and B2 is None

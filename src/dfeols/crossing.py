@@ -65,6 +65,79 @@ def diagonal_blocks(rows: np.ndarray, cols: np.ndarray, fe_of: np.ndarray) -> np
     return fe_of[rows] == fe_of[cols]
 
 
+def part_of(res: dict):
+    """A round-1 result's part of A (executors.Reduce.get)."""
+    return (res.get("crossing") or {}).get("part")
+
+
+def without_part(res: dict) -> dict:
+    """A round-1 result without its part of A (executors.Reduce.strip)."""
+    if "crossing" not in res:
+        return res
+    cr = {k: v for k, v in res["crossing"].items() if k != "part"}
+    return {**res, "crossing": cr}
+
+
+def combine_parts(*parts, offs: np.ndarray, max_nnz: int) -> dict:
+    """Sum shards' parts of A (worker.shard_round1's `part`, or earlier sums) on a worker, by
+    LevelGram's rules: past `max_nnz` keep only the diagonal blocks, past it again nothing.
+    Round 1 sums the parts in a tree on the workers (DaskExecutor's `reduce`), so the
+    coordinator receives A once rather than every shard's part (DB1B, 683M rows: 3.4e9
+    nonzeros shipped for an A of 5.7e7; round 1 took 755 s, most of it on the coordinator)."""
+    fe_of = np.repeat(np.arange(len(offs) - 1), np.diff(offs))
+    P = int(offs[-1])
+    out = {"full": True, "blocks": True, "parts_nnz": 0, "shards": 0, "reason": None}
+    mats = []
+    for p in parts:
+        if p is None or p.get("none"):  # a shard could not form its part
+            return {"none": True, "reason": (p or {}).get("reason") or "a shard could not form its part of A"}
+        out["parts_nnz"] += p.get("parts_nnz", p["nnz"])
+        out["shards"] += p.get("shards", 1)
+        if not p["full"] and out["full"]:
+            out["full"] = False
+            out["reason"] = p.get("reason") or f"one shard's part alone has {p['nnz']:,} nonzeros"
+        if not p["blocks"]:
+            out["blocks"] = False
+            out["reason"] = p.get("reason") or f"one shard's diagonal blocks alone have {p['block_nnz']:,} nonzeros"
+        if out["blocks"]:
+            mats.append(part_matrix(p, P))
+    if not out["blocks"]:
+        out.update(nnz=0, block_nnz=0)
+        return out
+    S = mats[0]
+    for M in mats[1:]:  # CSR + CSR merges sorted rows: no sort (2.5x the COO route on 4 x 20M)
+        S = S + M
+    del mats
+    if not out["full"]:
+        S = _blocks_only(S, fe_of)
+    if out["full"] and S.nnz > max_nnz:
+        out["full"] = False
+        out["reason"] = f"the shards' parts summed have more than {max_nnz:,} nonzeros"
+        S = _blocks_only(S, fe_of)
+    if S.nnz > max_nnz:
+        out.update(blocks=False, nnz=0, block_nnz=int(S.nnz))
+        out["reason"] = f"the diagonal blocks summed have more than {max_nnz:,} nonzeros"
+        return out
+    it = np.int32 if P < 2**31 else np.int64
+    out.update(
+        nnz=int(S.nnz), block_nnz=int(S.nnz), indptr=S.indptr.astype(np.int64), indices=S.indices.astype(it), data=S.data
+    )
+    return out
+
+
+def part_matrix(p: dict, P: int) -> sp.csr_matrix:
+    """A part of A as CSR: a shard's (r, c, v), or a sum's (indptr, indices, data)."""
+    if "indptr" in p:
+        return sp.csr_matrix((p["data"], p["indices"], p["indptr"]), shape=(P, P))
+    return sp.csr_matrix((p["v"], (p["r"], p["c"])), shape=(P, P))
+
+
+def _blocks_only(S: sp.csr_matrix, fe_of: np.ndarray) -> sp.csr_matrix:
+    A = S.tocoo()
+    keep = diagonal_blocks(A.row, A.col, fe_of)
+    return sp.csr_matrix((A.data[keep], (A.row[keep], A.col[keep])), shape=S.shape)
+
+
 class LevelGram:
     """A = D~'W D~ summed from the shards' parts within a budget of `max_nnz` nonzeros.
 
@@ -85,25 +158,34 @@ class LevelGram:
         self.buf: list[tuple] = []
         self.buffered = 0
         self.A = sp.csr_matrix((self.P, self.P))
-        self.parts_nnz = 0  # sum over shards: what was shipped, for the log
+        self.parts_nnz = 0  # sum over shards' parts, for the log
+        self.shipped_nnz = 0  # what reached the coordinator (the parts, or the workers' sum)
 
     def add(self, part: dict | None, shard) -> None:
-        if part is None:  # the shard could not form its part (local FE components too large)
-            self._give_up(f"shard {shard} could not form its part of A", blocks=False)
+        """Add one shard's part, or (shard None) the workers' sum of all of them (combine_parts)."""
+        who = f"shard {shard}" if shard is not None else "a shard"
+        if part is None or part.get("none"):  # a shard could not form its part (local FE components too large)
+            why = (part or {}).get("reason") or f"{who} could not form its part of A"
+            self._give_up(why, blocks=False)
             return
         if not part["full"] and self.full:
-            self._give_up(f"shard {shard}'s part alone has {part['nnz']:,} nonzeros", blocks=True)
+            why = part.get("reason") or f"{who}'s part alone has {part['nnz']:,} nonzeros"
+            self._give_up(why, blocks=True)
         if not part["blocks"]:
-            self._give_up(
-                f"shard {shard}'s diagonal blocks alone have {part['block_nnz']:,} nonzeros", blocks=False
-            )
+            why = part.get("reason") or f"{who}'s diagonal blocks alone have {part['block_nnz']:,} nonzeros"
+            self._give_up(why, blocks=False)
         if not self.blocks_ok:
             return
-        r, c, v = part["r"], part["c"], part["v"]
+        if "indptr" in part:  # the workers' sum (combine_parts)
+            r = np.repeat(np.arange(self.P, dtype=part["indices"].dtype), np.diff(part["indptr"]))
+            c, v = part["indices"], part["data"]
+        else:
+            r, c, v = part["r"], part["c"], part["v"]
         if not self.full:
             keep = diagonal_blocks(r, c, self.fe_of)
             r, c, v = r[keep], c[keep], v[keep]
-        self.parts_nnz += len(v)
+        self.parts_nnz += part.get("parts_nnz", len(v))
+        self.shipped_nnz += len(v)
         self.buf.append((r, c, v))
         self.buffered += len(v)
         if self.buffered > self.max_nnz:
