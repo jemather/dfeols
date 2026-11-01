@@ -781,6 +781,14 @@ What only dfeols has (most of it from draft 1):
 
 ## Collections ("all results")
 
+**Specified** in the estimation spec, section 11 (`estimation-collection/0.1`,
+github.com/estimation-format/estimation, 7f7b5ca; Ted's decisions 2026-11-01). The spec
+supersedes this section where they differ: members are always embedded or in a JSON Lines
+members file (no `path` to separate record files); there is no `order` field (members are in
+array order, events by time); member `sha256` is optional; locators are the collection's own,
+not copied into the member records; `session.elapsed_seconds` replaces `duration`. The text
+below is the 2026-10-24 design, kept for its reasoning.
+
 `estimation-collection/0.1`: a set of records plus what is true of the set as a whole. There are
 two main uses, and each leans on a different part (Ted, 2026-10-24):
 
