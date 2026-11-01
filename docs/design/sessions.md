@@ -140,9 +140,38 @@ in the repo and is versioned. Exports: Python through `maketables` (.tex, .docx,
 small extractor for dfeols results); R through modelsummary, since the file already carries
 `tidy` and `glance`. A session index (`results/index.jsonl`) lists every model run.
 
+## Session collection
+
+A session also leaves one `estimation-collection/0.1` file (`kind: "session"`; estimation spec
+section 11), so the whole run can be read, checked and replayed later. The session manager
+writes it to `<scratch>/sessions/<name>/session.estimation-collection.json` on `export`
+(`status: "open"`) and again when it ends (`closed`, `timed_out`, or `crashed` when the
+manager is restarted after a crash).
+
+- **Members:** the `estimation` record of every model the session ran, in the order run.
+  Each member record carries the session id in `provenance.execution.session` and stays
+  complete on its own. Above 16 MB they move to `session.members.jsonl`, as the spec does.
+- **`session`:** `id` (a UUID per session run; the name, e.g. `db1b`, can be reused, so it
+  goes in `fixed`), `started`, `ended`, `elapsed_seconds`, `status`, `clients` (each Python or R
+  client that attached, with connect and disconnect times), and `fixed`: the FE structure,
+  weights, sample definition, declared variables, singleton rule, tolerance and the
+  persisted-data key.
+- **`provenance`:** the manager job (SLURM fields, walltime requested and used, worker-seconds,
+  peak memory, idle time), the software and hardware of the manager and workers, and the
+  dataset's manifest sha256 and the persisted demeaned data (key, size, sha256) in `data`.
+- **`events`:** built from the request log and the session index: `data_loaded`,
+  `demeaned_persisted` or `demeaned_loaded`, `variable_created`, `setting_changed` (a vcov
+  change on an existing model), a `fit` per model with `member` set to its record id,
+  `worker_lost` and `worker_added`, `client_connected` and `client_disconnected`, and `error`
+  with the message. Replaying the events in order reproduces the members.
+
+`results/index.jsonl` stays the quick list of models; the collection is what gets shared, after
+`estimation redact`.
+
 ## Interfaces
 
-- **Python:** `dfeols.Session` (start, attach, fit, refit, add_variable, persist, export, close).
+- **Python:** `dfeols.Session` (start, attach, fit, refit, add_variable, persist, export, close;
+  `export` also writes the session collection).
 - **R:** a small package (jsonlite only) speaking the same request files: `attach_session`,
   `fit`, `add_variable`, `persist`; results as objects with `tidy()`/`glance()` methods.
 - **CLI:** `dfeols session start|status|fit|stop`.
@@ -166,7 +195,7 @@ small extractor for dfeols results); R through modelsummary, since the file alre
 
 1. DirLock race fix (prerequisite).
 2. Session core: start/attach/stop, demean once, OLS with iid/hetero/CRV1, request files,
-   estimates, `estimation` records. Python client and CLI.
+   estimates, `estimation` records, the session collection. Python client and CLI.
 3. Persisted demeaned data: write, find by key, reuse; size warning.
 4. Created variables; vcov changes on an existing model.
 5. Exports (maketables extractor); R client.
