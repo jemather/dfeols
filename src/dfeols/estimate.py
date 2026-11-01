@@ -858,7 +858,7 @@ def fit(
     )
     _check_worker_memory(executor, label, biggest, need_gb)
     coord_gb = estimate_coordinator_gb(plan)
-    if coord_gb > 4:
+    if coord_gb > 4 and not cells:  # the cell path builds no Gram matrix of dummies
         log.warning(
             "fit %s: %d crossing-FE dummies: the coordinator needs roughly %.0f GB for the Gram matrix",
             label,

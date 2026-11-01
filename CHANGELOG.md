@@ -104,6 +104,8 @@ break the API).
   path never does: on OSCER (job 35624287) the full DB1B fit was refused at "4601 GB" per
   2M-row shard. The cell path now has its own estimate (`cells_worker_gb`: key, value and
   deviation columns per row, then per cell the means and cross-products).
+  It also no longer warns that the coordinator needs a dense dummy Gram matrix (job 35625881:
+  "248 GB"); the full fit's coordinator peaked at 19.4 GB on 21.2M cells.
 - `dfeols plan` crashed when a candidate key shared a column with an FE (key `carrier`, FE
   `carrier^route`), and counted NaN outcomes in its sample, which fit drops; its rows and
   levels are now fit's sample.
