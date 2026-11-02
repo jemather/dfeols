@@ -909,3 +909,134 @@ def write_estimation(
 def write_estimations(result, path: str | os.PathLike, **kwargs: Any) -> dict[str, dict]:
     """One record per response, at `record_paths(result, path)`; returns them by response."""
     return {y: write_estimation(result, p, y, **kwargs) for y, p in record_paths(result, path).items()}
+
+
+# ---------------------------------------------------------------- collections
+
+
+def prepare_estimation(
+    result, y: str | None = None, *, redact: bool = False, digest: bool = True, **kwargs
+) -> dict:
+    """The record of response `y` as `write_estimation` would write it (encoded, `meta.id`,
+    history, digest; optionally redacted), in memory and without spilling. Other keywords
+    go to `to_estimation`."""
+    from . import __version__
+
+    rec = to_estimation(result, y, **kwargs)
+    return ef.prepare(
+        rec,
+        digest=digest,
+        redact_identifying=identifying_paths(rec) if redact else False,
+        by={"name": "dfeols", "version": __version__},
+    )
+
+
+def _collection_items(fits, labels) -> list[tuple[str | None, Any, str | None]]:
+    """(label, fit or record, response) per member. A fit with several responses gives one
+    member per response, labelled `<label>.<response>`."""
+    from .results import Result
+
+    if isinstance(fits, Result) or (isinstance(fits, dict) and "schema" in fits):
+        fits = [fits]
+    if isinstance(fits, dict):
+        names, fits = list(fits.keys()), list(fits.values())
+    else:
+        fits = list(fits)
+        names = [None] * len(fits)
+    out: list[tuple[str | None, Any, str | None]] = []
+    for name, f in zip(names, fits):
+        if isinstance(f, Result):
+            base = name if name is not None else f.label
+            ys = list(f.outcomes)
+            for y in ys:
+                out.append((base if len(ys) == 1 else f"{base}.{y}", f, y))
+        elif isinstance(f, dict):
+            out.append((name, f, None))
+        else:
+            raise TypeError(
+                f"write_collection takes dfeols Results or estimation records, not {type(f).__name__}"
+            )
+    if labels is not None:
+        labels = list(labels)
+        if len(labels) != len(out):
+            raise ValueError(f"labels has {len(labels)} entries for {len(out)} members (one per response)")
+        out = [(lab, f, y) for lab, (_, f, y) in zip(labels, out)]
+    return out
+
+
+def write_collection(
+    fits,
+    path: str | os.PathLike,
+    *,
+    kind: str = "batch",
+    labels=None,
+    locators=None,
+    publication: dict | None = None,
+    session: dict | None = None,
+    events: list[dict] | None = None,
+    provenance: dict | None = None,
+    redact: bool = False,
+    members: str = "auto",
+    sha256: bool = True,
+    title: str | None = None,
+    tags: list[str] | None = None,
+    notes: str | None = None,
+    **kwargs: Any,
+) -> dict:
+    """Write several fits as one `estimation-collection/0.1` file (estimation spec section 11)
+    at `path` (`<name>.estimation-collection.json`); returns the collection as written.
+
+    fits       dfeols Results and/or estimation records (dicts, e.g. from
+               `estimation_format.read`): a list, a mapping label -> fit, or one fit. A fit
+               with several responses gives one member per response (`<label>.<response>`)
+    kind       "batch" (default: a set of runs), "paper", "session", "replication", "other"
+    labels     the members' labels, one per member (default: the mapping's keys, else each
+               fit's label)
+    locators   where each member appears in `publication`: a label string, a locator dict
+               or a list of them, one entry per member (None where there is none)
+    publication  the collection's `publication` (the paper; members carry the locators)
+    redact     leave identifying details out of the members and the collection
+    members    "auto" (embed unless above 16 MB), "embed" or "jsonl" (a members file)
+
+    Large structures of a member (a vcov above 10,000 elements) go to side files next to the
+    collection, as `write_estimation` does for a record. Records passed in are kept as they
+    are (one without `meta.id` is prepared first). Other keywords go to `to_estimation`."""
+    from . import __version__
+
+    path = Path(path)
+    stem = path.name.removesuffix(".json").removesuffix(".estimation-collection")
+    by = {"name": "dfeols", "version": __version__}
+    items = _collection_items(fits, labels)
+    recs = []
+    for i, (lab, f, y) in enumerate(items):
+        if isinstance(f, dict):
+            rec = ef.to_json(f)
+            if not (rec.get("meta") or {}).get("id"):
+                rec = ef.prepare(rec, redact_identifying=identifying_paths(rec) if redact else False, by=by)
+            elif redact:
+                rec = ef.redact(rec, paths=identifying_paths(rec), by=by)
+                ef.add_digest(rec)
+        else:
+            rec = prepare_estimation(f, y, redact=redact, digest=False, **kwargs)
+            tag = re.sub(r"[^A-Za-z0-9._-]", "_", lab) if lab else f"m{i + 1}"
+            ef.spill(rec, path.parent, f"{stem}.{tag}")
+            ef.add_digest(rec)
+        recs.append(rec)
+    meta = {k: v for k, v in (("title", title), ("tags", tags), ("notes", notes)) if v is not None}
+    coll = ef.new_collection(
+        recs,
+        kind=kind,
+        labels=[lab for lab, _, _ in items],
+        locators=list(locators) if locators is not None else None,
+        publication=publication,
+        session=session,
+        events=events,
+        provenance=provenance,
+        sha256=sha256,
+        producer=by,
+        **meta,
+    )
+    if redact and (session is not None or provenance is not None):
+        shell = ef.redact_collection({**coll, "members": []}, by=by)
+        coll = {**shell, "members": coll["members"]}
+    return ef.write_collection(coll, path, members=members, by=by)

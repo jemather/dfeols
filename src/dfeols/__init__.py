@@ -10,6 +10,7 @@ from .executors import DaskExecutor, SerialExecutor
 from .lock import LockedError
 from .planner import plan
 from .prep import Dataset, prep
+from .record import write_collection
 from .results import Result
 from .site import profile
 
@@ -25,6 +26,7 @@ __all__ = [
     "executor",
     "profile",
     "LockedError",
+    "write_collection",
 ]
 __version__ = "0.7.0"
 
