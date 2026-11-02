@@ -251,6 +251,16 @@ coordinator while finished results waited in worker memory (15.8 GB). The parts 
 summed on the workers in a balanced tree (four at a time, CSR), and the coordinator fetches
 A once. The record labels were fixed with the level-space build.
 
+*Combining in completion order (2026-11-01).* On OSCER (job 35633461, 342 shards) round 1 still
+spent 57 s after its last shard: the tree's groups were fixed when the shards were submitted,
+so the last shard started a chain of about five combines, each of four A-sized sums (one takes
+6-9 s locally on 57M nonzeros, 85% of it in scipy's CSR add, plus 2 GB of inputs to move). On
+Dask the parts and sums are now combined in the order they finish: four as soon as four are
+ready, and once every part is in, any two at once, so the chain after the last shard is the
+combines already running plus one or two. Local bench (64 shards on 4 workers, 40M-nonzero A):
+tail 8 s to 3 s. The order of the sums now follows the workers, so A can differ between runs in
+the last bits. The in-process executor keeps the fixed tree.
+
 **Fitting from cells.** Every FE and the cluster are constant within a cell (a distinct
 combination of their keys), so the fit, CRV1 included, can run on per-cell sums and
 cross-products. DB1B's 669M rows are 21.3M cells; the whole fit took 2.5 min on one machine

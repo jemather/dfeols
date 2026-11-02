@@ -72,6 +72,42 @@ class _Tree:
         return carry
 
 
+class _Pool:
+    """Combine in completion order (DaskExecutor): parts and sums wait in `ready` once their
+    futures finish; fan_in of them make a combine as soon as they exist, and once every part
+    is in, any two ready ones are combined at once. The chain left after the last shard is
+    then the combines already running plus one or two more, not the tree's depth (DB1B,
+    342 shards, fan_in 4: five combines of A-sized sums one after another, 57 s). The order
+    of the sums follows the workers, so A can differ between runs in the last bits."""
+
+    def __init__(self, reduce: Reduce, submit: Callable):
+        self.r, self.submit = reduce, submit
+        self.ready: list = []
+        self.running: set = set()  # part and combine futures not finished yet
+        self.parts_left = 0
+        self.combines = 0
+
+    def add(self, part) -> None:
+        self.running.add(part)
+        self.parts_left += 1
+
+    def arrived(self, f, is_part: bool) -> None:
+        self.running.discard(f)
+        self.ready.append(f)
+        self.parts_left -= is_part
+        k = self.r.fan_in
+        while len(self.ready) >= k or (self.parts_left == 0 and len(self.ready) >= 2):
+            items, self.ready = self.ready[:k], self.ready[k:]
+            self.combines += 1
+            self.running.add(self.submit(self.r.combine, *items))
+
+    def finished(self) -> bool:
+        return not self.running and self.parts_left == 0 and len(self.ready) <= 1
+
+    def root(self):
+        return self.ready[0] if self.ready else None
+
+
 def _order(tasks):
     """Largest-first (LPT) for load balance, but one small task first so the
     ETA calibrates quickly."""
@@ -195,7 +231,8 @@ class DaskExecutor:
         n = len(ordered)
         run_id = uuid.uuid4().hex[:8]  # task keys must never repeat across runs (e.g. two preps)
         shared = self._scatter_shared(ordered)
-        tree = self._tree(reduce, stage, run_id, n + 2) if reduce else None
+        pool = self._pool(reduce, stage, run_id, n + 2) if reduce else None
+        part_futs: set = set()
         kw = {}
         if self.worker_memory:
             gb = getattr(progress, "task_gb", None)
@@ -204,17 +241,22 @@ class DaskExecutor:
         for i, (tid, _rows, args) in enumerate(ordered):
             key = f"dfeols-{stage}-{progress.label}-{run_id}-{tid}"
             sargs = [shared.get(id(a), a) for a in args]
-            f = self.client.submit(fn, *sargs, key=key, priority=n - i, retries=self.retries, pure=False, **kw)
+            f = self.client.submit(
+                fn, *sargs, key=key, priority=n - i, retries=self.retries, pure=False, **kw
+            )
             if reduce:  # on_result sees the result without its part; the part goes in the tree
                 hi = {"priority": n + 1, "pure": False}  # ahead of the shards still queued
-                tree.add(self.client.submit(reduce.get, f, key=f"{key}-part", **hi))
+                part = self.client.submit(reduce.get, f, key=f"{key}-part", **hi)
+                pool.add(part)
+                part_futs.add(part)
                 f = self.client.submit(reduce.strip, f, key=f"{key}-rest", **hi)
             futs[f] = tid
             fargs[f] = args
         order = list(futs)  # submission order = priority order
         pending = set(futs)
         key_to_tid = {f.key: futs[f] for f in futs}
-        while pending:
+        last_task = None
+        while pending or (pool and not pool.finished()):
             if local_help and self.slots()[0] == 0:
                 running = self._running_keys()
                 cand = [
@@ -233,11 +275,19 @@ class DaskExecutor:
                     progress.task_done(stage, tid, res.get("timing", {}).get("total", 0.0), res.get("timing"))
                     progress.tick()
                     continue
+            watch = pending | pool.running if pool else pending
             try:
-                done, _ = wait(pending, timeout=self.tick_s, return_when="FIRST_COMPLETED")
+                done, _ = wait(watch, timeout=self.tick_s, return_when="FIRST_COMPLETED")
             except Exception:  # timeout
                 done = set()
             for f in done:
+                if f not in futs:  # a part or a combine: into the pool
+                    if f.status == "error":
+                        exc = f.exception()
+                        raise RuntimeError(f"combining the parts failed in {stage}: {exc!r}") from exc
+                    pool.arrived(f, f in part_futs)
+                    part_futs.discard(f)
+                    continue
                 tid = futs[f]
                 if f.status == "error":
                     exc = f.exception()
@@ -247,23 +297,24 @@ class DaskExecutor:
                 progress.task_done(stage, tid, res.get("timing", {}).get("total", 0.0), res.get("timing"))
                 pending.discard(f)
                 f.release()
+                if not pending:
+                    last_task = time.perf_counter()
             s, mx = self.slots()
             progress.set_slots(s, mx)
             progress.running[stage] = {key_to_tid[k] for k in self._running_keys() if k in key_to_tid}
             progress.tick()
-        if tree:
-            t = time.perf_counter()
-            root = tree.finish()
+        if pool:
+            root = pool.root()
             reduce.done(root.result() if root is not None else None)
             log.info(
                 "%s %s: parts summed on the workers in %d combines (%.0f s after the last task)",
                 stage,
                 progress.label,
-                tree.combines,
-                time.perf_counter() - t,
+                pool.combines,
+                time.perf_counter() - (last_task or time.perf_counter()),
             )
 
-    def _tree(self, reduce: Reduce, stage: str, run_id: str, priority: int) -> _Tree:
+    def _pool(self, reduce: Reduce, stage: str, run_id: str, priority: int) -> _Pool:
         """Combine tasks, each summing fan_in parts as soon as they exist, ahead of the shards
         still queued (parts do not pile up on the workers). A combine holds fan_in parts at
         once: it asks for a whole worker."""
@@ -276,4 +327,4 @@ class DaskExecutor:
                 fn, *items, key=key, pure=False, retries=self.retries, priority=priority, **kw
             )
 
-        return _Tree(reduce, submit)
+        return _Pool(reduce, submit)

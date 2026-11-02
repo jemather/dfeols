@@ -34,11 +34,58 @@ def test_reduce_sums_every_part_once(n, dask):
             distributed.LocalCluster(n_workers=2, threads_per_worker=2, dashboard_address=None) as lc,
             distributed.Client(lc) as c,
         ):
-            DaskExecutor(c, max_workers=2, tick=0.1).run(_task, tasks, lambda t, r: seen.append(r), prog, "s", reduce=red)
+            DaskExecutor(c, max_workers=2, tick=0.1).run(
+                _task, tasks, lambda t, r: seen.append(r), prog, "s", reduce=red
+            )
     else:
         SerialExecutor().run(_task, tasks, lambda t, r: seen.append(r), prog, "s", reduce=red)
     assert sorted(got["sum"]) == list(range(n))  # every part exactly once
     assert len(seen) == n and all("part" not in r for r in seen)
+
+
+@pytest.mark.parametrize("seed", range(20))
+def test_pool_combines_in_completion_order(seed):
+    """_Pool with parts and combines finishing in random order: every part summed once. When
+    combines finish before the next part does, one combine is left after the last part."""
+    import random
+
+    from dfeols.executors import _Pool
+
+    rng = random.Random(seed)
+    n = rng.randint(1, 60)
+    fan_in = rng.choice([2, 3, 4])
+    for instant in (False, True):
+        vals, submitted = {}, []
+
+        def submit(fn, *items, vals=vals, submitted=submitted):
+            fut = object()
+            vals[fut] = fn(*(vals[i] for i in items))
+            submitted.append(fut)
+            return fut
+
+        pool = _Pool(Reduce(get=None, strip=None, combine=_combine, done=None, fan_in=fan_in), submit)
+        parts = []
+        for i in range(n):
+            p = object()
+            vals[p] = [i]
+            pool.add(p)
+            parts.append(p)
+        rng.shuffle(parts)
+        after_last = None
+        while not pool.finished():
+            combines = [f for f in pool.running if f not in parts]
+            if parts and not (instant and combines):
+                pool.arrived(parts.pop(), True)
+                if not parts:
+                    after_last = len(submitted)
+            else:
+                f = combines[0] if instant else rng.choice(sorted(pool.running, key=id))
+                if f in parts:
+                    parts.remove(f)
+                pool.arrived(f, f not in submitted)
+        assert vals[pool.root()] == list(range(n))
+        if instant and n > 1:
+            assert len(submitted) - after_last <= 1
 
 
 class _NoReduce:
@@ -68,7 +115,9 @@ def test_parts_summed_on_workers_equal_per_shard(tmp_path, level_space_gb):
     from simdata import sim_panel
 
     d = sim_panel().with_columns(cw=(pl.col("id_f") % 100) * 100 + pl.col("week"))
-    ds = dfeols.prep(d, shard_dir=tmp_path / "s", partition="id_a", fixed_effects=["spell", "cw", "week"], target_rows=3000)
+    ds = dfeols.prep(
+        d, shard_dir=tmp_path / "s", partition="id_a", fixed_effects=["spell", "cw", "week"], target_rows=3000
+    )
     f = "eng ~ feat + posts | spell + cw + week"
     kw = dict(crossing_fe="iterate", log_every=1e9, level_space_gb=level_space_gb)
     a = dfeols.fit(ds, f, executor=_NoReduce(), workdir=str(tmp_path / "a"), **kw)
@@ -77,10 +126,16 @@ def test_parts_summed_on_workers_equal_per_shard(tmp_path, level_space_gb):
         distributed.LocalCluster(n_workers=2, threads_per_worker=1, dashboard_address=None) as lc,
         distributed.Client(lc) as c,
     ):
-        b = dfeols.fit(ds, f, executor=DaskExecutor(c, max_workers=2, tick=0.1), workdir=str(tmp_path / "b"), **kw)
+        b = dfeols.fit(
+            ds, f, executor=DaskExecutor(c, max_workers=2, tick=0.1), workdir=str(tmp_path / "b"), **kw
+        )
     ca, cb = a.options["crossing_cg"], b.options["crossing_cg"]
     assert len(ds.shards) > 4 and ca["mode"] == cb["mode"] == ("level" if level_space_gb is None else "pass")
-    assert ca["A_nnz"] == cb["A_nnz"] and ca["block_nnz"] == cb["block_nnz"] and ca["parts_nnz"] == cb["parts_nnz"]
+    assert (
+        ca["A_nnz"] == cb["A_nnz"]
+        and ca["block_nnz"] == cb["block_nnz"]
+        and ca["parts_nnz"] == cb["parts_nnz"]
+    )
     assert ca["shipped_nnz"] == ca["parts_nnz"] and cb["shipped_nnz"] <= ca["shipped_nnz"]
     if level_space_gb is None:
         assert cb["shipped_nnz"] == cb["A_nnz"] < ca["shipped_nnz"]  # the coordinator got A once
