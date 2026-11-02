@@ -247,7 +247,8 @@ within 5e-15.
   the session folder and deletes them at the end. Each build appends to
   `<scratch>/demeaned/timings.jsonl`, which `session start` uses for its estimate.
 - **Collection.** `session.estimation-collection.json` (`kind: "session"`) on `export`
-  (`open`) and at the end (`closed`; `timed_out` at walltime or idle; `crashed` as above),
+  (`open`) and at the end (`closed`, also after `idle_minutes` idle (Ted 2026-11-02);
+  `timed_out` at walltime; `crashed` as above),
   through `estimation_format.new_collection`/`write_collection`: members in run order with
   labels, `session` (id, times, status, clients, `fixed`), `provenance` (software,
   environment, execution, the dataset and the demeaned data), `events`.
@@ -255,11 +256,13 @@ within 5e-15.
   `dfeols session serve` with walltime `--hours` (default 2) + 1.5 x the high end of the
   demeaning estimate (1 h without history); on a local profile it starts the manager as a
   detached process logging to `<scratch>/sessions/<name>.log`. SIGTERM closes cleanly.
+  `--hours` count from ready, not from submission. The manager asks for `max_workers` workers
+  and holds them for the whole session, idle or not (Ted 2026-11-02: once allocated for a
+  slot they are kept; `cluster.executor(hold=True)`), with the manager job's walltime.
 
 Not built: crossing FEs above `max_dummy_levels` (the sparse and plan C paths), progress
 streamed to the client and the per-model time estimate, `persist()` after `--no-persist`,
-`dfeols demeaned rm` and the scratch-quota check, `min_workers`/`max_workers` scaling while
-idle, and the replay of events.
+`dfeols demeaned rm` and the scratch-quota check, and the replay of events.
 
 ## Open questions
 

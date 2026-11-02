@@ -226,13 +226,20 @@ def make_cluster(p: Profile, log_directory: str | None = None):
 
 
 def executor(
-    profile: str | Profile | None = None, *, tick: float = 10.0, log_directory: str | None = None, **overrides
+    profile: str | Profile | None = None,
+    *,
+    tick: float = 10.0,
+    log_directory: str | None = None,
+    hold: bool = False,
+    **overrides,
 ):
     """Return a DaskExecutor whose workers come from the profile's scheduler.
 
     Worker settings (cores, memory, walltime, max_workers, min_workers,
     retire_minutes) and profile keys (queue, account, ...) can be overridden
     as keyword arguments. Workers join as the scheduler starts them.
+    hold=True asks for max_workers and keeps them while idle (sessions)
+    instead of adapting between min_workers and max_workers.
     The client and cluster are available as ex.client and ex.cluster.
     """
     from distributed import Client
@@ -245,7 +252,7 @@ def executor(
         p = load_profile(profile, **overrides)
     cl = make_cluster(p, log_directory)
     w = p.worker
-    if p.scheduler == "local":
+    if p.scheduler == "local" or hold:
         cl.scale(w["max_workers"])
     else:
         # Scale up fast, scale down slowly. Dask's default releases a worker
@@ -261,7 +268,9 @@ def executor(
             wait_count=wait,
         )
     client = Client(cl)
-    ex = DaskExecutor(client, max_workers=w["max_workers"], tick=tick, worker_memory=_memory_bytes(w["memory"]))
+    ex = DaskExecutor(
+        client, max_workers=w["max_workers"], tick=tick, worker_memory=_memory_bytes(w["memory"])
+    )
     ex.cluster = cl
     ex.profile = p
     log.info(

@@ -250,3 +250,21 @@ def test_cli_serve_fit_stop(ds, tmp_path, capsys):
         proc.kill()
     assert json.loads((root / "cli" / "session.json").read_text())["status"] == "closed"
     assert (root / "cli" / "session.estimation-collection.json").exists()
+
+
+def test_idle_end_is_closed_and_hours_count_from_ready(ds, roots, tmp_path):
+    import time
+
+    r = {"root": tmp_path / "s", "demeaned": roots["demeaned"]}
+    m = Manager(
+        "idle", Spec.make(ds.root, "spell", ["eng", "feat"]), idle_minutes=0.02, hours=1, poll=0.05, **r
+    )
+    m.start()
+    ready = time.time()
+    assert ready - 1 <= m.ends - 3600 <= ready + 1
+    assert m.serve() == "closed"
+    st = json.loads((r["root"] / "idle" / "session.json").read_text())
+    assert st["status"] == "closed"
+    coll = estimation.read_collection(r["root"] / "idle" / "session.estimation-collection.json")
+    assert coll["session"]["status"] == "closed"
+    assert coll["events"][-1]["message"].startswith("idle for")

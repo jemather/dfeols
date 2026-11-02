@@ -878,7 +878,8 @@ class Manager:
         self.dir = sessions_root(profile, root) / name
         self.demeaned_dir = demeaned_root(profile, demeaned)
         self.executor = executor or SerialExecutor()
-        self.ends = time.time() + hours * 3600 if hours else None
+        self.hours = hours
+        self.ends: float | None = None  # set when ready: the hours count from then
         self.idle = idle_minutes * 60 if idle_minutes else None
         self.persist = persist
         self.poll = poll
@@ -966,6 +967,8 @@ class Manager:
             self.lock.release()
             raise
         self.status = "ready"
+        if self.hours:
+            self.ends = time.time() + self.hours * 3600
         self._save_state()
         log.info("session %s: ready (%s)", self.name, self.id)
 
@@ -1024,7 +1027,7 @@ class Manager:
                     self.event("note", message="walltime reached")
                     break
                 if self.idle and now - self.last_request > self.idle:
-                    end = "timed_out"
+                    end = "closed"  # Ted 2026-11-02: an idle end is a normal close
                     self.event("note", message=f"idle for {self.idle / 60:g} minutes")
                     break
                 if not handled:
@@ -1573,6 +1576,8 @@ def _serve_words(args) -> list[str]:
         w.append("--keep-singletons")
     if getattr(args, "serial", False):
         w.append("--serial")
+    if getattr(args, "worker_walltime", None):
+        w += ["--worker-walltime", args.worker_walltime]
     return w
 
 
@@ -1586,7 +1591,9 @@ def cmd_serve(args) -> None:
         if p.scheduler != "local" or p.worker.get("max_workers", 1) > 1:
             from .cluster import executor
 
-            ex = executor(p)
+            # the workers are held for the whole session, idle or not (Ted 2026-11-02), and
+            # live as long as the manager's job
+            ex = executor(p, hold=True, walltime=args.worker_walltime)
     mgr = Manager(
         args.name,
         _spec_args(args),
@@ -1657,6 +1664,8 @@ def cmd_start(args) -> None:
         demean_h = (est[1] if est else 3600.0) / 3600
         wall = (hours + 1.5 * demean_h) * 3600
         p = dataclasses.replace(p, coordinator={**p.coordinator, "walltime": _hms(wall)})
+        args.worker_walltime = args.worker_walltime or _hms(wall)  # workers last the session
+        words = _serve_words(args)
         jobs = p.scratch_dir("jobs")
         jobs.mkdir(parents=True, exist_ok=True)
         cmd = "python -m dfeols.cli " + " ".join(shlex.quote(w) for w in words)
@@ -1764,6 +1773,7 @@ def add_parser(sub) -> None:
         q.add_argument("--fe-tol", type=float, default=1e-10)
         q.add_argument("--demeaned", help="demeaned-data folder (default: <scratch>/demeaned)")
         q.add_argument("--serial", action="store_true", help="no Dask workers: run in the manager")
+        q.add_argument("--worker-walltime", help="workers' walltime (start sets the manager job's)")
         if nm == "start":
             q.add_argument("--wait", action="store_true", help="wait until the session is ready")
     q = ss.add_parser("status", help="the session's state")
