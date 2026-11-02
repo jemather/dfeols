@@ -1,6 +1,8 @@
 # Design: interactive sessions (fixed FEs, many models)
 
-Status: draft for review (2026-10-24). Nothing here is implemented yet.
+Status: build order step 2 (session core) built 2026-11-02 in `src/dfeols/session.py`, with
+parts of step 3 (persisted data found by key and reused); see "As built" below. Steps 4-6 are
+not built.
 
 ## Goal
 
@@ -200,6 +202,64 @@ manager is restarted after a crash).
 4. Created variables; vcov changes on an existing model.
 5. Exports (maketables extractor); R client.
 6. IV in sessions.
+
+## As built (step 2, 2026-11-02)
+
+`dfeols.session`: `Spec` (what is fixed), `demean_once`, `fit_model`, `Manager` (the request
+loop), `Session` (the Python client), and `dfeols session start|serve|status|fit|export|stop`.
+`tests/test_session.py` checks every model against `dfeols.fit` on the same sample (FWL; local
+and crossing FEs, weights, iid/hetero/CRV1, a crossing cluster), the records and the collection
+against estimation-format, reuse of persisted data, the lock, crash recovery and the CLI with
+the manager as its own process. Also run on a 2-worker Dask cluster: b and V equal to `fit`'s
+within 5e-15.
+
+- **Demean once.** The declared variables are the outcome block of a worker `Plan` with no
+  regressors, so the session reuses fit's singleton passes (`_drop_singletons`) and round-1
+  demeaning (`_prepare`, `_round1_dense`). Crossing FEs enter as dense dummies; their block
+  `D~'WD~` and `D~'WV~` are summed, `Gamma` solved once on the coordinator, and a second pass
+  writes `V~ - D~ Gamma`. Each shard's residualised columns go to one Parquet file with the
+  weights and each declared cluster's codes.
+- **Gram matrix.** The demeaning passes also sum the weighted Gram matrix of all the
+  residualised columns (kept in `manifest.json`). A model's `X'WX`, `X'Wy` and `y'Wy` are
+  blocks of it, so coefficients, iid SEs, RSS and within R2 need **no pass**; hetero and CRV1
+  take one pass (residuals and meat). Several responses (`y1 + y2 ~ x`) share the pass.
+- **Clusters are declared at start** (`--cluster a,b`), like the variables: the nesting of
+  each FE in each cluster and the cluster counts (for the dof rules) are found while demeaning.
+- **Models** are `y ~ x1 + x2` on declared variables; the FE part may be left out or must be
+  the session's. Interactions of declared variables and `i()` terms are refused (an
+  interaction of demeaned columns is not the demeaned interaction; created variables are step
+  4). IV is step 6.
+- **Records.** Each model writes `result.json` and `result.estimation.json` (one per response)
+  in `models/<nnn>-<label>/`. The record is a normal dfeols record plus:
+  `provenance.execution.session` = the session id, the demeaned data as a `derived` data
+  entry, `specification.sample.restriction` naming the declared variables, and the call
+  `dfeols.Session.attach(name).fit(...)` (in `specification.call` and the dfeols replay).
+- **Requests.** `requests/<id>.json` (written atomically) -> `responses/<id>.json`; types
+  `attach`, `detach`, `fit`, `status`, `export`, `stop`. Errors come back in the response and
+  are logged as `error` events; the session keeps running.
+- **Folders.** `<scratch>/sessions/<name>/` (`session.json`, `requests/`, `responses/`,
+  `models/`, `results/index.jsonl`, `events.jsonl`, the collection), locked by the sibling
+  `<name>.lock`. A new run of a name moves the last run's files to `previous/<id>/`; if that
+  run's manager died, its collection is first rewritten from what it left, as `crashed`.
+  Demeaned data in `<scratch>/demeaned/<dataset>/<key>/` (`shards/part-*.parquet`, then
+  `manifest.json` last, so a manifest means complete), built under a DirLock on the key; a
+  later session with the same key loads it (`demeaned_loaded`). `--no-persist` keeps them in
+  the session folder and deletes them at the end. Each build appends to
+  `<scratch>/demeaned/timings.jsonl`, which `session start` uses for its estimate.
+- **Collection.** `session.estimation-collection.json` (`kind: "session"`) on `export`
+  (`open`) and at the end (`closed`; `timed_out` at walltime or idle; `crashed` as above),
+  through `estimation_format.new_collection`/`write_collection`: members in run order with
+  labels, `session` (id, times, status, clients, `fixed`), `provenance` (software,
+  environment, execution, the dataset and the demeaned data), `events`.
+- **Jobs.** `session start` with a SLURM profile submits the coordinator script running
+  `dfeols session serve` with walltime `--hours` (default 2) + 1.5 x the high end of the
+  demeaning estimate (1 h without history); on a local profile it starts the manager as a
+  detached process logging to `<scratch>/sessions/<name>.log`. SIGTERM closes cleanly.
+
+Not built: crossing FEs above `max_dummy_levels` (the sparse and plan C paths), progress
+streamed to the client and the per-model time estimate, `persist()` after `--no-persist`,
+`dfeols demeaned rm` and the scratch-quota check, `min_workers`/`max_workers` scaling while
+idle, and the replay of events.
 
 ## Open questions
 

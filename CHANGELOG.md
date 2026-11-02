@@ -8,6 +8,18 @@ break the API).
 ## [Unreleased]
 
 ### Added
+- Interactive sessions (`dfeols.Session`, `dfeols session start|serve|status|fit|export|stop`;
+  `docs/design/sessions.md`, build order step 2): a manager demeans the declared variables on
+  the session's FEs once (local FEs, crossing FEs as dense dummies), keeps the residualised
+  columns per shard and their Gram matrix, and fits `y ~ x` models from request files: b and
+  iid SEs with no pass over the data, hetero/CRV1 with one. Results equal `dfeols.fit` on the
+  same sample. Each model writes an `estimation` record carrying the session id; the session
+  writes an `estimation-collection/0.1` file (`kind: "session"`, with events) on export and
+  when it ends. Demeaned data are kept under `<scratch>/demeaned/<dataset>/<key>/` and reused
+  by a session with the same inputs.
+- `dfeols.write_collection(fits, path, kind=...)`: several fits (or records) as one
+  `estimation-collection/0.1` file, one member per response, with labels, locators,
+  publication, redaction and a members file above 16 MB; `record.prepare_estimation`.
 - Plan C in level space sums the shards' parts of A on the workers (Crossing-FE build): a
   balanced tree of combine tasks (`crossing.combine_parts`, four parts at a time, CSR sums,
   LevelGram's budget rules) runs as parts arrive, ahead of the shards still queued, and the

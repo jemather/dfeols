@@ -12,6 +12,7 @@ from .planner import plan
 from .prep import Dataset, prep
 from .record import write_collection
 from .results import Result
+from .session import Session
 from .site import profile
 
 __all__ = [
@@ -27,6 +28,7 @@ __all__ = [
     "profile",
     "LockedError",
     "write_collection",
+    "Session",
 ]
 __version__ = "0.7.0"
 

@@ -398,6 +398,9 @@ def main(argv=None):
     r.add_argument("-n", type=int, default=20)
     r.add_argument("--run", default=None, help="only this run id (prefix)")
     sub.add_parser("estimation", help="validate, redact or digest estimation records", add_help=False)
+    from . import session as _session
+
+    _session.add_parser(sub)
     args, rest = ap.parse_known_args(argv)
     if args.cmd == "bench":
         return bench_cmd(args, rest)
@@ -416,6 +419,7 @@ def main(argv=None):
         "jobscript": lambda: jobscript_cmd(args),
         "submit": lambda: submit_cmd(args),
         "check": lambda: check_cmd(args),
+        "session": lambda: _session.main(args),
     }[args.cmd]()
 
 
