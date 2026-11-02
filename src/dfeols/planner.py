@@ -48,7 +48,7 @@ FALLBACK = "plan C, a pass over the shards per CG step (A over the budget; may c
 
 SHARDS_PER_WORKER = 2  # balanced: largest group within target_rows or n / (this x workers)
 DEFAULT_WORKERS = 20  # the default profile's max_workers, when plan is given no profile
-CELLS_RATIO = 10  # recommend fit(cells=True) from this many rows per cell
+CELLS_RATIO = 2  # recommend fit(cells=True) from this many rows per cell (Ted, 2026-11-02)
 EXACT_PAIRS = 200_000_000  # most (group, level) pairs collected to count A's nonzeros exactly
 CHUNK_FLOPS = 50_000_000  # products per chunk of that count
 

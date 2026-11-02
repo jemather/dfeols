@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 import dfeols
 from dfeols.cli import main
 from dfeols.estimate import estimate_coordinator_gb
-from dfeols.planner import format_report
+from dfeols.planner import CELLS_RATIO, format_report
 from simdata import sim_panel
 
 
@@ -185,7 +185,7 @@ def test_plan_cells(data):
     c = r["cells"]
     cells = data.filter(pl.col("eng").is_finite()).select("id_a", "week").n_unique()
     assert c["key"] == ["id_a", "week"] and c["cells"] == cells
-    assert c["recommended"] == (r["sample_rows"] >= 10 * c["cells"]) and "cells" in format_report(r)
+    assert c["recommended"] == (r["sample_rows"] >= CELLS_RATIO * c["cells"]) and "cells" in format_report(r)
     assert not dfeols.plan(data, "eng ~ posts | spell | feat ~ eng2")["cells"]["eligible"]
 
 

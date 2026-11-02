@@ -234,8 +234,14 @@ On plan C keys it bounds A's nonzeros by min(sum_g t_ga t_gb, L_a L_b) over loca
 (exact with no local FE: the (a, b) pairs), and above the budget counts A's pattern exactly as
 B'B for the group x level incidence, in chunks, stopped at the budget, so the fallback warning
 comes before the run. Unbalanced keys get the bound only (counting near the budget took 45 s on
-DB1B 2005Q2-Q3). The report also gives the cell count and recommends the cell path from 10 rows
-per cell (proposed). DB1B 2005Q2-Q3 (10.4M rows, `| carrier^route + carrier^time +
+DB1B 2005Q2-Q3). The report also gives the cell count and recommends the cell path from 2 rows
+per cell (Ted, 2026-11-02; 10 was provisional). `scripts/cellbench.py` in the build area held N
+and the model fixed on DB1B 2005Q2-Q3 (10.3M rows, 4 local workers) and split cells by
+clustering at route^bK: the cell path was faster at every K, 7.6x at 27.8 rows per cell, 5.1x at
+10, 2.8x at 2.2 (11 s against 31), b within 1.1e-12. The default fit stayed at ~30 s; the cell
+path costs ~4 s plus ~1.6 s and ~1 GB of coordinator memory per million cells, so the coordinator
+memory estimate, not the ratio, limits it. Untested: below 2 rows per cell, and many more workers
+(the cell solve runs on the coordinator alone). DB1B 2005Q2-Q3 (10.4M rows, `| carrier^route + carrier^time +
 origin^time`): 373,730 cells (28 rows each); recommended key origin, 138 crossing levels on
 dense dummies; probe 3 s.
 
