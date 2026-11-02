@@ -206,6 +206,50 @@ def test_no_persist_removes_demeaned(ds, roots, tmp_path):
     assert not r["demeaned"].exists()
 
 
+def test_persist_after_no_persist(ds, tmp_path):
+    """persist() moves the data to the demeaned folder; the session keeps fitting from it,
+    it survives the end, and the next session with the same spec loads it."""
+    r = {"root": tmp_path / "s", "demeaned": tmp_path / "d"}
+    s = Session.start("pp", ds.root, "spell", ["eng", "feat"], persist=False, poll=0.05, **r)
+    before = Path(s.state()["demeaned"])
+    a = s.fit("eng ~ feat", vcov="hetero")
+    where = s.persist()
+    assert where.is_relative_to(r["demeaned"]) and (where / "manifest.json").exists()
+    assert not before.exists()
+    assert Path(s.state()["demeaned"]) == where
+    assert s.persist() == where  # again: a no-op
+    b = s.fit("eng ~ feat", vcov="hetero")
+    _same(a, b, rtol=0)
+    p = s.export()
+    s.stop()
+    assert (where / "manifest.json").exists()
+    coll = estimation.read_collection(p)
+    ev = [e for e in coll["events"] if e["type"] == "demeaned_persisted"]
+    assert len(ev) == 1 and ev[0]["detail"]["location"] == str(where)
+    assert coll["provenance"]["data"][-1]["location"] == str(where)
+
+    s2 = Session.start("pp2", ds.root, "spell", ["eng", "feat"], poll=0.05, **r)
+    c = s2.fit("eng ~ feat", vcov="hetero")
+    s2.stop()
+    _same(a, c, rtol=0)
+    ev = [json.loads(line) for line in (r["root"] / "pp2" / "events.jsonl").read_text().splitlines()]
+    assert ev[1]["type"] == "demeaned_loaded"
+
+
+def test_persist_when_key_already_kept(ds, tmp_path):
+    """If another session kept the same key meanwhile, persist() switches to that copy."""
+    r = {"root": tmp_path / "s", "demeaned": tmp_path / "d"}
+    s = Session.start("q1", ds.root, "spell", ["eng", "feat"], persist=False, poll=0.05, **r)
+    before = Path(s.state()["demeaned"])
+    kept = Session.start("q2", ds.root, "spell", ["eng", "feat"], poll=0.05, **r)
+    kept.stop()
+    where = s.persist()
+    assert not before.exists() and (where / "manifest.json").exists()
+    s.fit("eng ~ feat")
+    s.stop()
+    assert (where / "manifest.json").exists()
+
+
 def test_cli_serve_fit_stop(ds, tmp_path, capsys):
     """The manager as its own process (`dfeols session serve`), driven from the CLI."""
     import subprocess

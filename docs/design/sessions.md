@@ -1,7 +1,7 @@
 # Design: interactive sessions (fixed FEs, many models)
 
 Status: build order step 2 (session core) built 2026-11-02 in `src/dfeols/session.py`, with
-parts of step 3 (persisted data found by key and reused); see "As built" below. Steps 4-6 are
+parts of step 3 (persisted data found by key and reused, `persist()` after `--no-persist`); see "As built" below. Steps 4-6 are
 not built.
 
 ## Goal
@@ -256,7 +256,10 @@ within 5e-15.
   Demeaned data in `<scratch>/demeaned/<dataset>/<key>/` (`shards/part-*.parquet`, then
   `manifest.json` last, so a manifest means complete), built under a DirLock on the key; a
   later session with the same key loads it (`demeaned_loaded`). `--no-persist` keeps them in
-  the session folder and deletes them at the end. Each build appends to
+  the session folder and deletes them at the end, unless `s.persist()` (or `dfeols session
+  persist <name>`) moves them to the demeaned folder first (`demeaned_persisted` event, with
+  `from`); if that key was kept by another session meanwhile, the session switches to that
+  copy and deletes its own. Records written before the move keep the old location. Each build appends to
   `<scratch>/demeaned/timings.jsonl`, which `session start` uses for its estimate.
 - **Collection.** `session.estimation-collection.json` (`kind: "session"`) on `export`
   (`open`) and at the end (`closed`, also after `idle_minutes` idle (Ted 2026-11-02);
@@ -284,8 +287,7 @@ within 5e-15.
   The client prints the estimate, the model's progress lines (`models/<dir>/status.json`)
   and the time it took; the index and the fit's result keep the estimate beside the time.
 
-Not built: `persist()` after `--no-persist`,
-`dfeols demeaned rm` and the scratch-quota check, and the replay of events.
+Not built: `dfeols demeaned rm` and the scratch-quota check, and the replay of events.
 
 ## Open questions
 

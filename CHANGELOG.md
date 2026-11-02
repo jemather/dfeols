@@ -8,7 +8,7 @@ break the API).
 ## [Unreleased]
 
 ### Added
-- Interactive sessions (`dfeols.Session`, `dfeols session start|serve|status|fit|export|stop`;
+- Interactive sessions (`dfeols.Session`, `dfeols session start|serve|status|fit|export|persist|stop`;
   `docs/design/sessions.md`, build order step 2): a manager demeans the declared variables on
   the session's FEs once (local FEs, crossing FEs as dense dummies), keeps the residualised
   columns per shard and their Gram matrix, and fits `y ~ x` models from request files: b and
@@ -23,6 +23,9 @@ break the API).
   while a client waits; per model, an estimate before it runs (no pass, or rows x columns over
   the pass throughput measured in the session, calibrated on shard reads at first) and its
   progress lines. `progress.status_line` formats a status snapshot.
+  `Session.persist()` / `dfeols session persist`: a session started with `persist=False`
+  (`--no-persist`) moves its demeaned data to the demeaned folder, keeps fitting from there,
+  and leaves them for later sessions with the same inputs.
 - `dfeols.write_collection(fits, path, kind=...)`: several fits (or records) as one
   `estimation-collection/0.1` file, one member per response, with labels, locators,
   publication, redaction and a members file above 16 MB; `record.prepare_estimation`.

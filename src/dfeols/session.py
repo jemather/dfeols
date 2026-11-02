@@ -1230,6 +1230,39 @@ class Manager:
     def stop(self) -> None:
         self._stop.set()
 
+    def persist_data(self) -> dict:
+        """Keep the demeaned data after the session (for one started with persist=False):
+        move it from the session folder to <demeaned>/<dataset>/<key>/, where later sessions
+        with the same key load it. Requests are handled one at a time, so no model is reading
+        it during the move. Records written before keep the old location; the event says
+        where it went."""
+        if self.data is None:
+            raise RuntimeError("no demeaned data yet")
+        m = self.data.manifest
+        if self.persist:
+            return {"location": str(self.data.root), "already": True}
+        key = m["key"]
+        target = self.demeaned_dir / m["dataset"]["name"] / key
+        target.parent.mkdir(parents=True, exist_ok=True)
+        src = self.data.root
+        with DirLock(target, what="demeaned data"):
+            if (target / "manifest.json").exists():  # the same key was built by another session
+                self.data = Demeaned.open(target)
+                shutil.rmtree(src, ignore_errors=True)
+                moved = False
+            else:
+                shutil.rmtree(target, ignore_errors=True)  # an interrupted build
+                shutil.move(str(src), str(target))
+                self.data = Demeaned.open(target)
+                moved = True
+        self.persist = True
+        detail = {"key": key, "location": str(target), "from": str(src), "bytes": self.data.bytes()}
+        if not moved:
+            detail["note"] = "already persisted by another session; this session's copy deleted"
+        self.event("demeaned_persisted", detail=detail)
+        self._save_state()
+        return {"location": str(target), "already": False, "bytes": detail["bytes"]}
+
     def close(self, status: str = "closed") -> None:
         if self.status in ("closed", "timed_out", "crashed"):
             return
@@ -1305,6 +1338,8 @@ class Manager:
         if t == "stop":
             self.stop()
             return {}
+        if t == "persist":
+            return self.persist_data()
         raise ValueError(f"unknown request type {t!r}")
 
     def fit(self, req: dict) -> dict:
@@ -1792,6 +1827,15 @@ class Session:
         """Write the session collection now (status open); returns its path."""
         return Path(self._request("export", path=str(path) if path else None)["path"])
 
+    def persist(self) -> Path:
+        """Keep the demeaned data after the session ends (for a session started with
+        persist=False / --no-persist); later sessions with the same spec load it. Returns
+        where it is now; a no-op for a session that already persists."""
+        r = self._request("persist")
+        if not r.get("already"):
+            self._say(f"demeaned data kept in {r['location']}")
+        return Path(r["location"])
+
     def close(self) -> None:
         """Detach this client; the session keeps running."""
         if self.client:
@@ -2044,6 +2088,14 @@ def cmd_export(args) -> None:
         s.close()
 
 
+def cmd_persist(args) -> None:
+    s = Session.attach(args.name, root=args.root, profile=args.profile, timeout=args.timeout, progress=False)
+    try:
+        print(s.persist())
+    finally:
+        s.close()
+
+
 def cmd_stop(args) -> None:
     s = Session(args.name, root=args.root, profile=args.profile)
     st = s.state()
@@ -2097,6 +2149,9 @@ def add_parser(sub) -> None:
     common(q)
     q.add_argument("--path")
     q.add_argument("--timeout", type=float)
+    q = ss.add_parser("persist", help="keep a --no-persist session's demeaned data after it ends")
+    common(q)
+    q.add_argument("--timeout", type=float)
     q = ss.add_parser("stop", help="end a session")
     common(q)
 
@@ -2108,5 +2163,6 @@ def main(args) -> None:
         "status": cmd_status,
         "fit": cmd_fit,
         "export": cmd_export,
+        "persist": cmd_persist,
         "stop": cmd_stop,
     }[args.session_cmd](args)
