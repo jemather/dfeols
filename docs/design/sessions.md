@@ -215,10 +215,22 @@ within 5e-15.
 
 - **Demean once.** The declared variables are the outcome block of a worker `Plan` with no
   regressors, so the session reuses fit's singleton passes (`_drop_singletons`) and round-1
-  demeaning (`_prepare`, `_round1_dense`). Crossing FEs enter as dense dummies; their block
-  `D~'WD~` and `D~'WV~` are summed, `Gamma` solved once on the coordinator, and a second pass
-  writes `V~ - D~ Gamma`. Each shard's residualised columns go to one Parquet file with the
-  weights and each declared cluster's codes.
+  demeaning (`_prepare`, `_round1_dense`/`_round1_sparse`). Crossing FEs are absorbed one of
+  two ways (`crossing_fe`, default `auto`):
+  - **dense** (all crossing FEs within `max_dummy_levels`): dummies demeaned by the local FEs,
+    `D~'WD~` and `D~'WV~` summed, `Gamma` solved once on the coordinator;
+  - **iterate** (plan C, when any crossing FE is larger; added 2026-11-02): round 1 returns
+    the per-level sums `D'WV~` and each shard's part of `A = D~'WD~` (summed on the workers,
+    within `level_space_gb`), and `fit`'s CG (`_crossing_cg`, same preconditioners, `iter_tol`
+    default 1e-8) solves `A Gamma = D~'WV~` once for **all** declared variables together:
+    CG's cost is paid at start-up, never per model. Above the level-space budget each CG
+    step is a pass over the shards, with fit's slow-convergence warning.
+
+  A second pass writes `V~ - D~ Gamma` (plan C: `D Gamma`, each row's levels summed, demeaned
+  by the local FEs). Each shard's residualised columns go to one Parquet file with the
+  weights and each declared cluster's codes. Models are then exact OLS on these columns; on
+  plan C they carry CG's error in `Gamma` (tests: within 1e-7 of the dense solve at
+  `iter_tol=1e-10`).
 - **Gram matrix.** The demeaning passes also sum the weighted Gram matrix of all the
   residualised columns (kept in `manifest.json`). A model's `X'WX`, `X'Wy` and `y'Wy` are
   blocks of it, so coefficients, iid SEs, RSS and within R2 need **no pass**; hetero and CRV1
@@ -260,7 +272,7 @@ within 5e-15.
   and holds them for the whole session, idle or not (Ted 2026-11-02: once allocated for a
   slot they are kept; `cluster.executor(hold=True)`), with the manager job's walltime.
 
-Not built: crossing FEs above `max_dummy_levels` (the sparse and plan C paths), progress
+Not built: progress
 streamed to the client and the per-model time estimate, `persist()` after `--no-persist`,
 `dfeols demeaned rm` and the scratch-quota check, and the replay of events.
 

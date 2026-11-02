@@ -268,3 +268,66 @@ def test_idle_end_is_closed_and_hours_count_from_ready(ds, roots, tmp_path):
     coll = estimation.read_collection(r["root"] / "idle" / "session.estimation-collection.json")
     assert coll["session"]["status"] == "closed"
     assert coll["events"][-1]["message"].startswith("idle for")
+
+
+@pytest.mark.parametrize("level_space_gb", [None, 0])
+def test_crossing_fe_iterate(ds, tmp_path, level_space_gb):
+    """Crossing FEs above max_dummy_levels: plan C, one CG solve for every declared variable
+    (in level space, or with a pass per step when level_space_gb=0). Equal to the dense
+    solve's fit up to CG's tolerance."""
+    r = {"root": tmp_path / "s", "demeaned": tmp_path / "d"}
+    with pytest.warns(Warning) if level_space_gb == 0 else warnings.catch_warnings():
+        s = Session.start(
+            "it",
+            ds.root,
+            "spell + week",
+            VARS,
+            cluster="id_a, week",
+            max_dummy_levels=10,
+            level_space_gb=level_space_gb,
+            iter_tol=1e-10,
+            poll=0.05,
+            **r,
+        )
+    try:
+        m = json.loads((Path(s.state()["demeaned"]) / "manifest.json").read_text())
+        assert m["crossing"]["method"] == "iterate"
+        assert m["crossing"]["cg"]["mode"] == ("pass" if level_space_gb == 0 else "level")
+        assert [f["absorbed"] for f in m["fixed_effects"]] == ["local", "crossing_iterate"]
+        for kw in ({"cluster": "id_a", "vcov": ["CRV1", "hetero", "iid"]}, {"cluster": "week"}):
+            a = s.fit("eng ~ posts + feat", **kw)
+            b = _fit(ds, tmp_path / "f", "eng ~ posts + feat | spell + week", crossing_fe="dense", **kw)
+            assert a.N == b.N and a.coefnames == b.coefnames
+            np.testing.assert_allclose(a.coef(), b.coef(), rtol=1e-7)
+            for t in a.outcomes["eng"]["vcov"]:
+                np.testing.assert_allclose(a.vcov(type=t), b.vcov(type=t), rtol=1e-6)
+        rec = s.record(a)
+        issues = [i for i in estimation.validate(rec) if i.level != "info"]
+        assert not issues, "\n".join(map(str, issues))
+        num = rec["structures"]["numerics"]
+        assert "conjugate gradient" in num["algorithm"] and num["iterations"] == m["crossing"]["cg"]["steps"]
+    finally:
+        s.stop()
+
+
+def test_crossing_fe_only_iterate(ds, tmp_path):
+    """No local FE: the crossing FEs alone, by CG (they also span the constant)."""
+    r = {"root": tmp_path / "s", "demeaned": tmp_path / "d"}
+    with Session.start(
+        "w", ds.root, "week", ["eng", "feat"], max_dummy_levels=10, iter_tol=1e-10, poll=0.05, **r
+    ) as s:
+        a = s.fit("eng ~ feat", vcov="hetero")
+    b = _fit(ds, tmp_path / "f", "eng ~ feat | week", vcov="hetero")
+    np.testing.assert_allclose(a.coef(), b.coef(), rtol=1e-7)
+    np.testing.assert_allclose(a.vcov(), b.vcov(), rtol=1e-6)
+
+
+def test_dense_refuses_large_crossing_fe(ds, tmp_path):
+    m = Manager(
+        "d",
+        Spec.make(ds.root, "spell + week", ["eng"], max_dummy_levels=10, crossing_fe="dense"),
+        root=tmp_path / "s",
+        demeaned=tmp_path / "d",
+    )
+    with pytest.raises(ValueError, match="crossing_fe='iterate'"):
+        m.start()

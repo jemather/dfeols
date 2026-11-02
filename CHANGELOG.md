@@ -17,6 +17,8 @@ break the API).
   writes an `estimation-collection/0.1` file (`kind: "session"`, with events) on export and
   when it ends. Demeaned data are kept under `<scratch>/demeaned/<dataset>/<key>/` and reused
   by a session with the same inputs.
+  Crossing FEs above `max_dummy_levels` go by plan C: one CG solve, at start-up, for every
+  declared variable together (`crossing_fe`, `iter_tol`, `level_space_gb`, `crossing_precond`).
 - `dfeols.write_collection(fits, path, kind=...)`: several fits (or records) as one
   `estimation-collection/0.1` file, one member per response, with labels, locators,
   publication, redaction and a members file above 16 MB; `record.prepare_estimation`.

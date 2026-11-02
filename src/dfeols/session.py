@@ -34,6 +34,7 @@ from __future__ import annotations
 import dataclasses
 import datetime as _dt
 import hashlib
+import inspect
 import json
 import logging
 import os
@@ -123,6 +124,13 @@ class Spec:
     fe_tol: float = 1e-10
     fe_method: str = "auto"
     max_dummy_levels: int = 2000
+    # crossing FEs: "dense" dummies, "iterate" (plan C: one CG solve for every declared
+    # variable), or "auto": iterate when any crossing FE has more than max_dummy_levels
+    crossing_fe: str = "auto"
+    iter_tol: float = 1e-8
+    iter_maxiter: int = 5_000
+    level_space_gb: float | None = None
+    crossing_precond: str = "auto"
 
     @classmethod
     def make(cls, data, fe, variables, clusters=None, **kw) -> Spec:
@@ -156,11 +164,28 @@ class Spec:
                     "drop_singletons": self.drop_singletons,
                     "fe_tol": self.fe_tol,
                     "fe_method": self.fe_method,
+                    "crossing": self.crossing_method(ds),
+                    **({"iter_tol": self.iter_tol} if self.crossing_method(ds) == "iterate" else {}),
                 },
                 sort_keys=True,
             ).encode()
         )
         return h.hexdigest()[:16]
+
+    def crossing_method(self, ds: Dataset) -> str | None:
+        """How the crossing FEs are absorbed: "dense", "iterate", or None (none cross)."""
+        if self.crossing_fe not in ("auto", "dense", "iterate"):
+            raise ValueError(f"crossing_fe must be auto, dense or iterate, not {self.crossing_fe!r}")
+        levels = [
+            ds.fes[k]["n_levels"]
+            for k in ("^".join(fe_components(n)) for n in self.fe)
+            if k in ds.fes and not ds.fes[k]["nested_in_partition"]
+        ]
+        if not levels:
+            return None
+        if self.crossing_fe == "auto":
+            return "iterate" if max(levels) > self.max_dummy_levels else "dense"
+        return self.crossing_fe
 
 
 def _session_plan(spec: Spec, ds: Dataset, keep_dir: Path | None) -> tuple[Plan, list[dict]]:
@@ -188,13 +213,16 @@ def _session_plan(spec: Spec, ds: Dataset, keep_dir: Path | None) -> tuple[Plan,
         if m["nested_in_partition"]:
             local.append((key, m["column"]))
         else:
-            if m["n_levels"] > spec.max_dummy_levels:
-                raise NotImplementedError(
-                    f"FE {key!r} crosses the partition with {m['n_levels']:,} levels (> max_dummy_levels="
-                    f"{spec.max_dummy_levels}). Sessions take crossing FEs as dense dummies only for now; "
-                    "repartition so it is nested, or use dfeols.fit"
-                )
             glob.append((key, m["column"], m["n_levels"]))
+    method = spec.crossing_method(ds)
+    if method == "dense":
+        big = [(k, L) for k, _, L in glob if L > spec.max_dummy_levels]
+        if big:
+            raise ValueError(
+                f"FE {big[0][0]!r} crosses the partition with {big[0][1]:,} levels (> max_dummy_levels="
+                f"{spec.max_dummy_levels}); dense dummies would need rows x levels x 8 bytes per shard. "
+                "Use crossing_fe='iterate' (or 'auto')"
+            )
     clusters = []
     for c in spec.clusters:
         key = "^".join(fe_components(c))
@@ -239,6 +267,8 @@ def _session_plan(spec: Spec, ds: Dataset, keep_dir: Path | None) -> tuple[Plan,
         # every cluster's code column is read with the rows (prep drops rows missing a key,
         # so this deletes no extra rows); the raw ones hash into the records' row_key
         row_key_cols=tuple(sorted({*raw_key, *(c["column"] for c in clusters)})),
+        sparse_global=method == "iterate",
+        crossing_iterate=method == "iterate",
     )
     plan.raw_key = raw_key  # type: ignore[attr-defined]
     return plan, clusters
@@ -280,7 +310,15 @@ def demean_round1(plan: Plan, clusters: list[dict], sid: int, files: list[str], 
     df, n0, local_codes, w = _prepare(plan, sid, files, loaded)
     n = df.height
     T["read"] = time.perf_counter() - t0
-    Y, Yt, Zt, ZtZ, ZtY, converged, _ = _round1_dense(plan, df, n, local_codes, w, T)
+    aux = None
+    if plan.crossing_iterate:  # plan C: per-level sums D'W V~ and the shard's part of A
+        from .worker import _iter_store, _round1_sparse
+
+        _, Yt, _, _, _, extra, converged, aux = _round1_sparse(plan, sid, df, n0, local_codes, w, T, t0)
+        _iter_store(plan, sid, extra[0], extra[1], w)  # for CG steps with a pass each
+        Zt = ZtZ = ZtY = None
+    else:
+        _, Yt, Zt, ZtZ, ZtY, converged, _ = _round1_dense(plan, df, n, local_codes, w, T)
     r: dict[str, Any] = {
         "shard": sid,
         "rows_in": n0,
@@ -320,11 +358,26 @@ def demean_round1(plan: Plan, clusters: list[dict], sid: int, files: list[str], 
         r["clusters"][c["name"]] = {"present": np.unique(codes), "local_nested": nested, "global_minmax": gmm}
     names = list(plan.formula.depvars)
     if plan.global_fes:
-        r["ZtZ"], r["ZtY"] = ZtZ, ZtY
+        stage: dict[str, np.ndarray] = {"Y": Yt, "w": w, **{_cl_col(k): v for k, v in cls.items()}}
+        if aux is not None:
+            r["crossing"] = aux
+            offs = np.r_[0, np.cumsum([L for *_, L in plan.global_fes])[:-1]]
+            stage["G"] = (
+                np.stack(
+                    [df[c].to_numpy().astype(np.int64) + o for (_, c, _), o in zip(plan.global_fes, offs)]
+                )
+                if n
+                else np.zeros((len(plan.global_fes), 0), np.int64)
+            )
+            for i, lc in enumerate(local_codes):
+                stage[f"L{i}"] = lc
+        else:
+            r["ZtZ"], r["ZtY"] = ZtZ, ZtY
+            stage["Z"] = Zt
         p = _stage_path(out_dir, sid)
         p.parent.mkdir(parents=True, exist_ok=True)
         tmp = p.with_suffix(".tmp.npz")
-        np.savez(tmp, Y=Yt, Z=Zt, w=w, **{_cl_col(k): v for k, v in cls.items()})
+        np.savez(tmp, **stage)
         os.replace(tmp, p)
     else:
         r["gram"] = (Yt * w[:, None]).T @ Yt
@@ -335,16 +388,42 @@ def demean_round1(plan: Plan, clusters: list[dict], sid: int, files: list[str], 
     return r
 
 
-def demean_round2(sid: int, out: str, names: list[str], keep: np.ndarray, gamma: np.ndarray) -> dict:
-    """Per shard: partial the crossing-FE dummies out (V - D~ Gamma), write the final
-    columns, and return their Gram matrix."""
+def demean_round2(
+    sid: int, out: str, names: list[str], keep: np.ndarray | None, gamma: np.ndarray, plan: Plan | None = None
+) -> dict:
+    """Per shard: partial the crossing-FE dummies out (V~ - D~ Gamma), write the final
+    columns, and return their Gram matrix. Dense: D~ is the stage's demeaned dummy block.
+    Plan C (`plan` given): D~ Gamma is D Gamma (each row's levels summed) demeaned by the
+    local FEs."""
+    from .demean import demean
+
     t0 = time.perf_counter()
     out_dir = Path(out)
     p = _stage_path(out_dir, sid)
     with np.load(p) as d:
-        Yt, Zt, w = d["Y"], d["Z"], d["w"]
+        Yt, w = d["Y"], d["w"]
         cls = {k.removeprefix("__cl_"): d[k] for k in d.files if k.startswith("__cl_")}
-    V = Yt - Zt[:, keep] @ gamma if len(w) else Yt
+        if plan is None:
+            Zt = d["Z"]
+        else:
+            G = d["G"]
+            local = [
+                d[k]
+                for k in sorted((k for k in d.files if re.fullmatch(r"L\d+", k)), key=lambda s: int(s[1:]))
+            ]
+    if not len(w):
+        V = Yt
+    elif plan is None:
+        V = Yt - Zt[:, keep] @ gamma
+    else:
+        U = sum(gamma[g] for g in G)
+        if local:
+            U = demean(U, local, w, plan.fe_tol, plan.fe_maxiter, plan.fe_method)[0]
+        V = Yt - U
+    if plan is not None and plan.iter_token:
+        from .worker import _ITER_CACHE
+
+        _ITER_CACHE.pop((plan.iter_token, sid), None)
     _write_part(out_dir, sid, names, V, w, cls)
     p.unlink()
     return {
@@ -378,6 +457,21 @@ def model_meat(
 
 
 # ---------------------------------------------------------------- demean once
+
+
+def _level_reduce(gram, plan: Plan):
+    """Sum the shards' parts of A on the workers as they arrive (as fit's round 1)."""
+    import functools
+
+    from .crossing import combine_parts, part_of, without_part
+    from .executors import Reduce
+
+    return Reduce(
+        get=part_of,
+        strip=without_part,
+        combine=functools.partial(combine_parts, offs=gram.offs, max_nnz=plan.level_nnz),
+        done=lambda part: gram.add(part, None),
+    )
 
 
 class Demeaned:
@@ -442,7 +536,19 @@ def demean_once(
         },
     }
     k_tot = plan.n_dummy
-    if plan.global_fes:
+    reduce = None
+    if plan.crossing_iterate:
+        from .crossing import LevelGram, level_space_budget
+
+        plan.iter_token = f"{out}:{uuid.uuid4().hex}"
+        plan.level_nnz = level_space_budget(executor, spec.level_space_gb)
+        offs = np.r_[0, np.cumsum([L for *_, L in plan.global_fes])].astype(np.int64)
+        acc["DR"] = np.zeros((int(offs[-1]), len(names)))
+        acc["ddiag"] = np.zeros(int(offs[-1]))
+        if plan.level_nnz:
+            acc["gram_A"] = LevelGram(offs, [n for n, *_ in plan.global_fes], plan.level_nnz)
+            reduce = _level_reduce(acc["gram_A"], plan)
+    elif plan.global_fes:
         acc["ZtZ"] = np.zeros((k_tot, k_tot))
         acc["ZtY"] = np.zeros((k_tot, len(names)))
     local_of = {c["name"]: c["local"] for c in clusters}
@@ -461,6 +567,12 @@ def demean_once(
             acc["row_key"].append(r["row_key"])
         if "gram" in r:
             acc["gram"] += r["gram"]
+        elif "crossing" in r:
+            cr = r["crossing"]
+            acc["DR"][cr["idx"]] += cr["DR"]
+            acc["ddiag"][cr["idx"]] += cr["ddiag"]
+            if "gram_A" in acc and "part" in cr:  # else summed on the workers (reduce)
+                acc["gram_A"].add(cr["part"], tid)
         else:
             acc["ZtZ"] += r["ZtZ"]
             acc["ZtY"] += r["ZtY"]
@@ -481,19 +593,51 @@ def demean_once(
     ]
     prog.add_stage("demean", rows)
     prog.start("demean")
-    executor.run(demean_round1, tasks, on1, prog, "demean")
+    if reduce is not None and "reduce" in inspect.signature(executor.run).parameters:
+        prog.task_gb = None  # a shard's part of A is not in any estimate: a whole worker
+        executor.run(demean_round1, tasks, on1, prog, "demean", reduce=reduce)
+    else:
+        executor.run(demean_round1, tasks, on1, prog, "demean")
     prog.finish("demean")
-    crossing = {}
-    if plan.global_fes:
+    crossing: dict[str, Any] = {}
+    extra: tuple = ()
+    if plan.crossing_iterate:
+        from .estimate import _crossing_cg
+
+        # _crossing_cg reads A (a LevelGram) as "gram"
+        cg_acc = {"DR": acc["DR"], "ddiag": acc["ddiag"], "gram": acc.pop("gram_A", None)}
+        gamma = _crossing_cg(
+            plan,
+            ds,
+            executor,
+            prog,
+            rows,
+            cg_acc,
+            label,
+            spec.iter_tol,
+            spec.iter_maxiter,
+            spec.crossing_precond,
+        )
+        keep = None
+        extra = (plan,)
+        crossing = {"method": "iterate", "levels": int(len(acc["DR"])), "cg": cg_acc["cg"]}
+        from .worker import _ITER_CACHE
+
+        for k in [k for k in _ITER_CACHE if k[0] == plan.iter_token]:  # this process's (serial)
+            _ITER_CACHE.pop(k, None)
+    elif plan.global_fes:
         keep = collinear_keep(acc["ZtZ"], 1e-9)
         gamma, _ = solve_spd(acc["ZtZ"][np.ix_(keep, keep)], acc["ZtY"][keep])
-        crossing = {"dummies": int(k_tot), "kept": int(keep.sum())}
+        crossing = {"method": "dense", "dummies": int(k_tot), "kept": int(keep.sum())}
+    if plan.global_fes:
 
         def on2(tid, r):
             acc["rss_gb"] = max(acc["rss_gb"], r["timing"].get("maxrss_gb", 0.0))
             acc["gram"] += r["gram"]
 
-        tasks2 = [(s["id"], rows[s["id"]], (s["id"], str(out), names, keep, gamma)) for s in ds.shards]
+        tasks2 = [
+            (s["id"], rows[s["id"]], (s["id"], str(out), names, keep, gamma, *extra)) for s in ds.shards
+        ]
         prog.add_stage("partial_out", rows)
         prog.start("partial_out")
         executor.run(demean_round2, tasks2, on2, prog, "partial_out")
@@ -539,7 +683,11 @@ def demean_once(
         "load": acc["load"],
         "singletons": int(acc["rows_in"] - acc["n"]),
         "fixed_effects": [
-            {"name": n, "levels": L, "absorbed": "local" if i < len(plan.local_fes) else "crossing_dense"}
+            {
+                "name": n,
+                "levels": L,
+                "absorbed": "local" if i < len(plan.local_fes) else f"crossing_{crossing['method']}",
+            }
             for i, (n, L) in enumerate(zip(fe_names, fe_levels))
         ],
         "crossing": crossing,
@@ -726,11 +874,19 @@ def fit_model(
         "fe_tol": spec["fe_tol"],
         "fe_maxiter": m["fe_maxiter"],
         "fe_method": spec["fe_method"],
-        "crossing_fe": "dense" if m["crossing"] else None,
+        "crossing_fe": (m["crossing"] or {}).get("method"),
         "max_dummy_levels": spec["max_dummy_levels"],
         "collin_tol": collin_tol,
         "cache": False,
     }
+    if (m["crossing"] or {}).get("method") == "iterate":  # plan C: the record's numerics say CG
+        options.update(
+            iter_tol=spec["iter_tol"],
+            iter_maxiter=spec["iter_maxiter"],
+            level_space_gb=spec["level_space_gb"],
+            crossing_precond=spec["crossing_precond"],
+            crossing_cg=m["crossing"]["cg"],
+        )
     ds = Dataset.open(m["dataset"]["root"])
     run = _record.run_info(
         ds,
@@ -766,7 +922,7 @@ def fit_model(
     run["n_local_fes"] = sum(1 for fe in m["fixed_effects"] if fe["absorbed"] == "local")
     run["absorption"] = {
         fe["name"]: {
-            "method": "local" if fe["absorbed"] == "local" else "crossing_dense",
+            "method": fe["absorbed"],
             "nested_in_partition": fe["absorbed"] == "local",
         }
         for fe in m["fixed_effects"]
