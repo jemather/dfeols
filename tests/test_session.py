@@ -331,3 +331,27 @@ def test_dense_refuses_large_crossing_fe(ds, tmp_path):
     )
     with pytest.raises(ValueError, match="crossing_fe='iterate'"):
         m.start()
+
+
+def test_estimates_and_progress(ds, tmp_path, capsys):
+    r = {"root": tmp_path / "s", "demeaned": tmp_path / "d"}
+    with Session.start("p1", ds.root, "spell + week", ["eng", "feat"], cluster="id_a", poll=0.05, **r):
+        pass
+    assert (r["demeaned"] / "timings.jsonl").exists()
+    # a new key: the start-up estimate comes from the earlier run
+    s = Session.start("p2", ds.root, "spell + week", ["eng", "feat", "posts"], cluster="id_a", poll=0.05, **r)
+    try:
+        lo, hi = s.state()["demean_estimate_seconds"]
+        assert 0 < lo <= hi
+        capsys.readouterr()
+        s.fit("eng ~ feat", vcov="iid", label="a")
+        assert "no pass over the data" in capsys.readouterr().err
+        s.fit("eng ~ feat + posts", cluster="id_a", label="b")
+        err = capsys.readouterr().err
+        assert "estimated" in err and "read rate of" in err and "b: done in" in err
+        s.fit("eng ~ posts", vcov="hetero", label="c")
+        assert "measured in this session" in capsys.readouterr().err
+        idx = [json.loads(l) for l in (r["root"] / "p2" / "results" / "index.jsonl").read_text().splitlines()]
+        assert [m["estimate_seconds"] > 0 for m in idx] == [False, True, True]
+    finally:
+        s.stop()

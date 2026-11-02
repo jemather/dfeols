@@ -19,6 +19,10 @@ break the API).
   by a session with the same inputs.
   Crossing FEs above `max_dummy_levels` go by plan C: one CG solve, at start-up, for every
   declared variable together (`crossing_fe`, `iter_tol`, `level_space_gb`, `crossing_precond`).
+  Estimates and progress: the demeaning's estimate from earlier runs and its live progress
+  while a client waits; per model, an estimate before it runs (no pass, or rows x columns over
+  the pass throughput measured in the session, calibrated on shard reads at first) and its
+  progress lines. `progress.status_line` formats a status snapshot.
 - `dfeols.write_collection(fits, path, kind=...)`: several fits (or records) as one
   `estimation-collection/0.1` file, one member per response, with labels, locators,
   publication, redaction and a members file above 16 MB; `record.prepare_estimation`.

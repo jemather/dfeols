@@ -69,6 +69,7 @@ SESSION_FORMAT = "dfeols-session/1"
 DEMEANED_FORMAT = "dfeols-demeaned/1"
 COLLECTION_NAME = "session.estimation-collection.json"
 WEIGHT_COL = "__w"
+TASK_OVERHEAD = 0.005  # seconds a shard task costs beyond its reading (scheduling, results)
 VCOVS = ("iid", "hetero", "CRV1")
 _NAME = re.compile(r"^[A-Za-z0-9._-]+$")
 
@@ -102,6 +103,10 @@ def _read_json(path: Path) -> Any:
 def _append_jsonl(path: Path, obj: Any) -> None:
     with open(path, "a") as f:
         f.write(json.dumps(obj, default=_jsonable) + "\n")
+
+
+def _secs(s: float) -> str:
+    return fmt_td(s) if s >= 1 else f"{s:.1f} s"
 
 
 def _cl_col(name: str) -> str:
@@ -496,7 +501,13 @@ class Demeaned:
 
 
 def demean_once(
-    spec: Spec, ds: Dataset, out: Path, executor, label: str = "session", log_every: float = 30.0
+    spec: Spec,
+    ds: Dataset,
+    out: Path,
+    executor,
+    label: str = "session",
+    log_every: float = 30.0,
+    progress_dir: Path | None = None,
 ):
     """Demean every declared variable on all the session's FEs; write out/shards and
     out/manifest.json (last, so a manifest means the data are complete)."""
@@ -508,7 +519,7 @@ def demean_once(
     out.mkdir(parents=True, exist_ok=True)
     plan, clusters = _session_plan(spec, ds, out / "singletons")
     names = list(spec.variables)
-    prog = Progress(out, label=label, every=log_every)
+    prog = Progress(progress_dir or out, label=label, every=log_every)
     rows = {s["id"]: max(s["rows"], 1) for s in ds.shards}
     sing = {"passes": 0, "seconds": 0.0}
     if plan.keep_dir:
@@ -840,7 +851,9 @@ def fit_model(
         prog.add_stage("meat", rows)
         prog.start("meat")
         tasks = [(sid, 1, (d.part(sid), kept, ys, beta, vcov, cl)) for sid in d.shards]
+        t_meat = time.time()
         executor.run(model_meat, tasks, on, prog, "meat")
+        meat_seconds = time.time() - t_meat
         prog.finish("meat", log=False)
         if scores is not None:
             for j in range(len(ys)):
@@ -952,6 +965,7 @@ def fit_model(
         workdir=str(wd),
         timing={
             "passes": passes,
+            **({"meat_seconds": meat_seconds} if passes else {}),
             "n_shards": len(d.shards),
             **({"max_worker_rss_gb": meats["rss_gb"]} if passes else {}),
         },
@@ -1050,6 +1064,10 @@ class Manager:
         self.lock: DirLock | None = None
         self.data: Demeaned | None = None
         self._stop = threading.Event()
+        self.state_extra: dict[str, Any] = {}  # kept in session.json (estimates, progress file)
+        self.pass_rate: float | None = None  # row-columns per second of a model's pass, measured
+        self.calibration: tuple[float, int] | None = None  # (row-columns/s read, shards read)
+        self.progress_every = 2.0
 
     # ---- state on disk
     def _state(self, **extra) -> dict:
@@ -1070,6 +1088,7 @@ class Manager:
             "spec": dataclasses.asdict(self.spec),
             "demeaned": str(self.data.root) if self.data else None,
             "models": len(self.models),
+            **self.state_extra,
             **extra,
         }
 
@@ -1150,7 +1169,22 @@ class Manager:
                 self.event("demeaned_loaded", detail={"key": key, "location": str(where)})
                 return
             shutil.rmtree(where, ignore_errors=True)  # an interrupted build
-            self.data = demean_once(self.spec, ds, where, self.executor, label=f"session {self.name}")
+            est = estimate_seconds(self.demeaned_dir, ds.n_rows, len(self.spec.variables))
+            self.state_extra.update(
+                demean_estimate_seconds=list(est) if est else None,
+                progress="progress/demean/status.json",
+            )
+            self._save_state()
+            self.data = demean_once(
+                self.spec,
+                ds,
+                where,
+                self.executor,
+                label=f"session {self.name}",
+                log_every=self.progress_every,
+                progress_dir=self.dir / "progress" / "demean",
+            )
+            self.state_extra.pop("progress", None)
         self.event(
             "demeaned_persisted" if self.persist else "demeaned",
             detail={
@@ -1158,6 +1192,7 @@ class Manager:
                 "location": str(where),
                 "bytes": self.data.bytes(),
                 "seconds": self.data.manifest["seconds"],
+                "estimate_seconds": self.state_extra.get("demean_estimate_seconds"),
                 "rows": self.data.manifest["rows"],
                 "variables": self.data.names,
             },
@@ -1280,6 +1315,12 @@ class Manager:
         if not _NAME.match(label):
             raise ValueError(f"label must match {_NAME.pattern}: {label!r}")
         wd = self.dir / "models" / f"{n:03d}-{label}"
+        est = self.estimate(req)
+        if req.get("id"):
+            _write_json(
+                self.dir / "responses" / f"{req['id']}.accepted.json",
+                {"model_dir": str(wd.relative_to(self.dir)), **est, "accepted": _now()},
+            )
         res = fit_model(
             self.data,
             req["formula"],
@@ -1289,7 +1330,10 @@ class Manager:
             executor=self.executor,
             workdir=wd,
             session={"id": self.id, "name": self.name},
+            log_every=self.progress_every,
         )
+        if res.timing.get("meat_seconds"):
+            self.pass_rate = self.data.manifest["rows"] * est["columns"] / res.timing["meat_seconds"]
         recs = {}
         for y in res.outcomes:
             rec = session_record(res, y)
@@ -1306,6 +1350,7 @@ class Manager:
             "records": recs,
             "seconds": res.seconds,
             "passes": res.timing["passes"],
+            "estimate_seconds": est["estimate_seconds"],
             "finished": _now(),
         }
         self.models.append(entry)
@@ -1326,6 +1371,37 @@ class Manager:
             )
         self._save_state()
         return {"model": entry}
+
+    def estimate(self, req: dict) -> dict:
+        """A model's cost before it runs: passes x columns x the pass throughput measured in
+        this session (before the first pass: the demeaning's, which over-states the time)."""
+        _, ys, xs = _model_terms(req["formula"], self.spec.fe)
+        vcov = req.get("vcov") or (["CRV1"] if req.get("cluster") else ["iid"])
+        vcov = [vcov] if isinstance(vcov, str) else list(vcov)
+        passes = int(any(v in ("hetero", "CRV1") for v in vcov) and bool(xs))
+        cols = len(xs) + len(ys) + 1 + bool(req.get("cluster"))
+        rows = self.data.manifest["rows"]
+        if not passes:
+            return {"passes": 0, "columns": cols, "estimate_seconds": 0.0, "basis": "no pass"}
+        if self.pass_rate:
+            secs, basis = rows * cols / self.pass_rate, "measured in this session"
+        else:
+            rate, k = self.calibration or self._calibrate()
+            slots = max(int(self.executor.slots()[0] or 1), 1)
+            secs = rows * cols / (rate * slots) + TASK_OVERHEAD * len(self.data.shards) / slots
+            basis = f"read rate of {k} shard{'s' if k > 1 else ''}, {slots} worker{'s' if slots > 1 else ''}"
+        return {"passes": passes, "columns": cols, "estimate_seconds": secs, "basis": basis}
+
+    def _calibrate(self, k: int = 3) -> tuple[float, int]:
+        """Row-columns read per second by one process, from the largest few shard files
+        (a model's pass is mostly reading its columns)."""
+        d = self.data
+        parts = sorted(d.shards, key=lambda s: -Path(d.part(s)).stat().st_size)[:k]
+        cols = [*d.names, WEIGHT_COL]
+        t0 = time.perf_counter()
+        n = sum(pl.read_parquet(d.part(s), columns=cols).height for s in parts)
+        self.calibration = (max(n * len(cols), 1) / max(time.perf_counter() - t0, 1e-6), len(parts))
+        return self.calibration
 
     # ---- the session collection
     def session_block(self) -> dict:
@@ -1507,10 +1583,21 @@ class SessionError(RuntimeError):
 class Session:
     """A client of a running session (Python). The R client speaks the same files."""
 
-    def __init__(self, name: str, root=None, profile=None, *, manager: Manager | None = None, thread=None):
+    def __init__(
+        self,
+        name: str,
+        root=None,
+        profile=None,
+        *,
+        manager: Manager | None = None,
+        thread=None,
+        progress: bool = True,
+    ):
         self.name = name
         self.dir = sessions_root(profile, root) / name
         self.client: str | None = None
+        self.progress = progress  # print estimates and progress lines to stderr while waiting
+        self._shown: dict[str, Any] = {}
         self._manager = manager
         self._thread = thread
 
@@ -1558,9 +1645,12 @@ class Session:
         return s
 
     @classmethod
-    def attach(cls, name: str, root=None, profile=None, timeout: float | None = None) -> Session:
-        """Attach to a running session (waits for it to be ready)."""
-        s = cls(name, root=root, profile=profile)
+    def attach(
+        cls, name: str, root=None, profile=None, timeout: float | None = None, progress: bool = True
+    ) -> Session:
+        """Attach to a running session (waits for it to be ready, showing the demeaning's
+        progress)."""
+        s = cls(name, root=root, profile=profile, progress=progress)
         s._attach(timeout)
         return s
 
@@ -1576,6 +1666,12 @@ class Session:
                 )
             if timeout is not None and time.time() - t0 > timeout:
                 raise TimeoutError(f"session {self.name} not ready after {timeout:g} s")
+            if st:
+                est = st.get("demean_estimate_seconds")
+                if est and self._once("demean_estimate"):
+                    self._say(f"demeaning: estimated {fmt_td(est[0])} to {fmt_td(est[1])}")
+                if st.get("progress"):
+                    self._show_status(self.dir / st["progress"])
             time.sleep(0.5)
         r = self._request(
             "attach",
@@ -1593,7 +1689,46 @@ class Session:
         except (OSError, json.JSONDecodeError):
             return None
 
-    def _request(self, type: str, timeout: float | None = None, **payload) -> dict:
+    def _say(self, msg: str) -> None:
+        if self.progress:
+            print(f"[session {self.name}] {msg}", file=sys.stderr, flush=True)
+
+    def _once(self, key: str) -> bool:
+        if key in self._shown:
+            return False
+        self._shown[key] = True
+        return True
+
+    def _show_status(self, path: Path) -> None:
+        """Print a stage's status.json (Progress) when it has changed."""
+        from .progress import status_line
+
+        try:
+            snap = _read_json(path)
+        except (OSError, json.JSONDecodeError):
+            return
+        if snap.get("stages") and self._shown.get(str(path)) != snap.get("updated"):
+            self._shown[str(path)] = snap.get("updated")
+            self._say(status_line(snap))
+
+    def _watch_fit(self, rid: str) -> None:
+        acc = self.dir / "responses" / f"{rid}.accepted.json"
+        if not acc.exists():
+            return
+        try:
+            a = _read_json(acc)
+        except (OSError, json.JSONDecodeError):
+            return
+        if self._once(f"est:{rid}"):
+            e = a["estimate_seconds"]
+            self._say(
+                "no pass over the data (from the Gram matrix)"
+                if not a["passes"]
+                else f"estimated {_secs(e)}: {a['passes']} pass over {a['columns']} columns ({a['basis']})"
+            )
+        self._show_status(self.dir / a["model_dir"] / "status.json")
+
+    def _request(self, type: str, timeout: float | None = None, watch=None, **payload) -> dict:
         rid = f"{time.strftime('%Y%m%dT%H%M%S')}-{uuid.uuid4().hex[:8]}"
         req = {"id": rid, "type": type, "client": self.client, "sent": _now(), **payload}
         _write_json(self.dir / "requests" / f"{rid}.json", req)
@@ -1605,7 +1740,11 @@ class Session:
             st = self.state()
             if st and st["status"] not in ("ready", "starting") and not resp_path.exists():
                 raise SessionError(f"session {self.name} is {st['status']}")
+            if watch:
+                watch(rid)
             time.sleep(0.1)
+        if watch:  # a quick request may finish before the first look
+            watch(rid)
         resp = _read_json(resp_path)
         if not resp.get("ok"):
             raise SessionError(resp.get("error", "request failed"))
@@ -1621,8 +1760,19 @@ class Session:
         timeout: float | None = None,
     ) -> Result:
         """Fit `formula` (y ~ x1 + x2, declared variables; the FEs are the session's)."""
-        r = self._request("fit", timeout=timeout, formula=formula, vcov=vcov, cluster=cluster, label=label)
-        return Result.load(self.dir / r["model"]["dir"] / "result.json")
+        r = self._request(
+            "fit",
+            timeout=timeout,
+            watch=self._watch_fit,
+            formula=formula,
+            vcov=vcov,
+            cluster=cluster,
+            label=label,
+        )
+        m = r["model"]
+        if m["passes"] or m["seconds"] >= 1:
+            self._say(f"{m['label']}: done in {_secs(m['seconds'])}")
+        return Result.load(self.dir / m["dir"] / "result.json")
 
     def record(self, res: Result, y: str | None = None) -> dict:
         """The estimation record the session wrote for a model."""
@@ -1840,6 +1990,8 @@ def cmd_start(args) -> None:
                 break
             if st and st.get("status") == "failed":
                 sys.exit(f"session failed: {st.get('error')}")
+            if st and st.get("progress"):
+                s._show_status(s.dir / st["progress"])
             time.sleep(2)
     print(
         f"attach: dfeols.Session.attach({args.name!r}" + (f", root={str(root)!r}" if args.root else "") + ")"

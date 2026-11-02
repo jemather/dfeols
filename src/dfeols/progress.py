@@ -217,32 +217,11 @@ class Progress:
             "stages": stages,
             "eta_total_seconds": total_eta if total_known else None,
             "finish_time": _clock(now + total_eta) if total_known else None,
+            "note": self.note,
         }
 
     def line(self, snap: dict) -> str:
-        cur = next((s for s in snap["stages"] if not s["finished"]), snap["stages"][-1])
-        rps = cur["rows_per_sec_per_worker"]
-        parts = [
-            f"[{snap['label']} {cur['stage']}]",
-            f"{cur['tasks_done']}/{cur['tasks']} shards",
-            f"{cur['pct_rows']}% rows",
-            f"{snap['workers']} workers" + (f" (max {snap['max_workers']})" if snap["max_workers"] else ""),
-            f"{rps * max(snap['workers'], 1) / 1e6:.2f}M rows/s" if rps else "calibrating",
-            f"elapsed {fmt_td(snap['elapsed_seconds'])}",
-        ]
-        if cur["eta_seconds"] is not None:
-            e = f"stage ETA {fmt_td(cur['eta_seconds'])}"
-            if cur["eta_band_seconds"]:
-                lo, hi = cur["eta_band_seconds"]
-                e += f" ({fmt_td(lo)}-{fmt_td(hi)})"
-            parts.append(e)
-        if snap["eta_total_seconds"] is not None:
-            parts.append(f"total ETA {fmt_td(snap['eta_total_seconds'])} -> {snap['finish_time']}")
-        if cur.get("eta_seconds_at_max_workers") is not None:
-            parts.append(f"({fmt_td(cur['eta_seconds_at_max_workers'])} if all workers start)")
-        if self.note:
-            parts.append(self.note)
-        return " | ".join(parts)
+        return status_line(snap)
 
     def tick(self, force: bool = False):
         now = time.time()
@@ -270,3 +249,30 @@ class Progress:
             tmp = p.with_suffix(".tmp")
             tmp.write_text(json.dumps(snap, indent=1, default=float))
             os.replace(tmp, p)
+
+
+def status_line(snap: dict) -> str:
+    """One log line from a status snapshot (Progress.snapshot, or a status.json read back)."""
+    cur = next((s for s in snap["stages"] if not s["finished"]), snap["stages"][-1])
+    rps = cur["rows_per_sec_per_worker"]
+    parts = [
+        f"[{snap['label']} {cur['stage']}]",
+        f"{cur['tasks_done']}/{cur['tasks']} shards",
+        f"{cur['pct_rows']}% rows",
+        f"{snap['workers']} workers" + (f" (max {snap['max_workers']})" if snap["max_workers"] else ""),
+        f"{rps * max(snap['workers'], 1) / 1e6:.2f}M rows/s" if rps else "calibrating",
+        f"elapsed {fmt_td(snap['elapsed_seconds'])}",
+    ]
+    if cur["eta_seconds"] is not None:
+        e = f"stage ETA {fmt_td(cur['eta_seconds'])}"
+        if cur["eta_band_seconds"]:
+            lo, hi = cur["eta_band_seconds"]
+            e += f" ({fmt_td(lo)}-{fmt_td(hi)})"
+        parts.append(e)
+    if snap["eta_total_seconds"] is not None:
+        parts.append(f"total ETA {fmt_td(snap['eta_total_seconds'])} -> {snap['finish_time']}")
+    if cur.get("eta_seconds_at_max_workers") is not None:
+        parts.append(f"({fmt_td(cur['eta_seconds_at_max_workers'])} if all workers start)")
+    if snap.get("note"):
+        parts.append(snap["note"])
+    return " | ".join(parts)

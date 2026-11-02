@@ -272,8 +272,19 @@ within 5e-15.
   and holds them for the whole session, idle or not (Ted 2026-11-02: once allocated for a
   slot they are kept; `cluster.executor(hold=True)`), with the manager job's walltime.
 
-Not built: progress
-streamed to the client and the per-model time estimate, `persist()` after `--no-persist`,
+- **Estimates and progress** (2026-11-02). Before demeaning, `session start` and the manager
+  estimate it from `timings.jsonl` (rows x variables over earlier runs' throughput, as a
+  range) and put it in `session.json` with the path of the live progress file
+  (`progress/demean/status.json`, the usual `Progress` snapshot, refreshed every 2 s);
+  `Session.attach` and `session start --wait` print both while waiting. Per model, before it
+  runs, the manager writes `responses/<id>.accepted.json` with passes, columns and an
+  estimate: none needed when the Gram matrix answers it (b, iid), else rows x columns over
+  the pass throughput measured in this session, or, before the first pass, the read rate of
+  the three largest shard files (timed at the first estimate) times the connected workers.
+  The client prints the estimate, the model's progress lines (`models/<dir>/status.json`)
+  and the time it took; the index and the fit's result keep the estimate beside the time.
+
+Not built: `persist()` after `--no-persist`,
 `dfeols demeaned rm` and the scratch-quota check, and the replay of events.
 
 ## Open questions
