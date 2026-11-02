@@ -168,6 +168,16 @@ def test_partition_rule_smallest_crossing_subject_to_balance():
     assert r["recommended"] == "year"
     o = {x["key"]: x for x in r["options"]}
     assert not o["firm"]["balanced"] and any("unbalanced" in w for w in o["firm"]["warnings"])
+    # balance is relative to the workers: a firm with 8% of the rows is within half a
+    # worker's share of 4 workers (12.5%), not of 20 (2.5%)
+    big = d.with_columns(  # 50 years of 2% each, balanced either way
+        firm=pl.when(pl.arange(0, n) < 800).then(0).otherwise(pl.col("firm")), year=pl.arange(0, n) % 50
+    )
+    few = dfeols.plan(big, "y ~ x | firm + year", target_rows=100, workers=4)
+    many = dfeols.plan(big, "y ~ x | firm + year", target_rows=100, workers=20)
+    assert few["recommended"] == "firm" and few["max_balanced_group"] == 1250
+    assert many["recommended"] == "year" and many["max_balanced_group"] == 250
+    assert "20 workers" in format_report(many)
 
 
 def test_plan_cells(data):
@@ -193,6 +203,40 @@ def test_stats_from_cells_equal_scans(data, monkeypatch):
         for o in r["options"]:
             o.pop("A", None)  # not counted with EXACT_PAIRS 0
     assert a["fes"] == b["fes"] and a["sample_rows"] == b["sample_rows"] and a["cells"] == b["cells"]
-    assert [{k: v for k, v in o.items() if k not in ("solve", "path_text", "warnings")} for o in a["options"]] == [
-        {k: v for k, v in o.items() if k not in ("solve", "path_text", "warnings")} for o in b["options"]
-    ]
+    assert [
+        {k: v for k, v in o.items() if k not in ("solve", "path_text", "warnings")} for o in a["options"]
+    ] == [{k: v for k, v in o.items() if k not in ("solve", "path_text", "warnings")} for o in b["options"]]
+
+
+def test_prep_partition_auto(tmp_path):
+    # prep(partition="auto") shards by the key plan recommends and keeps the report; the fit
+    # equals one on shards by that key given explicitly
+    import numpy as np
+
+    rng = np.random.default_rng(1)
+    n = 6_000
+    d = pl.DataFrame({"firm": rng.integers(0, 60, n), "year": rng.integers(0, 8, n), "x": rng.normal(size=n)})
+    d = d.with_columns(y=pl.col("x") + pl.col("firm") * 0.01 + rng.normal(size=n))
+    f = "y ~ x | firm + year"
+    kw = dict(fixed_effects=["firm", "year"], clusters=["firm"], target_rows=800)
+    ds = dfeols.prep(d, shard_dir=tmp_path / "a", partition="auto", formula=f, **kw)
+    expect = dfeols.plan(d, f, cluster="firm", target_rows=800)["recommended"]
+    assert expect == "firm" and ds.partition == ["firm"]
+    assert (
+        ds.meta["partition_plan"]["recommended"] == "firm" and len(ds.meta["partition_plan"]["options"]) == 2
+    )
+    assert dfeols.Dataset.open(tmp_path / "a").meta["partition_plan"]["recommended"] == "firm"
+    by_hand = dfeols.prep(d, shard_dir=tmp_path / "b", partition="firm", **kw)
+    a = dfeols.fit(ds, f, vcov="CRV1", cluster="firm", workdir=str(tmp_path / "fa"), log_every=1e9)
+    b = dfeols.fit(by_hand, f, vcov="CRV1", cluster="firm", workdir=str(tmp_path / "fb"), log_every=1e9)
+    np.testing.assert_allclose(a.coef(), b.coef(), rtol=1e-12)
+    with pytest.raises(ValueError, match="needs formula"):
+        dfeols.prep(d, shard_dir=tmp_path / "c", partition="auto", **kw)
+    with pytest.raises(ValueError, match="not in fixed_effects"):
+        dfeols.prep(
+            d,
+            shard_dir=tmp_path / "c",
+            partition="auto",
+            formula="y ~ x | firm + year",
+            fixed_effects=["firm"],
+        )

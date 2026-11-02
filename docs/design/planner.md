@@ -227,7 +227,9 @@ path is `fit(cells=True)` (`cells.py`).
 
 **Partition rule and pre-run warning (built 2026-10-30).** `plan` ranks keys by the size of the
 crossing system (crossing levels; on plan C, level space before the fallback), after memory fit
-and shard balance (largest group within `target_rows` or 5% of the sample: proposed, for Ted).
+and shard balance (largest group within `target_rows` or half a worker's share of the sample,
+n / (2 x workers), workers from `plan(workers=)` or the profile's `max_workers`, else 20; Ted
+2026-11-02, replacing a flat 5%: a group of 5% is a whole worker's share at 20 workers).
 On plan C keys it bounds A's nonzeros by min(sum_g t_ga t_gb, L_a L_b) over local groups g
 (exact with no local FE: the (a, b) pairs), and above the budget counts A's pattern exactly as
 B'B for the group x level incidence, in chunks, stopped at the budget, so the fallback warning
@@ -363,7 +365,11 @@ paths multiply by the iteration range.
   (streaming, bounded memory), or as a short job for very large sources.
 - `dfeols.plan(source, formula, ...)` returns the same as a dict.
 - `prep(..., partition="auto")` runs the probe and uses the recommended key (Ted, 2026-10-28);
-  it logs the alternatives with their trade-offs, and an explicit key still wins.
+  it logs the alternatives with their trade-offs, and an explicit key still wins. *Built
+  (2026-11-02):* `prep(partition="auto", formula=...)` plans for that formula (its FEs among
+  `fixed_effects`, the cluster the one entry of `clusters`), with the executor's profile and
+  `max_workers`; the report is logged, the chosen key's warnings logged as warnings, and the
+  report kept in `dfeols_meta.json` under `partition_plan`.
 - `prep` and `fit` log the planner's verdict for the spec they were given, and `fit` refuses
   early, with the planner's explanation, where it now raises deep inside a run.
 

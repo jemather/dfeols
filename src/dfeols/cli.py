@@ -124,6 +124,7 @@ def plan_cmd(args):
         max_dummy_levels=args.max_dummy_levels,
         level_space_gb=args.level_space_gb,
         profile=args.profile,
+        workers=args.workers,
     )
     print(json.dumps(r, indent=1) if args.json else format_report(r))
 
@@ -387,6 +388,9 @@ def main(argv=None):
     pl_.add_argument("--max-dummy-levels", type=int, default=2000)
     pl_.add_argument("--level-space-gb", type=float, default=None, help="plan C's budget for A")
     pl_.add_argument("--profile", help="check memory against this site profile")
+    pl_.add_argument(
+        "--workers", type=int, help="workers for shard balance (default: the profile's max_workers)"
+    )
     pl_.add_argument("--json", action="store_true", help="print the report as JSON")
     r = sub.add_parser("results", help="benchmark results table")
     r.add_argument("root", nargs="?")

@@ -24,7 +24,7 @@ from pathlib import Path
 import numpy as np
 import polars as pl
 
-from .formula import fe_column, fe_components
+from .formula import fe_column, fe_components, parse
 from .rowhash import ALGORITHM as ROWSET
 from .rowhash import column_bits, hexdigest, rowset
 
@@ -224,6 +224,7 @@ def prep(
     *,
     shard_dir: str | os.PathLike,
     partition: str | list[str],
+    formula: str | None = None,
     fixed_effects: list[str] = (),
     clusters: list[str] = (),
     keep: list[str] | None = None,
@@ -240,6 +241,12 @@ def prep(
     shard_dir      Output directory. Put it on the shared scratch/temp filesystem.
     partition      Key whose groups never split across shards (e.g. "id_a").
                    FEs and clusters nested in this key are handled locally.
+                   "auto": `dfeols plan` picks it for `formula` (the smallest
+                   crossing system among balanced keys that fit); the report is
+                   logged and kept in dfeols_meta.json under "partition_plan".
+    formula        with partition="auto": the specification the shards are for
+                   (its FEs must be among fixed_effects; the cluster is the only
+                   entry of clusters, if there is one)
     fixed_effects  FE specs to encode, e.g. ["spell", "week", "id_a^week"].
                    Any FE used later in fit() must be listed here.
     clusters       Cluster variables to encode, e.g. ["id_a"].
@@ -255,8 +262,11 @@ def prep(
     """
     from .lock import DirLock
 
+    report = None
+    if isinstance(partition, str) and partition == "auto":
+        partition, report = _auto_partition(source, formula, fixed_effects, clusters, target_rows, executor)
     with DirLock(Path(shard_dir), what="shard folder"):
-        return _prep(
+        ds = _prep(
             source,
             shard_dir=shard_dir,
             partition=partition,
@@ -270,6 +280,44 @@ def prep(
             checksum=checksum,
             **dist_options,
         )
+        if report is not None:  # dfeols_meta.json marks a finished prep: replace it whole
+            m = dict(ds.meta, partition_plan=report)
+            tmp = Path(shard_dir) / (META + ".tmp")
+            tmp.write_text(json.dumps(m, indent=1))
+            os.replace(tmp, Path(shard_dir) / META)
+            ds = Dataset.open(shard_dir)
+    return ds
+
+
+def _auto_partition(source, formula, fixed_effects, clusters, target_rows, executor):
+    """partition="auto": the key `dfeols plan` recommends for `formula` (planner.md,
+    Interfaces; Ted 2026-10-28), with the report."""
+    from .planner import format_report, plan
+
+    if not formula:
+        raise ValueError('partition="auto" needs formula=, the specification the shards are for')
+    f = parse(formula)
+    have = {"^".join(fe_components(x)) for x in fixed_effects}
+    missing = ["^".join(fe_components(x)) for x in f.fes if "^".join(fe_components(x)) not in have]
+    if missing:
+        raise ValueError(f"the formula's FEs {missing} are not in fixed_effects")
+    if len(clusters) > 1:
+        raise ValueError('partition="auto" plans for one cluster; give at most one in clusters')
+    r = plan(
+        source,
+        formula,
+        cluster=clusters[0] if clusters else None,
+        target_rows=target_rows,
+        profile=getattr(executor, "profile", None),
+        workers=getattr(executor, "max_workers", None),
+    )
+    if not r["recommended"]:
+        raise ValueError("dfeols plan recommends no partition key for this formula:\n" + format_report(r))
+    log.info('prep: partition="auto" chose %s\n%s', r["recommended"], format_report(r))
+    best = r["options"][0]
+    for w in best["warnings"]:
+        log.warning("prep: partition %s: %s", best["key"], w)
+    return list(fe_components(r["recommended"])), r
 
 
 def _prep(

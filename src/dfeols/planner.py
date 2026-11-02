@@ -11,8 +11,9 @@ fit(cells=True). Everything is a Polars streaming aggregate on the source; nothi
 or written. Wall time and node classes are later steps.
 
 The recommended key is the one that makes the crossing system smallest (fewest crossing
-levels; on plan C, level space before the fallback) among keys whose largest group is within
-`target_rows` or MAX_GROUP_SHARE of the sample (Ted, 2026-10-29).
+levels; on plan C, level space before the fallback) among balanced keys (Ted, 2026-10-29): the
+largest group within `target_rows` or a 1/(SHARDS_PER_WORKER x workers) share of the sample, so
+no shard is more than half a worker's fair share of the work (Ted, 2026-11-02; was 5%).
 
 A is nested in K when n_unique(A) == n_unique(A, K), so each FE x key pair costs one
 distinct count; all of them run as one batch of group-bys over the source.
@@ -45,7 +46,8 @@ PATHS = {
 LEVEL_SPACE = "plan C in level space: A built in round 1, CG on the coordinator (2 passes)"
 FALLBACK = "plan C, a pass over the shards per CG step (A over the budget; may converge slowly)"
 
-MAX_GROUP_SHARE = 0.05  # a key is balanced if its largest group is within this or target_rows
+SHARDS_PER_WORKER = 2  # balanced: largest group within target_rows or n / (this x workers)
+DEFAULT_WORKERS = 20  # the default profile's max_workers, when plan is given no profile
 CELLS_RATIO = 10  # recommend fit(cells=True) from this many rows per cell
 EXACT_PAIRS = 200_000_000  # most (group, level) pairs collected to count A's nonzeros exactly
 CHUNK_FLOPS = 50_000_000  # products per chunk of that count
@@ -206,6 +208,7 @@ def plan(
     max_dummy_levels: int = 2000,
     level_space_gb: float | None = None,
     profile=None,
+    workers: int | None = None,
 ) -> dict:
     """Probe the FE structure of a specification and recommend a partition key and path.
 
@@ -218,6 +221,8 @@ def plan(
     level_space_gb  fit's budget for A on plan C (default: a quarter of the profile's
                 coordinator memory, else of this machine's)
     profile     site profile (name or Profile) to check worker and coordinator memory against
+    workers     workers the fit will run on, for shard balance (default: the profile's
+                max_workers, else DEFAULT_WORKERS)
 
     Returns a JSON-serialisable dict; `format_report` prints it.
     """
@@ -285,7 +290,11 @@ def plan(
     cells_df = None
     inside = [s for s in order if s <= set(cell_cols)]
     if len(inside) > 1:
-        est = sample.select(pl.struct(list(cell_cols)).hash().approx_n_unique()).collect(engine="streaming").item()
+        est = (
+            sample.select(pl.struct(list(cell_cols)).hash().approx_n_unique())
+            .collect(engine="streaming")
+            .item()
+        )
         if est <= EXACT_PAIRS:
             cells_df = sample.group_by(list(cell_cols)).agg(pl.len().alias("_w")).collect(engine="streaming")
     from_cells = set(inside) if cells_df is not None else set()
@@ -299,9 +308,9 @@ def plan(
                 for c in cols
             ],
         ),
-        sample.select(pl.len().alias("rows")) if cells_df is None else cells_df.lazy().select(
-            pl.col("_w").sum().alias("rows")
-        ),
+        sample.select(pl.len().alias("rows"))
+        if cells_df is None
+        else cells_df.lazy().select(pl.col("_w").sum().alias("rows")),
         *[
             _group_stats(cells_df.lazy(), sets[s], "_w") if s in from_cells else _group_stats(sample, sets[s])
             for s in order
@@ -346,6 +355,9 @@ def plan(
         coord_mem = _memory_bytes(profile.coordinator["memory"]) / 1e9
 
     budget = profile_budget(profile, level_space_gb)
+    if workers is None:
+        workers = (profile.worker.get("max_workers") if profile is not None else None) or DEFAULT_WORKERS
+    max_group = max(target_rows, n / (SHARDS_PER_WORKER * workers))
     # A's sizes need each key's distinct (group, level) pairs: take them from the distinct
     # cells (every FE and cluster column), collected once, not from a scan of all rows per
     # key and crossing FE (DB1B, 683M rows: 21M cells; 12 scans were 3 column sets)
@@ -381,7 +393,7 @@ def plan(
         kst = levels[k]
         n_bins = max(1, math.ceil(n / target_rows))
         shard_rows = max(kst["largest"] or 0, min(target_rows, n))
-        balanced = not kst["largest"] or kst["largest"] <= max(target_rows, MAX_GROUP_SHARE * n)
+        balanced = not kst["largest"] or kst["largest"] <= max_group
         a_size, solve = None, None
         if path == "C":
             # as estimate_worker_gb / estimate_coordinator_gb: no dummy columns or dense
@@ -393,7 +405,9 @@ def plan(
             memo = (tuple(gcols), tuple(sorted(glob)), balanced)  # keys with the same groups
             if memo not in a_sizes:  # and crossing FEs (DB1B: route, carrier^route) share A
                 src = pair_source({*gcols, *(c for a in glob for c in specs[a])})
-                a_sizes[memo] = _a_size(src, gcols, {a: specs[a] for a in glob}, g_levels, budget, count=balanced)
+                a_sizes[memo] = _a_size(
+                    src, gcols, {a: specs[a] for a in glob}, g_levels, budget, count=balanced
+                )
             a_size = a_sizes[memo]
             if a_size["bound"] <= budget or (a_size["exact"] and not a_size["over"]):
                 solve = "level"
@@ -411,7 +425,10 @@ def plan(
                 f"({kst['largest'] / max(n, 1):.0%} of the sample)"
             )
         if not balanced:
-            warnings.append(f"unbalanced: largest group over {MAX_GROUP_SHARE:.0%} of the sample")
+            warnings.append(
+                f"unbalanced: largest group over {max_group / max(n, 1):.1%} of the sample "
+                f"(1/{SHARDS_PER_WORKER} of a worker's share with {workers} workers)"
+            )
         if path == "dense" and n_dummy > 300:
             warnings.append(f"{n_dummy:,} dummy columns built densely in every shard")
         if solve in ("fallback", "maybe"):
@@ -522,6 +539,8 @@ def plan(
         "cluster": {"name": cl, "levels": levels[cl]["levels"]} if cl else None,
         "k_x": k_x,
         "target_rows": target_rows,
+        "workers": workers,
+        "max_balanced_group": int(max_group),
         "max_dummy_levels": max_dummy_levels,
         "profile": getattr(profile, "name", None),
         "options": ranked,
@@ -554,6 +573,11 @@ def format_report(r: dict) -> str:
         c = r["cluster"]
         out.append(f"  {c['name']:<{w}} {c['levels']:>12,} {'(cluster)':>11}")
     out.append("")
+    if "workers" in r:
+        out.append(
+            f"  balanced: largest group within {r['max_balanced_group']:,} rows "
+            f"(target_rows, or half a worker's share with {r['workers']} workers)"
+        )
     out.append(f"  {'partition':<{w}} {'largest group':>14} {'shards':>7}  path")
     for o in r["options"]:
         cross = ", ".join(f"{a} {L:,}" for a, L in o["crossing_fes"].items()) or "none"
