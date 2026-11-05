@@ -16,6 +16,8 @@ system (or one way of using it). `dfeols config init` writes a template.
     prologue = ["module load Python/3.12", "source $HOME/envs/dfeols/bin/activate"]
     interface = "auto"             # coordinator network interface ("auto" = private/internal)
     extra_directives = []          # e.g. ["--qos=long"] (Slurm) or ["-l place=scatter"] (PBS)
+    record_level = 5               # estimation records' disclosure level, 1-5 (default 4);
+                                   # 5 keeps the scheduler, timing, hosts and every package
 
     [profiles.mycluster.worker]
     cores = 8
@@ -59,6 +61,7 @@ DEFAULTS = {
     "interface": "auto",
     "extra_directives": [],
     "env": {},
+    "record_level": None,  # estimation records' disclosure level (estimation spec 4.9); None: 4
     "worker": {
         "cores": 8,
         "memory": "32GB",
@@ -103,6 +106,9 @@ prologue = [
 ]
 interface = "auto"             # coordinator NIC; "auto" picks a private (internal) address
 extra_directives = []          # raw scheduler directives, e.g. ["--qos=long"]
+# disclosure level of estimation records, 1-5 (default 4: no scheduler, timing, hosts or
+# package list); 5 keeps them, for diagnosing runs on this system
+# record_level = 5
 
 [profiles.cluster.worker]
 cores = 8
@@ -174,6 +180,7 @@ class Profile:
     max_walltime: str | None = None
     billing: str | None = None
     scratch_purge_days: int | None = None
+    record_level: int | None = None
     nodes: dict = field(default_factory=dict)
     source: str = ""
 
@@ -215,6 +222,8 @@ def profile(name: str | None = None, path=None, **overrides) -> Profile:
     d = _expand(_apply_overrides(_merge(DEFAULTS, profiles.get(name, {})), overrides))
     if d["scheduler"] not in SCHEDULERS:
         raise ValueError(f"scheduler must be one of {SCHEDULERS}, got {d['scheduler']!r}")
+    if d.get("record_level") is not None and d["record_level"] not in (1, 2, 3, 4, 5):
+        raise ValueError(f"record_level must be 1 to 5, got {d['record_level']!r}")
     for k in ("account", "queue", "project"):
         if d.get(k) == "":
             d[k] = None

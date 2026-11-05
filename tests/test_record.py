@@ -65,6 +65,7 @@ def _fit(ds, tmp_path, formula, **kw):
     return r, _check(tmp_path / "result.estimation.json")
 
 
+@pytest.mark.usefixtures("full_records")
 def test_default_record_fe_cluster(ds, tmp_path):
     r, rec = _fit(
         ds, tmp_path, "eng ~ feat:i(tbin) + posts | spell + week", cluster="id_a", vcov=["CRV1", "iid"]
@@ -197,6 +198,7 @@ def test_no_fe_intercept_and_collinear(ds, tmp_path):
     assert "r2" in rec["metrics"] and rec["meta"]["messages"][0]["code"] == "collinear"
 
 
+@pytest.mark.usefixtures("full_records")
 def test_redacted_record(ds, tmp_path):
     _fit(ds, tmp_path, "eng ~ feat + posts | spell", cluster="id_a", redact=True)
     rec = _check(tmp_path / "result.estimation.json")
@@ -309,6 +311,7 @@ def test_record_failure_does_not_fail_fit(ds, tmp_path, monkeypatch):
     assert (tmp_path / "result.json").exists() and r.N > 0
 
 
+@pytest.mark.usefixtures("full_records")
 def test_slurm_fields_and_their_redaction(ds, tmp_path, monkeypatch):
     env = {
         "SLURM_JOB_ID": "35448540",
@@ -331,6 +334,7 @@ def test_slurm_fields_and_their_redaction(ds, tmp_path, monkeypatch):
     assert red["provenance"]["execution"]["scheduler"]["Partition"] == "normal"
 
 
+@pytest.mark.usefixtures("full_records")
 def test_dask_executor_and_profile(ds, tmp_path):
     from types import SimpleNamespace
 
@@ -461,6 +465,7 @@ def test_source_checksum_frame(ds, data, tmp_path):
     assert inp[0]["checksum"] == src["checksum"]
 
 
+@pytest.mark.usefixtures("full_records")
 def test_source_checksum_files_and_prep_drops(data, tmp_path):
     import hashlib
 
@@ -518,3 +523,76 @@ def test_fit_logs_which_dfeols(ds, tmp_path, caplog):
         dfeols.fit(ds, "eng ~ feat | spell + week", workdir=str(tmp_path), log_every=1e9)
     (line,) = [r.getMessage() for r in caplog.records if f"dfeols {dfeols.__version__}" in r.getMessage()]
     assert dfeols_source()["commit"][:7] in line and str(Path(dfeols.__file__).parent) in line
+
+
+# ---------------------------------------------------------------- disclosure levels
+
+
+def test_records_are_level_4_by_default(ds, tmp_path, monkeypatch):
+    monkeypatch.delenv("DFEOLS_RECORD_LEVEL", raising=False)
+    _, rec = _fit(ds, tmp_path, "eng ~ posts | spell + week", cluster="id_a")
+    assert rec["meta"]["disclosure"] == {"level": 4}
+    prov = rec["provenance"]
+    assert set(prov) <= {"software", "data", "execution"} and "agent" not in prov
+    assert {s["role"] for s in prov["software"]} <= {"estimator", "language", "writer"}
+    assert "dask" not in rec["extensions"]["dfeols"] and "folder" not in rec["extensions"]["dfeols"]["shards"]
+    assert rec["meta"]["profiles"] == ["inference/0.1", "linear-fe/0.1", "dfeols/0.1"]
+
+
+@pytest.mark.parametrize("level", [1, 2, 3])
+def test_record_level_argument(ds, tmp_path, level):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # profile claims the level drops
+        _, rec = _fit(ds, tmp_path, "eng ~ posts | spell + week", cluster="id_a", record_level=level)
+    assert rec["meta"]["disclosure"] == {"level": level}
+    assert "provenance" not in rec and "extensions" not in rec
+    assert estimation.record_level(rec) <= level
+
+
+def test_record_level_from_the_environment_and_the_profile(monkeypatch):
+    monkeypatch.setenv("DFEOLS_RECORD_LEVEL", "2")
+    assert record.record_level() == 2
+    assert record.record_level(3) == 3
+
+    class Ex:
+        profile = dfeols.site.Profile(
+            name="x",
+            scheduler="local",
+            queue=None,
+            account=None,
+            project=None,
+            scratch=None,
+            prologue=[],
+            interface=None,
+            extra_directives=[],
+            env={},
+            worker={},
+            coordinator={},
+            record_level=5,
+        )
+
+    assert record.record_level(None, Ex()) == 5
+    monkeypatch.delenv("DFEOLS_RECORD_LEVEL")
+    assert record.record_level() is None
+    with pytest.raises(ValueError, match="1 to 5"):
+        record.record_level(7)
+
+
+def test_profile_record_level_is_read_from_the_config(tmp_path):
+    cfg = tmp_path / "config.toml"
+    cfg.write_text('[profiles.hpc]\nscheduler = "slurm"\nrecord_level = 5\n')
+    assert dfeols.site.profile("hpc", path=cfg).record_level == 5
+    cfg.write_text('[profiles.hpc]\nscheduler = "slurm"\nrecord_level = 9\n')
+    with pytest.raises(ValueError, match="record_level"):
+        dfeols.site.profile("hpc", path=cfg)
+
+
+def test_collection_at_a_level(ds, tmp_path):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        r = dfeols.fit(ds, "eng ~ posts | spell + week", cluster="id_a", workdir=tmp_path / "w", record=False)
+        out = dfeols.write_collection({"a": r}, tmp_path / "c.estimation-collection.json", level=2)
+    assert out["meta"]["disclosure"] == {"level": 2}
+    assert out["members"][0]["record"]["meta"]["disclosure"] == {"level": 2}
+    back = estimation.read_collection(tmp_path / "c.estimation-collection.json")
+    assert not [i for i in estimation.validate_collection(back, base_dir=tmp_path) if i.level == "error"]

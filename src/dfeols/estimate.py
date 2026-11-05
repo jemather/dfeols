@@ -750,6 +750,8 @@ def fit(
     record: bool | str | os.PathLike = True,
     publication: dict | None = None,
     redact: bool = False,
+    record_level: int | None = None,
+    purpose: str | list[str] | None = None,
     estimator: str = "2sls",
     fuller: float | None = None,
 ) -> Result:
@@ -765,6 +767,10 @@ def fit(
                several responses), a path puts them there, False skips them
     publication  `publication` block for the record (citation, locator, links)
     redact     leave identifying details (user, host, paths, job ids) out of the record
+    record_level  disclosure level of the record, 1-5 (estimation spec 4.9): default the
+               executor profile's `record_level`, else $DFEOLS_RECORD_LEVEL, else 4 (or what
+               `purpose` needs). 5 keeps the scheduler, timing, hosts and every package
+    purpose    purpose profiles the record is for, e.g. "aea/0.1"
     estimator  IV formulas (`y ~ x | fe | d ~ z`): "2sls" (default) or "liml"
     fuller     Fuller's modified LIML with constant a (estimator="liml"); a=1 is common
     crossing_fe  how FEs that cross the partition are absorbed: "dense" dummy columns,
@@ -1252,7 +1258,13 @@ def fit(
     if record:
         rpath = wd / "result.estimation.json" if record is True else Path(record)
         try:
-            res.write_estimation(rpath, publication=publication, redact=redact)
+            res.write_estimation(
+                rpath,
+                publication=publication,
+                redact=redact,
+                level=_record.record_level(record_level, executor),
+                purpose=purpose,
+            )
             log.info("fit %s: record %s", label, rpath)
         except Exception:  # the fit is done and saved; a record can be rewritten from result.json
             log.exception("fit %s: writing the estimation record failed", label)

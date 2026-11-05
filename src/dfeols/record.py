@@ -87,6 +87,27 @@ SLURM_ENV = {
 CPU_FLAGS = ("sse4_2", "avx", "avx2", "fma", "avx512f", "avx512dq", "avx512bw", "avx512vl")
 
 
+def record_level(level: int | None = None, executor: Any = None) -> int | None:
+    """The disclosure level to write records at (estimation spec 4.9): `level` if given,
+    else the executor's site profile's `record_level`, else $DFEOLS_RECORD_LEVEL, else None
+    (the format's default, 4, or what a purpose needs). An HPC profile can set
+    `record_level = 5` so its runs keep the scheduler, timing and hosts."""
+    if level is None:
+        prof = getattr(executor, "profile", None)
+        level = getattr(prof, "record_level", None)
+    if level is None and os.environ.get("DFEOLS_RECORD_LEVEL"):
+        level = os.environ["DFEOLS_RECORD_LEVEL"]
+    if level is None:
+        return None
+    try:
+        level = int(level)
+    except (TypeError, ValueError):
+        raise ValueError(f"record level must be 1 to 5, got {level!r}") from None
+    if level not in ef.LEVELS:
+        raise ValueError(f"record level must be 1 to 5, got {level}")
+    return level
+
+
 def _utc(t: float) -> str:
     return _dt.datetime.fromtimestamp(t, _dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
@@ -888,11 +909,15 @@ def write_estimation(
     redact: bool = False,
     digest: bool = True,
     spill_large: bool = True,
+    level: int | None = None,
+    purpose: str | list[str] | None = None,
     **kwargs: Any,
 ) -> dict:
     """Write the record of response `y` to `path` (`<name>.estimation.json`); returns it
-    as written. `redact=True` removes the identifying fields; other keywords go to
-    `to_estimation`. For every response of a fit, see `write_estimations`."""
+    as written. `level` is the disclosure level (1-5, default 4 or what `purpose` needs;
+    see `record_level`); `purpose` names purpose profiles such as "aea/0.1". `redact=True`
+    removes the identifying fields; other keywords go to `to_estimation`. For every response
+    of a fit, see `write_estimations`."""
     from . import __version__
 
     rec = to_estimation(result, y, **kwargs)
@@ -903,6 +928,8 @@ def write_estimation(
         spill_large=spill_large,
         redact_identifying=identifying_paths(rec) if redact else False,
         by={"name": "dfeols", "version": __version__},
+        level=record_level(level),
+        purpose=purpose,
     )
 
 
@@ -915,11 +942,18 @@ def write_estimations(result, path: str | os.PathLike, **kwargs: Any) -> dict[st
 
 
 def prepare_estimation(
-    result, y: str | None = None, *, redact: bool = False, digest: bool = True, **kwargs
+    result,
+    y: str | None = None,
+    *,
+    redact: bool = False,
+    digest: bool = True,
+    level: int | None = None,
+    purpose: str | list[str] | None = None,
+    **kwargs,
 ) -> dict:
     """The record of response `y` as `write_estimation` would write it (encoded, `meta.id`,
-    history, digest; optionally redacted), in memory and without spilling. Other keywords
-    go to `to_estimation`."""
+    history, digest, at its disclosure level; optionally redacted), in memory and without
+    spilling. Other keywords go to `to_estimation`."""
     from . import __version__
 
     rec = to_estimation(result, y, **kwargs)
@@ -928,6 +962,8 @@ def prepare_estimation(
         digest=digest,
         redact_identifying=identifying_paths(rec) if redact else False,
         by={"name": "dfeols", "version": __version__},
+        level=record_level(level),
+        purpose=purpose,
     )
 
 
@@ -981,6 +1017,8 @@ def write_collection(
     title: str | None = None,
     tags: list[str] | None = None,
     notes: str | None = None,
+    level: int | None = None,
+    purpose: str | list[str] | None = None,
     **kwargs: Any,
 ) -> dict:
     """Write several fits as one `estimation-collection/0.1` file (estimation spec section 11)
@@ -997,6 +1035,11 @@ def write_collection(
     publication  the collection's `publication` (the paper; members carry the locators)
     redact     leave identifying details out of the members and the collection
     members    "auto" (embed unless above 16 MB), "embed" or "jsonl" (a members file)
+    level      disclosure level of the collection and its members (estimation spec 4.9, 11.7):
+               fits are written at it (default 4, see `record_level`), records above it are
+               lowered (new records with meta.parent). With only records and no `level`,
+               no level is declared and the records stay as they are
+    purpose    purpose profiles for the fits' records, e.g. "aea/0.1"
 
     Large structures of a member (a vcov above 10,000 elements) go to side files next to the
     collection, as `write_estimation` does for a record. Records passed in are kept as they
@@ -1007,6 +1050,11 @@ def write_collection(
     stem = path.name.removesuffix(".json").removesuffix(".estimation-collection")
     by = {"name": "dfeols", "version": __version__}
     items = _collection_items(fits, labels)
+    level = record_level(level)
+    if level is None and any(not isinstance(f, dict) for _, f, _ in items):
+        purposes = [purpose] if isinstance(purpose, str) else list(purpose or [])
+        sc = ef.load_schemas()
+        level = max(ef.min_level(p, sc) for p in purposes) if purposes else ef.DEFAULT_LEVEL
     recs = []
     for i, (lab, f, y) in enumerate(items):
         if isinstance(f, dict):
@@ -1017,7 +1065,9 @@ def write_collection(
                 rec = ef.redact(rec, paths=identifying_paths(rec), by=by)
                 ef.add_digest(rec)
         else:
-            rec = prepare_estimation(f, y, redact=redact, digest=False, **kwargs)
+            rec = prepare_estimation(
+                f, y, redact=redact, digest=False, level=level, purpose=purpose, **kwargs
+            )
             tag = re.sub(r"[^A-Za-z0-9._-]", "_", lab) if lab else f"m{i + 1}"
             ef.spill(rec, path.parent, f"{stem}.{tag}")
             ef.add_digest(rec)
@@ -1034,6 +1084,7 @@ def write_collection(
         provenance=provenance,
         sha256=sha256,
         producer=by,
+        level=level,
         **meta,
     )
     if redact and (session is not None or provenance is not None):

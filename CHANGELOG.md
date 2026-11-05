@@ -8,6 +8,13 @@ break the API).
 ## [Unreleased]
 
 ### Added
+- Disclosure levels for `estimation` records and collections (estimation spec 4.9, 11.7):
+  `fit(record_level=, purpose=)`, `write_estimation`, `prepare_estimation` and
+  `write_collection` take `level`/`purpose`; session models and the session collection use the
+  same level. The level is the argument, else the site profile's `record_level`, else
+  `$DFEOLS_RECORD_LEVEL`, else 4 (`record.record_level`). **Records are level 4 by default**:
+  no scheduler, timing, hosts, Dask block, shard folder or package list; set
+  `record_level = 5` in an HPC profile to keep them. estimation-format pinned to ddc864f.
 - Interactive sessions (`dfeols.Session`, `dfeols session start|serve|status|fit|export|persist|stop`;
   `docs/design/sessions.md`, build order step 2): a manager demeans the declared variables on
   the session's FEs once (local FEs, crossing FEs as dense dummies), keeps the residualised

@@ -112,3 +112,10 @@ def synth(request, tmp_path_factory):
             overwrite=True,
         )
     return {"raw": raw, "ds": ds, "truth": truth, "base": base, "dgp": d}
+
+
+@pytest.fixture
+def full_records(monkeypatch):
+    """Records at disclosure level 5 (estimation spec 4.9: scheduler, timing, hosts, every
+    package), for the tests of what a full record holds. The default is 4."""
+    monkeypatch.setenv("DFEOLS_RECORD_LEVEL", "5")

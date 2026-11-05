@@ -142,6 +142,7 @@ def test_second_manager_same_name_fails(sess, ds, roots):
         m.start()
 
 
+@pytest.mark.usefixtures("full_records")
 def test_collection_and_reuse(ds, roots, tmp_path):
     s = _start("coll", ds, roots)
     a1 = s.fit("eng ~ posts + feat", cluster="id_a", label="base")
@@ -206,6 +207,7 @@ def test_no_persist_removes_demeaned(ds, roots, tmp_path):
     assert not r["demeaned"].exists()
 
 
+@pytest.mark.usefixtures("full_records")
 def test_persist_after_no_persist(ds, tmp_path):
     """persist() moves the data to the demeaned folder; the session keeps fitting from it,
     it survives the end, and the next session with the same spec loads it."""

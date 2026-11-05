@@ -1373,7 +1373,12 @@ class Manager:
         for y in res.outcomes:
             rec = session_record(res, y)
             name = "result.estimation.json" if len(res.outcomes) == 1 else f"result.{y}.estimation.json"
-            rec = ef_write(rec, wd / name, by={"name": "dfeols", "version": _version()})
+            rec = ef_write(
+                rec,
+                wd / name,
+                by={"name": "dfeols", "version": _version()},
+                level=_record_level(None, self.executor),
+            )
             recs[y] = {"id": rec["meta"]["id"], "path": str((wd / name).relative_to(self.dir))}
         entry = {
             "n": n,
@@ -1506,7 +1511,13 @@ class Manager:
     def write_collection(self, path=None) -> Path:
         path = Path(path) if path else self.dir / COLLECTION_NAME
         _write_session_collection(
-            self.dir, self.models, self.events, self.session_block(), self.provenance_block(), path
+            self.dir,
+            self.models,
+            self.events,
+            self.session_block(),
+            self.provenance_block(),
+            path,
+            level=_record_level(None, self.executor) or _default_level(),
         )
         return path
 
@@ -1517,7 +1528,29 @@ def _version() -> str:
     return __version__
 
 
-def _write_session_collection(sdir: Path, models, events, session: dict, provenance: dict | None, path: Path):
+def _record_level(level, executor):
+    from .record import record_level
+
+    return record_level(level, executor)
+
+
+def _default_level() -> int:
+    import estimation_format as ef
+
+    return ef.DEFAULT_LEVEL
+
+
+def _write_session_collection(
+    sdir: Path,
+    models,
+    events,
+    session: dict,
+    provenance: dict | None,
+    path: Path,
+    level: int | None = None,
+):
+    """The session's collection, at `level` (the level its records were written at; when
+    None, the highest level the records declare, so nothing is cut)."""
     import estimation_format as ef
 
     recs, labels = [], []
@@ -1525,6 +1558,10 @@ def _write_session_collection(sdir: Path, models, events, session: dict, provena
         for y, r in mdl["records"].items():
             recs.append(ef.read(sdir / r["path"], nonfinite="string"))
             labels.append(mdl["label"] if len(mdl["records"]) == 1 else f"{mdl['label']}.{y}")
+    if level is None:
+        declared = [(r.get("meta") or {}).get("disclosure", {}).get("level") for r in recs]
+        level = max([d for d in declared if isinstance(d, int)], default=ef.DEFAULT_LEVEL)
+    level = max(level, 4)  # a session collection needs level 4 or more (spec 11.7)
     coll = ef.new_collection(
         recs,
         kind="session",
@@ -1534,6 +1571,7 @@ def _write_session_collection(sdir: Path, models, events, session: dict, provena
         provenance=provenance,
         title=f"session {session['fixed']['name']}",
         producer={"name": "dfeols", "version": _version()},
+        level=level,
     )
     return ef.write_collection(coll, path, by={"name": "dfeols", "version": _version()})
 
