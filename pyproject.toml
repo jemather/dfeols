@@ -45,7 +45,7 @@ dependencies = [
   "psutil>=5.9",
   # estimation records (reader, writer, validator, schemas). Pinned to a commit until
   # estimation-format is on PyPI; dfeols can't be released to PyPI before then.
-  "estimation-format @ git+https://github.com/estimation-format/estimation@ddc864f42590f58f0c6d643959cf0f07b6b75fd2",
+  "estimation-format @ git+https://github.com/estimation-format/estimation@3ecc14efebb71c25d0ddde9cf8bf1df7871c8348",
   "tomli>=2.0; python_version < '3.11'",
 ]
 

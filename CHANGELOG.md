@@ -14,7 +14,9 @@ break the API).
   same level. The level is the argument, else the site profile's `record_level`, else
   `$DFEOLS_RECORD_LEVEL`, else 4 (`record.record_level`). **Records are level 4 by default**:
   no scheduler, timing, hosts, Dask block, shard folder or package list; set
-  `record_level = 5` in an HPC profile to keep them. estimation-format pinned to ddc864f.
+  `record_level = 5` in an HPC profile to keep them. estimation-format pinned to 3ecc14e,
+  where the journals' purpose profile is `dcas/0.1` (Data and Code Availability Standard;
+  drafted as `aea/0.1`).
 - Interactive sessions (`dfeols.Session`, `dfeols session start|serve|status|fit|export|persist|stop`;
   `docs/design/sessions.md`, build order step 2): a manager demeans the declared variables on
   the session's FEs once (local FEs, crossing FEs as dense dummies), keeps the residualised

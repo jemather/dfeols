@@ -770,7 +770,7 @@ def fit(
     record_level  disclosure level of the record, 1-5 (estimation spec 4.9): default the
                executor profile's `record_level`, else $DFEOLS_RECORD_LEVEL, else 4 (or what
                `purpose` needs). 5 keeps the scheduler, timing, hosts and every package
-    purpose    purpose profiles the record is for, e.g. "aea/0.1"
+    purpose    purpose profiles the record is for, e.g. "dcas/0.1"
     estimator  IV formulas (`y ~ x | fe | d ~ z`): "2sls" (default) or "liml"
     fuller     Fuller's modified LIML with constant a (estimator="liml"); a=1 is common
     crossing_fe  how FEs that cross the partition are absorbed: "dense" dummy columns,

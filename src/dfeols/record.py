@@ -915,7 +915,7 @@ def write_estimation(
 ) -> dict:
     """Write the record of response `y` to `path` (`<name>.estimation.json`); returns it
     as written. `level` is the disclosure level (1-5, default 4 or what `purpose` needs;
-    see `record_level`); `purpose` names purpose profiles such as "aea/0.1". `redact=True`
+    see `record_level`); `purpose` names purpose profiles such as "dcas/0.1". `redact=True`
     removes the identifying fields; other keywords go to `to_estimation`. For every response
     of a fit, see `write_estimations`."""
     from . import __version__
@@ -1039,7 +1039,7 @@ def write_collection(
                fits are written at it (default 4, see `record_level`), records above it are
                lowered (new records with meta.parent). With only records and no `level`,
                no level is declared and the records stay as they are
-    purpose    purpose profiles for the fits' records, e.g. "aea/0.1"
+    purpose    purpose profiles for the fits' records, e.g. "dcas/0.1"
 
     Large structures of a member (a vcov above 10,000 elements) go to side files next to the
     collection, as `write_estimation` does for a record. Records passed in are kept as they
