@@ -763,7 +763,7 @@ def fit(
     workdir    where status.json and the demeaned cache go; defaults to
                <shard_dir>/runs/<spec id>. Put it on shared scratch.
     record     write `estimation` records, one per response: True puts them at
-               <workdir>/result.estimation.json (result.<y>.estimation.json with
+               <workdir>/result.estrec.json (result.<y>.estrec.json with
                several responses), a path puts them there, False skips them
     publication  `publication` block for the record (citation, locator, links)
     redact     leave identifying details (user, host, paths, job ids) out of the record
@@ -1256,7 +1256,7 @@ def fit(
     )
     res.save(wd / "result.json")
     if record:
-        rpath = wd / "result.estimation.json" if record is True else Path(record)
+        rpath = wd / "result.estrec.json" if record is True else Path(record)
         try:
             res.write_estimation(
                 rpath,

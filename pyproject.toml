@@ -44,14 +44,14 @@ dependencies = [
   "pyfixest>=0.50.1,<1",
   "psutil>=5.9",
   # estimation records (reader, writer, validator, schemas). Pinned to a commit until
-  # estimation-format is on PyPI; dfeols can't be released to PyPI before then.
-  "estimation-format @ git+https://github.com/estimation-format/estimation@3ecc14efebb71c25d0ddde9cf8bf1df7871c8348",
+  # estrec is on PyPI; dfeols can't be released to PyPI before then.
+  "estrec @ git+https://github.com/estrec/estrec@b269d9f92bbf119b01e06c370132b178d430b2f2",
   "tomli>=2.0; python_version < '3.11'",
 ]
 
 [project.optional-dependencies]
 dask = ["dask>=2024.1", "distributed>=2024.1", "dask-jobqueue>=0.8"]
-# JSON Schema validation of estimation records; without it estimation_format uses built-in checks
+# JSON Schema validation of estimation records; without it estrec uses built-in checks
 estimation = ["jsonschema>=4.18"]
 # AMG block solves for plan C's preconditioner on large sparse crossing-FE components
 amg = ["pyamg>=5"]

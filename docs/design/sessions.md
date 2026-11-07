@@ -144,9 +144,9 @@ small extractor for dfeols results); R through modelsummary, since the file alre
 
 ## Session collection
 
-A session also leaves one `estimation-collection/0.1` file (`kind: "session"`; estimation spec
+A session also leaves one `estrec-collection/0.1` file (`kind: "session"`; estimation spec
 section 11), so the whole run can be read, checked and replayed later. The session manager
-writes it to `<scratch>/sessions/<name>/session.estimation-collection.json` on `export`
+writes it to `<scratch>/sessions/<name>/session.estrec-collection.json` on `export`
 (`status: "open"`) and again when it ends (`closed`, `timed_out`, or `crashed` when the
 manager is restarted after a crash).
 
@@ -168,7 +168,7 @@ manager is restarted after a crash).
   with the message. Replaying the events in order reproduces the members.
 
 `results/index.jsonl` stays the quick list of models; the collection is what gets shared, after
-`estimation redact`.
+`estrec redact`.
 
 ## Interfaces
 
@@ -209,7 +209,7 @@ manager is restarted after a crash).
 loop), `Session` (the Python client), and `dfeols session start|serve|status|fit|export|stop`.
 `tests/test_session.py` checks every model against `dfeols.fit` on the same sample (FWL; local
 and crossing FEs, weights, iid/hetero/CRV1, a crossing cluster), the records and the collection
-against estimation-format, reuse of persisted data, the lock, crash recovery and the CLI with
+against estrec, reuse of persisted data, the lock, crash recovery and the CLI with
 the manager as its own process. Also run on a 2-worker Dask cluster: b and V equal to `fit`'s
 within 5e-15.
 
@@ -241,7 +241,7 @@ within 5e-15.
   the session's. Interactions of declared variables and `i()` terms are refused (an
   interaction of demeaned columns is not the demeaned interaction; created variables are step
   4). IV is step 6.
-- **Records.** Each model writes `result.json` and `result.estimation.json` (one per response)
+- **Records.** Each model writes `result.json` and `result.estrec.json` (one per response)
   in `models/<nnn>-<label>/`. The record is a normal dfeols record plus:
   `provenance.execution.session` = the session id, the demeaned data as a `derived` data
   entry, `specification.sample.restriction` naming the declared variables, and the call
@@ -261,10 +261,10 @@ within 5e-15.
   `from`); if that key was kept by another session meanwhile, the session switches to that
   copy and deletes its own. Records written before the move keep the old location. Each build appends to
   `<scratch>/demeaned/timings.jsonl`, which `session start` uses for its estimate.
-- **Collection.** `session.estimation-collection.json` (`kind: "session"`) on `export`
+- **Collection.** `session.estrec-collection.json` (`kind: "session"`) on `export`
   (`open`) and at the end (`closed`, also after `idle_minutes` idle (Ted 2026-11-02);
   `timed_out` at walltime; `crashed` as above),
-  through `estimation_format.new_collection`/`write_collection`: members in run order with
+  through `estrec.new_collection`/`write_collection`: members in run order with
   labels, `session` (id, times, status, clients, `fixed`), `provenance` (software,
   environment, execution, the dataset and the demeaned data), `events`.
 - **Jobs.** `session start` with a SLURM profile submits the coordinator script running

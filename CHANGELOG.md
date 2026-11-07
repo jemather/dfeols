@@ -7,6 +7,14 @@ break the API).
 
 ## [Unreleased]
 
+### Changed
+- The estimation format is now **estrec** (github.com/estrec/estrec, clean break): dfeols
+  depends on `estrec` (pinned to b269d9f), imports `estrec`, and writes `estrec/0.1` records
+  as `result.estrec.json` (`result.<y>.estrec.json` per response) and collections as
+  `*.estrec-collection.json`, including `session.estrec-collection.json`. Records written
+  under the old names no longer validate. `dfeols estimation ...`, `Result.write_estimation`,
+  `write_collection` and the `estimation` extra keep their names.
+
 ### Added
 - Disclosure levels for `estimation` records and collections (estimation spec 4.9, 11.7):
   `fit(record_level=, purpose=)`, `write_estimation`, `prepare_estimation` and

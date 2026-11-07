@@ -405,7 +405,7 @@ def main(argv=None):
     if args.cmd == "bench":
         return bench_cmd(args, rest)
     if args.cmd == "estimation":
-        from estimation_format import main as estimation_main
+        from estrec import main as estimation_main
 
         sys.exit(estimation_main(rest))
     if rest:

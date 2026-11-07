@@ -19,7 +19,7 @@ the compute node is needed and an R client needs only jsonlite.
       models/<nnn>-<label>/result.json      each model: Result, and its estimation record
       results/index.jsonl                   one line per model
       events.jsonl                          the timeline (the collection's events)
-      session.estimation-collection.json    on export and when the session ends
+      session.estrec-collection.json    on export and when the session ends
 
 The demeaned data go to <demeaned>/<dataset>/<key>/ (key: a hash of what fixes them) and
 are reused by a later session with the same inputs.
@@ -67,7 +67,7 @@ log = logging.getLogger("dfeols")
 
 SESSION_FORMAT = "dfeols-session/1"
 DEMEANED_FORMAT = "dfeols-demeaned/1"
-COLLECTION_NAME = "session.estimation-collection.json"
+COLLECTION_NAME = "session.estrec-collection.json"
 WEIGHT_COL = "__w"
 TASK_OVERHEAD = 0.005  # seconds a shard task costs beyond its reading (scheduling, results)
 VCOVS = ("iid", "hetero", "CRV1")
@@ -978,7 +978,7 @@ def fit_model(
 
 
 def session_record(res: Result, y: str | None = None, **kwargs) -> dict:
-    """A model's estimation record (unencoded; write it with estimation_format.write), saying
+    """A model's estimation record (unencoded; write it with estrec.write), saying
     it came from a session: the sample rule is the session's, the call replays through it."""
     from . import record as _record
 
@@ -1343,7 +1343,7 @@ class Manager:
         raise ValueError(f"unknown request type {t!r}")
 
     def fit(self, req: dict) -> dict:
-        from estimation_format import write as ef_write
+        from estrec import write as ef_write
 
         n = len(self.models) + 1
         label = req.get("label") or f"m{n}"
@@ -1372,7 +1372,7 @@ class Manager:
         recs = {}
         for y in res.outcomes:
             rec = session_record(res, y)
-            name = "result.estimation.json" if len(res.outcomes) == 1 else f"result.{y}.estimation.json"
+            name = "result.estrec.json" if len(res.outcomes) == 1 else f"result.{y}.estrec.json"
             rec = ef_write(
                 rec,
                 wd / name,
@@ -1535,7 +1535,7 @@ def _record_level(level, executor):
 
 
 def _default_level() -> int:
-    import estimation_format as ef
+    import estrec as ef
 
     return ef.DEFAULT_LEVEL
 
@@ -1551,7 +1551,7 @@ def _write_session_collection(
 ):
     """The session's collection, at `level` (the level its records were written at; when
     None, the highest level the records declare, so nothing is cut)."""
-    import estimation_format as ef
+    import estrec as ef
 
     recs, labels = [], []
     for mdl in models:
@@ -1849,12 +1849,12 @@ class Session:
 
     def record(self, res: Result, y: str | None = None) -> dict:
         """The estimation record the session wrote for a model."""
-        import estimation_format as ef
+        import estrec as ef
 
         name = (
-            "result.estimation.json"
+            "result.estrec.json"
             if len(res.outcomes) == 1
-            else f"result.{y or next(iter(res.outcomes))}.estimation.json"
+            else f"result.{y or next(iter(res.outcomes))}.estrec.json"
         )
         return ef.read(Path(res.workdir) / name)
 

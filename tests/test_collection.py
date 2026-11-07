@@ -1,5 +1,5 @@
-"""dfeols.write_collection: several fits as one estimation-collection/0.1 file, validated
-with estimation-format (each member as a record)."""
+"""dfeols.write_collection: several fits as one estrec-collection/0.1 file, validated
+with estrec (each member as a record)."""
 
 import json
 import sys
@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent))
-import estimation_format as estimation
+import estrec as estimation
 
 import dfeols
 from simdata import sim_panel
@@ -52,7 +52,7 @@ def _issues(path):
 
 def test_batch_one_member_per_response(fits, tmp_path):
     base, full, two = fits
-    p = tmp_path / "runs.estimation-collection.json"
+    p = tmp_path / "runs.estrec-collection.json"
     out = dfeols.write_collection([base, full, two], p)
     coll, bad = _issues(p)
     assert not bad, "\n".join(map(str, bad))
@@ -71,7 +71,7 @@ def test_batch_one_member_per_response(fits, tmp_path):
 
 def test_paper_with_locators_and_mapping(fits, tmp_path):
     base, full, _ = fits
-    p = tmp_path / "table3.estimation-collection.json"
+    p = tmp_path / "table3.estrec-collection.json"
     dfeols.write_collection(
         {"col1": base, "col2": full},
         p,
@@ -92,8 +92,8 @@ def test_paper_with_locators_and_mapping(fits, tmp_path):
 
 def test_records_pass_through_and_redact(fits, tmp_path):
     base, full, _ = fits
-    rec = estimation.read(Path(base.workdir) / "result.estimation.json")
-    p = tmp_path / "mixed.estimation-collection.json"
+    rec = estimation.read(Path(base.workdir) / "result.estrec.json")
+    p = tmp_path / "mixed.estrec-collection.json"
     coll = dfeols.write_collection([rec, full], p, redact=True)
     _, bad = _issues(p)
     assert not bad, "\n".join(map(str, bad))
@@ -105,7 +105,7 @@ def test_records_pass_through_and_redact(fits, tmp_path):
 
 
 def test_members_file(fits, tmp_path):
-    p = tmp_path / "big.estimation-collection.json"
+    p = tmp_path / "big.estrec-collection.json"
     dfeols.write_collection(list(fits), p, members="jsonl")
     on_disk = json.loads(p.read_text())
     assert all("attachment" in m and "record" not in m for m in on_disk["members"])
@@ -116,4 +116,4 @@ def test_members_file(fits, tmp_path):
 
 def test_label_count_must_match(fits, tmp_path):
     with pytest.raises(ValueError, match="one per response"):
-        dfeols.write_collection(list(fits), tmp_path / "x.estimation-collection.json", labels=["a", "b", "c"])
+        dfeols.write_collection(list(fits), tmp_path / "x.estrec-collection.json", labels=["a", "b", "c"])

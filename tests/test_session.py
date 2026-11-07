@@ -12,7 +12,7 @@ import polars as pl
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent))
-import estimation_format as estimation
+import estrec as estimation
 
 import dfeols
 from dfeols.session import Manager, Session, SessionError, Spec
@@ -176,7 +176,7 @@ def test_collection_and_reuse(ds, roots, tmp_path):
     _same(a1, b1, rtol=0)
     ev = [json.loads(l) for l in (roots["root"] / "coll" / "events.jsonl").read_text().splitlines()]
     assert ev[1]["type"] == "demeaned_loaded"
-    assert (roots["root"] / "coll" / "previous" / sid / "session.estimation-collection.json").exists()
+    assert (roots["root"] / "coll" / "previous" / sid / "session.estrec-collection.json").exists()
 
 
 def test_crashed_run_closed_by_next(ds, roots):
@@ -188,7 +188,7 @@ def test_crashed_run_closed_by_next(ds, roots):
     m2 = Manager("crash", Spec.make(ds.root, "spell + week", VARS, "id_a"), **roots)
     m2.start()
     m2.close()
-    p = roots["root"] / "crash" / "previous" / old / "session.estimation-collection.json"
+    p = roots["root"] / "crash" / "previous" / old / "session.estrec-collection.json"
     coll = estimation.read_collection(p)
     assert coll["session"]["status"] == "crashed"
     assert len(coll["members"]) == 1
@@ -295,7 +295,7 @@ def test_cli_serve_fit_stop(ds, tmp_path, capsys):
     finally:
         proc.kill()
     assert json.loads((root / "cli" / "session.json").read_text())["status"] == "closed"
-    assert (root / "cli" / "session.estimation-collection.json").exists()
+    assert (root / "cli" / "session.estrec-collection.json").exists()
 
 
 def test_idle_end_is_closed_and_hours_count_from_ready(ds, roots, tmp_path):
@@ -311,7 +311,7 @@ def test_idle_end_is_closed_and_hours_count_from_ready(ds, roots, tmp_path):
     assert m.serve() == "closed"
     st = json.loads((r["root"] / "idle" / "session.json").read_text())
     assert st["status"] == "closed"
-    coll = estimation.read_collection(r["root"] / "idle" / "session.estimation-collection.json")
+    coll = estimation.read_collection(r["root"] / "idle" / "session.estrec-collection.json")
     assert coll["session"]["status"] == "closed"
     assert coll["events"][-1]["message"].startswith("idle for")
 

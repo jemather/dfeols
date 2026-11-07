@@ -36,7 +36,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-import estimation_format as ef
+import estrec as ef
 import numpy as np
 
 from .vcov import df_k as _df_k
@@ -123,7 +123,7 @@ def identifying_paths(record: dict) -> list[str]:
 
 def check_profile(record: dict) -> list[ef.Issue]:
     """Built-in check of dfeols/0.1 (linear-fe's plus the dfeols block), for
-    `estimation_format.validate(..., profiles={"dfeols/0.1": check_profile})` when
+    `estrec.validate(..., profiles={"dfeols/0.1": check_profile})` when
     jsonschema is missing; with it, the profile's schema is the check."""
     issues = ef.records.PROFILES["linear-fe/0.1"](record)
     if "dfeols" not in (record.get("extensions") or {}):
@@ -603,7 +603,7 @@ def to_estimation(
     publication  a `publication` block: citation (CSL-JSON), locator, links
     provenance   False leaves out provenance (software, environment, execution, ...)
 
-    Write it with `estimation_format.write` (or `Result.write_estimation`), which encodes it,
+    Write it with `estrec.write` (or `Result.write_estimation`), which encodes it,
     adds history and the core digest, spills large structures and can redact."""
     from . import __version__
 
@@ -892,13 +892,13 @@ def to_estimation(
 
 def record_paths(result, path: str | os.PathLike) -> dict[str, Path]:
     """Where each response's record goes: `path` itself for a one-response fit, else
-    `<name>.<response>.estimation.json` next to it."""
+    `<name>.<response>.estrec.json` next to it."""
     path = Path(path)
     ys = list(result.outcomes)
     if len(ys) == 1:
         return {ys[0]: path}
-    stem = path.name.removesuffix(".json").removesuffix(".estimation")
-    return {y: path.with_name(f"{stem}.{re.sub(r'[^A-Za-z0-9._-]', '_', y)}.estimation.json") for y in ys}
+    stem = path.name.removesuffix(".json").removesuffix(".estrec")
+    return {y: path.with_name(f"{stem}.{re.sub(r'[^A-Za-z0-9._-]', '_', y)}.estrec.json") for y in ys}
 
 
 def write_estimation(
@@ -913,7 +913,7 @@ def write_estimation(
     purpose: str | list[str] | None = None,
     **kwargs: Any,
 ) -> dict:
-    """Write the record of response `y` to `path` (`<name>.estimation.json`); returns it
+    """Write the record of response `y` to `path` (`<name>.estrec.json`); returns it
     as written. `level` is the disclosure level (1-5, default 4 or what `purpose` needs;
     see `record_level`); `purpose` names purpose profiles such as "dcas/0.1". `redact=True`
     removes the identifying fields; other keywords go to `to_estimation`. For every response
@@ -1021,11 +1021,11 @@ def write_collection(
     purpose: str | list[str] | None = None,
     **kwargs: Any,
 ) -> dict:
-    """Write several fits as one `estimation-collection/0.1` file (estimation spec section 11)
-    at `path` (`<name>.estimation-collection.json`); returns the collection as written.
+    """Write several fits as one `estrec-collection/0.1` file (estimation spec section 11)
+    at `path` (`<name>.estrec-collection.json`); returns the collection as written.
 
     fits       dfeols Results and/or estimation records (dicts, e.g. from
-               `estimation_format.read`): a list, a mapping label -> fit, or one fit. A fit
+               `estrec.read`): a list, a mapping label -> fit, or one fit. A fit
                with several responses gives one member per response (`<label>.<response>`)
     kind       "batch" (default: a set of runs), "paper", "session", "replication", "other"
     labels     the members' labels, one per member (default: the mapping's keys, else each
@@ -1047,7 +1047,7 @@ def write_collection(
     from . import __version__
 
     path = Path(path)
-    stem = path.name.removesuffix(".json").removesuffix(".estimation-collection")
+    stem = path.name.removesuffix(".json").removesuffix(".estrec-collection")
     by = {"name": "dfeols", "version": __version__}
     items = _collection_items(fits, labels)
     level = record_level(level)

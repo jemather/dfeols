@@ -185,10 +185,10 @@ def test_estimator_needs_iv(ds):
     ],
 )
 def test_record_claims_iv_and_validates(ds, tmp_path, fml, kw):
-    est = pytest.importorskip("estimation_format")
+    est = pytest.importorskip("estrec")
     pytest.importorskip("jsonschema")
     dfeols.fit(ds, fml, workdir=tmp_path, log_every=1e9, **kw)
-    path = tmp_path / "result.estimation.json"
+    path = tmp_path / "result.estrec.json"
     rec = est.read(path, nonfinite="string")
     bad = [i for i in est.validate(rec, base_dir=tmp_path) if i.level != "info"]
     assert not bad, "\n".join(map(str, bad))

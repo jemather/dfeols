@@ -1,5 +1,10 @@
 # Design: the `estimation` format (`estimation/0.1`)
 
+> **Renamed (2026-11-06): the format is now estrec**, specified in its own repository,
+> https://github.com/estrec/estrec (`spec/estrec.md`). Type strings `estrec/0.1`,
+> `estrec-collection/0.1`; suffixes `.estrec.json`, `.estrec-collection.json`; the Python
+> package and CLI `estrec`. This design record keeps the old names as written.
+
 Status: draft 6 (2026-10-24), all design questions settled (`ssc` last). Tool fields verified
 and the JSON Schema written (2026-10-24, Next steps 1–2); Ted answered the seven points they
 raised (Questions for Ted), so nothing is open. Draft 6

@@ -1,5 +1,5 @@
 """dfeols writes its own `estimation` records (dfeols.record); every record a fit writes
-here is validated against estimation-format's schemas (core + inference, linear-fe, dfeols)."""
+here is validated against estrec's schemas (core + inference, linear-fe, dfeols)."""
 
 import json
 import sys
@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent))
-import estimation_format as estimation
+import estrec as estimation
 
 import dfeols
 from dfeols import record
@@ -62,7 +62,7 @@ def _check(path: Path) -> dict:
 
 def _fit(ds, tmp_path, formula, **kw):
     r = dfeols.fit(ds, formula, workdir=tmp_path, log_every=1e9, **kw)
-    return r, _check(tmp_path / "result.estimation.json")
+    return r, _check(tmp_path / "result.estrec.json")
 
 
 @pytest.mark.usefixtures("full_records")
@@ -163,8 +163,8 @@ def test_weights_and_multiple_outcomes(ds, tmp_path):
         workdir=tmp_path,
         log_every=1e9,
     )
-    assert not (tmp_path / "result.estimation.json").exists()
-    recs = {y: _check(tmp_path / f"result.{y}.estimation.json") for y in ("eng", "eng2")}
+    assert not (tmp_path / "result.estrec.json").exists()
+    recs = {y: _check(tmp_path / f"result.{y}.estrec.json") for y in ("eng", "eng2")}
     fit_ids = {rec["extensions"]["dfeols"]["fit"]["id"] for rec in recs.values()}
     assert len(fit_ids) == 1 and len({rec["meta"]["id"] for rec in recs.values()}) == 2
     for y, rec in recs.items():
@@ -201,7 +201,7 @@ def test_no_fe_intercept_and_collinear(ds, tmp_path):
 @pytest.mark.usefixtures("full_records")
 def test_redacted_record(ds, tmp_path):
     _fit(ds, tmp_path, "eng ~ feat + posts | spell", cluster="id_a", redact=True)
-    rec = _check(tmp_path / "result.estimation.json")
+    rec = _check(tmp_path / "result.estrec.json")
     text = json.dumps(rec)
     assert "agent" not in rec["provenance"]
     assert "hostname" not in rec["provenance"]["environment"]
@@ -238,10 +238,10 @@ def test_deprecated_module_and_cli(ds, tmp_path, monkeypatch):
     from dfeols import cli
 
     sys.modules.pop("dfeols.estimation", None)
-    with pytest.warns(DeprecationWarning, match="estimation_format"):
+    with pytest.warns(DeprecationWarning, match="estrec"):
         from dfeols import estimation as old
     assert old.read is estimation.read and set(record.IDENTIFYING) <= set(old.DEFAULT_IDENTIFYING)
-    path = tmp_path / "result.estimation.json"
+    path = tmp_path / "result.estrec.json"
     dfeols.fit(ds, "eng ~ feat | spell", workdir=tmp_path, log_every=1e9)
     rec = estimation.read(path)
     assert not [i for i in old.validate(rec) if i.level == "error"]
@@ -256,7 +256,7 @@ def test_deprecated_module_and_cli(ds, tmp_path, monkeypatch):
 
 
 def test_publication_and_record_path(ds, tmp_path):
-    out = tmp_path / "t3c9.estimation.json"
+    out = tmp_path / "t3c9.estrec.json"
     dfeols.fit(
         ds,
         "eng ~ feat + posts | spell",
@@ -267,16 +267,16 @@ def test_publication_and_record_path(ds, tmp_path):
     )
     rec = _check(out)
     assert rec["publication"]["locator"]["label"] == "Table 3, column 9"
-    assert not (tmp_path / "wd" / "result.estimation.json").exists()
+    assert not (tmp_path / "wd" / "result.estrec.json").exists()
     dfeols.fit(ds, "eng ~ feat + posts | spell", workdir=tmp_path / "off", record=False, log_every=1e9)
-    assert not (tmp_path / "off" / "result.estimation.json").exists()
+    assert not (tmp_path / "off" / "result.estrec.json").exists()
 
 
 def test_from_saved_result(ds, tmp_path):
     r, rec = _fit(ds, tmp_path, "eng ~ feat + posts | spell", cluster="id_a")
     loaded = dfeols.Result.load(tmp_path / "result.json")
-    again = loaded.write_estimation(tmp_path / "again.estimation.json", title="again")["eng"]
-    _check(tmp_path / "again.estimation.json")
+    again = loaded.write_estimation(tmp_path / "again.estrec.json", title="again")["eng"]
+    _check(tmp_path / "again.estrec.json")
     assert again["parameters"] == rec["parameters"]
     assert again["metrics"] == rec["metrics"]
     assert again["meta"]["title"] == "again"
@@ -295,8 +295,8 @@ def test_result_saved_before_records(ds, tmp_path):
         del o["tss"]
     (tmp_path / "old.json").write_text(json.dumps(d))
     old = dfeols.Result.load(tmp_path / "old.json")
-    old.write_estimation(tmp_path / "old.estimation.json")
-    rec = estimation.read(tmp_path / "old.estimation.json")
+    old.write_estimation(tmp_path / "old.estrec.json")
+    rec = estimation.read(tmp_path / "old.estrec.json")
     issues = estimation.validate(rec)
     assert not [i for i in issues if i.level == "error"], issues
     assert [i.path for i in issues if i.level == "warning"] == ["provenance"]
@@ -591,8 +591,8 @@ def test_collection_at_a_level(ds, tmp_path):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         r = dfeols.fit(ds, "eng ~ posts | spell + week", cluster="id_a", workdir=tmp_path / "w", record=False)
-        out = dfeols.write_collection({"a": r}, tmp_path / "c.estimation-collection.json", level=2)
+        out = dfeols.write_collection({"a": r}, tmp_path / "c.estrec-collection.json", level=2)
     assert out["meta"]["disclosure"] == {"level": 2}
     assert out["members"][0]["record"]["meta"]["disclosure"] == {"level": 2}
-    back = estimation.read_collection(tmp_path / "c.estimation-collection.json")
+    back = estimation.read_collection(tmp_path / "c.estrec-collection.json")
     assert not [i for i in estimation.validate_collection(back, base_dir=tmp_path) if i.level == "error"]

@@ -59,17 +59,17 @@ untested on real systems.
 ## Estimation profiles
 
 The `estimation` result format, its schemas and profile catalog, and the
-`estimation-format` validator dfeols uses live in their own repository,
-https://github.com/estimation-format/estimation. Propose new profiles (and
+`estrec` validator dfeols uses live in their own repository,
+https://github.com/estrec/estrec. Propose new profiles (and
 changes to `dfeols/0.1`) there; its CONTRIBUTING.md explains how. To try a
-draft profile against dfeols records, point `ESTIMATION_SCHEMA_PATH` (or
+draft profile against dfeols records, point `ESTREC_SCHEMA_PATH` (or
 `dfeols estimation validate --schema-path`) at its folder.
 
 ## Releasing (maintainers)
 
 1. Update the version in `src/dfeols/__init__.py`, `CITATION.cff` and the
    changelog. PyPI rejects dependencies given as git URLs, so while
-   `estimation-format` is pinned to a commit in `pyproject.toml`, first
+   `estrec` is pinned to a commit in `pyproject.toml`, first
    publish it to PyPI and require it by version.
 2. Tag `vX.Y.Z` and push the tag. The release workflow builds the sdist and
    wheel, publishes to TestPyPI, then to PyPI (trusted publishing).

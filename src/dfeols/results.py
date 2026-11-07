@@ -97,8 +97,8 @@ class Result:
         return to_estimation(self, y, **kwargs)
 
     def write_estimation(self, path, **kwargs) -> dict:
-        """Write one record per response: at `path` (`<name>.estimation.json`) for one
-        response, else `<name>.<response>.estimation.json`. `redact=True` removes
+        """Write one record per response: at `path` (`<name>.estrec.json`) for one
+        response, else `<name>.<response>.estrec.json`. `redact=True` removes
         identifying fields, `publication={...}` adds a publication block. Returns the
         records as written, by response."""
         from .record import write_estimations
