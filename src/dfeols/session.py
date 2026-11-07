@@ -579,8 +579,8 @@ def demean_once(
         acc["rss_gb"] = max(acc["rss_gb"], r["timing"].get("maxrss_gb", 0.0))
         for k in ("n", "rows_in", "sumw", "y_s1", "y_s2", "y_net"):
             acc[k] += r[k]
-        for k in ("z_s1", "z_s2"):
-            if k in r:
+        for k in ("z_s1", "z_s2"):  # the dense dummy block, when there is one
+            if k in acc:
                 acc[k] += r[k]
         for k, v in r["load"].items():
             acc["load"][k] += v
