@@ -20,9 +20,10 @@ def collinear_keep(
     one matrix product. One triangular solve per column against all kept
     columns took minutes with thousands of crossing-FE dummies.
 
-    `ref_diag` replaces ZtZ's diagonal as the scale of each test: plan C's Gram is net of the
-    crossing FEs, so a regressor they absorb has a diagonal of cancellation noise, and the
-    pivot must be tested against its diagonal before them."""
+    `ref_diag` replaces ZtZ's diagonal as the scale of each test. ZtZ is the Gram of columns
+    net of FEs, so a column an FE absorbs has a diagonal of rounding noise (~1e-29) and, tested
+    against itself, would look independent and be kept; the callers pass each column's
+    centered sum of squares before the FEs (`reference_ss`), against which it is dropped."""
     k = ZtZ.shape[0]
     keep = np.zeros(k, dtype=bool)
     d = np.diag(ZtZ).copy() if ref_diag is None else np.asarray(ref_diag, np.float64).copy()
@@ -53,6 +54,23 @@ def collinear_keep(
             W = solve_triangular(L[:m, :m], S[p + np.array(kept), q:], lower=True)
             S[q:, q:] -= W.T @ W
     return keep
+
+
+def reference_ss(s1: np.ndarray, s2: np.ndarray, sumw: float) -> np.ndarray:
+    """Each column's weighted sum of squares about its weighted mean, from its weighted sum
+    s1 and sum of squares s2 before any FE: the scale against which collinear_keep tests a
+    column net of the FEs. Every FE absorbs the constant, so centering is the least any FE
+    removes; a constant column gets 0 and is dropped."""
+    s1, s2 = np.asarray(s1, np.float64), np.asarray(s2, np.float64)
+    if not sumw > 0:
+        return np.zeros_like(s2)
+    return np.maximum(s2 - s1 * s1 / sumw, 0.0)
+
+
+def absorbed(net_ss: np.ndarray, ref: np.ndarray, tol: float = 1e-9) -> np.ndarray:
+    """Columns whose sum of squares net of the FEs (net_ss) is at most tol of their centered
+    sum of squares before them (ref): absorbed by the FEs, as collinear_keep tests them."""
+    return ~(np.asarray(net_ss) > tol * np.asarray(ref))
 
 
 def solve_spd(A: np.ndarray, B: np.ndarray) -> tuple[np.ndarray, np.ndarray]:

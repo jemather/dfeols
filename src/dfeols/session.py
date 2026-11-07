@@ -54,7 +54,7 @@ import polars as pl
 
 from .executors import SerialExecutor
 from .formula import Formula, fe_components, parse
-from .linalg import collinear_keep, solve_spd
+from .linalg import absorbed, collinear_keep, reference_ss, solve_spd
 from .lock import DirLock, LockedError
 from .prep import Dataset
 from .progress import Progress, fmt_td
@@ -66,7 +66,7 @@ from .worker import Plan, _maxrss_gb, _meat, _prepare, _round1_dense
 log = logging.getLogger("dfeols")
 
 SESSION_FORMAT = "dfeols-session/1"
-DEMEANED_FORMAT = "dfeols-demeaned/1"
+DEMEANED_FORMAT = "dfeols-demeaned/2"  # 2: raw_ss, the collinearity scale
 COLLECTION_NAME = "session.estrec-collection.json"
 WEIGHT_COL = "__w"
 TASK_OVERHEAD = 0.005  # seconds a shard task costs beyond its reading (scheduling, results)
@@ -316,14 +316,15 @@ def demean_round1(plan: Plan, clusters: list[dict], sid: int, files: list[str], 
     n = df.height
     T["read"] = time.perf_counter() - t0
     aux = None
+    raw: dict = {}
     if plan.crossing_iterate:  # plan C: per-level sums D'W V~ and the shard's part of A
         from .worker import _iter_store, _round1_sparse
 
-        _, Yt, _, _, _, extra, converged, aux = _round1_sparse(plan, sid, df, n0, local_codes, w, T, t0)
+        Y, Yt, _, _, _, extra, converged, aux = _round1_sparse(plan, sid, df, n0, local_codes, w, T, t0)
         _iter_store(plan, sid, extra[0], extra[1], w)  # for CG steps with a pass each
         Zt = ZtZ = ZtY = None
     else:
-        _, Yt, Zt, ZtZ, ZtY, converged, _ = _round1_dense(plan, df, n, local_codes, w, T)
+        Y, Yt, Zt, ZtZ, ZtY, converged, _ = _round1_dense(plan, df, n, local_codes, w, T, raw)
     r: dict[str, Any] = {
         "shard": sid,
         "rows_in": n0,
@@ -337,7 +338,13 @@ def demean_round1(plan: Plan, clusters: list[dict], sid: int, files: list[str], 
         ],
         "row_key": rowset(df, plan.raw_key) if plan.raw_key else None,  # type: ignore[attr-defined]
         "clusters": {},
+        # the collinearity scale: each variable's sums before the FEs, and net of the local FEs
+        "y_s1": w @ Y,
+        "y_s2": w @ (Y * Y),
+        "y_net": w @ (Yt * Yt),
     }
+    if raw:  # the dense dummy block's, likewise
+        r["z_s1"], r["z_s2"] = raw["s1"], raw["s2"]
     cls = {}
     for c in clusters:
         codes = df[c["column"]].to_numpy().astype(np.int64)
@@ -534,6 +541,9 @@ def demean_once(
         "gpresent": [np.zeros(L, bool) for *_, L in plan.global_fes],
         "row_key": [],
         "gram": np.zeros((len(names), len(names))),
+        "y_s1": np.zeros(len(names)),
+        "y_s2": np.zeros(len(names)),
+        "y_net": np.zeros(len(names)),
         "rss_gb": 0.0,
         "cl": {
             c["name"]: {
@@ -562,12 +572,16 @@ def demean_once(
     elif plan.global_fes:
         acc["ZtZ"] = np.zeros((k_tot, k_tot))
         acc["ZtY"] = np.zeros((k_tot, len(names)))
+        acc["z_s1"], acc["z_s2"] = np.zeros(k_tot), np.zeros(k_tot)
     local_of = {c["name"]: c["local"] for c in clusters}
 
     def on1(tid, r):
         acc["rss_gb"] = max(acc["rss_gb"], r["timing"].get("maxrss_gb", 0.0))
-        for k in ("n", "rows_in", "sumw"):
+        for k in ("n", "rows_in", "sumw", "y_s1", "y_s2", "y_net"):
             acc[k] += r[k]
+        for k in ("z_s1", "z_s2"):
+            if k in r:
+                acc[k] += r[k]
         for k, v in r["load"].items():
             acc["load"][k] += v
         acc["converged"] &= r["converged"]
@@ -612,7 +626,14 @@ def demean_once(
     prog.finish("demean")
     crossing: dict[str, Any] = {}
     extra: tuple = ()
+    # each variable's centered sum of squares before the FEs (linalg.reference_ss): the scale
+    # fit_model tests a column of the Gram against, so one the FEs absorb is dropped
+    has_fe = bool(plan.local_fes or plan.global_fes)
+    ref_y = reference_ss(acc["y_s1"], acc["y_s2"], acc["sumw"]) if has_fe else None
     if plan.crossing_iterate:
+        if plan.local_fes:  # absorbed by the local FEs: rounding noise, zero CG column
+            gone = absorbed(acc["y_net"], ref_y)
+            acc["DR"][:, gone] = 0.0
         from .estimate import _crossing_cg
 
         # _crossing_cg reads A (a LevelGram) as "gram"
@@ -637,7 +658,8 @@ def demean_once(
         for k in [k for k in _ITER_CACHE if k[0] == plan.iter_token]:  # this process's (serial)
             _ITER_CACHE.pop(k, None)
     elif plan.global_fes:
-        keep = collinear_keep(acc["ZtZ"], 1e-9)
+        zref = reference_ss(acc["z_s1"], acc["z_s2"], acc["sumw"]) if plan.local_fes else None
+        keep = collinear_keep(acc["ZtZ"], 1e-9, ref_diag=zref)
         gamma, _ = solve_spd(acc["ZtZ"][np.ix_(keep, keep)], acc["ZtY"][keep])
         crossing = {"method": "dense", "dummies": int(k_tot), "kept": int(keep.sum())}
     if plan.global_fes:
@@ -715,6 +737,7 @@ def demean_once(
             else None
         ),
         "gram": gram,
+        "raw_ss": ref_y,
         "shards": [s["id"] for s in ds.shards],
         "n_shards": len(ds.shards),
         "fe_maxiter": plan.fe_maxiter,
@@ -806,7 +829,9 @@ def fit_model(
     ix, iy = [pos[x] for x in xs], [pos[y] for y in ys]
     Gm = d.gram
     XX = Gm[np.ix_(ix, ix)]
-    keep = collinear_keep(XX, collin_tol) if xs else np.zeros(0, bool)
+    ref = m.get("raw_ss")  # format 1 manifests have none: then the Gram's own diagonal
+    ref = None if ref is None else np.asarray(ref, np.float64)[ix]
+    keep = collinear_keep(XX, collin_tol, ref_diag=ref) if xs else np.zeros(0, bool)
     kept = [xs[i] for i in np.flatnonzero(keep)]
     dropped = [xs[i] for i in np.flatnonzero(~keep)]
     ik = [pos[x] for x in kept]

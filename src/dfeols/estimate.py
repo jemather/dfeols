@@ -22,7 +22,7 @@ from . import iv as _iv
 from . import rowhash
 from .executors import SerialExecutor
 from .formula import fe_components, parse
-from .linalg import collinear_keep, solve_spd
+from .linalg import absorbed, collinear_keep, reference_ss, solve_spd
 from .prep import Dataset
 from .progress import Progress, fmt_td
 from .results import Result
@@ -397,6 +397,39 @@ def _drop_singletons(plan: Plan, ds: Dataset, executor, prog: Progress, rows: di
     return {"passes": p, "seconds": time.time() - t0}
 
 
+def _at(ref, idx):
+    return None if ref is None else ref[idx]
+
+
+def _references(plan: Plan, acc: dict) -> None:
+    """The collinearity test's scale (linalg.reference_ss): each Z column's and outcome-block
+    column's centered sum of squares before the FEs, in acc["ref"] and acc["ref_y"]. Only with
+    local FEs: they are what the columns are demeaned by. Without, the Gram's columns are the
+    raw ones (crossing dummies enter as columns), so their own diagonal is the scale."""
+    if not plan.local_fes:
+        acc["ref"] = acc["ref_y"] = None
+        return
+    acc["ref"] = reference_ss(acc["raw_s1"], acc["raw_s2"], acc["sumw"])
+    acc["ref_y"] = reference_ss(acc["sum_wy"], acc["sum_wy2"], acc["sumw"])
+
+
+def _zero_absorbed(plan: Plan, acc: dict, collin_tol: float) -> None:
+    """Plan C: a regressor or outcome the local FEs absorb is rounding noise net of them, and
+    its conjugate-gradient column could not reach a relative tolerance; its right-hand side
+    is set to zero (Gamma 0), and the collinearity test then drops it."""
+    if acc.get("ref") is None:
+        return
+    k = plan.k_x
+    gone = np.r_[
+        absorbed(np.diag(acc["ZtZ"]), acc["ref"], collin_tol),
+        absorbed(np.diag(acc["YtY"]), acc["ref_y"], collin_tol),
+    ]
+    gone = gone[: acc["DR"].shape[1]]
+    if gone.any():
+        acc["DR"][:, gone] = 0.0
+        log.debug("plan C: %d columns absorbed by the local FEs (k=%d)", int(gone.sum()), k)
+
+
 def _ols_solve(plan: Plan, acc: dict, collin_tol: float) -> _iv.Solution:
     """OLS from the round-1 cross-products, and round 2's maps (worker.shard_round2):
     residuals Y - Z beta, score regressors the kept columns (on the sparse path, the
@@ -410,7 +443,8 @@ def _ols_solve(plan: Plan, acc: dict, collin_tol: float) -> _iv.Solution:
     k_x, k_tot = plan.k_x, acc["ZtZ"].shape[0]
     order = np.r_[np.arange(k_x, k_tot), np.arange(k_x)]
     keep = np.zeros(k_tot, bool)
-    keep[order[collinear_keep(acc["ZtZ"][np.ix_(order, order)], collin_tol)]] = True
+    ref = acc.get("ref")
+    keep[order[collinear_keep(acc["ZtZ"][np.ix_(order, order)], collin_tol, ref_diag=_at(ref, order))]] = True
     beta_k, bread = solve_spd(acc["ZtZ"][np.ix_(keep, keep)], acc["ZtY"][keep])
     dropped = [plan.colnames[i] for i in range(k_rep) if not keep[i]]
     kept = np.flatnonzero(keep)
@@ -464,7 +498,8 @@ def _ols_solve_iterate(plan: Plan, acc: dict, collin_tol: float) -> _iv.Solution
     XX = acc["ZtZ"] - R[:, :k].T @ Gam[:, :k]
     XX = (XX + XX.T) / 2
     XY = acc["ZtY"] - R[:, :k].T @ Gam[:, k:]
-    keep = collinear_keep(XX, collin_tol, ref_diag=np.diag(acc["ZtZ"]))
+    ref = acc.get("ref")
+    keep = collinear_keep(XX, collin_tol, ref_diag=np.diag(acc["ZtZ"]) if ref is None else ref)
     kept = np.flatnonzero(keep)
     beta, bread = solve_spd(XX[np.ix_(kept, kept)], XY[kept])
     lin = {
@@ -493,7 +528,7 @@ def _tss(plan: Plan, acc: dict, m: int, collin_tol: float) -> np.ndarray:
     if plan.crossing_iterate:
         return yy - np.einsum("ij,ij->j", acc["DR"][:, k : k + m], acc["Gamma"][:, k : k + m])
     DD, DY = acc["ZtZ"][k:, k:], acc["ZtY"][k:, :m]
-    d = collinear_keep(DD, collin_tol)
+    d = collinear_keep(DD, collin_tol, ref_diag=_at(acc.get("ref"), slice(k, None)))
     g = cho_solve(cho_factor(DD[np.ix_(d, d)], lower=True), DY[d])
     return yy - np.einsum("ij,ij->j", DY[d], g)
 
@@ -930,6 +965,8 @@ def fit(
             "YtY": np.zeros((mY, mY)),
             "sum_wy": np.zeros(mY),
             "sum_wy2": np.zeros(mY),
+            "raw_s1": np.zeros(k_tot),
+            "raw_s2": np.zeros(k_tot),
             "n": 0,
             "rows_in": 0,
             "sumw": 0.0,
@@ -966,7 +1003,7 @@ def fit(
                 acc["ZtZ"][g.row, g.col] += g.data
             else:
                 acc["ZtZ"] += g
-            for key in ("ZtY", "YtY", "sum_wy", "sum_wy2"):
+            for key in ("ZtY", "YtY", "sum_wy", "sum_wy2", "raw_s1", "raw_s2"):
                 acc[key] += r[key]
             acc["n"] += r["n"]
             acc["rows_in"] += r["rows_in"]
@@ -1026,7 +1063,9 @@ def fit(
             log.warning("fit %s: FE demeaning did not converge in some shards", label)
 
         N = acc["n"]
+        _references(plan, acc)
         if plan.crossing_iterate:
+            _zero_absorbed(plan, acc, collin_tol)
             acc["Gamma"] = _crossing_cg(
                 plan, ds, executor, prog, rows, acc, label, iter_tol, iter_maxiter, crossing_precond
             )

@@ -368,13 +368,17 @@ def _dummy_gram(plan: Plan, local_codes, w, Dm, gcodes, P: int, sparse_out: bool
     return DWD - (C.T @ sp.diags(1.0 / WA) @ C).toarray()
 
 
-def _round1_sparse(plan: Plan, shard_id: int, df, n0: int, local_codes, w, T, t0):
+def _round1_sparse(plan: Plan, shard_id: int, df, n0: int, local_codes, w, T, t0, raw: dict | None = None):
     """Local FEs plus crossing FEs, without dense dummies.
 
     With Q the within-local-FEs residual maker (W-orthogonal), for the dummy
     block D:  D~'W X~ = D'W X~ (per-level sums),  D~'W D~ = D'W D - D'W P_L D
     (_projected_dummy_gram; with one local FE, C'diag(1/W_a) C where C holds the
     weight in each (local group, level) cell).
+
+    `raw`, if given, receives each column's weighted sum and sum of squares before the FEs
+    ("s1", "s2", in the order of the returned Gram's columns: the regressors, then on the
+    sparse path the dummies), the scale of the collinearity test (linalg.reference_ss).
     """
     import scipy.sparse as sp
 
@@ -388,6 +392,8 @@ def _round1_sparse(plan: Plan, shard_id: int, df, n0: int, local_codes, w, T, t0
     X = np.column_stack(cols) if cols else np.zeros((n, 0))
     Dm, gcodes = _global_matrix(df, plan, n)
     T["build"] = time.perf_counter() - t
+    if raw is not None:
+        raw["s1"], raw["s2"] = w @ X, w @ (X * X)
 
     t = time.perf_counter()
     m = Y.shape[1]
@@ -451,6 +457,13 @@ def _round1_sparse(plan: Plan, shard_id: int, df, n0: int, local_codes, w, T, t0
     DD = _dummy_gram(plan, local_codes, w, Dm, gcodes, P, sparse_out)
     sel = np.flatnonzero(zpos >= 0)
     zp = zpos[sel]
+    if raw is not None:  # a 0/1 dummy's sum and sum of squares are both its weight
+        sw = np.asarray(Dm.T @ w).ravel()
+        for key in ("s1", "s2"):
+            v = np.zeros(k_tot)
+            v[:k] = raw[key]
+            v[zp] = sw[sel]
+            raw[key] = v
     if sparse_out:
         # a dense k_tot^2 Gram per shard is too much to ship (450 MB at 7,500 levels);
         # the dummy block is sparse. Dummies follow the k regressors in Z (zp = k, k+1, ...)
@@ -505,13 +518,14 @@ def _round1(plan: Plan, shard_id: int, files: list[str], write_cache: bool):
         np.bincount(df[c].to_numpy().astype(np.int64), minlength=L) > 0 for _, c, L in plan.global_fes
     ]
 
+    raw: dict = {}
     if plan.sparse_global:
         Y, Yt, Zt, ZtZ, ZtY, extra, converged, aux = _round1_sparse(
-            plan, shard_id, df, n0, local_codes, w, T, t0
+            plan, shard_id, df, n0, local_codes, w, T, t0, raw
         )
         t = time.perf_counter() - T.pop("crossprod")  # keep timing the cluster bookkeeping
     else:
-        Y, Yt, Zt, ZtZ, ZtY, converged, t = _round1_dense(plan, df, n, local_codes, w, T)
+        Y, Yt, Zt, ZtZ, ZtY, converged, t = _round1_dense(plan, df, n, local_codes, w, T, raw)
         extra = aux = None
     out = {
         "shard": shard_id,
@@ -526,6 +540,9 @@ def _round1(plan: Plan, shard_id: int, files: list[str], write_cache: bool):
         # raw sums for R2 when there are no fixed effects
         "sum_wy": (Y * w[:, None]).sum(0),
         "sum_wy2": (Y * Y * w[:, None]).sum(0),
+        # each Z column's sums before the FEs: the collinearity test's scale
+        "raw_s1": raw["s1"],
+        "raw_s2": raw["s2"],
         "fe_levels": [int(c.max()) + 1 if len(c) else 0 for c in local_codes],
         "global_present": gpresent,
         "converged": converged,
@@ -536,7 +553,7 @@ def _round1(plan: Plan, shard_id: int, files: list[str], write_cache: bool):
     return _round1_finish(plan, shard_id, df, local_codes, w, Yt, Zt, out, T, t, t0, write_cache, extra)
 
 
-def _round1_dense(plan: Plan, df, n, local_codes, w, T):
+def _round1_dense(plan: Plan, df, n, local_codes, w, T, raw: dict | None = None):
     f = plan.formula
     t = time.perf_counter()
     Y = _outcome_block(plan, df, n)
@@ -556,6 +573,8 @@ def _round1_dense(plan: Plan, df, n, local_codes, w, T):
         cols.append(np.ones(n))  # hidden constant: the dummies' dropped level
     Z = np.column_stack([c if c.ndim == 2 else c[:, None] for c in cols]) if cols else np.zeros((n, 0))
     T["build"] = time.perf_counter() - t
+    if raw is not None:  # before the FEs: the collinearity test's scale (_round1_sparse)
+        raw["s1"], raw["s2"] = w @ Z, w @ (Z * Z)
 
     t = time.perf_counter()
     YZ = np.hstack([Y, Z])

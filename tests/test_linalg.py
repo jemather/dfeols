@@ -58,3 +58,23 @@ def test_dummies_with_intercept_drop_one_level():
     keep = collinear_keep(G, block=64)
     assert (keep == _reference(G)).all()
     assert keep[:4].all() and (~keep).sum() == 1 + 5  # one level, and the 5 sums of two levels
+
+
+def test_collinear_keep_drops_noise_columns_against_reference():
+    # a column an FE absorbs is rounding noise net of it: against its own diagonal it looks
+    # independent; against its sum of squares before the FEs it is dropped
+    import numpy as np
+
+    from dfeols.linalg import absorbed, collinear_keep, reference_ss
+
+    rng = np.random.default_rng(0)
+    X = rng.normal(size=(200, 3))
+    X[:, 1] = rng.normal(scale=1e-15, size=200)  # what an absorbed column looks like net of the FE
+    G = X.T @ X
+    assert collinear_keep(G).tolist() == [True, True, True]
+    raw = np.c_[X[:, 0], 5 + rng.normal(size=200), X[:, 2]]  # before the FE it varied
+    w = np.ones(200)
+    ref = reference_ss(w @ raw, w @ (raw * raw), w.sum())
+    assert collinear_keep(G, ref_diag=ref).tolist() == [True, False, True]
+    assert absorbed(np.diag(G), ref).tolist() == [False, True, False]
+    assert reference_ss(np.array([200.0]), np.array([200.0]), 200.0).tolist() == [0.0]  # a constant

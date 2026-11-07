@@ -356,6 +356,39 @@ def test_crossing_fe_iterate(ds, tmp_path, level_space_gb):
         s.stop()
 
 
+@pytest.mark.parametrize("max_dummy_levels", [2000, 10], ids=["dense", "iterate"])
+def test_absorbed_variables_dropped(ds, tmp_path, max_dummy_levels):
+    """A declared variable an FE absorbs (sp: spell, local; wk: week, crossing) is dropped
+    from a model, as fit drops it; it used to be reported from the Gram's rounding noise."""
+    data = sim_panel().drop_nulls().filter(pl.col("eng").is_finite())
+    data = data.with_columns(sp=(pl.col("spell") * 0.37 + 1).sqrt(), wk=(pl.col("week") * 1.3).sin())
+    dsa = dfeols.prep(
+        data,
+        shard_dir=tmp_path / "sh",
+        partition="id_a",
+        fixed_effects=["spell", "week"],
+        clusters=["id_a"],
+        target_rows=3000,
+    )
+    r = {"root": tmp_path / "s", "demeaned": tmp_path / "d"}
+    vs = ["eng", "posts", "sp", "wk"]
+    with Session.start(
+        "ab",
+        dsa.root,
+        "spell + week",
+        vs,
+        cluster="id_a",
+        poll=0.05,
+        max_dummy_levels=max_dummy_levels,
+        iter_tol=1e-11,
+        **r,
+    ) as s:
+        a = s.fit("eng ~ posts + sp + wk", cluster="id_a")
+    assert a.collinear == ["sp", "wk"] and a.coefnames == ["posts"]
+    b = _fit(dsa, tmp_path / "f", "eng ~ posts | spell + week", cluster="id_a", vcov=["CRV1"])
+    _same(a, b, rtol=1e-7)
+
+
 def test_crossing_fe_only_iterate(ds, tmp_path):
     """No local FE: the crossing FEs alone, by CG (they also span the constant)."""
     r = {"root": tmp_path / "s", "demeaned": tmp_path / "d"}

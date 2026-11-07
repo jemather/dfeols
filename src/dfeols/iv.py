@@ -71,7 +71,14 @@ def solve(plan, acc: dict, N: int, *, estimator: str = "2sls", fuller: float | N
     # regressor the crossing FEs absorb, or an instrument collinear with X1, is the one dropped
     order = np.r_[np.arange(k_x, k_tot), np.arange(k_rep), np.arange(k_rep, k_x)]
     keep = np.zeros(k_tot, bool)
-    keep[order[collinear_keep(ZtZ[np.ix_(order, order)], collin_tol)]] = True
+    ref, ref_y = acc.get("ref"), acc.get("ref_y")  # before the FEs (estimate._references)
+    keep[
+        order[
+            collinear_keep(
+                ZtZ[np.ix_(order, order)], collin_tol, ref_diag=None if ref is None else ref[order]
+            )
+        ]
+    ] = True
     zc = np.flatnonzero(keep)  # kept Z columns, in Z order
     is_inst = (zc >= k_rep) & (zc < k_x)
     x1, z2 = np.flatnonzero(~is_inst), np.flatnonzero(is_inst)  # positions within zc
@@ -95,7 +102,18 @@ def solve(plan, acc: dict, N: int, *, estimator: str = "2sls", fuller: float | N
     Xhy = np.vstack([B1[:, :m], Pi.T @ B[:, :m]])
 
     # an endogenous regressor whose fitted values are collinear with X1 is dropped
-    kx = collinear_keep(XhXh, collin_tol)
+    ref_h = None
+    if ref is not None:
+        # the fitted values keep their own scale (a weak first stage is not a collinear one),
+        # unless the local FEs absorb the endogenous regressor itself: then its fitted values
+        # are rounding noise and the scale is its sum of squares before the FEs
+        from .linalg import absorbed
+
+        dh = np.diag(XhXh)[len(x1) :].copy()
+        gone = absorbed(np.diag(C)[m:], ref_y[m:], collin_tol)
+        dh[gone] = ref_y[m:][gone]
+        ref_h = np.r_[ref[zc][x1], dh]
+    kx = collinear_keep(XhXh, collin_tol, ref_diag=ref_h)
     ek = np.flatnonzero(kx[len(x1) :])  # kept endogenous
     dropped += [plan.endog_names[i] for i in range(p) if not kx[len(x1) + i]]
     if len(ek) == 0:

@@ -31,7 +31,7 @@ import polars as pl
 import scipy.sparse as sp
 
 from . import crossing as cx
-from .linalg import collinear_keep, solve_spd
+from .linalg import absorbed, collinear_keep, solve_spd
 from .vcov import df_k as _df_k
 from .vcov import vcov_crv1, vcov_iid
 
@@ -204,6 +204,12 @@ def solve(
     Ng = np.bincount(g, weights=W)
     gm = np.column_stack([np.bincount(g, weights=W * Mz[:, j]) for j in range(p)]) / Ng[:, None]
     Zq = Mz - gm[g]
+    # the collinearity scale: each column's centered sum of squares before the FEs (within
+    # cells plus between them about the weighted mean), and net of the absorbed FE
+    zbar = (W @ Mz) / W.sum() if C else np.zeros(p)
+    ref = np.diag(Ctot) + (W[:, None] * (Mz - zbar) ** 2).sum(0)
+    net0 = np.diag(Ctot) + (W[:, None] * Zq**2).sum(0)
+    gone = absorbed(net0, ref, collin_tol)  # absorbed by the absorbed FE: rounding noise
     cross = [i for i in range(len(codes)) if i != a]
     fs = [codes[i] for i in cross]
     Ps = [levels[i] for i in cross]
@@ -275,6 +281,7 @@ def solve(
                 U -= ((Gt @ U) / Ng[:, None])[g]
                 return D.T @ (U * W[:, None])
 
+        R[:, gone] = 0.0  # its CG column could not reach a relative tolerance; Gamma 0
         Gam, steps, rel = cx.pcg(matvec, R, Mp, act, tol, maxiter)
         if rel > tol:
             raise RuntimeError(
@@ -301,7 +308,7 @@ def solve(
     ZZ = (ZZ + ZZ.T) / 2
     xs, ys = np.arange(m, p), np.arange(m)
     XX = ZZ[np.ix_(xs, xs)]
-    keepx = collinear_keep(XX, collin_tol, ref_diag=np.diag(Z0)[xs])
+    keepx = collinear_keep(XX, collin_tol, ref_diag=ref[xs])
     kept = np.flatnonzero(keepx)
     beta, bread = solve_spd(XX[np.ix_(kept, kept)], ZZ[np.ix_(xs[kept], ys)])  # (kk x m)
     xk = xs[kept]

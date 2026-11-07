@@ -7,6 +7,20 @@ break the API).
 
 ## [Unreleased]
 
+### Fixed
+- Columns a local FE absorbs are dropped as collinear on every path. Net of the local FEs
+  such a column is rounding noise (~1e-29), and `collinear_keep` tested each pivot against
+  the column's own diagonal, so the noise looked independent and was kept: a regressor
+  constant within a local FE got b ~ 4e11 (dense and sparse crossing FEs), made plan C's and
+  the cell path's CG fail to converge, and was reported in sessions; crossing-FE dummies that
+  sum to a local FE (`spell + id_a^week + tbin^week`) left the dense solve singular, so b
+  moved 1.5e-6 with 5e-14 changes in the demeaned data. Each column is now tested against its
+  weighted centered sum of squares before the FEs (`linalg.reference_ss`, from per-shard sums
+  in round 1; with local FEs only), plan C and the cell path give absorbed columns a zero CG
+  right-hand side, and IV tests an absorbed endogenous regressor's fitted values the same way.
+  Session demeaned data move to format 2 (`raw_ss` in the manifest), so data from earlier
+  versions are rebuilt. Tests against pyfixest on each path.
+
 ### Changed
 - The estimation format is now **estrec** (github.com/estrec/estrec, clean break): dfeols
   depends on `estrec` (pinned to b269d9f), imports `estrec`, and writes `estrec/0.1` records

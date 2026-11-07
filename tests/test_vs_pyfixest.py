@@ -426,6 +426,74 @@ def test_regressor_absorbed_by_crossing_fe_is_dropped(ds_cw, crossing_fe):
     np.testing.assert_allclose(np.sqrt(np.diag(a.vcov())), m.se().to_numpy(), rtol=1e-7)
 
 
+@pytest.fixture(scope="module")
+def ds_absorbed(ds_cw, tmp_path_factory):
+    """sp depends only on spell, a local FE; wk only on week, a crossing FE."""
+    import polars as pl
+
+    d, _ = ds_cw
+    d = d.with_columns(sp=(pl.col("spell") * 0.37 + 1).sqrt(), wk=(pl.col("week") * 1.3).sin())
+    ds = dfeols.prep(
+        d,
+        shard_dir=tmp_path_factory.mktemp("absorbed"),
+        partition="id_a",
+        fixed_effects=["spell", "week", "id_a^week", "tbin^week"],
+        clusters=["id_a"],
+        target_rows=3000,
+    )
+    return d, ds
+
+
+@pytest.mark.parametrize(
+    "kw",
+    [{}, {"crossing_fe": "sparse"}, {"crossing_fe": "iterate", "iter_tol": 1e-11}, {"cells": True}],
+    ids=["dense", "sparse", "iterate", "cells"],
+)
+def test_regressor_absorbed_by_local_fe_is_dropped(ds_absorbed, kw):
+    # net of spell, sp is rounding noise (~1e-29); tested against that noise it looked
+    # independent: kept with b ~ 4e11 (dense, sparse), CG failing to converge (iterate, cells).
+    # The test's scale is now each column's sum of squares before the FEs
+    d, ds = ds_absorbed
+    f = "eng ~ feat + sp + wk + posts | spell + week"
+    a = dfeols.fit(ds, f, cluster="id_a", log_every=1e9, **kw)
+    assert a.collinear == ["sp", "wk"] and a.coefnames == ["feat", "posts"]
+    m = pf.feols(
+        "eng ~ feat + posts | spell + week",
+        data=d.to_pandas().dropna(subset=["eng"]),
+        vcov={"CRV1": "id_a"},
+        **pyfixest_tol_kwargs(1e-13),
+    )
+    np.testing.assert_allclose(a.coef(), m.coef().to_numpy(), rtol=1e-8, atol=1e-10)
+    np.testing.assert_allclose(np.sqrt(np.diag(a.vcov())), m.se().to_numpy(), rtol=1e-7)
+
+
+@pytest.mark.parametrize("fe_method", ["auto", "iterate"])
+def test_crossing_dummies_absorbed_by_local_fes(ds_absorbed, fe_method):
+    # sum over tbin of tbin^week = week, which id_a^week absorbs within each shard: some
+    # dummies are rounding noise net of the local FEs. They used to be kept (96 of a rank-92
+    # block), so b moved 1.5e-6 with 5e-14 changes in the demeaned data
+    d, ds = ds_absorbed
+    f = "eng ~ feat + posts | spell + id_a^week + tbin^week"
+    a = dfeols.fit(ds, f, cluster="id_a", fe_method=fe_method, crossing_fe="dense", log_every=1e9)
+    dp = d.to_pandas().dropna(subset=["eng"])
+    dp["aw"] = dp.id_a.astype(str) + "_" + dp.week.astype(str)
+    dp["tw"] = dp.tbin.astype(str) + "_" + dp.week.astype(str)
+    m = pf.feols(
+        "eng ~ feat + posts | spell + aw + tw", data=dp, vcov={"CRV1": "id_a"}, **pyfixest_tol_kwargs(1e-13)
+    )
+    np.testing.assert_allclose(a.coef(), m.coef().to_numpy(), rtol=1e-10, atol=1e-12)
+    np.testing.assert_allclose(np.sqrt(np.diag(a.vcov())), m.se().to_numpy(), rtol=1e-7)
+
+
+def test_iv_exogenous_absorbed_by_local_fe_is_dropped(ds_absorbed):
+    d, ds = ds_absorbed
+    a = dfeols.fit(ds, "eng ~ posts + sp | spell + week | feat ~ eng2", cluster="id_a", log_every=1e9)
+    b = dfeols.fit(ds, "eng ~ posts | spell + week | feat ~ eng2", cluster="id_a", log_every=1e9)
+    assert a.collinear == ["sp"] and a.coefnames == b.coefnames
+    np.testing.assert_allclose(a.coef(), b.coef(), rtol=1e-12)
+    np.testing.assert_allclose(a.vcov(), b.vcov(), rtol=1e-10)
+
+
 def test_iterate_auto_and_limits(ds_cw):
     _, ds = ds_cw
     kw = dict(cluster="id_a", log_every=1e9)
