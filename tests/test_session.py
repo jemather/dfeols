@@ -399,5 +399,9 @@ def test_estimates_and_progress(ds, tmp_path, capsys):
         assert "measured in this session" in capsys.readouterr().err
         idx = [json.loads(l) for l in (r["root"] / "p2" / "results" / "index.jsonl").read_text().splitlines()]
         assert [m["estimate_seconds"] > 0 for m in idx] == [False, True, True]
+        # the pass's progress counts rows, not shards (OSCER 35828091 showed 0.00M rows/s)
+        snap = json.loads((r["root"] / "p2" / idx[1]["dir"] / "status.json").read_text())
+        meat = next(st for st in snap["stages"] if st["stage"] == "meat")
+        assert meat["rows"] == ds.n_rows
     finally:
         s.stop()

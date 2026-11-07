@@ -846,7 +846,9 @@ def fit_model(
                 for j in range(len(ys)):
                     np.add.at(scores[j], r["cluster_codes"], r["cluster_scores"][j])
 
-        rows = {sid: 1 for sid in d.shards}
+        # each shard's prepared rows (before singletons), so the progress line's rate is in rows
+        src_rows = {sh["id"]: sh["rows"] for sh in Dataset.open(m["dataset"]["root"]).shards}
+        rows = {sid: src_rows.get(sid, 1) for sid in d.shards}
         prog = Progress(wd, label=label or "model", every=log_every)
         prog.add_stage("meat", rows)
         prog.start("meat")
