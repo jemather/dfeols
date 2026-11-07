@@ -251,7 +251,7 @@ def test_deprecated_module_and_cli(ds, tmp_path, monkeypatch):
     issues = old.validate(rec)
     assert any(i.level == "error" and i.path == "extensions.dfeols" for i in issues)
     with pytest.raises(SystemExit) as e:
-        cli.main(["estimation", "validate", "-q", str(path)])
+        cli.main(["estrec", "validate", "-q", str(path)])
     assert e.value.code == 0
 
 

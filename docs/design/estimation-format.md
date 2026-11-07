@@ -883,7 +883,7 @@ filled, plus `extensions.dfeols` and `history`.
   Schemas with `x-identifying`, `x-extends`, `x-deviations`) and `examples/`, shipped as
   package data. `$id`s are `https://raw.githubusercontent.com/jemather/dfeols/main/src/dfeols/schema/<file>`:
   file names carry the version and published files never change, so `main` is stable.
-- `jsonschema` is the optional extra `dfeols[estimation]` (and part of `test`).
+- `jsonschema` is the optional extra `dfeols[estrec]` (called `dfeols[estimation]` before the estrec rename) and part of `test`.
 - `src/dfeols/estimation.py`: writer, reader, redactor, validator, attachment spilling.
 - Tests validate every record dfeols writes, round-trip a hand-written base R example, and
   check that redaction removes every marked field.

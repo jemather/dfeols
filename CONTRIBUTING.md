@@ -63,7 +63,7 @@ The `estimation` result format, its schemas and profile catalog, and the
 https://github.com/estrec/estrec. Propose new profiles (and
 changes to `dfeols/0.1`) there; its CONTRIBUTING.md explains how. To try a
 draft profile against dfeols records, point `ESTREC_SCHEMA_PATH` (or
-`dfeols estimation validate --schema-path`) at its folder.
+`dfeols estrec validate --schema-path`) at its folder.
 
 ## Releasing (maintainers)
 

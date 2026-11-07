@@ -397,17 +397,17 @@ def main(argv=None):
     r.add_argument("--profile")
     r.add_argument("-n", type=int, default=20)
     r.add_argument("--run", default=None, help="only this run id (prefix)")
-    sub.add_parser("estimation", help="validate, redact or digest estimation records", add_help=False)
+    sub.add_parser("estrec", help="validate, redact or digest estrec records", add_help=False)
     from . import session as _session
 
     _session.add_parser(sub)
     args, rest = ap.parse_known_args(argv)
     if args.cmd == "bench":
         return bench_cmd(args, rest)
-    if args.cmd == "estimation":
-        from estrec import main as estimation_main
+    if args.cmd == "estrec":
+        from estrec import main as estrec_main
 
-        sys.exit(estimation_main(rest))
+        sys.exit(estrec_main(rest))
     if rest:
         ap.error(f"unrecognized arguments: {' '.join(rest)}")
     {

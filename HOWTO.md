@@ -196,7 +196,7 @@ Each spec writes to `<scratch>/runs/<label>/`:
   `dfeols.Result.load(path)`, then use `.tidy()`, `.summary()`, `.coef()` and `.vcov()`.
 - `result.estrec.json` (`result.<y>.estrec.json` for each outcome of a multi-outcome
   fit): the same result as an `estimation` record, with where and how it ran. Check it with
-  `dfeols estimation validate <file>`; pass `redact=True` to `fit` (or run `dfeols estimation
+  `dfeols estrec validate <file>`; pass `redact=True` to `fit` (or run `dfeols estrec
   redact`) before sharing it.
 - `coefs.csv`: the tidy table.
 - `status.json` and `history.jsonl`: progress and ETA history.

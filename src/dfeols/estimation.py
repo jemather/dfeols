@@ -6,8 +6,8 @@ The reader, writer, validator and redactor for `estimation` records moved to the
 `estrec` package, which dfeols now depends on, together with the schemas.
 This module re-exports it so old code keeps working, with two dfeols additions:
 DEFAULT_IDENTIFYING includes the dfeols block's fields, and `validate` checks
-`dfeols/0.1` with dfeols's built-in check when jsonschema is missing. `dfeols estimation
-...` runs the `estimation` command line.
+`dfeols/0.1` with dfeols's built-in check when jsonschema is missing. `dfeols estrec
+...` runs the `estrec` command line.
 """
 
 from __future__ import annotations

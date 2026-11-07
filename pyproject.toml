@@ -52,7 +52,7 @@ dependencies = [
 [project.optional-dependencies]
 dask = ["dask>=2024.1", "distributed>=2024.1", "dask-jobqueue>=0.8"]
 # JSON Schema validation of estimation records; without it estrec uses built-in checks
-estimation = ["jsonschema>=4.18"]
+estrec = ["jsonschema>=4.18"]
 # AMG block solves for plan C's preconditioner on large sparse crossing-FE components
 amg = ["pyamg>=5"]
 test = ["pytest>=7", "jsonschema>=4.18"]
