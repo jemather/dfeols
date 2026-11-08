@@ -732,6 +732,7 @@ def _fit_cells(
     )
     acc["sumw"] = float(df["W"].sum())
     acc["rows_in"] = r["rows"]
+    check_sample(int(r["N"]), acc["rows_in"], acc["load"])
     info = r["info"]
     log.info(
         "fit %s: %s rows in %s cells; %s absorbed, crossing %s (%s, %s steps); solve %s",
@@ -756,6 +757,25 @@ def _fit_cells(
             "singleton_seconds": 0.0,
         },
     }
+
+
+def check_sample(n: int, rows_in: int, load: dict) -> None:
+    """Raise a ValueError naming where the rows went when none are left to estimate on."""
+    if n > 0:
+        return
+    parts = [
+        f"{load.get(k, 0):,} {what}"
+        for k, what in (
+            ("missing", "with a missing value"),
+            ("non_finite", "non-finite"),
+            ("zero_weights", "with a zero weight"),
+        )
+        if load.get(k)
+    ]
+    if rows_in - n:
+        parts.append(f"{rows_in - n:,} singletons")
+    why = "; dropped " + ", ".join(parts) if parts else ""
+    raise ValueError(f"no rows left in the estimation sample ({load.get('rows', 0):,} rows read{why})")
 
 
 def fit(
@@ -1063,6 +1083,7 @@ def fit(
             log.warning("fit %s: FE demeaning did not converge in some shards", label)
 
         N = acc["n"]
+        check_sample(N, acc["rows_in"], acc["load"])
         _references(plan, acc)
         if plan.crossing_iterate:
             _zero_absorbed(plan, acc, collin_tol)

@@ -20,6 +20,20 @@ break the API).
   right-hand side, and IV tests an absorbed endogenous regressor's fitted values the same way.
   Session demeaned data move to format 2 (`raw_ss` in the manifest), so data from earlier
   versions are rebuilt. Tests against pyfixest on each path.
+- An empty estimation sample is an error. When every row is a singleton (or missing, or
+  zero-weight), `fit` and session demeaning raise a ValueError that says where the rows went;
+  `drop_singletons` raised an IndexError on a shard with no rows left, and `fit` returned
+  an empty result.
+- Session model estimates keep the first pass apart: it reads files no node has cached
+  (OSCER 35828091: m1 took 17 s with 5 columns, then m2 6 s with 8, so m2 was estimated at
+  27 s). Before a later pass has been measured, the estimate is a range (`estimate_range` in
+  `responses/<id>.accepted.json`), taken from this session's first pass, the first passes of
+  earlier sessions (`<demeaned>/passes.jsonl`, new), or the shard read rate on one worker
+  up to all of them.
+- `session start`'s demeaned-size figure comes from the compressed size of earlier builds
+  (`timings.jsonl` now records columns and bytes), at most 8 bytes a value; it printed
+  rows x columns x 8 bytes, 44 GB where the flags data took 6.9 GB.
+- `Session.start` takes `progress=` as `Session.attach` does.
 
 ### Changed
 - The estimation format is now **estrec** (github.com/estrec/estrec, clean break): dfeols

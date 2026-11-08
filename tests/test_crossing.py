@@ -124,7 +124,16 @@ def test_combine_parts_as_level_gram(max_nnz):
         r, c = rng.integers(0, 50, 60), rng.integers(0, 50, 60)
         S = sp.csr_matrix((rng.random(60), (r, c)), shape=(50, 50))
         S = (S + S.T).tocoo()
-        parts.append({"full": True, "blocks": True, "nnz": S.nnz, "r": S.row.astype(np.int32), "c": S.col.astype(np.int32), "v": S.data})
+        parts.append(
+            {
+                "full": True,
+                "blocks": True,
+                "nnz": S.nnz,
+                "r": S.row.astype(np.int32),
+                "c": S.col.astype(np.int32),
+                "v": S.data,
+            }
+        )
     one = LevelGram(offs, ["a", "b"], max_nnz)
     for i, p in enumerate(parts):
         one.add(p, i)

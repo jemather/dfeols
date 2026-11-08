@@ -99,8 +99,8 @@ variables), singleton rule, tolerance. `session start` with the same inputs find
 demeaning; a different key never reuses it. `manifest.json` records those inputs in plain form,
 the per-variable list (with creation expressions), rows, absorbed-level counts per FE, dfeols
 version and commit, and creation time. Persisting is the default (`--no-persist` to skip;
-Ted, 2026-10-28, see `planner.md`): the session prints the size (rows x columns x 8 bytes,
-plus ids) and the scratch quota, and asks for confirmation only where the site profile says
+Ted, 2026-10-28, see `planner.md`): the session prints the size (from earlier builds'
+compressed size, at most rows x columns x 8 bytes) and the scratch quota, and asks for confirmation only where the site profile says
 scratch is scarce (`demeaned_confirm_gb`). Removal is explicit (`dfeols demeaned rm`). Columns
 are float64 throughout (Ted, 2026-10-24).
 
@@ -281,11 +281,25 @@ within 5e-15.
   (`progress/demean/status.json`, the usual `Progress` snapshot, refreshed every 2 s);
   `Session.attach` and `session start --wait` print both while waiting. Per model, before it
   runs, the manager writes `responses/<id>.accepted.json` with passes, columns and an
-  estimate: none needed when the Gram matrix answers it (b, iid), else rows x columns over
-  the pass throughput measured in this session, or, before the first pass, the read rate of
-  the three largest shard files (timed at the first estimate) times the connected workers.
-  The client prints the estimate, the model's progress lines (`models/<dir>/status.json`)
-  and the time it took; the index and the fit's result keep the estimate beside the time.
+  estimate: none needed when the Gram matrix answers it (b, iid), else rows x the columns the
+  pass reads (regressors, responses, weight, cluster codes) over a measured throughput. The
+  first pass reads files no node has cached (OSCER 35828091, 2026-11-07: m1 17 s with 5
+  columns, m2 6 s with 8), so it is kept apart (2026-11-08): after a later pass, that pass's
+  rate; after only the first, a range up to the first pass's rate; before any, a range from
+  the first passes of earlier sessions (`<scratch>/demeaned/passes.jsonl`, one line per pass
+  with `first`), or with none from the read rate of the three largest shard files on one
+  worker (high end) and on every connected worker at once (low end). `estimate_seconds` is
+  the high end and `estimate_range` the range. The client prints the estimate, the model's
+  progress lines (`models/<dir>/status.json`) and the time it took; the index and the fit's
+  result keep the estimate beside the time.
+- **Size** (2026-11-08). `timings.jsonl` also records each build's columns and bytes on
+  disk; `session start` gives the demeaned size as rows x columns x the range of earlier
+  builds' bytes per value, capped at 8 bytes a value (the flags data took 1.3 bytes a value,
+  6.9 GB against the 44 GB uncompressed figure it printed before), or the 8-byte bound with
+  no history.
+- **Empty samples** (2026-11-08). When no rows are left (all missing, zero weight or
+  singletons), the demeaning and `fit` raise a ValueError that says where the rows went;
+  `fit` used to return an empty result, and a session went on to fit models on nothing.
 
 Not built: `dfeols demeaned rm` and the scratch-quota check, and the replay of events.
 

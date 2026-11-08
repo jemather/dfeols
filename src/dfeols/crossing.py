@@ -98,7 +98,9 @@ def combine_parts(*parts, offs: np.ndarray, max_nnz: int) -> dict:
             out["reason"] = p.get("reason") or f"one shard's part alone has {p['nnz']:,} nonzeros"
         if not p["blocks"]:
             out["blocks"] = False
-            out["reason"] = p.get("reason") or f"one shard's diagonal blocks alone have {p['block_nnz']:,} nonzeros"
+            out["reason"] = (
+                p.get("reason") or f"one shard's diagonal blocks alone have {p['block_nnz']:,} nonzeros"
+            )
         if out["blocks"]:
             mats.append(part_matrix(p, P))
     if not out["blocks"]:
@@ -120,7 +122,11 @@ def combine_parts(*parts, offs: np.ndarray, max_nnz: int) -> dict:
         return out
     it = np.int32 if P < 2**31 else np.int64
     out.update(
-        nnz=int(S.nnz), block_nnz=int(S.nnz), indptr=S.indptr.astype(np.int64), indices=S.indices.astype(it), data=S.data
+        nnz=int(S.nnz),
+        block_nnz=int(S.nnz),
+        indptr=S.indptr.astype(np.int64),
+        indices=S.indices.astype(it),
+        data=S.data,
     )
     return out
 
@@ -164,7 +170,8 @@ class LevelGram:
     def add(self, part: dict | None, shard) -> None:
         """Add one shard's part, or (shard None) the workers' sum of all of them (combine_parts)."""
         who = f"shard {shard}" if shard is not None else "a shard"
-        if part is None or part.get("none"):  # a shard could not form its part (local FE components too large)
+        # a shard could not form its part (local FE components too large)
+        if part is None or part.get("none"):
             why = (part or {}).get("reason") or f"{who} could not form its part of A"
             self._give_up(why, blocks=False)
             return

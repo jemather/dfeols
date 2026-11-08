@@ -65,3 +65,8 @@ def test_numpy_fallback_slow_panel():
         ref, _ = dm._pf_demean(np.ascontiguousarray(x), flist3.astype(np.uint64), w, 1e-12, 1_000_000)
         assert ok3
         np.testing.assert_allclose(fb3, np.asarray(ref), atol=1e-8)
+
+
+def test_drop_singletons_when_every_row_is_one():
+    keep = dm.drop_singletons([np.arange(5), np.zeros(5, np.int64)])
+    assert not keep.any()

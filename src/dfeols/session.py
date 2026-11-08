@@ -624,6 +624,9 @@ def demean_once(
     else:
         executor.run(demean_round1, tasks, on1, prog, "demean")
     prog.finish("demean")
+    from .estimate import check_sample
+
+    check_sample(int(acc["n"]), int(acc["rows_in"]), acc["load"])
     crossing: dict[str, Any] = {}
     extra: tuple = ()
     # each variable's centered sum of squares before the FEs (linalg.reference_ss): the scale
@@ -1092,7 +1095,11 @@ class Manager:
         self.data: Demeaned | None = None
         self._stop = threading.Event()
         self.state_extra: dict[str, Any] = {}  # kept in session.json (estimates, progress file)
-        self.pass_rate: float | None = None  # row-columns per second of a model's pass, measured
+        # row-columns per second of a model's pass, measured in this session: the first pass
+        # reads files no node has cached yet (OSCER 35828091: 17 s for m1, 6 s for m2 with more
+        # columns), so it is kept apart from the later passes
+        self.pass_rate: float | None = None
+        self.first_pass_rate: float | None = None
         self.calibration: tuple[float, int] | None = None  # (row-columns/s read, shards read)
         self.progress_every = 2.0
 
@@ -1224,7 +1231,7 @@ class Manager:
                 "variables": self.data.names,
             },
         )
-        _log_timing(self.demeaned_dir, self.data.manifest)
+        _log_timing(self.demeaned_dir, self.data.manifest, self.data.bytes())
 
     def serve(self) -> str:
         """Start (if not started), answer requests until the session ends; returns the end
@@ -1395,7 +1402,7 @@ class Manager:
             log_every=self.progress_every,
         )
         if res.timing.get("meat_seconds"):
-            self.pass_rate = self.data.manifest["rows"] * est["columns"] / res.timing["meat_seconds"]
+            self._log_pass(est["columns"], res.timing["meat_seconds"])
         recs = {}
         for y in res.outcomes:
             rec = session_record(res, y)
@@ -1440,24 +1447,74 @@ class Manager:
         return {"model": entry}
 
     def estimate(self, req: dict) -> dict:
-        """A model's cost before it runs: passes x columns x the pass throughput measured in
-        this session (before the first pass: the demeaning's, which over-states the time)."""
+        """A model's cost before it runs: rows x the columns its pass reads, at a rate from
+        (in order) this session's later passes, its first pass, the first passes of earlier
+        sessions on these demeaned data's file system, or a read of a few shard files. The
+        last three give a range; `estimate_seconds` is its upper end."""
         _, ys, xs = _model_terms(req["formula"], self.spec.fe)
         vcov = req.get("vcov") or (["CRV1"] if req.get("cluster") else ["iid"])
         vcov = [vcov] if isinstance(vcov, str) else list(vcov)
         passes = int(any(v in ("hetero", "CRV1") for v in vcov) and bool(xs))
+        # the columns model_meat reads: regressors, responses, the weight, the cluster codes
         cols = len(xs) + len(ys) + 1 + bool(req.get("cluster"))
-        rows = self.data.manifest["rows"]
+        work = self.data.manifest["rows"] * cols
+        out = {"passes": passes, "columns": cols, "estimate_seconds": 0.0, "estimate_range": None}
         if not passes:
-            return {"passes": 0, "columns": cols, "estimate_seconds": 0.0, "basis": "no pass"}
+            return {**out, "basis": "no pass"}
         if self.pass_rate:
-            secs, basis = rows * cols / self.pass_rate, "measured in this session"
+            return {**out, "estimate_seconds": work / self.pass_rate, "basis": "measured in this session"}
+        lo = self._parallel_read_seconds(work)
+        if self.first_pass_rate:
+            hi = work / self.first_pass_rate
+            basis = "this session's first pass; later passes are usually faster"
         else:
-            rate, k = self.calibration or self._calibrate()
-            slots = max(int(self.executor.slots()[0] or 1), 1)
-            secs = rows * cols / (rate * slots) + TASK_OVERHEAD * len(self.data.shards) / slots
-            basis = f"read rate of {k} shard{'s' if k > 1 else ''}, {slots} worker{'s' if slots > 1 else ''}"
-        return {"passes": passes, "columns": cols, "estimate_seconds": secs, "basis": basis}
+            hist = pass_history(self.demeaned_dir)
+            if hist:
+                lo, hi = work / max(hist), work / min(hist)
+                basis = f"first pass of {len(hist)} earlier session{'s' if len(hist) > 1 else ''}"
+            else:
+                rate, k = self.calibration or self._calibrate()
+                hi = work / rate + TASK_OVERHEAD * len(self.data.shards)  # one reader, no overlap
+                slots = self._workers()
+                basis = (
+                    f"read rate of {k} shard{'s' if k > 1 else ''}, 1 to {slots} "
+                    f"worker{'s' if slots > 1 else ''}; first pass, no earlier sessions"
+                )
+        lo = min(lo, hi)
+        return {**out, "estimate_seconds": hi, "estimate_range": [lo, hi], "basis": basis}
+
+    def _workers(self) -> int:
+        running, most = self.executor.slots()
+        return max(int(running or most or 1), 1)
+
+    def _parallel_read_seconds(self, work: float) -> float:
+        """The pass at the calibrated read rate on every running worker at once: a lower
+        bound, as the workers share the file system."""
+        rate, _ = self.calibration or self._calibrate()
+        slots = self._workers()
+        return work / (rate * slots) + TASK_OVERHEAD * len(self.data.shards) / slots
+
+    def _log_pass(self, columns: int, seconds: float) -> None:
+        rate = self.data.manifest["rows"] * columns / max(seconds, 1e-6)
+        first = self.first_pass_rate is None and self.pass_rate is None
+        if first:
+            self.first_pass_rate = rate
+        else:
+            self.pass_rate = rate
+        try:
+            _append_jsonl(
+                self.demeaned_dir / "passes.jsonl",
+                {
+                    "when": _now(),
+                    "rows": self.data.manifest["rows"],
+                    "columns": columns,
+                    "seconds": seconds,
+                    "workers": self._workers(),
+                    "first": first,
+                },
+            )
+        except OSError:
+            pass
 
     def _calibrate(self, k: int = 3) -> tuple[float, int]:
         """Row-columns read per second by one process, from the largest few shard files
@@ -1634,7 +1691,11 @@ def _rewrite_collection(sdir: Path, state: dict, status: str) -> None:
     _write_session_collection(sdir, models, events, session, None, sdir / COLLECTION_NAME)
 
 
-def _log_timing(root: Path, manifest: dict) -> None:
+def _demeaned_columns(variables: int, clusters: int) -> int:
+    return variables + 1 + clusters  # the variables, the weight, the cluster codes
+
+
+def _log_timing(root: Path, manifest: dict, nbytes: int | None = None) -> None:
     """One line per demeaning in <demeaned>/timings.jsonl, for start-up estimates."""
     try:
         _append_jsonl(
@@ -1647,10 +1708,50 @@ def _log_timing(root: Path, manifest: dict) -> None:
                 "local_fes": sum(1 for f in manifest["fixed_effects"] if f["absorbed"] == "local"),
                 "shards": manifest["n_shards"],
                 "seconds": manifest["seconds"],
+                "columns": _demeaned_columns(len(manifest["variables"]), len(manifest["clusters"])),
+                "bytes": nbytes,
             },
         )
     except OSError:
         pass
+
+
+def size_estimate(root: Path, rows: int, columns: int) -> tuple[float, float, int] | None:
+    """A range of bytes for demeaned data of `rows` x `columns`, from the compressed size of
+    earlier runs (bytes per value), or None with no history. The third value is the number
+    of runs it comes from. Compression depends on the variables (a dummy packs far smaller
+    than a continuous variable), so the range can be wide."""
+    p = Path(root) / "timings.jsonl"
+    if not p.exists():
+        return None
+    per = []
+    for line in p.read_text().splitlines():
+        try:
+            t = json.loads(line)
+            if t.get("bytes") and t["rows"] > 0 and t["columns"] > 0:
+                per.append(t["bytes"] / (t["rows"] * t["columns"]))
+        except (ValueError, KeyError, TypeError):
+            continue
+    if not per:
+        return None
+    return rows * columns * min(per), rows * columns * max(per), len(per)
+
+
+def pass_history(root: Path) -> list[float]:
+    """Row-columns per second of the first model pass of earlier sessions (from
+    <demeaned>/passes.jsonl)."""
+    p = Path(root) / "passes.jsonl"
+    if not p.exists():
+        return []
+    rates = []
+    for line in p.read_text().splitlines():
+        try:
+            t = json.loads(line)
+            if t.get("first") and t["seconds"] > 0:
+                rates.append(t["rows"] * t["columns"] / t["seconds"])
+        except (ValueError, KeyError, TypeError):
+            continue
+    return rates
 
 
 def estimate_seconds(root: Path, rows: int, variables: int) -> tuple[float, float] | None:
@@ -1720,6 +1821,7 @@ class Session:
         persist: bool = True,
         poll: float = 0.2,
         timeout: float | None = None,
+        progress: bool = True,
         **spec_kw,
     ) -> Session:
         """Run a manager in a background thread of this process and attach to it (for a
@@ -1740,7 +1842,7 @@ class Session:
         mgr.start()
         th = threading.Thread(target=mgr.serve, name=f"dfeols-session-{name}", daemon=True)
         th.start()
-        s = cls(name, root=root, manager=mgr, thread=th)
+        s = cls(name, root=root, manager=mgr, thread=th, progress=progress)
         s._attach(timeout)
         return s
 
@@ -1820,11 +1922,16 @@ class Session:
         except (OSError, json.JSONDecodeError):
             return
         if self._once(f"est:{rid}"):
-            e = a["estimate_seconds"]
+            rng = a.get("estimate_range")
+            e = (
+                f"{_secs(rng[0])} to {_secs(rng[1])}"
+                if rng and _secs(rng[0]) != _secs(rng[1])
+                else _secs(a["estimate_seconds"])
+            )
             self._say(
                 "no pass over the data (from the Gram matrix)"
                 if not a["passes"]
-                else f"estimated {_secs(e)}: {a['passes']} pass over {a['columns']} columns ({a['basis']})"
+                else f"estimated {e}: {a['passes']} pass over {a['columns']} columns ({a['basis']})"
             )
         self._show_status(self.dir / a["model_dir"] / "status.json")
 
@@ -2058,8 +2165,24 @@ def cmd_start(args) -> None:
             )
         else:
             print(f"demeaning {len(spec.variables)} variables: no earlier runs to estimate from")
-        size = ds.n_rows * (len(spec.variables) + 1 + len(spec.clusters)) * 8
-        print(f"demeaned data: ~{size / 1e9:.1f} GB in {where if not args.no_persist else root / args.name}")
+        cols = _demeaned_columns(len(spec.variables), len(spec.clusters))
+        most = ds.n_rows * cols * 8  # 8 bytes a value, before compression
+        dest = where if not args.no_persist else root / args.name
+        se = size_estimate(dm_root, ds.n_rows, cols)
+        if se:
+            lo, hi, n = se
+            hi = min(hi, most)
+            rng = (
+                f"~{lo / 1e9:.1f} GB"
+                if f"{lo / 1e9:.1f}" == f"{hi / 1e9:.1f}"
+                else f"{lo / 1e9:.1f} to {hi / 1e9:.1f} GB"
+            )
+            print(
+                f"demeaned data: {rng} in {dest} (compressed size of {n} earlier "
+                f"run{'s' if n > 1 else ''}; at most {most / 1e9:.1f} GB)"
+            )
+        else:
+            print(f"demeaned data: at most {most / 1e9:.1f} GB in {dest} (before compression)")
     words = _serve_words(args)
     if p.scheduler == "local":
         root.mkdir(parents=True, exist_ok=True)

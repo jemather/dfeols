@@ -32,6 +32,8 @@ def drop_singletons(fe_codes: list[np.ndarray]) -> np.ndarray:
     while changed and fe_codes:
         changed = False
         for c in fe_codes:
+            if not keep.any():  # every row was a singleton
+                return keep
             cnt = np.bincount(c[keep])
             bad = keep & (cnt[np.minimum(c, len(cnt) - 1)] <= 1)
             if bad.any():

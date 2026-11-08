@@ -15,7 +15,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 import estrec as estimation
 
 import dfeols
-from dfeols.session import Manager, Session, SessionError, Spec
+from dfeols.session import Manager, Session, SessionError, Spec, size_estimate
 from simdata import sim_panel
 
 pytest.importorskip("jsonschema")
@@ -428,13 +428,58 @@ def test_estimates_and_progress(ds, tmp_path, capsys):
         s.fit("eng ~ feat + posts", cluster="id_a", label="b")
         err = capsys.readouterr().err
         assert "estimated" in err and "read rate of" in err and "b: done in" in err
+        # the first pass reads cold files (OSCER 35828091: m1 17 s, m2 6 s): kept apart
         s.fit("eng ~ posts", vcov="hetero", label="c")
+        assert "this session's first pass" in capsys.readouterr().err
+        s.fit("eng ~ feat", vcov="hetero", label="d")
         assert "measured in this session" in capsys.readouterr().err
         idx = [json.loads(l) for l in (r["root"] / "p2" / "results" / "index.jsonl").read_text().splitlines()]
-        assert [m["estimate_seconds"] > 0 for m in idx] == [False, True, True]
+        assert [m["estimate_seconds"] > 0 for m in idx] == [False, True, True, True]
+        acc = sorted(
+            (json.loads(p.read_text()) for p in (r["root"] / "p2" / "responses").glob("*.accepted.json")),
+            key=lambda a: a["accepted"],
+        )
+        assert [a["estimate_range"] is None for a in acc] == [True, False, False, True]
+        assert all(a["estimate_range"][0] <= a["estimate_range"][1] for a in acc[1:3])
+        passes = [json.loads(l) for l in (r["demeaned"] / "passes.jsonl").read_text().splitlines()]
+        assert [p["first"] for p in passes] == [True, False, False]
         # the pass's progress counts rows, not shards (OSCER 35828091 showed 0.00M rows/s)
         snap = json.loads((r["root"] / "p2" / idx[1]["dir"] / "status.json").read_text())
         meat = next(st for st in snap["stages"] if st["stage"] == "meat")
         assert meat["rows"] == ds.n_rows
     finally:
         s.stop()
+
+
+def test_estimates_from_earlier_sessions(ds, tmp_path, capsys):
+    r = {"root": tmp_path / "s", "demeaned": tmp_path / "d"}
+    with Session.start("q1", ds.root, "spell + week", ["eng", "feat"], cluster="id_a", poll=0.05, **r) as s:
+        s.fit("eng ~ feat", cluster="id_a")
+    t = [json.loads(l) for l in (r["demeaned"] / "timings.jsonl").read_text().splitlines()]
+    assert t[0]["columns"] == 4 and t[0]["bytes"] > 0
+    lo, hi, n = size_estimate(r["demeaned"], t[0]["rows"], 4)
+    assert n == 1 and lo == hi == pytest.approx(t[0]["bytes"])
+    capsys.readouterr()
+    with Session.start("q2", ds.root, "spell + week", ["eng", "posts"], cluster="id_a", poll=0.05, **r) as s:
+        s.fit("eng ~ posts", cluster="id_a")
+        assert "first pass of 1 earlier session" in capsys.readouterr().err
+
+
+def test_start_quiet(ds, tmp_path, capsys):
+    r = {"root": tmp_path / "s", "demeaned": tmp_path / "d"}
+    with Session.start("qq", ds.root, "spell", ["eng", "feat"], poll=0.05, progress=False, **r) as s:
+        s.fit("eng ~ feat", vcov="hetero")
+    assert capsys.readouterr().err == ""
+
+
+def test_empty_sample_is_an_error(tmp_path):
+    data = sim_panel().drop_nulls().filter(pl.col("eng").is_finite())
+    d = dfeols.prep(
+        data, shard_dir=tmp_path / "sh", partition="id_a", fixed_effects=["spell^week"], target_rows=3000
+    )
+    r = {"root": tmp_path / "s", "demeaned": tmp_path / "d"}
+    with pytest.raises(ValueError, match=r"no rows left .*dropped [0-9,]+ singletons"):
+        Session.start("e", d.root, "spell^week", ["eng", "feat"], poll=0.05, progress=False, **r)
+    for method in ("auto", "cells"):  # fit returned an empty result
+        with pytest.raises(ValueError, match="no rows left"):
+            dfeols.fit(d.root, "eng ~ feat | spell^week", workdir=tmp_path / method, fe_method=method)
