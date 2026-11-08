@@ -46,6 +46,17 @@ break the API).
   names.
 
 ### Added
+- `dfeols demeaned list` and `dfeols demeaned rm <key>` for persisted demeaned data (sessions
+  step 3): size, when written, purge date (`scratch_purge_days`), the running sessions using
+  each key, incomplete and old-format folders; `rm` asks (or `--yes`) and refuses while a
+  running session uses the key or a build holds its lock. `dfeols.store` (`entries`,
+  `find`, `remove`, `space`); `lock.holder()`.
+- Scratch checks for session demeaned data: `session start` prints the file system's free
+  space, stops when the size estimate's low end does not fit (the manager makes the same
+  check before demeaning) and warns when the high end does not. Profile settings
+  `demeaned_storage` (`"plentiful"`, the default, or `"confirm"`) and `demeaned_confirm_gb`
+  (default 500): with `"confirm"`, `session start` asks before a larger write, or needs
+  `--yes`. Reusing data prints when the site may purge it.
 - Disclosure levels for `estimation` records and collections (estimation spec 4.9, 11.7):
   `fit(record_level=, purpose=)`, `write_estimation`, `prepare_estimation` and
   `write_collection` take `level`/`purpose`; session models and the session collection use the

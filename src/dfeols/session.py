@@ -1203,6 +1203,7 @@ class Manager:
                 self.event("demeaned_loaded", detail={"key": key, "location": str(where)})
                 return
             shutil.rmtree(where, ignore_errors=True)  # an interrupted build
+            self._check_space(ds, where)
             est = estimate_seconds(self.demeaned_dir, ds.n_rows, len(self.spec.variables))
             self.state_extra.update(
                 demean_estimate_seconds=list(est) if est else None,
@@ -1232,6 +1233,20 @@ class Manager:
             },
         )
         _log_timing(self.demeaned_dir, self.data.manifest, self.data.bytes())
+
+    def _check_space(self, ds: Dataset, where: Path) -> None:
+        """Stop before demeaning when even the low end of the size estimate does not fit."""
+        from .store import fmt_bytes, space
+
+        se = size_estimate(
+            self.demeaned_dir, ds.n_rows, _demeaned_columns(len(self.spec.variables), len(self.spec.clusters))
+        )
+        sp = space(where)
+        if se and sp and se[0] > sp["free"]:
+            raise RuntimeError(
+                f"not enough scratch for the demeaned data: at least {fmt_bytes(se[0])}, "
+                f"{fmt_bytes(sp['free'])} free in {sp['path']} (dfeols demeaned list / rm frees space)"
+            )
 
     def serve(self) -> str:
         """Start (if not started), answer requests until the session ends; returns the end
@@ -2135,6 +2150,36 @@ def cmd_serve(args) -> None:
     print(f"session {args.name}: {end}", flush=True)
 
 
+def _check_storage(p, dest: Path, lo: float | None, hi: float, yes: bool) -> None:
+    """Scratch space for the demeaned data `session start` will write: the file system's free
+    space, a stop when even the low end does not fit, and the profile's confirmation where
+    storage is scarce (`demeaned_storage = "confirm"`, above `demeaned_confirm_gb`)."""
+    from .store import fmt_bytes, space
+
+    sp = space(dest)
+    if sp:
+        print(f"scratch: {fmt_bytes(sp['free'])} free of {fmt_bytes(sp['total'])} ({sp['path']})")
+        if lo is not None and lo > sp["free"]:
+            sys.exit(
+                f"not enough scratch for the demeaned data: at least {fmt_bytes(lo)}, "
+                f"{fmt_bytes(sp['free'])} free (dfeols demeaned list / rm frees space)"
+            )
+        if hi > sp["free"]:
+            print(f"warning: the demeaned data may need up to {fmt_bytes(hi)}, more than is free")
+    if p.demeaned_storage == "confirm" and hi > (p.demeaned_confirm_gb or 0) * 1e9:
+        msg = (
+            f"the demeaned data may take up to {fmt_bytes(hi)} "
+            f"(profile asks above {p.demeaned_confirm_gb:g} GB)"
+        )
+        if yes:
+            print(f"{msg}: confirmed by --yes")
+        elif sys.stdin.isatty():
+            if input(f"{msg}. Continue? [y/N] ").strip().lower() not in ("y", "yes"):
+                sys.exit("not started")
+        else:
+            sys.exit(f"{msg}: confirm with --yes")
+
+
 def cmd_start(args) -> None:
     """Print the plan and estimates, then submit the manager (a job, or a local process)."""
     import shlex
@@ -2156,6 +2201,12 @@ def cmd_start(args) -> None:
     est = None
     if (where / "manifest.json").exists():
         print(f"demeaned data found ({key}): no demeaning needed")
+        if p.scratch_purge_days:
+            from .store import entries
+
+            e = next((e for e in entries(dm_root) if e["path"] == str(where)), None)
+            if e:
+                print(f"  written {e['written']}; the site may purge it after ~{e['purge_after']}")
         est = (0.0, 0.0)
     else:
         est = estimate_seconds(dm_root, ds.n_rows, len(spec.variables))
@@ -2169,6 +2220,7 @@ def cmd_start(args) -> None:
         most = ds.n_rows * cols * 8  # 8 bytes a value, before compression
         dest = where if not args.no_persist else root / args.name
         se = size_estimate(dm_root, ds.n_rows, cols)
+        lo, hi = None, most
         if se:
             lo, hi, n = se
             hi = min(hi, most)
@@ -2183,6 +2235,7 @@ def cmd_start(args) -> None:
             )
         else:
             print(f"demeaned data: at most {most / 1e9:.1f} GB in {dest} (before compression)")
+        _check_storage(p, dest, lo, hi, args.yes)
     words = _serve_words(args)
     if p.scheduler == "local":
         root.mkdir(parents=True, exist_ok=True)
@@ -2324,6 +2377,7 @@ def add_parser(sub) -> None:
         q.add_argument("--worker-walltime", help="workers' walltime (start sets the manager job's)")
         if nm == "start":
             q.add_argument("--wait", action="store_true", help="wait until the session is ready")
+            q.add_argument("--yes", action="store_true", help="confirm a large demeaned-data write")
     q = ss.add_parser("status", help="the session's state")
     common(q)
     q = ss.add_parser("fit", help="fit a model in a running session")

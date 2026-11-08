@@ -56,6 +56,24 @@ def _holder() -> dict:
     }
 
 
+def holder(directory, stale: float = 300.0) -> dict | None:
+    """Who holds the DirLock on `directory`, or None when it is free or its holder is gone
+    (the test DirLock.acquire applies, without taking or removing anything)."""
+    d = Path(directory)
+    path = d.parent / f"{d.name}.lock"
+    try:
+        st = path.stat()
+        info = json.loads(path.read_text() or "{}")
+    except FileNotFoundError:
+        return None
+    except ValueError:
+        info = {}
+    probe = DirLock(d, stale=stale)
+    if probe._is_stale(info, time.time() - st.st_mtime):
+        return None
+    return {k: v for k, v in info.items() if k != "token"}
+
+
 class DirLock:
     """Exclusive claim on a folder; use as a context manager or acquire()/release()."""
 

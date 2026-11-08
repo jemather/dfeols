@@ -1,8 +1,9 @@
 # Design: interactive sessions (fixed FEs, many models)
 
 Status: build order step 2 (session core) built 2026-11-02 in `src/dfeols/session.py`, with
-parts of step 3 (persisted data found by key and reused, `persist()` after `--no-persist`); see "As built" below. Steps 4-6 are
-not built.
+step 3 (persisted data found by key and reused, `persist()` after `--no-persist`, `dfeols
+demeaned list/rm`, the scratch checks; 2026-11-08); see "As built" below. Steps 4-6 are not
+built.
 
 ## Goal
 
@@ -297,6 +298,25 @@ within 5e-15.
   builds' bytes per value, capped at 8 bytes a value (the flags data took 1.3 bytes a value,
   6.9 GB against the 44 GB uncompressed figure it printed before), or the 8-byte bound with
   no history.
+- **Storage** (step 3, 2026-11-08; policy from planner.md, Ted 2026-10-28). `dfeols demeaned
+  list` shows each `<dataset>/<key>` folder: size, when written, rows, variables and FEs, the
+  purge date (written + the profile's `scratch_purge_days`), the running sessions using it (a
+  session counts while it holds its folder's lock and its `session.json` names the folder),
+  and folders that are incomplete (an interrupted build), being built (the key's lock is
+  held) or in an old format (no longer loaded: a session rebuilds them under a new key).
+  `--json` gives the same as data. `dfeols demeaned rm <key>...` (a unique prefix, or
+  `<dataset>/<key>`) asks first (`--yes` to skip; refused without a terminal), refuses
+  while a running session uses the folder or a build holds its lock, and otherwise takes
+  the key's lock, checks the users again, renames the folder aside (so a session starting
+  meanwhile builds afresh rather than loading half a folder) and deletes it, then the
+  dataset's folder if it was the last key. `timings.jsonl` and `passes.jsonl` stay. Space:
+  `session start` prints the free space of the file system that will hold the data (a
+  site's per-user quota is not visible to dfeols), stops when even the low end of the size
+  estimate does not fit and warns when the high end does not; the manager makes the same
+  stop before it demeans (so `Session.start` in Python gets it too). A profile with
+  `demeaned_storage = "confirm"` makes `session start` ask before writing more than
+  `demeaned_confirm_gb` (default 500), or exit asking for `--yes` without a terminal;
+  `"plentiful"`, the default (OSCER), never asks.
 - **Empty samples** (2026-11-08). When no rows are left (all missing, zero weight or
   singletons), the demeaning and `fit` raise a ValueError that says where the rows went;
   `fit` used to return an empty result, and a session went on to fit models on nothing.

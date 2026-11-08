@@ -78,6 +78,10 @@ DEFAULTS = {
     "max_walltime": None,  # longest general job; a node class may override it
     "billing": None,  # none | cores | nodes | tres
     "scratch_purge_days": None,
+    # persisted demeaned data (planner.md, Ted 2026-10-28): "plentiful" never asks; "confirm"
+    # asks before `session start` writes more than demeaned_confirm_gb
+    "demeaned_storage": "plentiful",
+    "demeaned_confirm_gb": None,
     "nodes": {},  # node classes: {name: {partition, count, in_service, cores, memory, ...}}
 }
 
@@ -109,6 +113,11 @@ extra_directives = []          # raw scheduler directives, e.g. ["--qos=long"]
 # disclosure level of estimation records, 1-5 (default 4: no scheduler, timing, hosts or
 # package list); 5 keeps them, for diagnosing runs on this system
 # record_level = 5
+# persisted demeaned data: "plentiful" (default) never asks; "confirm" makes `session start`
+# ask before writing more than demeaned_confirm_gb (default 500) where scratch is scarce
+# demeaned_storage = "confirm"
+# demeaned_confirm_gb = 500
+# scratch_purge_days = 14        # the site deletes scratch files this many days old
 
 [profiles.cluster.worker]
 cores = 8
@@ -180,6 +189,8 @@ class Profile:
     max_walltime: str | None = None
     billing: str | None = None
     scratch_purge_days: int | None = None
+    demeaned_storage: str = "plentiful"
+    demeaned_confirm_gb: float | None = None
     record_level: int | None = None
     nodes: dict = field(default_factory=dict)
     source: str = ""
@@ -224,6 +235,10 @@ def profile(name: str | None = None, path=None, **overrides) -> Profile:
         raise ValueError(f"scheduler must be one of {SCHEDULERS}, got {d['scheduler']!r}")
     if d.get("record_level") is not None and d["record_level"] not in (1, 2, 3, 4, 5):
         raise ValueError(f"record_level must be 1 to 5, got {d['record_level']!r}")
+    if d.get("demeaned_storage") not in ("plentiful", "confirm"):
+        raise ValueError(f"demeaned_storage must be 'plentiful' or 'confirm', got {d['demeaned_storage']!r}")
+    if d["demeaned_storage"] == "confirm" and d.get("demeaned_confirm_gb") is None:
+        d["demeaned_confirm_gb"] = 500.0
     for k in ("account", "queue", "project"):
         if d.get(k) == "":
             d[k] = None
