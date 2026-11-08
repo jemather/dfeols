@@ -38,7 +38,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 os.environ.setdefault("POLARS_MAX_THREADS", "1")
-import polars as pl  # noqa: E402
+import polars as pl
 
 log = logging.getLogger("eve.convert_orders")
 
@@ -165,7 +165,7 @@ def main(argv=None) -> int:
                     el = time.time() - t0
                     log.info("%d/%d done, %.2fB rows, %.0f s, eta %.0f min", done, len(todo),
                              rows / 1e9, el, el / done * (len(todo) - done) / 60)
-            except Exception as e:  # noqa: BLE001 - log and carry on
+            except Exception as e:
                 failed += 1
                 log.error("FAILED %s: %s", rel, e)
     log.info("finished: %d converted, %d failed, %.3fB rows", done, failed, rows / 1e9)
