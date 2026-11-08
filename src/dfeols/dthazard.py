@@ -27,6 +27,7 @@ import json
 import logging
 import math
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -35,7 +36,7 @@ import numpy as np
 import polars as pl
 
 from .executors import SerialExecutor
-from .formula import Term, fe_components, parse
+from .formula import Term, _term, fe_components, parse
 from .lock import DirLock
 from .prep import META, Dataset, remove_dir
 from .progress import Progress
@@ -55,8 +56,33 @@ DROP_REASONS = {
 }
 
 
-def _instrument_name(term: Term, j: int) -> str:
-    return f"D{j}_" + "_x_".join(term.conts)
+def _instrument_columns(terms: list[Term], instrumented: list[int], j: int, cat_levels: dict) -> list:
+    """(term index, level or None, column name) for every instrument column the builder
+    makes: one per continuous term, one per level of the categorical for an i() term (the
+    levels of the prepared data; those absent from the sample are left out later)."""
+    out, seen = [], set()
+    for i in instrumented:
+        t = terms[i]
+        tail = "_x_".join(t.conts)
+        for lv in cat_levels[t.cat] if t.cat else [None]:
+            lvs = re.sub(r"\W", "_", str(lv))
+            base = f"D{j}_" + (f"{t.cat}_{lvs}" if t.cat else "")
+            name = base + ("_x_" if t.cat and tail else "") + tail
+            k, cand = 1, name
+            while cand in seen:
+                k += 1
+                cand = f"{name}_{k}"
+            seen.add(cand)
+            out.append((i, lv, cand))
+    return out
+
+
+def _term_text(t: Term) -> str:
+    """The term as formula text, ref= included (Term.label leaves it out)."""
+    parts = []
+    if t.cat:
+        parts.append(f"i({t.cat}, ref={t.ref!r})" if t.ref is not None else f"i({t.cat})")
+    return ":".join([*parts, *t.conts])
 
 
 def _binom(j: int) -> list[int]:
@@ -101,16 +127,18 @@ def _build_task(paths: list[str], out_file: str, spec: dict) -> dict:
         df = df.filter(~after)
         out["dropped"]["after_event"] = n_after
 
-    # term columns (products made here), their validity, and Δ^j
-    tcols = []
-    for i, conts_i in enumerate(spec["terms"]):
+    # term columns (the continuous part; products made here), their validity, and Δ^j
+    tcols, valid = [], []
+    for i, term in enumerate(spec["terms"]):
         e = pl.lit(1.0)
-        for c in conts_i:
+        for c in term["conts"]:
             e = e * pl.col(c).cast(pl.Float64)
         tcols.append(e.alias(f"__t{i}"))
+        valid.append(pl.col(f"__t{i}").is_not_null() & pl.col(f"__t{i}").is_finite())
+        if term["cat"]:
+            valid.append(pl.col(term["cat"]).is_not_null())
     df = df.with_columns(tcols)
-    tnames = [f"__t{i}" for i in range(len(spec["terms"]))]
-    ok_x = pl.all_horizontal([pl.col(t).is_not_null() & pl.col(t).is_finite() for t in tnames])
+    ok_x = pl.all_horizontal(valid)
     df = df.with_columns(ok_x.alias("__okx"))
     own_ok = pl.col("__okx") & pl.col(y).is_not_null()
     if spec["weights"]:
@@ -131,12 +159,13 @@ def _build_task(paths: list[str], out_file: str, spec: dict) -> dict:
         .alias("__why")
     )
     w = _binom(j)
-    diffs = [
-        sum((pl.col(tnames[i]).shift(k) * w[k] for k in range(1, j + 1)), pl.col(tnames[i]) * w[0]).alias(
-            spec["instruments"][i]
-        )
-        for i in spec["instrumented"]
-    ]
+    diffs = []
+    for i, lv, name in spec["inst_cols"]:
+        cat = spec["terms"][i]["cat"]
+        col = pl.col(f"__t{i}")
+        if cat:
+            col = col * (pl.col(cat) == lv).cast(pl.Float64)
+        diffs.append(sum((col.shift(k) * w[k] for k in range(1, j + 1)), col * w[0]).alias(name))
     preds = [pl.col(c).shift(1).alias(f"__pred_{c}") for c in spec["fe_cols"]]
     df = df.with_columns([reason, *diffs, *preds])
     counts = df.group_by("__why").len()
@@ -158,6 +187,7 @@ def _build_task(paths: list[str], out_file: str, spec: dict) -> dict:
     out["y_sum"] = float(kept[y].sum()) if kept.height else 0.0
     out["units"] = int(kept[unit].n_unique()) if kept.height else 0
     out["rows"] = kept.height
+    out["cat_levels"] = {c: kept[c].drop_nulls().unique().to_list() for c in spec["cats"]}
     if kept.height:
         keep_cols = list(dict.fromkeys([*spec["write"], *spec["instruments_kept"]]))
         tmp = out_file + ".tmp"
@@ -279,12 +309,16 @@ def lpm_dthazard(
     """Discrete-time hazard linear probability model by the Farbmacher-Tauchmann IV
     (docs/design/hazard.md).
 
-    formula   `y ~ x1 + x2 + x1:x2 | fe1 + fe2`: y is the absorbing-state indicator, every
-              term is instrumented by its own j-th difference (unless named in `levels`), the
-              FEs are absorbed as exogenous. An intercept is always included (the paper's
-              constant) unless FEs absorb it. i() terms are not supported: absorb them as FEs
-              (for time, age or group-by-time dummies that is the same estimator) or make
-              dummy columns before prep. A FE involving `unit` is refused (that is the within
+    formula   `y ~ x1 + x2 + x1:x2 + i(age, ref=55) + x1:i(g) | fe1 + fe2`: y is the
+              absorbing-state indicator; every term is instrumented by its own j-th difference
+              (unless named in `levels`), the FEs are absorbed as exogenous. An intercept is
+              always included (the paper's constant) unless FEs absorb it. An i() term is
+              estimated on the levels present in the sample (minus ref=, or the first level):
+              each dummy is instrumented by Δ^j of itself. Levels that never occur in the
+              sample (e.g. the youngest age, seen only in a unit's first period) get no
+              coefficient and are reported (`excluded_levels`), as the paper drops age 53.
+              Absorbing such a variable as a FE instead gives the same other coefficients
+              (docs/design/hazard.md). A FE involving `unit` is refused (that is the within
               estimator, which is biased here).
     unit      the spell (unit) identifier; the dataset must be prepared with partition=unit
               (or a FE/cluster on unit nested in the partition), so a unit's rows are in one
@@ -328,18 +362,15 @@ def lpm_dthazard(
         raise ValueError("diff must be an integer >= 1 (diff=0 would be pooled OLS)")
     if after_event not in ("error", "drop"):
         raise ValueError("after_event must be 'error' or 'drop'")
-    for t in f.terms:
-        if t.cat is not None:
-            raise NotImplementedError(
-                f"{t.label}: i() terms are not supported in lpm_dthazard; absorb the variable as a FE "
-                "(equivalent for time, age or group x time dummies; docs/design/hazard.md) or make dummy "
-                "columns before prep"
-            )
-    labels = [t.label for t in f.terms]
-    unknown = [lv for lv in levels if lv not in labels]
-    if unknown:
-        raise ValueError(f"levels names terms not in the formula: {unknown}")
-    instrumented = [i for i, t in enumerate(f.terms) if t.label not in levels]
+    labels = [_term_text(t) for t in f.terms]
+    lev_terms = []
+    for lv in levels:
+        lt = _term(lv)
+        if lt not in f.terms:
+            raise ValueError(f"levels names a term not in the formula: {lv!r}")
+        lev_terms.append(lt)
+    levels = [_term_text(t) for t in lev_terms]
+    instrumented = [i for i, t in enumerate(f.terms) if t not in lev_terms]
     if not instrumented:
         raise ValueError("every term is in levels: nothing to instrument (that is pooled OLS)")
     y = f.depvars[0]
@@ -362,7 +393,8 @@ def lpm_dthazard(
             )
         if fe not in ds.fes:
             raise KeyError(f"FE {fe!r} was not encoded by prep (have {list(ds.fes)})")
-    for c in (unit, time, y, *(c for t in f.terms for c in t.conts), *([weights] if weights else [])):
+    cats = list(dict.fromkeys(t.cat for t in f.terms if t.cat))
+    for c in (unit, time, y, *(c for t in f.terms for c in t.conts), *cats, *([weights] if weights else [])):
         if c not in ds.columns:
             raise KeyError(f"Column {c!r} is not in the dataset")
     if cluster is not None and cluster not in ds.clusters:
@@ -374,8 +406,13 @@ def lpm_dthazard(
     fe_cols = [ds.fes[fe]["column"] for fe in f.fes]
     cl_cols = [ds.clusters[cluster]["column"]] if cluster else []
     conts = list(dict.fromkeys(c for t in f.terms for c in t.conts))
-    instruments = [_instrument_name(f.terms[i], diff) for i in instrumented]
-    write = list(dict.fromkeys([unit, time, y, *conts, *fe_cols, *cl_cols, *([weights] if weights else [])]))
+    from .estimate import category_levels
+
+    parent_levels = category_levels(ds, cats, executor) if cats else {}
+    inst_cols = _instrument_columns(list(f.terms), instrumented, diff, parent_levels)
+    write = list(
+        dict.fromkeys([unit, time, y, *conts, *cats, *fe_cols, *cl_cols, *([weights] if weights else [])])
+    )
     spec = {
         "unit": unit,
         "time": time,
@@ -384,16 +421,15 @@ def lpm_dthazard(
         "after_event": after_event,
         "weights": weights,
         "conts": conts,
-        "terms": [list(t.conts) for t in f.terms],
+        "terms": [{"conts": list(t.conts), "cat": t.cat} for t in f.terms],
+        "cats": cats,
         "instrumented": instrumented,
-        "instruments": {i: name for i, name in zip(instrumented, instruments)},
-        "instruments_kept": instruments,
+        "inst_cols": inst_cols,
+        "instruments_kept": [name for *_, name in inst_cols],
         "fe_cols": fe_cols,
         "read": write,
         "write": write,
     }
-    # the instruments dict is keyed by term index; tasks see it as a list indexed the same way
-    spec["instruments"] = [spec["instruments"].get(i) for i in range(len(f.terms))]
 
     key = hashlib.sha256(
         json.dumps(
@@ -409,12 +445,12 @@ def lpm_dthazard(
         ).encode()
     ).hexdigest()[:16]
     sample_dir = Path(ds.root) / "_dthazard" / key
+    warnings: list[str] = []
     built = _build_sample(ds, spec, sample_dir, executor, label or "dthazard")
     sds = Dataset.open(sample_dir)
     info = sds.meta["dthazard"]
 
     # FE checks: nested in the unit (refused), movers (warned)
-    warnings: list[str] = []
     fe_checks = {}
     for fe in f.fes:
         c = info["fe_checks"][ds.fes[fe]["column"]]
@@ -434,6 +470,38 @@ def lpm_dthazard(
             warnings.append(msg)
             log.warning("lpm_dthazard: %s", msg)
 
+    # i() terms: fit expands them from the levels present in the sample (sorted, as
+    # category_levels does), dropping ref= or the first; instrument exactly those levels
+    sample_levels = {c: info["cat_levels"][c] for c in cats}
+    instruments, excluded = [], {}
+    for i in instrumented:
+        t = f.terms[i]
+        cols = [(lv, name) for ti, lv, name in inst_cols if ti == i]
+        if not t.cat:
+            instruments.append(cols[0][1])
+            continue
+        present = sample_levels[t.cat]
+        if t.ref is not None and t.ref not in present:
+            raise ValueError(f"{labels[i]}: the reference level {t.ref!r} is not in the estimation sample")
+        if t.ref is not None:
+            est = [lv for lv in present if lv != t.ref]
+        else:
+            est = present[1:] if t.drop_first else present
+        by_level = dict(cols)
+        instruments += [by_level[lv] for lv in est]
+        gone = [lv for lv in parent_levels[t.cat] if lv not in present]
+        if gone:
+            excluded[labels[i]] = gone
+            msg = (
+                f"{labels[i]}: level(s) {gone} never occur in the estimation sample (e.g. the youngest age, "
+                "seen only in a unit's first period), so they get no coefficient (the paper drops them too)"
+            )
+            warnings.append(msg)
+            log.warning("lpm_dthazard: %s", msg)
+        if t.ref is None and t.drop_first and present and parent_levels[t.cat][0] != present[0]:
+            msg = f"{labels[i]}: reference level is {present[0]!r}, the first level in the sample"
+            warnings.append(msg)
+            log.warning("lpm_dthazard: %s", msg)
     endog = [labels[i] for i in instrumented]
     exog = list(levels) or ["1"]
     fe_part = f" | {' + '.join(f.fes)}" if f.fes else ""
@@ -504,6 +572,7 @@ def lpm_dthazard(
         "sample": sample,
         "drop_reasons": {k: DROP_REASONS[k] for k in sample["dropped"]},
         "fe_checks": fe_checks,
+        "excluded_levels": {k: [str(v) for v in vs] for k, vs in excluded.items()},
         "G": G,
         "fit_formula": main_f,
         "sample_key": key,
@@ -679,6 +748,10 @@ def _build_sample(ds: Dataset, spec: dict, out: Path, executor, label: str) -> b
                 "units": sum(r["units"] for r in results.values()),
                 "events": sum(r["y_sum"] for r in results.values()),
                 "fe_checks": fe_checks,
+                "cat_levels": {
+                    c: sorted({lv for r in results.values() for lv in r["cat_levels"].get(c, [])})
+                    for c in spec["cats"]
+                },
             },
         )
         meta.pop("partition_plan", None)

@@ -1,6 +1,6 @@
 # Discrete-time hazard LPM: the Farbmacher-Tauchmann IV estimator
 
-Status: design agreed (Ted, 2026-11-08; STATE.md Decisions), not built yet.
+Status: built (`src/dfeols/dthazard.py`, `tests/test_dthazard.py`), 2026-11-08.
 
 Source: Farbmacher, H. and Tauchmann, H. (2021), "Linear fixed-effects estimation with
 non-repeated outcomes", FAU Discussion Papers in Economics 03/2021 (`raw/03-2021-1.pdf`).
@@ -86,7 +86,11 @@ columns), so refits and sessions don't rebuild.
                   unit="order_id", time="day", diff=1,
                   vcov="hetero", cluster=None, after_event="error")
 
-- formula: the usual `y ~ x | fe` (no IV part; every x is instrumented by its own Δ^j)
+- formula: the usual `y ~ x | fe` (no IV part; every x is instrumented by its own Δ^j).
+  `i(c)`, `i(c, ref=)` and `x:i(c)` terms (Ted 2026-11-08: needed): estimated on the levels
+  present in the sample, each dummy instrumented by Δ^j of itself; levels that never occur in
+  the sample (the youngest age, seen only in first periods) get no coefficient and are listed
+  as `excluded_levels`, as the paper drops age 53
 - `diff=j` (default 1)
 - `levels=[...]`: regressors assumed uncorrelated with a_i in levels, so instrumented by
   themselves (default none). Optional; useful for regressors with no within variation.

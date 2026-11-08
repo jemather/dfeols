@@ -51,7 +51,9 @@ def hazard_panel(n=3000, T=6, seed=1, movers=0.0, gaps=0.0, missing=0.0):
         df = df.with_columns(
             pl.when(pl.Series(rng.random(df.height)) < missing).then(None).otherwise(pl.col("x1")).alias("x1")
         )
-    return df.with_columns(gt=pl.col("g") * 100 + pl.col("t"))
+    start = np.random.default_rng(seed + 100).integers(50, 55, n)
+    age = start[df["uid"].to_numpy()] + df["t"].to_numpy() - 1
+    return df.with_columns(gt=pl.col("g") * 100 + pl.col("t"), age=pl.Series(age))
 
 
 def reference_sample(df: pl.DataFrame, j: int, terms=("x1", "x2")):
@@ -94,7 +96,7 @@ def ds(data, tmp_path_factory):
         data,
         shard_dir=tmp_path_factory.mktemp("hz"),
         partition="uid",
-        fixed_effects=["t", "g^t", "uid"],
+        fixed_effects=["t", "g^t", "uid", "g"],
         clusters=["uid", "g"],
         target_rows=2000,
     )
@@ -228,8 +230,6 @@ def test_refusals(ds, data, tmp_path):
         lpm_dthazard(ds, "y ~ x1 | uid", unit="uid", time="t", workdir=tmp_path)
     with pytest.raises(ValueError, match="IV part"):
         lpm_dthazard(ds, "y ~ 1 | x1 ~ x2", unit="uid", time="t", workdir=tmp_path)
-    with pytest.raises(NotImplementedError, match="absorb"):
-        lpm_dthazard(ds, "y ~ x1 + i(g)", unit="uid", time="t", workdir=tmp_path)
     with pytest.raises(ValueError, match="constant"):
         lpm_dthazard(ds, "y ~ 0 + x1", unit="uid", time="t", workdir=tmp_path)
     with pytest.raises(ValueError, match="nothing to instrument"):
@@ -298,3 +298,86 @@ def test_monte_carlo_sanity(tmp_path):
     assert abs(b - 1) < 4 * se
     assert abs(h.fd.coef()[-1] - 0.5) < 4 * np.sqrt(h.fd.vcov()[-1, -1])
     assert h.ols.coef()[-1] > 1.2
+
+
+def _with_dummies(df: pl.DataFrame, cat: str, cont: str | None = None) -> tuple[pl.DataFrame, dict]:
+    """One 0/1 column per level of `cat` (times `cont` if given), named safely."""
+    names = {}
+    for lv in sorted(df[cat].unique().to_list()):
+        name = f"{cat}_{lv}" + (f"_x_{cont}" if cont else "")
+        e = (pl.col(cat) == lv).cast(pl.Float64)
+        df = df.with_columns((e * pl.col(cont) if cont else e).alias(name))
+        names[lv] = name
+    return df, names
+
+
+@pytest.mark.parametrize("j", [1, 2])
+@pytest.mark.parametrize("term,ref", [("i(age, ref=53)", 53), ("i(age)", None)])
+def test_i_terms_match_hand_built_dummies(ds, data, tmp_path, j, term, ref):
+    """i(age): dummies instrumented by their own Δ^j; the youngest ages occur only in
+    units' first periods, so they drop out (as age 53 does in the paper's Table 3)."""
+    h = lpm_dthazard(
+        ds, f"y ~ x1 + {term} | g", unit="uid", time="t", diff=j, workdir=tmp_path / "h", log_every=1e9
+    )
+    df, names = _with_dummies(data, "age")
+    ref_df, _ = reference_sample(df, j, terms=("x1", *names.values()))
+    present = sorted(lv for lv, n in names.items() if ref_df[n].abs().sum() > 0)
+    est = [lv for lv in present if lv != ref] if ref is not None else present[1:]
+    assert min(names) not in present  # the youngest age is excluded
+    assert any("never occur" in w for w in h.warnings)
+    endog = ["x1", *(names[lv] for lv in est)]
+    rds = dfeols.prep(
+        pl.from_pandas(ref_df),
+        shard_dir=tmp_path / "r",
+        partition="uid",
+        fixed_effects=["g"],
+        target_rows=10**6,
+    )
+    r = dfeols.fit(
+        rds,
+        f"y ~ 1 | g | {' + '.join(endog)} ~ {' + '.join(f'D{j}_{e}' for e in endog)}",
+        vcov="hetero",
+        log_every=1e9,
+        workdir=tmp_path / "rf",
+        record=False,
+    )
+    assert h.iv.coefnames == ["x1", *(f"age::{lv}" for lv in est)]
+    np.testing.assert_allclose(h.iv.coef(), r.coef(), **TOL)
+    np.testing.assert_allclose(h.iv.vcov(), r.vcov(), rtol=1e-8, atol=1e-14)
+    assert h.iv.N == r.N
+
+
+def test_continuous_by_factor_term(ds, data, tmp_path):
+    """x1:i(g): one slope per group, each instrumented by Δ(x1 1[g = L])."""
+    h = lpm_dthazard(ds, "y ~ x1:i(g) | t", unit="uid", time="t", workdir=tmp_path / "h", log_every=1e9)
+    df, names = _with_dummies(data, "g", "x1")
+    ref_df, _ = reference_sample(df, 1, terms=tuple(names.values()))
+    rds = dfeols.prep(
+        pl.from_pandas(ref_df),
+        shard_dir=tmp_path / "r",
+        partition="uid",
+        fixed_effects=["t"],
+        target_rows=10**6,
+    )
+    endog = list(names.values())
+    r = dfeols.fit(
+        rds,
+        f"y ~ 1 | t | {' + '.join(endog)} ~ {' + '.join('D1_' + e for e in endog)}",
+        vcov="hetero",
+        log_every=1e9,
+        workdir=tmp_path / "rf",
+        record=False,
+    )
+    assert h.iv.coefnames == [f"g::{lv}:x1" for lv in names]
+    np.testing.assert_allclose(h.iv.coef(), r.coef(), **TOL)
+    np.testing.assert_allclose(h.iv.vcov(), r.vcov(), rtol=1e-8, atol=1e-14)
+
+
+def test_i_term_record_validates(ds, tmp_path):
+    est = pytest.importorskip("estrec")
+    pytest.importorskip("jsonschema")
+    lpm_dthazard(ds, "y ~ x1 + i(age, ref=53)", unit="uid", time="t", workdir=tmp_path, log_every=1e9)
+    rec = est.read(tmp_path / "result.estrec.json", nonfinite="string")
+    bad = [i for i in est.validate(rec, base_dir=tmp_path) if i.level != "info"]
+    assert not bad, "\n".join(map(str, bad))
+    assert rec["extensions"]["dfeols"]["dthazard"]["excluded_levels"] == {"i(age, ref=53)": ["50"]}
