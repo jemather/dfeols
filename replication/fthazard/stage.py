@@ -8,6 +8,7 @@ reference.json, simulate.json and check.py (the manifest is written afterwards b
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -109,7 +110,10 @@ def main(src: Path, dst: Path, commit: str):
         raise SystemExit(f"{dst} is already staged (never change a pushed dataset; build _v2)")
     (dst / "data").mkdir(parents=True, exist_ok=True)
     for p in info["parts"]:
-        shutil.copyfile(src / p["file"], dst / p["file"])
+        try:  # build/ and outbox/ share a file system: link, don't copy (~2 GB a dataset)
+            os.link(src / p["file"], dst / p["file"])
+        except OSError:
+            shutil.copyfile(src / p["file"], dst / p["file"])
     for f in ("simulate.json", "reference.json"):
         shutil.copyfile(src / f, dst / f)
     shutil.copyfile(HERE / "check.py", dst / "check.py")

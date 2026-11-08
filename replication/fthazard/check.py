@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import time
 from pathlib import Path
 
@@ -59,7 +60,11 @@ def compare(ours: dict, pub: dict, rounding: float) -> list[dict]:
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("root", type=Path)
-    ap.add_argument("--profile", default=None)
+    ap.add_argument(
+        "--profile",
+        default=os.environ.get("DFEOLS_PROFILE"),
+        help="default $DFEOLS_PROFILE (set by dfeols submit)",
+    )
     ap.add_argument("--max-workers", type=int, default=None)
     ap.add_argument("--target-rows", type=int, default=2_000_000)
     ap.add_argument("--shards", type=Path, default=None, help="where to prep (default: profile scratch)")
