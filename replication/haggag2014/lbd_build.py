@@ -53,6 +53,7 @@ log = logging.getLogger("haggag2014.lbd_build")
 D2_ZIP = "raw/haggag2017/113636-V1.zip"
 TIGER = "build/haggag2014/extract/tl_2011_*/*.shp"
 MIN = 60_000_000  # microseconds per minute
+TIE_DESC = os.environ.get("LBD_TIE", "desc") == "desc"
 DEDUP = [
     "car_id",
     "driver_id",
@@ -213,7 +214,9 @@ def build_bucket(trips: str, b: str, out: str, commit: str) -> dict:
     n_dedup = df.height
     p, d = pl.col("pkp_time_tmp"), pl.col("drf_time_tmp")
     df = df.with_columns(pkp_time=pl.min_horizontal(p, d), drf_time=pl.max_horizontal(p, d), flipped=p > d)
-    df = df.sort("driver_id", "pkp_time", "drf_time", "row")
+    # line 107 (sort driver_id pkp_time) leaves ties in pickup time unordered; TIE_DESC puts the
+    # later drop-off first, so the sequencing fix (line 111) truncates that trip
+    df = df.sort("driver_id", "pkp_time", "drf_time", "row", descending=[False, False, TIE_DESC, False])
     nxt = pl.col("pkp_time").shift(-1).over("driver_id")
     df = df.with_columns(seq_fix=(pl.col("drf_time") > nxt).fill_null(False))
     df = df.with_columns(drf_time=pl.when("seq_fix").then(nxt).otherwise("drf_time"))
@@ -239,6 +242,7 @@ def build_bucket(trips: str, b: str, out: str, commit: str) -> dict:
         drf_dow=(pl.col("drf_date").dt.weekday() % 7).cast(pl.Int8),
     )
     # section 2: shifts (145-187)
+    df = df.sort("driver_id", "pkp_time", "drf_time", "row")  # line 145
     df = df.with_columns(
         duration_outlier=(pl.col("ride_duration") > 180) | (pl.col("ride_duration") <= 0),
         distance_outlier=(pl.col("distance") > 100) | (pl.col("distance") <= 0),

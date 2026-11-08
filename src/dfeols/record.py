@@ -472,6 +472,8 @@ def _t_stats(b, se, df):
 
 
 def _call(result) -> str:
+    if (result.run or {}).get("call"):  # a wrapper such as lpm_dthazard records its own call
+        return result.run["call"]
     o = result.options
     args = [repr(result.formula)]
     for k in (
@@ -844,7 +846,7 @@ def to_estimation(
         "fixed_effects": list(r.fe),
         "clusters": [r.cluster] if r.cluster else [],
         "sample": {
-            "restriction": None,
+            "restriction": run.get("restriction"),
             **({"rows_input": sample["rows_input"]} if "rows_input" in sample else {}),
             "dropped": {**dropped, "singletons": n_sing},
         },
@@ -882,6 +884,8 @@ def to_estimation(
         ext["absorption"] = absorption
     if iv:
         ext["first_stage"] = iv["first_stage"]
+    if run.get("dthazard"):
+        ext["dthazard"] = run["dthazard"]
     if r.timing:
         ext["timing"] = r.timing
     src = dfeols_source() if provenance else {}

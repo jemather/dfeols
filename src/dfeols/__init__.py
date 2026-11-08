@@ -5,6 +5,7 @@
 import logging as _logging
 
 from .cluster import executor
+from .dthazard import lpm_dthazard
 from .estimate import build_plan, fit
 from .executors import DaskExecutor, SerialExecutor
 from .lock import LockedError
@@ -29,6 +30,7 @@ __all__ = [
     "LockedError",
     "write_collection",
     "Session",
+    "lpm_dthazard",
 ]
 __version__ = "0.7.0"
 
