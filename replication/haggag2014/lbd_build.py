@@ -15,8 +15,9 @@ lines are lbd_clean.do's (``docs/haggag2014.md``). Decisions 2026-11-08:
   shift file (``exper_driver_group``, ``new_driver``) through ``driver_link.parquet``. Our own
   new and incumbent rules (lines 418-437) are computed alongside, for comparison.
 
-Not ported yet: the difficulty and location-experience measures (sections 7 and 9, and
-section 12's variables built from them). Table 3's main specification doesn't use them.
+Ported from section 9 so far: total experience at ride 3 (``end_exp_all``, Table 3 col 4).
+Not ported yet: the difficulty and location-specific experience measures (sections 7 and 9,
+and section 12's variables built from them).
 
 Ties: Stata's ``sort`` orders ties arbitrarily; here ties in pickup time are broken by
 dropoff time, then file order.
@@ -444,6 +445,19 @@ def finish(out: Path, link_path: str, pub_path: str, commit: str) -> dict:
         start_month=pl.col("start_date").dt.month().cast(pl.Int8),
     )
     sh = sh.with_columns(entry_month=pl.col("start_month").min().over("driver_id"))
+    # line 595: experience at ride 3's drop-off = the driver's earlier trips (earlier shifts' rides
+    # plus rides 1-2). end_exp_all counts only shifts the code keeps (120-minute rule);
+    # end_exp_all_keep2 also counts the 2-120 minute shifts. Missing without a ride 3 (line 893).
+    sh = sh.sort("driver_id", "shift")
+    kept = (~pl.col("short_shift_120")).cast(pl.Int64)
+    sh = sh.with_columns(
+        end_exp_all=pl.when(pl.col("end_time").is_not_null() & ~pl.col("short_shift_120")).then(
+            (pl.col("shift_rides") * kept).cum_sum().shift(1).fill_null(0).over("driver_id") + 2
+        ),
+        end_exp_all_keep2=pl.when(pl.col("end_time").is_not_null()).then(
+            pl.col("shift_rides").cast(pl.Int64).cum_sum().shift(1).fill_null(0).over("driver_id") + 2
+        ),
+    )
     # published samples via the link
     link = pl.read_parquet(link_path).select(pub_driver_id="driver_id", driver_id="hack_license")
     pubd = (
@@ -481,6 +495,9 @@ def finish(out: Path, link_path: str, pub_path: str, commit: str) -> dict:
     ok_hr = pl.col("shift_hours") >= (pl.col("end_en") + 60) / 60
     a = a.with_columns(
         log_new_shift=pl.col("log_shift") * pl.col("new_driver"),
+        log_all_exper=pl.col("end_exp_all").log(),
+        log_new_all_exper=pl.col("end_exp_all").log() * pl.col("new_driver"),
+        log_new_all_exper_keep2=pl.col("end_exp_all_keep2").log() * pl.col("new_driver"),
         log_avg_earn=pl.col("avg_earn").log(),
         log_hr_fare=pl.when(ok_hr & (pl.col("fare_hour") > 0)).then(pl.col("fare_hour").log()),
         log_hr_fare_ib=pl.when(ok_hr).then((1 + pl.col("fare_hour")).log()),
