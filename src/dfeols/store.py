@@ -44,13 +44,17 @@ def _tree_bytes(p: Path) -> int:
 
 def _created(kd: Path) -> list[str]:
     """The expressions of the variables created on a key's data (created/*/variable.json)."""
+    from .session import CREATED_FORMAT
+
     out = []
     for vj in sorted((kd / "created").glob("*/variable.json")):
         try:
-            out.append(json.loads(vj.read_text())["canonical"])
-        except (OSError, ValueError, KeyError):
-            pass
-    return out
+            doc = json.loads(vj.read_text())
+        except (OSError, ValueError):
+            continue
+        if doc.get("format") == CREATED_FORMAT:
+            out += [v["canonical"] for v in doc.get("variables", [])]
+    return sorted(out)
 
 
 def live_users(sessions: Path | None) -> dict[str, list[str]]:

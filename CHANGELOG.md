@@ -36,6 +36,8 @@ break the API).
 - `Session.start` takes `progress=` as `Session.attach` does.
 
 ### Changed
+- Created variables are stored in batches (`dfeols-created/2`; format 1 folders are ignored and
+  rebuilt).
 - Session demeaned data move to format 3: the singleton masks are kept in `sample/` (one bit
   a row) so created variables get the same rows. Format 2 data are rebuilt by the next
   session (none had been built on OSCER yet).
@@ -71,6 +73,30 @@ break the API).
   `setting_changed` (old and new vcov and cluster) before the new model's `fit`; the index
   entry has `refit_of`.
 - `dfeols demeaned list` shows each key's created variables.
+- Session exports (sessions step 5) through the estrec table tool (Ted 2026-11-08):
+  `s.export([m1, m2], "table2.tex")` / `export_table` / `dfeols session export --models`
+  write the table (.tex, .md, .html, .csv, .txt, .doc), its `estrec-table/0.1` spec and the
+  session collection it reads, so it renders again from the files alone.
+- The R client (sessions step 5), package `dfeols` in `r/`: `attach_session`, `fit`, `refit`,
+  `add_variable(s)`, `export_table`, ...; models come back as estrec records, so `tidy()`,
+  `glance()` and modelsummary work. `dfeols session where` gives clients the folder.
+  Tested from Python against a live session: R equals Python to 1e-12.
+- IV in sessions (step 6): `y ~ x | d ~ z`, 2SLS, LIML, Fuller, from the Gram matrix (b,
+  iid SEs, kappa, overidentification tests, first stage) and one pass for hetero/CRV1; OLS
+  and IV share the pass (linear maps of a block of columns). Equal to `dfeols.fit`'s IV.
+- Two-way clustering in sessions (Ted 2026-11-08): `cluster="a+b"`, Cameron-Gelbach-Miller
+  with pyfixest's conventions (G_min in each term and in the t df), equal to pyfixest to
+  1e-13; the intersection's codes are made per shard. Records list both clusters.
+- `i()` terms in session models: indicator columns created in one batch (one demeaning for
+  every level), named and dropped as `fit` does, equal to `fit`'s `i()`.
+- `Session.add_variables({name: expression})`: new columns demeaned together in one batch;
+  each column keeps its own digest and is reused alone.
+- `dfeols.session.replay` / `dfeols session replay`: a session collection's events run
+  again in a running session, each member compared with its record.
+- Plan C session builds keep the level-space A (`<key>/crossing/A.npz`); creating variables
+  then skips A in round 1 and solves on it.
+- `session start` warns when a demeaning task would not fit a worker thread's memory (no cap
+  on declared variables, Ted 2026-11-08).
 - `dfeols demeaned list` and `dfeols demeaned rm <key>` for persisted demeaned data (sessions
   step 3): size, when written, purge date (`scratch_purge_days`), the running sessions using
   each key, incomplete and old-format folders; `rm` asks (or `--yes`) and refuses while a

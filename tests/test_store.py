@@ -168,3 +168,18 @@ def test_manager_stops_before_demeaning_when_it_cannot_fit(ds, tmp_path):
     with pytest.raises(RuntimeError, match="not enough scratch"):
         Session.start("big", ds.root, "spell + week", ["eng", "feat"], poll=0.05, progress=False, **r)
     assert json.loads((r["root"] / "big" / "session.json").read_text())["status"] == "failed"
+
+
+def test_memory_warning_for_many_variables(ds):
+    """No cap on declared variables (Ted 2026-11-08); a warning when a demeaning task would
+    not fit a worker thread's share of the profile's memory."""
+    from dfeols.session import Spec, _session_plan, memory_warnings
+
+    spec = Spec.make(ds.root, "spell + week", ["eng", "feat"], "id_a")
+    plan, _ = _session_plan(spec, ds, None)
+    roomy = types.SimpleNamespace(worker={"memory": "32GB", "cores": 8})
+    assert memory_warnings(spec, ds, plan, roomy) == []
+    tight = types.SimpleNamespace(worker={"memory": "1MB", "cores": 4})
+    (w,) = memory_warnings(spec, ds, plan, tight)
+    assert "a demeaning task needs" in w and "1MB / 4 cores" in w
+    assert memory_warnings(spec, ds, plan, types.SimpleNamespace()) == []

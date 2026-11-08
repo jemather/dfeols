@@ -2,8 +2,10 @@
 
 Status: build order step 2 (session core) built 2026-11-02 in `src/dfeols/session.py`, with
 step 3 (persisted data found by key and reused, `persist()` after `--no-persist`, `dfeols
-demeaned list/rm`, the scratch checks; 2026-11-08) and step 4 (created variables, refit;
-2026-11-08); see "As built" below. Steps 5-6 are not built.
+demeaned list/rm`, the scratch checks; 2026-11-08), step 4 (created variables, refit), step 5
+(exports through the estrec table tool, the R client in `r/`) and step 6 (IV), with two-way
+clustering, `i()` terms and the replay of a session collection (all 2026-11-08); see "As
+built" below. Every step of the build order is built.
 
 ## Goal
 
@@ -33,7 +35,7 @@ m2 = s.fit("lfare ~ hhi + lpax + dist")
 s.add_variable("lfare_x_hhi", "lfare_raw * hhi")           # built from raw columns, then demeaned
 m3 = s.refit(m2, vcov="hetero")                            # residual pass only
 s.persist()                                                 # if started with --no-persist
-s.export([m1, m2, m3], "table2.tex")                       # also .docx, .md; JSON always written
+s.export([m1, m2, m3], "table2.tex")                       # also .md, .html, .csv, .doc; spec and collection beside it
 ```
 
 ```r
@@ -173,11 +175,11 @@ manager is restarted after a crash).
 
 ## Interfaces
 
-- **Python:** `dfeols.Session` (start, attach, fit, refit, add_variable, persist, export, close;
-  `export` also writes the session collection).
+- **Python:** `dfeols.Session` (start, attach, fit, refit, add_variable, add_variables,
+  variables, persist, export, export_table, close, stop; `dfeols.session.replay`).
 - **R:** a small package (jsonlite only) speaking the same request files: `attach_session`,
   `fit`, `add_variable`, `persist`; results as objects with `tidy()`/`glance()` methods.
-- **CLI:** `dfeols session start|status|fit|stop`.
+- **CLI:** `dfeols session start|serve|status|where|fit|refit|add-variable|export|persist|replay|stop`.
 
 ## Lifecycle and safety
 
@@ -200,9 +202,9 @@ manager is restarted after a crash).
 2. Session core: start/attach/stop, demean once, OLS with iid/hetero/CRV1, request files,
    estimates, `estimation` records, the session collection. Python client and CLI.
 3. Persisted demeaned data: write, find by key, reuse; size warning.
-4. Created variables; vcov changes on an existing model.
-5. Exports (maketables extractor); R client.
-6. IV in sessions.
+4. Created variables; vcov changes on an existing model. **Done.**
+5. Exports (estrec table tool; Ted 2026-11-08, not maketables); R client. **Done.**
+6. IV in sessions. **Done.**
 
 ## As built (step 2, 2026-11-02)
 
@@ -337,10 +339,10 @@ within 5e-15.
   solve or plan C's CG, round 2), and the same passes give its Gram entry, its raw sums
   (collinearity scale) and its cross-products with every column of the session, so a model
   with it needs no extra pass. A row where it is missing or not finite (`log(0)`) is an
-  error with the count, and nothing is kept. It goes to `<key>/created/<digest>/`
-  (`shards/part-*.parquet` with one column, `variable.json` last, under a DirLock), where
-  `<digest>` names the expression's tree with the two operands of each `+` and `*` sorted
-  (exact in float64). A later session on the same key reuses it under any name; the
+  error with the count, and nothing is kept. It goes to `<key>/created/<batch>/`
+  (`shards/part-*.parquet`, `variable.json` last, under a DirLock; see batches below), and is
+  known by its digest, which names the expression's tree with the two operands of each `+`
+  and `*` sorted (exact in float64). A later session on the same key reuses it under any name; the
   cross-products with that session's other created columns come from either column's
   `variable.json`, or else from one pass (`cross_pass`). Asking again for the same name and
   expression does nothing; a name in use, or an expression already created under another
@@ -350,8 +352,8 @@ within 5e-15.
   list the created variables used (`extensions.dfeols.created_variables`, one `derived` data
   entry per column) and the replay call adds them (`attach(...).add_variable(...).fit(...)`);
   the collection logs `variable_created` (name, expression, digest, reused, seconds).
-  Creating a variable costs about a declared variable's demeaning; on plan C the crossing
-  system `A` is rebuilt (it is not persisted), so it costs most of the original build.
+  Creating a variable costs about a declared variable's demeaning (on plan C, since the same
+  day, with the build's saved A: see "Plan C's A kept"); a batch costs the same as one.
 - **Refit** (step 4). `s.refit(model, vcov=, cluster=)` (a Result or a label; CLI `dfeols
   session refit <session> <model> --vcov ... --cluster ...`) fits the model's formula again
   with the new vcov: b from the Gram matrix, one pass for hetero or CRV1, none for iid. A
@@ -360,10 +362,72 @@ within 5e-15.
   `setting_changed` (model, its record as `member`, vcov and cluster from and to) and then
   the new model's `fit`; the index entry has `refit_of`.
 
-Not built: the replay of events.
+- **Exports** (step 5, 2026-11-08; Ted: through the estrec table tool, not maketables).
+  `s.export([m1, m2], "table2.tex", title=...)` (or `s.export_table(...)`; CLI `dfeols
+  session export <session> --models m1,m2 --path table2.tex`) writes three files: the table
+  in the format of the suffix (`.tex`, `.md`, `.html`, `.csv`, `.txt`, `.doc`: an HTML
+  document styled for Word, which opens it; `.docx` is refused with that hint), its
+  `estrec-table/0.1` spec `<stem>.estrec-table.json`, and the session collection
+  `<stem>.estrec-collection.json`, which the spec names as its source, so the table renders
+  again from the files alone. Other keywords go to estrec's `new_table` (`stats` defaults to
+  N, within R2 and the vcov; `rows`, `keep`, `drop`, `uncertainty`, `stars`). The manager
+  renders it, so R's export is the same file.
+- **R client** (step 5; Ted: in this repo under `r/`, results as estrec records). Package
+  `dfeols` (jsonlite and estrec's R package): `attach_session`, `fit` (an S3 generic, method
+  for sessions), `refit`, `add_variable`, `add_variables`, `variables`, `persist`,
+  `export_session`, `export_table`, `session_status`, `detach_session`, `stop_session`. It
+  writes the same request files as Python (atomic renames) and prints the same estimates and
+  progress. Each model comes back as `estrec::read_estimation(result.estrec.json)` (a named
+  list for several responses), so `tidy()`, `glance()` and modelsummary work. The session
+  folder comes from `root=`, `DFEOLS_SESSIONS`, or `dfeols session where <name> --profile`
+  (the site profile stays Python's). `tests/test_session_r.py` installs estrec and dfeols
+  into a temporary library and runs `r/inst/tests/session_client.R` against a session: R's
+  estimates equal Python's to 1e-12 (OLS, LIML IV, two-way with `i()`).
+- **IV** (step 6). `y ~ x | d ~ z1 + z2` (the FE part may be left out), `estimator="liml"`,
+  `fuller=a`. Every column is residualised on all the FEs, so `iv.solve` runs on blocks of
+  the Gram matrix (Z = exogenous and instruments, Y = responses and endogenous; no dummies),
+  as do iid SEs, kappa, Sargan and Anderson-Rubin, and the first stage (`iv.first_stage`:
+  coefficients, partial R2, iid F); hetero and CRV1 take one pass for the second stage's and
+  the first stages' meats. OLS and IV share that pass: a model is linear maps of a block of
+  columns T (residuals T @ A, scores T @ H, per group: outcomes, first stages). Equal to
+  `dfeols.fit`'s IV on dense and iterated crossing FEs (2SLS, LIML, Fuller, just
+  identified, two endogenous, a created instrument); a refit keeps the estimator.
+- **Two-way clustering** (Ted 2026-11-08). `cluster="a+b"` (or a list) on two declared
+  clusters: V = V_a + V_b - V_ab (Cameron, Gelbach and Miller), each term with the smaller
+  cluster count in G/(G-1), t df G_min - 1, an FE nested in either cluster counted as nested,
+  no eigenvalue fix: pyfixest's `vcov={"CRV1": "a+b"}` (equal to 1e-13 at a tight
+  tolerance). The intersection's codes are made per shard from the two code columns (a x
+  L_b + b), so the persisted data need nothing more; when both clusters cross the partition
+  its scores are summed by code at the end. Records list both clusters, both counts and the
+  formula. With IV too.
+- **i() terms** (2026-11-08). `i(year)` and `i(year, ref=2000)` on a numeric column become
+  created indicator columns (`year == level`, named `year::level` as `fit` names them; the
+  first level dropped without `ref`), made in one batch the first time (one demeaning
+  however many levels) and reused after; levels from fit's `category_levels` (cached with
+  the shards). Equal to `fit`'s `i()`. `i(x):z` interactions are refused with the
+  `add_variable` that makes them.
+- **Created-variable batches** (format `dfeols-created/2`). `s.add_variables({name: expr})`
+  demeans every new column together, into one `created/<batch>/` folder whose
+  `variable.json` lists each column (expression, digest, file column, Gram entry, raw sums,
+  cross-products with the session's columns and with the batch). A column is found by its
+  digest in any batch, so one can be reused alone.
+- **Plan C's A kept** (2026-11-08). A session build on plan C whose crossing system fits in
+  level space saves A in `<key>/crossing/A.npz` (on the flags data 57M nonzeros, from 3.4G
+  in the shards' parts). Creating variables then skips A in round 1 (`level_nnz` 0) and runs
+  CG on the saved A: two passes, no singleton passes, no parts. Data built without it
+  rebuild A as before.
+- **Replay** (2026-11-08). `dfeols.session.replay(collection, session)` (CLI `dfeols session
+  replay <session> <collection>`) runs a collection's events again in a running session on
+  the same data: `variable_created` as add_variable (i() columns are made by their fits),
+  each model's `fit` once (formula, vcov, cluster, estimator), and compares every member's
+  estimates and SEs with the collection's record (`rtol`, default 1e-8); it says whether the
+  demeaned data's key is the collection's.
+- **Variable count** (Ted 2026-11-08: no cap). `session start` warns when a demeaning task
+  (the largest shard's rows x columns x 8 bytes x 4, plus dense dummies) is over a worker
+  thread's share of the profile's worker memory.
 
 ## Open questions
 
-- Multi-way clustering (CRV1 on two variables) in sessions: wanted?
-- Where the R package lives (this repo under `r/`, or its own).
-- Upper bound on declared variables (memory and persisted size scale with it).
+None. Settled 2026-11-08 (Ted): two-way clustering in sessions (built); the R package in this
+repo under `r/`, returning estrec records; no cap on declared variables, a memory warning
+instead; exports through the estrec table tool.

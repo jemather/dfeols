@@ -552,7 +552,14 @@ def _first_stage(iv: dict, default_vcov: str, overid: list | None) -> tuple[dict
     return {"kind": "object", "per_endogenous": per}, tests
 
 
-def _ssc(vtype: str, N: int, k: int, dfk: int, G: int | None, nested: list[bool]) -> dict:
+def _clusters(r) -> list[str]:
+    """The cluster variables: one, or two for two-way clustering ("a+b")."""
+    return r.cluster.split("+") if r.cluster else []
+
+
+def _ssc(
+    vtype: str, N: int, k: int, dfk: int, G: int | None, nested: list[bool], multiway: bool = False
+) -> dict:
     K_counts = {
         "K": dfk,
         "regressors": k,
@@ -564,7 +571,12 @@ def _ssc(vtype: str, N: int, k: int, dfk: int, G: int | None, nested: list[bool]
     if vtype == "CRV1":
         return {
             "convention": "fixest",
-            "formula": "G/(G-1) * (N-1)/(N-K)",
+            "formula": (
+                "V_a + V_b - V_ab (Cameron, Gelbach and Miller), each G/(G-1) * (N-1)/(N-K) "
+                "with G the smaller cluster count"
+                if multiway
+                else "G/(G-1) * (N-1)/(N-K)"
+            ),
             "factors": {"G/(G-1)": G / (G - 1), "(N-1)/(N-K)": (N - 1) / (N - dfk), "settings": settings},
             "K_counts": {**K_counts, "fe_nested_in_cluster": nested},
         }
@@ -711,8 +723,12 @@ def to_estimation(
             "type": VCOV_TYPES.get(vt, vt),
         }
         if vt == "CRV1":
-            entry.update(cluster=[r.cluster], n_clusters={r.cluster: r.G}, n_clusters_min=r.G)
-        entry["ssc"] = _ssc(vt, r.N, k, dfk_cl if vt == "CRV1" else dfk_plain, r.G, nested_cl)
+            entry.update(
+                cluster=_clusters(r), n_clusters=run.get("n_clusters") or {r.cluster: r.G}, n_clusters_min=r.G
+            )
+        entry["ssc"] = _ssc(
+            vt, r.N, k, dfk_cl if vt == "CRV1" else dfk_plain, r.G, nested_cl, multiway=len(_clusters(r)) > 1
+        )
         entry.update(df_t=dft, default=vt == r.vcov_default)
         vcovs.append(entry)
 
@@ -754,7 +770,11 @@ def to_estimation(
             "kind": "object",
             "name": name,
             "levels": int(L),
-            **({"nested_in": [r.cluster]} if r.cluster and i < len(nested_cl) and nested_cl[i] else {}),
+            **(
+                {"nested_in": (run.get("fe_nested_in") or {}).get(name) or _clusters(r)}
+                if r.cluster and i < len(nested_cl) and nested_cl[i]
+                else {}
+            ),
             **(
                 {"redundant": 0 if i == 0 else 1, "redundant_method": "one_per_additional_fe"}
                 if len(r.fe) > 1
@@ -844,7 +864,7 @@ def to_estimation(
         "terms": [row["term"] for row in terms],
         "weights": {"variable": opts["weights"], "type": "analytic"} if opts.get("weights") else None,
         "fixed_effects": list(r.fe),
-        "clusters": [r.cluster] if r.cluster else [],
+        "clusters": _clusters(r),
         "sample": {
             "restriction": run.get("restriction"),
             **({"rows_input": sample["rows_input"]} if "rows_input" in sample else {}),

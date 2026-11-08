@@ -103,6 +103,12 @@ def test_created_matches_fit(ds, ds_made, tmp_path, spec):
         a = s.fit("lwt ~ feat + fp", vcov="hetero")  # a created response
         b = _fit(ds_made, tmp_path / "f3", "lwt ~ feat + feat:posts | spell + week", vcov="hetero")
         _same(a, b, **tol)
+        root = s._manager.data.root
+        batches = [json.loads(p.read_text()) for p in (root / "created").glob("*/variable.json")]
+        saved = (root / "crossing" / "A.npz").exists()
+        # plan C keeps A when it fits in level space, and created variables use it
+        assert saved == (spec.get("max_dummy_levels") == 10 and spec.get("level_space_gb") != 0)
+        assert all(("A_from" in b_["crossing"]) == saved for b_ in batches)
 
 
 def test_created_must_cover_the_sample(ds, tmp_path):
@@ -263,3 +269,82 @@ def test_cli_add_variable_and_refit(ds, tmp_path, capsys):
         assert [m["label"] for m in s._manager.models] == ["a", "a.crv1.id_a"]
     finally:
         s.stop()
+
+
+def test_export_table(ds, tmp_path, capsys):
+    """Step 5: a table of models through the estrec table tool, with its spec and the session
+    collection beside it; the spec validates and renders again from the files alone."""
+    from estrec.table import read_table, render_table, validate_table
+
+    r = _roots(tmp_path)
+    with _start("ex", ds, r) as s:
+        s.add_variable("fp", "feat * posts")
+        a = s.fit("eng ~ posts", cluster="id_a")
+        b = s.fit("eng ~ posts + fp", cluster="id_a")
+        two = s.fit("eng + fp ~ posts", label="two")
+        out = tmp_path / "out"
+        md = s.export([a, b], out / "t2.md", title="Table 2")
+        assert md == out / "t2.md"
+        text = md.read_text()
+        assert "Table 2" in text and "fp" in text and "26,253" in text.replace("26253", "26,253")
+        for suffix in (".tex", ".html", ".csv", ".txt", ".doc"):
+            p = s.export_table([a, "m2", two], out / f"t3{suffix}", stats=["nobs"])
+            assert p.exists() and p.stat().st_size > 0
+        assert "\\begin{tabular}" in (out / "t3.tex").read_text()
+        with pytest.raises(SessionError, match=r"\.doc is a Word document"):
+            s.export_table([a], out / "t.docx")
+        with pytest.raises(SessionError, match="no model 'nope'"):
+            s.export_table(["nope"], out / "t.md")
+        from dfeols.cli import main
+
+        main(
+            [
+                "session",
+                "export",
+                "ex",
+                "--models",
+                "m1,m2",
+                "--path",
+                str(out / "cli.md"),
+                "--root",
+                str(r["root"]),
+            ]
+        )
+        assert capsys.readouterr().out.strip() == str(out / "cli.md")
+    spec = out / "t2.estrec-table.json"
+    assert (out / "t2.estrec-collection.json").exists()
+    issues = [i for i in validate_table(read_table(spec), base_dir=out) if i.level == "error"]
+    assert not issues, issues
+    assert render_table(spec, "markdown") == text  # from the files alone, after the session
+    cols = json.loads((out / "t3.estrec-table.json").read_text())["columns"]
+    assert [c["header"] for c in cols] == ["m1", "m2", "two.eng", "two.fp"]
+
+
+@pytest.mark.parametrize("spec", [{}, {"max_dummy_levels": 10, "iter_tol": 1e-12}], ids=["dense", "iterate"])
+def test_factor_terms(ds, tmp_path, spec):
+    """i(tbin) and i(tbin, ref=...) in a session: indicator columns created in one batch,
+    named and dropped as fit does; equal to fit's i() on the same sample."""
+    r = _roots(tmp_path)
+    tol = {} if not spec else {"rtol": 1e-6, "vtol": 1e-6}
+    with _start("fac", ds, r, **spec) as s:
+        a = s.fit("eng ~ posts + i(tbin)", cluster="id_a")
+        b = _fit(ds, tmp_path / "f1", "eng ~ posts + i(tbin) | spell + week", cluster="id_a")
+        _same(a, b, **tol)
+        assert a.coefnames == b.coefnames and a.coefnames[1].startswith("tbin::")
+        made = [c["name"] for c in s._manager.data.created]
+        assert len({c["dir"] for c in s._manager.data.created}) == 1  # one batch, one demeaning
+        a = s.fit("eng ~ i(tbin, ref=2) + feat", vcov="hetero")
+        b = _fit(ds, tmp_path / "f2", "eng ~ i(tbin, ref=2) + feat | spell + week", vcov="hetero")
+        _same(a, b, **tol)
+        assert a.coefnames == b.coefnames
+        assert len(s._manager.data.created) == len(made) + 1  # only tbin::1 was new
+        rec = s.record(a)
+        with pytest.raises(SessionError, match="interacted"):
+            s.fit("eng ~ i(tbin):feat")
+        with pytest.raises(SessionError, match="not a level"):
+            s.fit("eng ~ i(tbin, ref=99)")
+    issues = [i for i in estimation.validate(rec) if i.level != "info"]
+    assert not issues, "\n".join(map(str, issues))
+    assert "add_variable" not in rec["specification"]["call"]
+    fac = [t for t in rec["parameters"] if t["term"].startswith("tbin::")]
+    assert fac and fac[0]["canonical"]["factors"][0]["variable"] == "tbin"

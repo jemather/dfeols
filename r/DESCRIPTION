@@ -1,0 +1,18 @@
+Package: dfeols
+Type: Package
+Title: R Client for 'dfeols' Interactive Sessions
+Version: 0.1.0.9000
+Authors@R: person("Ted", "Matherly", role = c("aut", "cre"),
+    email = "jemather@gmail.com")
+Description: Attaches to a running 'dfeols' session (a manager that has absorbed a set of
+    fixed effects once on a large dataset) and fits models against it, speaking the session's
+    request files, so no network path to the compute node is needed. Each model comes back as
+    an 'estrec' record, which 'estrec' gives tidy() and glance() methods for, so
+    'modelsummary' and other table packages take it as they take a fitted model.
+License: GPL (>= 3)
+URL: https://github.com/jemather/dfeols
+Depends: R (>= 4.1)
+Imports: jsonlite, estrec, stats, utils
+Suggests: modelsummary
+Remotes: estrec/estrec/r
+Encoding: UTF-8
