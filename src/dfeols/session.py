@@ -24,9 +24,11 @@ the compute node is needed and an R client needs only jsonlite.
 The demeaned data go to <demeaned>/<dataset>/<key>/ (key: a hash of what fixes them) and
 are reused by a later session with the same inputs.
 
-Not built yet (build order 3-6): created variables, a vcov change on an existing model,
-persisted-data removal and size checks, exports, the R client, IV; crossing FEs on the
-sparse or iterate path (sessions take crossing FEs as dense dummies, up to max_dummy_levels).
+Created variables (`add_variable`, an expression on raw columns, dfeols.expr) are computed
+on the session's rows and demeaned like the declared ones, then kept in
+<key>/created/<digest>/ for later sessions; `refit` reruns a model with another vcov.
+
+Not built yet (build order 5-6): exports, the R client, IV.
 """
 
 from __future__ import annotations
@@ -66,7 +68,9 @@ from .worker import Plan, _maxrss_gb, _meat, _prepare, _round1_dense
 log = logging.getLogger("dfeols")
 
 SESSION_FORMAT = "dfeols-session/1"
-DEMEANED_FORMAT = "dfeols-demeaned/2"  # 2: raw_ss, the collinearity scale
+DEMEANED_FORMAT = "dfeols-demeaned/3"  # 2: raw_ss, the collinearity scale; 3: sample/ masks
+CREATED_FORMAT = "dfeols-created/1"
+CREATED_COL = "__created"  # a created variable's column in its files (each session names it)
 COLLECTION_NAME = "session.estrec-collection.json"
 WEIGHT_COL = "__w"
 TASK_OVERHEAD = 0.005  # seconds a shard task costs beyond its reading (scheduling, results)
@@ -290,9 +294,14 @@ def _part_path(out: Path, sid: int) -> Path:
     return out / "shards" / f"part-{sid:06d}.parquet"
 
 
-def _write_part(out: Path, sid: int, names: list[str], V: np.ndarray, w: np.ndarray, cls: dict) -> None:
+def _write_part(
+    out: Path, sid: int, names: list[str], V: np.ndarray, w: np.ndarray | None, cls: dict
+) -> None:
+    """One shard's final columns; with the weights and cluster codes, except for a created
+    variable (w None), whose files hold its column only."""
     cols = {n: V[:, j] for j, n in enumerate(names)}
-    cols[WEIGHT_COL] = w
+    if w is not None:
+        cols[WEIGHT_COL] = w
     for name, codes in cls.items():
         cols[_cl_col(name)] = codes
     p = _part_path(out, sid)
@@ -302,10 +311,32 @@ def _write_part(out: Path, sid: int, names: list[str], V: np.ndarray, w: np.ndar
     os.replace(tmp, p)
 
 
-def demean_round1(plan: Plan, clusters: list[dict], sid: int, files: list[str], out: str) -> dict:
+def _cross(V: np.ndarray, w: np.ndarray, sid: int, others) -> np.ndarray:
+    """V'W O for the session's existing columns O of this shard (created variables)."""
+    O = _read_columns(others, sid, V.shape[0])
+    return (V * w[:, None]).T @ O
+
+
+def _read_columns(groups, sid: int, n: int | None = None) -> np.ndarray:
+    """The columns of `groups` [(root, [(file column, name)])] for one shard, in order."""
+    blocks = []
+    for root, cols in groups:
+        if not cols:
+            continue
+        df = pl.read_parquet(_part_path(Path(root), sid), columns=[c for c, _ in cols])
+        if n is not None and df.height != n:
+            raise RuntimeError(f"shard {sid}: {root} has {df.height} rows, not {n}")
+        blocks.append(df.to_numpy().astype(np.float64))
+    return np.hstack(blocks) if blocks else np.zeros((n or 0, 0))
+
+
+def demean_round1(
+    plan: Plan, clusters: list[dict], sid: int, files: list[str], out: str, others=None
+) -> dict:
     """Per shard: the session sample, every declared variable demeaned by the local FEs and
     the crossing-FE dummies too, their cross-products, and the cluster facts. With no
-    crossing FE the columns are final and written; else they wait in a stage file."""
+    crossing FE the columns are final and written; else they wait in a stage file. For a
+    created variable (plan.created), `others` are the session's columns to cross it with."""
     from .rowhash import rowset
 
     t0 = time.perf_counter()
@@ -393,7 +424,9 @@ def demean_round1(plan: Plan, clusters: list[dict], sid: int, files: list[str], 
         os.replace(tmp, p)
     else:
         r["gram"] = (Yt * w[:, None]).T @ Yt
-        _write_part(out_dir, sid, names, Yt, w, cls)
+        if others:
+            r["cross"] = _cross(Yt, w, sid, others)
+        _write_part(out_dir, sid, names, Yt, None if plan.created else w, cls)
     T["total"] = time.perf_counter() - t0
     T["maxrss_gb"] = _maxrss_gb()
     r["timing"] = T
@@ -401,7 +434,14 @@ def demean_round1(plan: Plan, clusters: list[dict], sid: int, files: list[str], 
 
 
 def demean_round2(
-    sid: int, out: str, names: list[str], keep: np.ndarray | None, gamma: np.ndarray, plan: Plan | None = None
+    sid: int,
+    out: str,
+    names: list[str],
+    keep: np.ndarray | None,
+    gamma: np.ndarray,
+    plan: Plan | None = None,
+    others=None,
+    bare: bool = False,
 ) -> dict:
     """Per shard: partial the crossing-FE dummies out (V~ - D~ Gamma), write the final
     columns, and return their Gram matrix. Dense: D~ is the stage's demeaned dummy block.
@@ -436,22 +476,36 @@ def demean_round2(
         from .worker import _ITER_CACHE
 
         _ITER_CACHE.pop((plan.iter_token, sid), None)
-    _write_part(out_dir, sid, names, V, w, cls)
+    _write_part(out_dir, sid, names, V, None if bare else w, cls)
     p.unlink()
-    return {
+    r = {
         "shard": sid,
         "gram": (V * w[:, None]).T @ V,
         "timing": {"total": time.perf_counter() - t0, "maxrss_gb": _maxrss_gb()},
     }
+    if others:
+        r["cross"] = _cross(V, w, sid, others)
+    return r
 
 
 def model_meat(
-    path: str, xs: list[str], ys: list[str], beta: np.ndarray, vcov_types: tuple, cluster: dict | None
+    parts, xs: list[str], ys: list[str], beta: np.ndarray, vcov_types: tuple, cluster: dict | None
 ) -> dict:
-    """Per shard, for one model: residuals, RSS and the meats (hetero, CRV1)."""
+    """Per shard, for one model: residuals, RSS and the meats (hetero, CRV1). `parts` is the
+    declared variables' file (or a path to it) and, for created variables, theirs:
+    [(path, [(file column, name)])], the first holding the weights and cluster codes."""
     t0 = time.perf_counter()
-    cols = [*xs, *ys, WEIGHT_COL] + ([_cl_col(cluster["name"])] if cluster else [])
-    df = pl.read_parquet(path, columns=list(dict.fromkeys(cols)))
+    if isinstance(parts, str):
+        parts = [(parts, [(c, c) for c in dict.fromkeys([*xs, *ys])])]
+    path, own = parts[0]
+    extra = [WEIGHT_COL] + ([_cl_col(cluster["name"])] if cluster else [])
+    df = pl.read_parquet(path, columns=list(dict.fromkeys([*(c for c, _ in own), *extra])))
+    df = df.rename({c: nm for c, nm in own if c != nm})
+    for p_, cols in parts[1:]:
+        o = pl.read_parquet(p_, columns=[c for c, _ in cols])
+        if o.height != df.height:
+            raise RuntimeError(f"{p_} has {o.height} rows, {path} {df.height}")
+        df = df.hstack(o.rename({c: nm for c, nm in cols}))
     X = df.select(xs).to_numpy().astype(np.float64) if xs else np.zeros((df.height, 0))
     Y = df.select(ys).to_numpy().astype(np.float64)
     w = df[WEIGHT_COL].to_numpy()
@@ -487,14 +541,24 @@ def _level_reduce(gram, plan: Plan):
 
 
 class Demeaned:
-    """The persisted demeaned data: residualised columns per shard and manifest.json."""
+    """The persisted demeaned data: residualised columns per shard and manifest.json, plus
+    the variables this session created (each in created/<digest>/, with variable.json).
+
+    `names`, `gram` and `raw_ss` cover the declared variables and then the created ones;
+    `ids` name the columns across sessions (a declared variable's name, a created one's
+    "created/<digest>": another session may call it something else)."""
 
     def __init__(self, root: Path, manifest: dict):
         self.root = Path(root)
         self.manifest = manifest
-        self.names = list(manifest["variables"])
+        self.declared = list(manifest["variables"])
+        self.names = list(self.declared)
+        self.ids = list(self.declared)
         self.gram = np.asarray(manifest["gram"], float)
+        rs = manifest.get("raw_ss")
+        self.raw_ss = None if rs is None else np.asarray(rs, float)
         self.shards = manifest["shards"]
+        self.created: list[dict] = []  # {name, id, dir (relative), expression, info}
 
     @classmethod
     def open(cls, root) -> Demeaned:
@@ -503,8 +567,63 @@ class Demeaned:
     def part(self, sid: int) -> str:
         return str(_part_path(self.root, sid))
 
+    def groups(self, names=None) -> list[tuple[str, list[tuple[str, str]]]]:
+        """[(folder, [(file column, name)])] holding `names` (default: every column), the
+        declared variables' folder first (it has the weights and cluster codes)."""
+        want = set(self.names if names is None else names)
+        out = [(str(self.root), [(n, n) for n in self.declared if n in want])]
+        for c in self.created:
+            if c["name"] in want:
+                out.append((str(self.root / c["dir"]), [(CREATED_COL, c["name"])]))
+        return out
+
+    def files(self, sid: int, names) -> list[tuple[str, list[tuple[str, str]]]]:
+        return [(str(_part_path(Path(r), sid)), cols) for r, cols in self.groups(names)]
+
+    def expression(self, name: str) -> str | None:
+        return next((c["expression"] for c in self.created if c["name"] == name), None)
+
+    def add_created(
+        self, name: str, info: dict, cross: dict[str, float], expression: str | None = None
+    ) -> None:
+        """Add a created variable: its variable.json `info`, its cross-product with each
+        current column (by id; `known_cross` and a pass for the rest), and the expression as
+        this session wrote it (default: as the session that built it did)."""
+        cid = f"created/{info['digest']}"
+        row = np.array([cross[i] for i in self.ids], float)
+        k = len(self.ids)
+        g = np.zeros((k + 1, k + 1))
+        g[:k, :k] = self.gram
+        g[k, :k] = g[:k, k] = row
+        g[k, k] = float(info["gram"][0][0])
+        self.gram = g
+        if self.raw_ss is not None:
+            self.raw_ss = np.r_[self.raw_ss, float(info["raw_ss"][0])]
+        self.names.append(name)
+        self.ids.append(cid)
+        self.created.append(
+            {
+                "name": name,
+                "id": cid,
+                "dir": f"created/{info['digest']}",
+                "expression": expression or info["expression"],
+                "info": info,
+            }
+        )
+
+    def known_cross(self, info: dict) -> dict[str, float]:
+        """A created variable's cross-products with the current columns that are on file:
+        its own variable.json's, and the other created variables' with it."""
+        cid = f"created/{info['digest']}"
+        out = {i: float(v) for i, v in info.get("cross", {}).items() if i in self.ids}
+        for c in self.created:
+            v = c["info"].get("cross", {}).get(cid)
+            if v is not None and c["id"] not in out:
+                out[c["id"]] = float(v)
+        return out
+
     def bytes(self) -> int:
-        return sum(p.stat().st_size for p in (self.root / "shards").glob("*.parquet"))
+        return sum(p.stat().st_size for p in self.root.rglob("part-*.parquet"))
 
 
 def demean_once(
@@ -515,9 +634,17 @@ def demean_once(
     label: str = "session",
     log_every: float = 30.0,
     progress_dir: Path | None = None,
+    create: str | None = None,
+    base: Demeaned | None = None,
 ):
     """Demean every declared variable on all the session's FEs; write out/shards and
-    out/manifest.json (last, so a manifest means the data are complete)."""
+    out/manifest.json (last, so a manifest means the data are complete).
+
+    With `create` (an expression on raw columns, dfeols.expr) and `base` (the session's
+    demeaned data): the created variable instead, on the same rows (the declared variables'
+    sample and base's singleton masks), crossed with every column of `base` as it goes;
+    returns what its variable.json needs (the caller writes it). A row of the sample where
+    the expression is missing or not finite is an error, with the count."""
     from . import rowhash
     from .estimate import _drop_singletons
     from .record import dfeols_source
@@ -526,10 +653,34 @@ def demean_once(
     out.mkdir(parents=True, exist_ok=True)
     plan, clusters = _session_plan(spec, ds, out / "singletons")
     names = list(spec.variables)
+    others = None
+    if create is not None:
+        names = [CREATED_COL]
+        sample = base.root / "sample"
+        plan = dataclasses.replace(
+            plan,
+            formula=Formula(
+                text=f"{CREATED_COL} ~ 1 | {' + '.join(spec.fe)}",
+                depvars=(CREATED_COL,),
+                terms=(),
+                fes=tuple(spec.fe),
+            ),
+            filter_vars=tuple(spec.variables),
+            created=((CREATED_COL, create),),
+            keep_dir=str(sample) if plan.keep_dir else None,
+            row_key_cols=(),
+        )
+        plan.raw_key = []  # type: ignore[attr-defined]
+        if plan.keep_dir and not sample.is_dir():
+            raise RuntimeError(
+                f"{base.root} has no singleton masks (sample/): rebuild it to create variables"
+            )
+        clusters = []
+        others = base.groups()
     prog = Progress(progress_dir or out, label=label, every=log_every)
     rows = {s["id"]: max(s["rows"], 1) for s in ds.shards}
     sing = {"passes": 0, "seconds": 0.0}
-    if plan.keep_dir:
+    if plan.keep_dir and create is None:
         sing = _drop_singletons(plan, ds, executor, prog, rows, label)
     acc: dict[str, Any] = {
         "n": 0,
@@ -545,6 +696,8 @@ def demean_once(
         "y_s2": np.zeros(len(names)),
         "y_net": np.zeros(len(names)),
         "rss_gb": 0.0,
+        "missing": 0,
+        "cross": np.zeros((len(names), len(base.names) if create is not None else 0)),
         "cl": {
             c["name"]: {
                 "G_local": 0,
@@ -583,7 +736,12 @@ def demean_once(
             if k in acc:
                 acc[k] += r[k]
         for k, v in r["load"].items():
-            acc["load"][k] += v
+            if k == "created_missing":
+                acc["missing"] += sum(v.values())
+            else:
+                acc["load"][k] += v
+        if "cross" in r:
+            acc["cross"] += r["cross"]
         acc["converged"] &= r["converged"]
         acc["fe_levels"] += np.asarray(r["fe_levels"], np.int64)
         for i, p in enumerate(r["global_present"]):
@@ -614,7 +772,8 @@ def demean_once(
                 a["ghi"][i] = np.maximum(a["ghi"][i], hi)
 
     tasks = [
-        (s["id"], rows[s["id"]], (plan, clusters, s["id"], ds.shard_paths(s), str(out))) for s in ds.shards
+        (s["id"], rows[s["id"]], (plan, clusters, s["id"], ds.shard_paths(s), str(out), others))
+        for s in ds.shards
     ]
     prog.add_stage("demean", rows)
     prog.start("demean")
@@ -627,6 +786,12 @@ def demean_once(
     from .estimate import check_sample
 
     check_sample(int(acc["n"]), int(acc["rows_in"]), acc["load"])
+    if acc["missing"]:
+        raise ValueError(
+            f"{create!r} is missing or not finite on {acc['missing']:,} of the session's "
+            f"{int(acc['n']):,} rows; a created variable must be defined on every row of the "
+            "sample, which is fixed (a new session with it declared changes the sample)"
+        )
     crossing: dict[str, Any] = {}
     extra: tuple = ()
     # each variable's centered sum of squares before the FEs (linalg.reference_ss): the scale
@@ -670,19 +835,47 @@ def demean_once(
         def on2(tid, r):
             acc["rss_gb"] = max(acc["rss_gb"], r["timing"].get("maxrss_gb", 0.0))
             acc["gram"] += r["gram"]
+            if "cross" in r:
+                acc["cross"] += r["cross"]
 
+        xplan = extra[0] if extra else None
         tasks2 = [
-            (s["id"], rows[s["id"]], (s["id"], str(out), names, keep, gamma, *extra)) for s in ds.shards
+            (
+                s["id"],
+                rows[s["id"]],
+                (s["id"], str(out), names, keep, gamma, xplan, others, create is not None),
+            )
+            for s in ds.shards
         ]
         prog.add_stage("partial_out", rows)
         prog.start("partial_out")
         executor.run(demean_round2, tasks2, on2, prog, "partial_out")
         prog.finish("partial_out")
         shutil.rmtree(out / "stage", ignore_errors=True)
-    if plan.keep_dir:
-        shutil.rmtree(plan.keep_dir, ignore_errors=True)
+    if plan.keep_dir and create is None:
+        _pack_masks(Path(plan.keep_dir), out / "sample")
     if not acc["converged"]:
         log.warning("%s: FE demeaning did not converge in some shards", label)
+    if create is not None:
+        from . import expr as _expr
+
+        return {
+            "format": CREATED_FORMAT,
+            "expression": create,
+            "canonical": _expr.canonical(create),
+            "digest": _expr.digest(create),
+            "columns": _expr.columns(create),
+            "key": base.manifest["key"],
+            "rows": int(acc["n"]),
+            "gram": (acc["gram"] + acc["gram"].T) / 2,
+            "raw_ss": ref_y,
+            "cross": dict(zip(base.ids, map(float, acc["cross"][0]))),
+            "crossing": crossing,
+            "converged": bool(acc["converged"]),
+            "created": _now(),
+            "seconds": time.time() - t_start,
+            "max_worker_rss_gb": acc["rss_gb"],
+        }
 
     fe_names = [n for n, _ in plan.local_fes] + [n for n, *_ in plan.global_fes]
     fe_levels = list(map(int, acc["fe_levels"])) + [int(p.sum()) for p in acc["gpresent"]]
@@ -763,6 +956,15 @@ def demean_once(
     return d
 
 
+def _pack_masks(src: Path, dest: Path) -> None:
+    """Keep the singleton masks with the demeaned data, one bit a row, so a created variable
+    is computed on the same rows; then remove the passes' folder."""
+    dest.mkdir(parents=True, exist_ok=True)
+    for f in sorted(src.glob("shard_*.npy")):
+        np.save(dest / f.name.replace(".npy", ".bits.npy"), np.packbits(np.load(f)))
+    shutil.rmtree(src, ignore_errors=True)
+
+
 # ---------------------------------------------------------------- one model
 
 
@@ -781,7 +983,8 @@ def _model_terms(formula: str, spec_fe: list[str]) -> tuple[Formula, list[str], 
         if len(t.conts) != 1:
             raise ValueError(
                 f"{t.label}: an interaction of demeaned columns is not the demeaned interaction; "
-                "create the product from raw columns (add_variable, not built yet) and declare it"
+                f'create the product from raw columns: add_variable("{"_x_".join(t.conts)}", '
+                f'"{" * ".join(t.conts)}")'
             )
         xs.append(t.conts[0])
     return f, list(f.depvars), xs
@@ -800,8 +1003,9 @@ def fit_model(
     collin_tol: float = 1e-9,
     log_every: float = 30.0,
 ) -> Result:
-    """OLS of `formula` (y ~ x1 + x2, declared variables) on the demeaned data. Exact by
-    Frisch-Waugh-Lovell; b and iid SEs from the Gram matrix, hetero/CRV1 with one pass."""
+    """OLS of `formula` (y ~ x1 + x2, declared or created variables) on the demeaned data.
+    Exact by Frisch-Waugh-Lovell; b and iid SEs from the Gram matrix, hetero/CRV1 with one
+    pass."""
     from . import record as _record
 
     executor = executor or SerialExecutor()
@@ -812,7 +1016,11 @@ def fit_model(
     f, ys, xs = _model_terms(formula, spec["fe"])
     unknown = [v for v in [*ys, *xs] if v not in d.names]
     if unknown:
-        raise KeyError(f"not declared in this session: {unknown} (declared: {', '.join(d.names)})")
+        raise KeyError(
+            f"not declared or created in this session: {unknown} (declared: {', '.join(d.declared)}"
+            + (f"; created: {', '.join(c['name'] for c in d.created)}" if d.created else "")
+            + "); add_variable(name, expression) creates one from raw columns"
+        )
     cluster = "^".join(fe_components(cluster)) if cluster else None
     if cluster and cluster not in m["clusters"]:
         raise KeyError(
@@ -832,8 +1040,7 @@ def fit_model(
     ix, iy = [pos[x] for x in xs], [pos[y] for y in ys]
     Gm = d.gram
     XX = Gm[np.ix_(ix, ix)]
-    ref = m.get("raw_ss")  # format 1 manifests have none: then the Gram's own diagonal
-    ref = None if ref is None else np.asarray(ref, np.float64)[ix]
+    ref = None if d.raw_ss is None else d.raw_ss[ix]
     keep = collinear_keep(XX, collin_tol, ref_diag=ref) if xs else np.zeros(0, bool)
     kept = [xs[i] for i in np.flatnonzero(keep)]
     dropped = [xs[i] for i in np.flatnonzero(~keep)]
@@ -880,7 +1087,7 @@ def fit_model(
         prog = Progress(wd, label=label or "model", every=log_every)
         prog.add_stage("meat", rows)
         prog.start("meat")
-        tasks = [(sid, 1, (d.part(sid), kept, ys, beta, vcov, cl)) for sid in d.shards]
+        tasks = [(sid, 1, (d.files(sid, [*kept, *ys]), kept, ys, beta, vcov, cl)) for sid in d.shards]
         t_meat = time.time()
         executor.run(model_meat, tasks, on, prog, "meat")
         meat_seconds = time.time() - t_meat
@@ -946,9 +1153,20 @@ def fit_model(
             "name": f"demeaned/{m['key']}",
             "location": str(d.root),
             "rows": N,
-            "columns": list(d.names),
+            "columns": list(d.declared),
         }
     )
+    for c in d.created:
+        if c["name"] in (*ys, *xs):
+            run["provenance"]["data"].append(
+                {
+                    "role": "derived",
+                    "name": f"demeaned/{m['key']}/{c['id']}",
+                    "location": str(d.root / c["dir"]),
+                    "rows": N,
+                    "columns": [c["name"]],
+                }
+            )
     src_rows = (ds.meta.get("source") or {}).get("rows")
     run["sample"] = {
         "rows_input": int(m["load"]["rows"]),
@@ -975,9 +1193,16 @@ def fit_model(
     run["session"] = {
         **(session or {}),
         "demeaned_key": m["key"],
-        "declared": list(d.names),
+        "declared": list(d.declared),
         "passes": passes,
     }
+    used = {v: d.expression(v) for v in [*ys, *xs] if d.expression(v) is not None}
+    if used:  # in the order created, so a replay can make them again
+        run["session"]["created"] = [
+            {"name": c["name"], "expression": c["expression"], "id": c["id"]}
+            for c in d.created
+            if c["name"] in used
+        ]
     res = Result(
         formula=text,
         label=label or f.fingerprint(cluster=cluster, vcov=list(vcov)),
@@ -1015,7 +1240,8 @@ def session_record(res: Result, y: str | None = None, **kwargs) -> dict:
     rec = _record.to_estimation(res, y, **kwargs)
     s = res.run.get("session") or {}
     declared = s.get("declared") or []
-    call = f"dfeols.Session.attach({s.get('name', '')!r}).fit({res.formula.split(' | ')[0]!r}"
+    made = "".join(f".add_variable({c['name']!r}, {c['expression']!r})" for c in s.get("created", []))
+    call = f"dfeols.Session.attach({s.get('name', '')!r}){made}.fit({res.formula.split(' | ')[0]!r}"
     o = res.options
     if o.get("cluster"):
         call += f", cluster={o['cluster']!r}"
@@ -1026,6 +1252,8 @@ def session_record(res: Result, y: str | None = None, **kwargs) -> dict:
     )
     ext = rec["extensions"]["dfeols"]
     ext["replay"]["call"] = call
+    if s.get("created"):  # the created variables' definitions, on the session's raw columns
+        ext["created_variables"] = [{"name": c["name"], "expression": c["expression"]} for c in s["created"]]
     rec.setdefault("meta", {}).setdefault("tags", []).append("session")
     return rec
 
@@ -1122,6 +1350,9 @@ class Manager:
             "spec": dataclasses.asdict(self.spec),
             "demeaned": str(self.data.root) if self.data else None,
             "models": len(self.models),
+            "created": [{"name": c["name"], "expression": c["expression"]} for c in self.data.created]
+            if self.data
+            else [],
             **self.state_extra,
             **extra,
         }
@@ -1294,16 +1525,26 @@ class Manager:
         target = self.demeaned_dir / m["dataset"]["name"] / key
         target.parent.mkdir(parents=True, exist_ok=True)
         src = self.data.root
+        created = list(self.data.created)
         with DirLock(target, what="demeaned data"):
             if (target / "manifest.json").exists():  # the same key was built by another session
+                for c in created:  # keep this session's created variables, unless there too
+                    if not (target / c["dir"] / "variable.json").exists():
+                        (target / c["dir"]).parent.mkdir(parents=True, exist_ok=True)
+                        shutil.rmtree(target / c["dir"], ignore_errors=True)
+                        shutil.move(str(src / c["dir"]), str(target / c["dir"]))
+                old = self.data
                 self.data = Demeaned.open(target)
                 shutil.rmtree(src, ignore_errors=True)
                 moved = False
             else:
                 shutil.rmtree(target, ignore_errors=True)  # an interrupted build
                 shutil.move(str(src), str(target))
+                old = self.data
                 self.data = Demeaned.open(target)
                 moved = True
+        for c in old.created:  # the same columns, now under target
+            self.data.add_created(c["name"], c["info"], old_cross(old, c), c["expression"])
         self.persist = True
         detail = {"key": key, "location": str(target), "from": str(src), "bytes": self.data.bytes()}
         if not moved:
@@ -1362,6 +1603,10 @@ class Manager:
         t = req.get("type")
         if t == "fit":
             return self.fit(req)
+        if t == "refit":
+            return self.refit(req)
+        if t == "add_variable":
+            return self.add_variable(req)
         if t == "attach":
             cid = req.get("client") or str(uuid.uuid4())
             c = {
@@ -1442,6 +1687,8 @@ class Manager:
             "estimate_seconds": est["estimate_seconds"],
             "finished": _now(),
         }
+        if req.get("refit_of"):
+            entry["refit_of"] = req["refit_of"]
         self.models.append(entry)
         _append_jsonl(self.dir / "results" / "index.jsonl", entry)
         for y, r in recs.items():
@@ -1460,6 +1707,147 @@ class Manager:
             )
         self._save_state()
         return {"model": entry}
+
+    def add_variable(self, req: dict) -> dict:
+        """Create a variable from raw columns: computed on the session's rows, demeaned on its
+        FEs, and kept in <demeaned>/created/<digest>/ (a later session with the same data and
+        expression reuses it). Asking again for the same name and expression does nothing."""
+        from . import expr as _expr
+
+        name, text = req.get("name"), req.get("expression")
+        if not isinstance(name, str) or not re.match(r"^[A-Za-z_]\w*$", name) or name.startswith("__"):
+            raise ValueError(f"a created variable's name must be a column name: {name!r}")
+        digest = _expr.digest(text)
+        d = self.data
+        for c in d.created:
+            if c["name"] == name and c["info"]["digest"] == digest:
+                return {"variable": self._var_entry(c, reused=True, already=True)}
+            if c["name"] == name:
+                raise ValueError(f"{name} is already created in this session, as {c['expression']!r}")
+            if c["info"]["digest"] == digest:
+                raise ValueError(f"{text!r} is already created in this session, as {c['name']}")
+        if name in d.declared:
+            raise ValueError(f"{name} is declared for this session; created variables need a new name")
+        ds = Dataset.open(self.spec.data)
+        raw = {c for c in ds.columns if not c.startswith("__")}
+        unknown = [c for c in _expr.columns(text) if c not in raw]
+        if unknown:
+            raise KeyError(f"{text!r}: not columns of the prepared data: {unknown}")
+        _expr.compile(text)  # every error in the expression before any work
+        where = d.root / "created" / digest
+        where.parent.mkdir(parents=True, exist_ok=True)
+        t0 = time.time()
+        reused = True
+        with DirLock(where, what="created variable"):
+            vj = where / "variable.json"
+            if not vj.exists():
+                reused = False
+                shutil.rmtree(where, ignore_errors=True)  # an interrupted build
+                est = self._create_estimate()
+                prog_dir = self.dir / "progress" / f"create-{name}"
+                if req.get("id"):
+                    _write_json(
+                        self.dir / "responses" / f"{req['id']}.accepted.json",
+                        {
+                            "model_dir": str(prog_dir.relative_to(self.dir)),
+                            **est,
+                            "what": f"creating {name} = {text}",
+                            "accepted": _now(),
+                        },
+                    )
+                info = demean_once(
+                    self.spec,
+                    ds,
+                    where,
+                    self.executor,
+                    label=f"session {self.name}: {name}",
+                    log_every=self.progress_every,
+                    progress_dir=prog_dir,
+                    create=text,
+                    base=d,
+                )
+                _write_json(vj, info)
+            info = _read_json(vj)
+        cross = d.known_cross(info)
+        missing = [n for n, i in zip(d.names, d.ids) if i not in cross]
+        if missing:  # reused, and crossed with none of this session's other created columns
+            new = [(str(where), [(CREATED_COL, name)])]
+            groups = d.groups(missing)
+            order = [nm for _, cols in groups for _, nm in cols]
+            x = cross_pass(d, groups, new, self.executor, self.dir / "progress" / f"cross-{name}")[0]
+            cross.update(zip([d.ids[d.names.index(n)] for n in order], map(float, x)))
+        d.add_created(name, info, cross, text)
+        c = d.created[-1]
+        entry = self._var_entry(c, reused=reused, seconds=time.time() - t0)
+        self.event("variable_created", detail=entry)
+        self._save_state()
+        return {"variable": entry}
+
+    def _var_entry(self, c: dict, **kw) -> dict:
+        info = c["info"]
+        return {
+            "name": c["name"],
+            "expression": c["expression"],
+            "columns": info["columns"],
+            "digest": info["digest"],
+            "location": str(self.data.root / c["dir"]),
+            "rows": info["rows"],
+            "build_seconds": info["seconds"],
+            **kw,
+        }
+
+    def _create_estimate(self) -> dict:
+        """Creating a variable demeans one column: about the session's demeaning per
+        variable, up to all of it (the FEs' work, CG on crossing FEs, does not shrink with
+        the columns)."""
+        m = self.data.manifest
+        sec = float(m.get("seconds") or 0.0)
+        lo = sec / max(len(self.data.declared), 1)
+        return {
+            "passes": None,
+            "columns": 1,
+            "estimate_seconds": sec,
+            "estimate_range": [lo, sec],
+            "basis": f"demeaning {len(self.data.declared)} variables took {_secs(sec)}",
+        }
+
+    def refit(self, req: dict) -> dict:
+        """An earlier model with another vcov or cluster: the coefficients again from the
+        Gram matrix, and one pass for the new meat (none for iid)."""
+        ref = req.get("model")
+        old = next((m for m in reversed(self.models) if m["label"] == ref or str(m["n"]) == str(ref)), None)
+        if old is None:
+            raise KeyError(f"no model {ref!r} in this session ({', '.join(m['label'] for m in self.models)})")
+        vcov = req.get("vcov") or old["vcov"]
+        vcov = [vcov] if isinstance(vcov, str) else list(vcov)
+        cluster = req.get("cluster")
+        if cluster is None and "CRV1" in vcov:
+            cluster = old["cluster"]
+        if vcov == list(old["vcov"]) and cluster == old["cluster"]:
+            raise ValueError(f"{old['label']} already has vcov {vcov} and cluster {cluster!r}")
+        label = req.get("label") or f"{old['label']}.{'-'.join(v.lower() for v in vcov)}"
+        if cluster and cluster != old["cluster"]:
+            label = req.get("label") or f"{label}.{re.sub(r'[^A-Za-z0-9._-]', '_', cluster)}"
+        self.event(
+            "setting_changed",
+            member=next(iter(old["records"].values()))["id"] if old["records"] else None,
+            detail={
+                "model": old["label"],
+                "new_label": label,
+                "vcov": {"from": old["vcov"], "to": vcov},
+                "cluster": {"from": old["cluster"], "to": cluster},
+            },
+        )
+        return self.fit(
+            {
+                "id": req.get("id"),
+                "formula": old["formula"],
+                "vcov": vcov,
+                "cluster": cluster,
+                "label": label,
+                "refit_of": old["label"],
+            }
+        )
 
     def estimate(self, req: dict) -> dict:
         """A model's cost before it runs: rows x the columns its pass reads, at a rate from
@@ -1536,7 +1924,7 @@ class Manager:
         (a model's pass is mostly reading its columns)."""
         d = self.data
         parts = sorted(d.shards, key=lambda s: -Path(d.part(s)).stat().st_size)[:k]
-        cols = [*d.names, WEIGHT_COL]
+        cols = [*d.declared, WEIGHT_COL]
         t0 = time.perf_counter()
         n = sum(pl.read_parquet(d.part(s), columns=cols).height for s in parts)
         self.calibration = (max(n * len(cols), 1) / max(time.perf_counter() - t0, 1e-6), len(parts))
@@ -1619,6 +2007,37 @@ class Manager:
             level=_record_level(None, self.executor) or _default_level(),
         )
         return path
+
+
+def old_cross(d: Demeaned, c: dict) -> dict[str, float]:
+    """Created column c's cross-products with the columns before it in d."""
+    j = d.ids.index(c["id"])
+    return dict(zip(d.ids[:j], map(float, d.gram[j, :j])))
+
+
+def cross_pass(d: Demeaned, name_groups, new_groups, executor, progress_dir: Path) -> np.ndarray:
+    """One pass: the weighted cross-products of the columns in `new_groups` with those in
+    `name_groups` (each as Demeaned.groups gives them)."""
+    acc: dict[str, Any] = {"x": None}
+
+    def on(tid, r):
+        acc["x"] = r["x"] if acc["x"] is None else acc["x"] + r["x"]
+
+    prog = Progress(progress_dir, label="cross-products", every=30.0)
+    prog.add_stage("cross", {sid: 1 for sid in d.shards})
+    prog.start("cross")
+    tasks = [(sid, 1, (sid, str(d.root), new_groups, name_groups)) for sid in d.shards]
+    executor.run(_cross_task, tasks, on, prog, "cross")
+    prog.finish("cross", log=False)
+    return acc["x"]
+
+
+def _cross_task(sid: int, w_root: str, new_groups, name_groups) -> dict:
+    t0 = time.perf_counter()
+    w = pl.read_parquet(_part_path(Path(w_root), sid), columns=[WEIGHT_COL])[WEIGHT_COL].to_numpy()
+    A = _read_columns(new_groups, sid, len(w))
+    B = _read_columns(name_groups, sid, len(w))
+    return {"x": (A * w[:, None]).T @ B, "timing": {"total": time.perf_counter() - t0}}
 
 
 def _version() -> str:
@@ -1943,11 +2362,14 @@ class Session:
                 if rng and _secs(rng[0]) != _secs(rng[1])
                 else _secs(a["estimate_seconds"])
             )
-            self._say(
-                "no pass over the data (from the Gram matrix)"
-                if not a["passes"]
-                else f"estimated {e}: {a['passes']} pass over {a['columns']} columns ({a['basis']})"
-            )
+            if a.get("what"):
+                self._say(f"{a['what']}: estimated {e} ({a['basis']})")
+            else:
+                self._say(
+                    "no pass over the data (from the Gram matrix)"
+                    if not a["passes"]
+                    else f"estimated {e}: {a['passes']} pass over {a['columns']} columns ({a['basis']})"
+                )
         self._show_status(self.dir / a["model_dir"] / "status.json")
 
     def _request(self, type: str, timeout: float | None = None, watch=None, **payload) -> dict:
@@ -1995,6 +2417,56 @@ class Session:
         if m["passes"] or m["seconds"] >= 1:
             self._say(f"{m['label']}: done in {_secs(m['seconds'])}")
         return Result.load(self.dir / m["dir"] / "result.json")
+
+    def refit(
+        self,
+        model,
+        *,
+        vcov=None,
+        cluster: str | None = None,
+        label: str | None = None,
+        timeout: float | None = None,
+    ) -> Result:
+        """An earlier model (a Result, or its label) with another vcov or cluster: the
+        coefficients come from the Gram matrix again, the new SEs take one pass (iid none).
+        A CRV1 refit keeps the model's cluster unless `cluster` names another."""
+        ref = model.label if isinstance(model, Result) else model
+        r = self._request(
+            "refit",
+            timeout=timeout,
+            watch=self._watch_fit,
+            model=ref,
+            vcov=vcov,
+            cluster=cluster,
+            label=label,
+        )
+        m = r["model"]
+        if m["passes"] or m["seconds"] >= 1:
+            self._say(f"{m['label']}: done in {_secs(m['seconds'])}")
+        return Result.load(self.dir / m["dir"] / "result.json")
+
+    def add_variable(self, name: str, expression: str, *, timeout: float | None = None) -> Session:
+        """Create `name` from raw columns of the dataset (`log(x)`, `a * b`, `x > 0`,
+        `ifelse(x > 0, y, 0)`; R's `^`, `&`, `|`, `!` are fine), demeaned on the session's
+        FEs; models can then use it like a declared variable. It must be defined on every row
+        of the session's sample. Kept with the demeaned data, so another session on them
+        reuses it. Returns the session, so calls chain."""
+        r = self._request(
+            "add_variable", timeout=timeout, watch=self._watch_fit, name=name, expression=expression
+        )
+        v = r["variable"]
+        if not v.get("already"):
+            how = "reused from an earlier session" if v["reused"] else f"in {_secs(v['seconds'])}"
+            self._say(f"created {v['name']} = {v['expression']} ({how})")
+        return self
+
+    def variables(self) -> dict:
+        """The declared variables and the created ones (name -> expression)."""
+        st = self.state() or {}
+        return {
+            "declared": list((st.get("spec") or {}).get("variables", [])),
+            "created": {c["name"]: c["expression"] for c in st.get("created", [])},
+        }
 
     def record(self, res: Result, y: str | None = None) -> dict:
         """The estimation record the session wrote for a model."""
@@ -2321,6 +2793,25 @@ def cmd_fit(args) -> None:
         s.close()
 
 
+def cmd_refit(args) -> None:
+    s = Session.attach(args.name, root=args.root, profile=args.profile, timeout=args.timeout)
+    try:
+        vcov = [v.strip() for v in args.vcov.split(",")] if args.vcov else None
+        r = s.refit(args.model, vcov=vcov, cluster=args.cluster, label=args.label)
+        print(r.summary())
+    finally:
+        s.close()
+
+
+def cmd_add_variable(args) -> None:
+    s = Session.attach(args.name, root=args.root, profile=args.profile, timeout=args.timeout)
+    try:
+        s.add_variable(args.variable, args.expression)
+        print(f"{args.variable} = {s.variables()['created'][args.variable]}")
+    finally:
+        s.close()
+
+
 def cmd_export(args) -> None:
     s = Session.attach(args.name, root=args.root, profile=args.profile, timeout=args.timeout)
     try:
@@ -2387,6 +2878,18 @@ def add_parser(sub) -> None:
     q.add_argument("--cluster")
     q.add_argument("--label")
     q.add_argument("--timeout", type=float)
+    q = ss.add_parser("refit", help="an earlier model with another vcov or cluster")
+    common(q)
+    q.add_argument("model", help="the model's label (m1, ...) or number")
+    q.add_argument("--vcov", help="iid, hetero, CRV1 (comma-separated)")
+    q.add_argument("--cluster")
+    q.add_argument("--label")
+    q.add_argument("--timeout", type=float)
+    q = ss.add_parser("add-variable", help="create a variable from raw columns, demeaned on the FEs")
+    common(q)
+    q.add_argument("variable", help="its name")
+    q.add_argument("expression", help="e.g. 'log(fare)', 'hhi * dist', 'pax > 0'")
+    q.add_argument("--timeout", type=float)
     q = ss.add_parser("export", help="write the session collection now")
     common(q)
     q.add_argument("--path")
@@ -2404,6 +2907,8 @@ def main(args) -> None:
         "serve": cmd_serve,
         "status": cmd_status,
         "fit": cmd_fit,
+        "refit": cmd_refit,
+        "add-variable": cmd_add_variable,
         "export": cmd_export,
         "persist": cmd_persist,
         "stop": cmd_stop,

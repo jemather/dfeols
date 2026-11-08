@@ -80,6 +80,11 @@ class Plan:
     row_key_cols: tuple[str, ...] = ()  # raw columns hashed into the record's row_key
     endog_names: list[str] = field(default_factory=list)  # IV: endogenous columns (outcome block)
     inst_names: list[str] = field(default_factory=list)  # IV: excluded instruments (regressor block)
+    # sessions' created variables: the sample is the declared variables' (listwise deletion on
+    # `filter_vars`, not on the outcomes), and each (name, expression) in `created` is computed
+    # from raw columns after it; rows where one is missing are counted, not dropped
+    filter_vars: tuple[str, ...] | None = None
+    created: tuple[tuple[str, str], ...] = ()
 
     @property
     def k_x(self) -> int:
@@ -136,7 +141,9 @@ def _load(plan: Plan, files: list[str], dropped: dict | None = None):
     """The shard's rows for this spec. `dropped`, if given, gets the rows removed by
     reason (missing, non_finite, zero_weights), for the record's sample counts."""
     f = plan.formula
-    cols = set(f.variables)
+    created = dict(plan.created)
+    sample = set(plan.filter_vars) if plan.filter_vars is not None else set(f.variables)
+    cols = sample | (set(f.variables) - set(created))
     cols.update(c for _, c in plan.local_fes)
     cols.update(c for _, c, _ in plan.global_fes)
     if plan.cluster:
@@ -144,11 +151,17 @@ def _load(plan: Plan, files: list[str], dropped: dict | None = None):
     if plan.weights:
         cols.add(plan.weights)
     cols.update(plan.row_key_cols)
-    df = pl.read_parquet(files, columns=sorted(cols))
-    # listwise deletion on the variables of this spec
-    num = [c for c in f.variables if df.schema[c].is_float()]
+    raw = set()
+    if created:
+        from .expr import columns as _expr_columns
+
+        for e in created.values():
+            raw.update(_expr_columns(e))
+    df = pl.read_parquet(files, columns=sorted(cols | raw))
+    # listwise deletion on the variables of this spec (a session's: its declared variables)
+    num = [c for c in sorted(sample) if df.schema[c].is_float()]
     n = [df.height]
-    df = df.drop_nulls()
+    df = df.drop_nulls(subset=sorted(cols)) if raw - cols else df.drop_nulls()
     n.append(df.height)
     if num:
         df = df.filter(pl.all_horizontal([pl.col(c).is_finite() for c in num]))
@@ -160,6 +173,17 @@ def _load(plan: Plan, files: list[str], dropped: dict | None = None):
         dropped.update(
             {"rows": n[0], "missing": n[0] - n[1], "non_finite": n[1] - n[2], "zero_weights": n[2] - n[3]}
         )
+    if created:
+        from .expr import compile as _expr
+
+        # missing: null, or not finite (log of 0); counted (the session refuses the variable)
+        # and set to 0 so the shard's work goes on
+        df = df.with_columns([_expr(e).alias(name) for name, e in created.items()]).with_columns(
+            [pl.when(pl.col(n).is_finite()).then(pl.col(n)).otherwise(None).alias(n) for n in created]
+        )
+        if dropped is not None:
+            dropped["created_missing"] = {name: int(df[name].is_null().sum()) for name in created}
+        df = df.with_columns([pl.col(name).fill_null(0.0) for name in created])
     return df
 
 
@@ -184,6 +208,15 @@ def _cache_path(plan: Plan, shard_id: int) -> Path:
 
 def _keep_path(plan: Plan, shard_id: int) -> Path:
     return Path(plan.keep_dir) / f"shard_{shard_id:06d}.npy"
+
+
+def _read_keep(plan: Plan, shard_id: int, n: int) -> np.ndarray:
+    """A shard's keep mask: the passes' .npy, or a session's packed copy (.bits.npy, one bit
+    a row, kept with the demeaned data so created variables get the same rows)."""
+    p = _keep_path(plan, shard_id)
+    if p.exists():
+        return np.load(p)
+    return np.unpackbits(np.load(p.with_suffix(".bits.npy")), count=n).astype(bool)
 
 
 def shard_singletons(plan: Plan, shard_id: int, files: list[str], gcount, first: bool) -> dict:
@@ -494,7 +527,7 @@ def _prepare(plan: Plan, shard_id: int, files: list[str], loaded: dict | None = 
     df = _load(plan, files, loaded)
     n0 = df.height
     if plan.keep_dir:  # singletons over all FEs, found in the passes before round 1
-        keep = np.load(_keep_path(plan, shard_id))
+        keep = _read_keep(plan, shard_id, n0)
         if not keep.all():
             df = df.filter(pl.Series(keep))
     local_codes = [densify(df[c].to_numpy())[0] for _, c in plan.local_fes]

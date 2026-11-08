@@ -42,6 +42,17 @@ def _tree_bytes(p: Path) -> int:
     return n
 
 
+def _created(kd: Path) -> list[str]:
+    """The expressions of the variables created on a key's data (created/*/variable.json)."""
+    out = []
+    for vj in sorted((kd / "created").glob("*/variable.json")):
+        try:
+            out.append(json.loads(vj.read_text())["canonical"])
+        except (OSError, ValueError, KeyError):
+            pass
+    return out
+
+
 def live_users(sessions: Path | None) -> dict[str, list[str]]:
     """Demeaned folders (resolved) used by a running session -> the sessions' names. A session
     is running while it holds the lock on its folder."""
@@ -102,6 +113,7 @@ def entries(root, sessions=None, purge_days: int | None = None) -> list[dict]:
                 ),
                 "sessions": users.get(str(kd.resolve()), []),
                 "building": holder(kd),
+                "created": _created(kd),
             }
             out.append(e)
     return out
@@ -211,6 +223,8 @@ def cmd_list(args) -> None:
         print(f"  {e['dataset']}/{e['key']}  {fmt_bytes(e['bytes'])}  written {e['written']}")
         if what:
             print(f"      {what}")
+        if e["created"]:
+            print(f"      created: {', '.join(e['created'])}")
         if state:
             print(f"      {'; '.join(state)}")
     total = sum(e["bytes"] for e in es)

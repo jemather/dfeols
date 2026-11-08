@@ -36,6 +36,9 @@ break the API).
 - `Session.start` takes `progress=` as `Session.attach` does.
 
 ### Changed
+- Session demeaned data move to format 3: the singleton masks are kept in `sample/` (one bit
+  a row) so created variables get the same rows. Format 2 data are rebuilt by the next
+  session (none had been built on OSCER yet).
 - The estimation format is now **estrec** (github.com/estrec/estrec, clean break): dfeols
   depends on `estrec` (pinned to b269d9f), imports `estrec`, and writes `estrec/0.1` records
   as `result.estrec.json` (`result.<y>.estrec.json` per response) and collections as
@@ -46,6 +49,28 @@ break the API).
   names.
 
 ### Added
+- Created variables in sessions (sessions step 4): `Session.add_variable(name, expression)`
+  and `dfeols session add-variable`. The expression is on raw columns of the prepared data
+  (`feat * posts`, `log(wt)`, `posts > 0`, `ifelse(x > 0, y, 0)`; R's `^`, `&`, `|`, `!`
+  with R's precedence), parsed by `dfeols.expr` through an allowlist of `ast` nodes (no
+  eval) into a Polars expression. It is computed on the session's rows (the declared
+  variables' sample and the singleton masks), demeaned on the session's FEs like a declared
+  variable (dense or plan C crossing FEs), and crossed with every column in the same passes,
+  so models use it with no extra pass. A row of the sample where it is missing or not finite
+  is an error with the count (the sample is fixed). It is kept in
+  `<key>/created/<digest>/` (`variable.json` last; `a * b` and `b * a` share a digest), and
+  a later session on the same demeaned data reuses it, under any name, with one pass for
+  cross-products with that session's other created variables if none are on file. Models
+  with created variables equal `dfeols.fit` with the column made before prep (or fit's own
+  `a:b` interaction) on dense and iterated crossing FEs. Records carry the definitions
+  (`extensions.dfeols.created_variables`, a derived data entry per column, and
+  `.add_variable(...)` in the replay call); the collection logs `variable_created`.
+- `Session.refit(model, vcov=, cluster=)` and `dfeols session refit`: an earlier model with
+  another vcov or cluster, the coefficients from the Gram matrix again and one pass for the
+  new SEs (none for iid); a CRV1 refit keeps the model's cluster. Logged as
+  `setting_changed` (old and new vcov and cluster) before the new model's `fit`; the index
+  entry has `refit_of`.
+- `dfeols demeaned list` shows each key's created variables.
 - `dfeols demeaned list` and `dfeols demeaned rm <key>` for persisted demeaned data (sessions
   step 3): size, when written, purge date (`scratch_purge_days`), the running sessions using
   each key, incomplete and old-format folders; `rm` asks (or `--yes`) and refuses while a

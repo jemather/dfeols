@@ -2,8 +2,8 @@
 
 Status: build order step 2 (session core) built 2026-11-02 in `src/dfeols/session.py`, with
 step 3 (persisted data found by key and reused, `persist()` after `--no-persist`, `dfeols
-demeaned list/rm`, the scratch checks; 2026-11-08); see "As built" below. Steps 4-6 are not
-built.
+demeaned list/rm`, the scratch checks; 2026-11-08) and step 4 (created variables, refit;
+2026-11-08); see "As built" below. Steps 5-6 are not built.
 
 ## Goal
 
@@ -238,10 +238,10 @@ within 5e-15.
   take one pass (residuals and meat). Several responses (`y1 + y2 ~ x`) share the pass.
 - **Clusters are declared at start** (`--cluster a,b`), like the variables: the nesting of
   each FE in each cluster and the cluster counts (for the dof rules) are found while demeaning.
-- **Models** are `y ~ x1 + x2` on declared variables; the FE part may be left out or must be
-  the session's. Interactions of declared variables and `i()` terms are refused (an
-  interaction of demeaned columns is not the demeaned interaction; created variables are step
-  4). IV is step 6.
+- **Models** are `y ~ x1 + x2` on declared (or, step 4, created) variables; the FE part may
+  be left out or must be the session's. Interactions of declared variables and `i()` terms
+  are refused (an interaction of demeaned columns is not the demeaned interaction; the error
+  names the `add_variable` call that makes it from raw columns). IV is step 6.
 - **Records.** Each model writes `result.json` and `result.estrec.json` (one per response)
   in `models/<nnn>-<label>/`. The record is a normal dfeols record plus:
   `provenance.execution.session` = the session id, the demeaned data as a `derived` data
@@ -321,7 +321,46 @@ within 5e-15.
   singletons), the demeaning and `fit` raise a ValueError that says where the rows went;
   `fit` used to return an empty result, and a session went on to fit models on nothing.
 
-Not built: `dfeols demeaned rm` and the scratch-quota check, and the replay of events.
+- **Created variables** (step 4, 2026-11-08). `s.add_variable(name, expression)` (CLI
+  `dfeols session add-variable <session> <name> <expression>`; it returns the session, so
+  calls chain). The expression is on raw columns of the prepared data: numbers, `+ - * /`,
+  `^` (or `**`), comparisons (1.0 or 0.0), `&`, `|`, `!` (or `and`, `or`, `not`), and
+  `log`, `log2`, `log10`, `log1p`, `exp`, `sqrt`, `abs`, `ifelse(cond, a, b)`, with R's
+  precedence. `dfeols.expr` turns R's spelling into Python's, parses it with `ast` (which
+  runs nothing), refuses any node outside an allowlist and compiles the tree to a Polars
+  expression; it is null wherever a column it reads is null or not finite, so `&` or
+  `ifelse` cannot hide a missing input. The manager computes it per shard on the session's
+  rows (worker `Plan.filter_vars`: listwise deletion on the declared variables, not on the
+  new column; `Plan.created`: the expressions, computed after it) and the singleton masks,
+  which format 3 keeps in `<key>/sample/` (one bit a row; format 2 deleted them). Then it is
+  demeaned exactly as a declared variable (`demean_once(create=, base=)`: round 1, the dense
+  solve or plan C's CG, round 2), and the same passes give its Gram entry, its raw sums
+  (collinearity scale) and its cross-products with every column of the session, so a model
+  with it needs no extra pass. A row where it is missing or not finite (`log(0)`) is an
+  error with the count, and nothing is kept. It goes to `<key>/created/<digest>/`
+  (`shards/part-*.parquet` with one column, `variable.json` last, under a DirLock), where
+  `<digest>` names the expression's tree with the two operands of each `+` and `*` sorted
+  (exact in float64). A later session on the same key reuses it under any name; the
+  cross-products with that session's other created columns come from either column's
+  `variable.json`, or else from one pass (`cross_pass`). Asking again for the same name and
+  expression does nothing; a name in use, or an expression already created under another
+  name, is an error. `persist()` takes the session's created columns with it (into a key
+  another session kept, too). Models: `Demeaned.names`/`gram`/`raw_ss` cover the declared
+  and created columns, and the meat pass reads each column's file (`Demeaned.files`). Records
+  list the created variables used (`extensions.dfeols.created_variables`, one `derived` data
+  entry per column) and the replay call adds them (`attach(...).add_variable(...).fit(...)`);
+  the collection logs `variable_created` (name, expression, digest, reused, seconds).
+  Creating a variable costs about a declared variable's demeaning; on plan C the crossing
+  system `A` is rebuilt (it is not persisted), so it costs most of the original build.
+- **Refit** (step 4). `s.refit(model, vcov=, cluster=)` (a Result or a label; CLI `dfeols
+  session refit <session> <model> --vcov ... --cluster ...`) fits the model's formula again
+  with the new vcov: b from the Gram matrix, one pass for hetero or CRV1, none for iid. A
+  CRV1 refit keeps the model's cluster unless given another; the same vcov and cluster is
+  an error. The label is `<model>.<vcov>[.<cluster>]` by default. The manager logs
+  `setting_changed` (model, its record as `member`, vcov and cluster from and to) and then
+  the new model's `fit`; the index entry has `refit_of`.
+
+Not built: the replay of events.
 
 ## Open questions
 
