@@ -279,7 +279,10 @@ def first_stage(plan, sol: Solution, acc: dict, acc2: dict, N: int, fe_levels, n
             if plan.local_fes
             else acc["sum_wy2"][m + l] - acc["sum_wy"][m + l] ** 2 / acc["sumw"]
         )
-        f_iid = ((rss_x1 - rss) / q) / (rss / (N - dfk))
+        # Exact fit: the instruments span the endogenous regressor (e.g. time dummies by their
+        # own differences in lpm_dthazard). Its residual variance is zero, so the F statistics
+        # are infinite or undefined: report the fit, leave the tests out.
+        exact = rss <= 1e-10 * max(tss, 0.0)
         entry = {
             "endogenous": name,
             "instruments": fs["inst_names"],
@@ -287,9 +290,11 @@ def first_stage(plan, sol: Solution, acc: dict, acc2: dict, N: int, fe_levels, n
             "r2": float(1 - rss / tss),
             "partial_r2": float(1 - rss / rss_x1),
             "rss": float(rss),
-            "f_stat": [_test("f_iid", f_iid, q, N - dfk)],
+            "f_stat": [] if exact else [_test("f_iid", ((rss_x1 - rss) / q) / (rss / (N - dfk)), q, N - dfk)],
             "vcov": {},
         }
+        if exact:
+            entry["exact_fit"] = True
         for t in plan.vcov_types:
             if t == "iid":
                 V, df2 = vcov_iid(bread, rss, N, dfk), N - dfk
@@ -299,6 +304,8 @@ def first_stage(plan, sol: Solution, acc: dict, acc2: dict, N: int, fe_levels, n
                 dfk_cl = df_k(k_fs, fe_levels, nested)
                 V, df2 = vcov_crv1(bread, acc2["fs_crv"][l], N, dfk_cl, G), G - 1
             entry["vcov"][t] = V.tolist()
+            if exact:
+                continue
             if t != "iid":
                 wald = float(pi @ np.linalg.solve(V, pi)) / q
                 entry["f_stat"].append(_test(f"wald_{t}", wald, q, df2))

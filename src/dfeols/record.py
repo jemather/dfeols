@@ -505,6 +505,8 @@ def _first_stage_params(r, opts: dict) -> list[dict]:
     rows = []
     for e in r.iv["first_stage"]["per_endogenous"]:
         b = np.asarray(e["coef"], float)
+        if e.get("exact_fit"):  # instruments span the regressor: no inference to report; the
+            continue  # coefficients stay in extensions.dfeols.first_stage
         se = np.sqrt(np.diag(np.asarray(e["vcov"][vt], float)))
         test = next(t for t in e["f_stat"] if t["name"] == ("f_iid" if vt == "iid" else f"wald_{vt}"))
         t, p, q = _t_stats(b, se, test["df2"])
@@ -534,8 +536,10 @@ def _first_stage(iv: dict, default_vcov: str, overid: list | None) -> tuple[dict
     vtype = VCOV_TYPES.get(default_vcov, default_vcov)
     per, tests = [], []
     for e in iv["first_stage"]["per_endogenous"]:
-        f = next(t for t in e["f_stat"] if t["name"] == want)
         per.append({"endogenous": e["endogenous"], "r2": e["r2"], "partial_r2": e["partial_r2"]})
+        if e.get("exact_fit"):  # no F test: the instruments fit the regressor exactly
+            continue
+        f = next(t for t in e["f_stat"] if t["name"] == want)
         where = {
             "category": "first_stage",
             "component": "first_stage",

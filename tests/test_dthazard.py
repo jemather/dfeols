@@ -381,3 +381,21 @@ def test_i_term_record_validates(ds, tmp_path):
     bad = [i for i in est.validate(rec, base_dir=tmp_path) if i.level != "info"]
     assert not bad, "\n".join(map(str, bad))
     assert rec["extensions"]["dfeols"]["dthazard"]["excluded_levels"] == {"i(age, ref=53)": ["50"]}
+
+
+def test_time_dummies_exact_first_stage(ds, tmp_path):
+    """i(t): in the t >= 2 sample the wave dummies are spanned by their own differences, so
+    their first stages fit exactly (no F tests, exact_fit); x's coefficient equals the fit
+    with t absorbed as a FE (the equivalence in docs/design/hazard.md)."""
+    est = pytest.importorskip("estrec")
+    pytest.importorskip("jsonschema")
+    h = lpm_dthazard(ds, "y ~ x1 + i(t)", unit="uid", time="t", workdir=tmp_path / "a", log_every=1e9)
+    fs = {e["endogenous"]: e for e in h.iv.iv["first_stage"]["per_endogenous"]}
+    assert all(fs[f"t::{k}"].get("exact_fit") for k in (3, 4, 5)) and not fs["x1"].get("exact_fit")
+    assert fs["x1"]["f_stat"]
+    h2 = lpm_dthazard(ds, "y ~ x1 | t", unit="uid", time="t", workdir=tmp_path / "b", log_every=1e9)
+    assert h.iv.coef()[h.iv.coefnames.index("x1")] == pytest.approx(h2.iv.coef()[0], rel=1e-9)
+    assert h.summary()
+    rec = est.read(tmp_path / "a" / "result.estrec.json", nonfinite="string")
+    bad = [i for i in est.validate(rec, base_dir=tmp_path / "a") if i.level != "info"]
+    assert not bad, "\n".join(map(str, bad))
