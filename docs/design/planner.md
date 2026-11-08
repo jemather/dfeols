@@ -132,9 +132,15 @@ default 8; a worker without them re-reads the shard), and the Dask executor scat
 per step instead of once per task. beta follows by Frisch-Waugh-Lovell on the coordinator, and
 round 2 is the sparse path's, so every vcov works. Equal to pyfixest and to the dense-solve
 path; on a 1M-row worker panel with 8,000 firms it took 13 steps (5 s, against 11 s for plan
-A's dense solve). Not built yet: IV on this path, a tree reduction for the per-step sums, and
-checkpoints (a step's state is the coordinator's few P x c blocks, so resuming is cheap to
-add). The sketch below was the starting point.
+A's dense solve). Built since (2026-11-08): IV on this path (`_iv_solve_iterate`: CG solves
+every column, so the k-class solve runs on cross-products net of the crossing FEs and round
+2 subtracts each map's dummy part; equal to the dense path and pyfixest); a tree reduction of
+the per-step sums (`crossing.step_combine` through the executor's `Reduce`: shards' levels and
+sums merged on the workers, one block per step reaches the coordinator); and checkpoints
+(`crossing.Checkpoint`: with a pass per step, CG's state X, r, p, rz is written after each
+step to the fit's workdir, `cg_checkpoint.npz`, or beside a session's demeaned folder, and a
+rerun of the same solve, with a right-hand side equal to 1e-10, resumes bit for bit; the
+record's `crossing_cg` gives `resumed_from`). The sketch below was the starting point.
 
 Alternating projections distribute as map/reduce rounds: nested FEs are demeaned inside each
 shard with no communication; for a crossing FE each shard returns per-level sums and counts,

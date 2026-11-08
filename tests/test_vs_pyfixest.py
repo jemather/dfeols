@@ -495,12 +495,20 @@ def test_iv_exogenous_absorbed_by_local_fe_is_dropped(ds_absorbed):
 
 
 def test_iterate_auto_and_limits(ds_cw):
-    _, ds = ds_cw
+    import polars as pl
+
+    d, ds = ds_cw
     kw = dict(cluster="id_a", log_every=1e9)
     # no FE nested in the partition and a crossing FE above max_dummy_levels: auto iterates
     assert dfeols.fit(ds, "eng ~ feat | cw", **kw).options["crossing_fe"] == "iterate"
-    with pytest.raises(NotImplementedError, match="IV with crossing_fe='iterate'"):
-        dfeols.fit(ds, "eng ~ posts | cw | feat ~ eng2", **kw)
+    # IV there too (2026-11-08): equal to pyfixest
+    iv = "eng ~ posts | cw | feat ~ eng2"
+    a = dfeols.fit(ds, iv, iter_tol=1e-12, fe_tol=1e-12, **kw)
+    assert a.options["crossing_fe"] == "iterate"
+    sample = d.filter(pl.col("eng").is_finite()).drop_nulls(["eng", "posts", "feat", "eng2", "cw", "id_a"])
+    m = pf.feols(iv, data=sample.to_pandas(), vcov={"CRV1": "id_a"}, **pyfixest_tol_kwargs(1e-12))
+    np.testing.assert_allclose(a.coef(), m.coef().to_numpy(), rtol=1e-7)
+    np.testing.assert_allclose(np.sqrt(np.diag(a.vcov())), m.se().to_numpy(), rtol=1e-6)
     with pytest.raises(RuntimeError, match="did not converge in 2 steps"):
         dfeols.fit(ds, "eng ~ feat | cw + id_f", crossing_fe="iterate", iter_maxiter=2, **kw)
 

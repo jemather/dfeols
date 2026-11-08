@@ -148,3 +148,44 @@ def test_combine_parts_as_level_gram(max_nnz):
             assert abs(x - y).max() < 1e-12
     if not one.blocks_ok:
         assert B1 is None and B2 is None
+
+
+def test_step_combine_sums_levels_like_the_coordinator():
+    # CG steps' tree reduction: shards' (levels, sums) merged on workers equal the
+    # coordinator adding every shard's sums into a dense P x c block
+    rng = np.random.default_rng(3)
+    P, c = 40, 3
+    parts = []
+    for _ in range(7):
+        idx = np.sort(rng.choice(P, size=rng.integers(1, 15), replace=False))
+        parts.append({"idx": idx, "S": rng.standard_normal((len(idx), c)), "timing": {"total": 0.1}})
+    dense = np.zeros((P, c))
+    for p in parts:
+        dense[p["idx"]] += p["S"]
+    a = cx.step_combine(*(cx.step_part(p) for p in parts[:3]))
+    b = cx.step_combine(*(cx.step_part(p) for p in parts[3:]), None)
+    lv, S = cx.step_combine(a, b)
+    tree = np.zeros((P, c))
+    tree[lv] = S
+    np.testing.assert_allclose(tree, dense, rtol=1e-13)
+    assert cx.step_strip(parts[0]) == {"timing": {"total": 0.1}}
+    assert cx.step_combine(None) is None
+
+
+def test_pcg_resumes_from_a_checkpoint(tmp_path):
+    B = _gram(40, 12, 200, 1, 3)
+    R = B @ np.random.default_rng(2).standard_normal((40, 2))
+    act = B.diagonal() > 1e-12
+    M = cx.make_precond("jacobi", B.diagonal(), np.array([0, 40]))
+    X0, it0, _ = cx.pcg(lambda p: B @ p, R, M, act, 1e-10, 500)
+    ck = cx.Checkpoint(tmp_path / "cg.npz", R, 1e-10, "jacobi")
+    X, it, rel = cx.pcg(lambda p: B @ p, R, M, act, 1e-10, 5, on_state=ck.save)
+    assert it == 5 and rel > 1e-10  # stopped early
+    state = ck.load()
+    assert int(state["it"]) == 5
+    X1, it1, _ = cx.pcg(lambda p: B @ p, R, M, act, 1e-10, 500, state=state)
+    assert it1 == it0
+    np.testing.assert_array_equal(X1, X0)  # the same steps, bit for bit
+    assert cx.Checkpoint(tmp_path / "cg.npz", R * (1 + 1e-14), 1e-10, "jacobi").load() is not None
+    assert cx.Checkpoint(tmp_path / "cg.npz", R * 1.01, 1e-10, "jacobi").load() is None
+    assert cx.Checkpoint(tmp_path / "cg.npz", R, 1e-8, "jacobi").load() is None

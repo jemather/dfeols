@@ -20,7 +20,9 @@ blocks block-Jacobi; the fallback always uses block-Jacobi, which costs no extra
 from __future__ import annotations
 
 import logging
+import os
 import time
+from pathlib import Path
 
 import numpy as np
 import scipy.sparse as sp
@@ -478,21 +480,40 @@ def make_precond(method: str, diag: np.ndarray, offs: np.ndarray, solvers=None, 
     raise ValueError(method)
 
 
-def pcg(matvec, R: np.ndarray, precond, act: np.ndarray, tol: float, maxiter: int, on_step=None):
+def pcg(
+    matvec,
+    R: np.ndarray,
+    precond,
+    act: np.ndarray,
+    tol: float,
+    maxiter: int,
+    on_step=None,
+    state: dict | None = None,
+    on_state=None,
+):
     """Preconditioned CG for A X = R, one column per right-hand side, in lockstep: stops when
     every column's residual is below `tol` relative to its right-hand side. A is singular (one
     redundant level per connected component of the FEs) but the system is consistent, so CG
     converges to a solution whose D~ X, the only part used, is unique. `on_step(it, rel)` is
-    called after each step and may raise. Returns X, steps and the largest relative residual."""
+    called after each step and may raise. Returns X, steps and the largest relative residual.
+
+    `state` (X, r, p, rz, it, as `on_state(state)` receives it after each step) resumes an
+    interrupted solve exactly where it stopped: CG's whole state is these few P x c blocks."""
     P, c = R.shape
-    X = np.zeros((P, c))
-    r = R * act[:, None]
-    bnorm = np.linalg.norm(r, axis=0)
+    r0 = R * act[:, None]
+    bnorm = np.linalg.norm(r0, axis=0)
     bnorm[bnorm == 0] = 1.0
-    z = precond(r)
-    p = z.copy()
-    rz = (r * z).sum(0)
-    it, rel = 0, np.linalg.norm(r, axis=0) / bnorm
+    if state is not None:
+        X, r, p = state["X"].copy(), state["r"].copy(), state["p"].copy()
+        rz, it = state["rz"].copy(), int(state["it"])
+    else:
+        X = np.zeros((P, c))
+        r = r0
+        z = precond(r)
+        p = z.copy()
+        rz = (r * z).sum(0)
+        it = 0
+    rel = np.linalg.norm(r, axis=0) / bnorm
     while rel.max() > tol:
         if it >= maxiter:
             return X, it, float(rel.max())
@@ -508,6 +529,69 @@ def pcg(matvec, R: np.ndarray, precond, act: np.ndarray, tol: float, maxiter: in
         p = z + beta * p
         rz = rz_new
         rel = np.linalg.norm(r, axis=0) / bnorm
+        if on_state is not None:
+            on_state({"X": X, "r": r, "p": p, "rz": rz, "it": it})
         if on_step is not None:
             on_step(it, rel)
     return X, it, float(rel.max())
+
+
+class Checkpoint:
+    """A CG solve's state on disk, written after each step (atomically) and read back by a
+    rerun of the same solve: the same shape, tolerance and preconditioner, and a right-hand
+    side equal to 1e-10 (shards' sums arrive in another order on a rerun, so not to the
+    bit; the difference is far below any CG tolerance). Removed once the solve converges."""
+
+    RTOL = 1e-10
+
+    def __init__(self, path, R: np.ndarray, tol: float, method: str):
+        self.path = Path(path)
+        self.R = R
+        self.digest = f"{R.shape}|{tol!r}|{method}"
+
+    def load(self) -> dict | None:
+        try:
+            with np.load(self.path) as d:
+                if str(d["digest"]) != self.digest:
+                    return None
+                if not np.allclose(
+                    d["R"], self.R, rtol=self.RTOL, atol=self.RTOL * float(np.abs(self.R).max(initial=0.0))
+                ):
+                    return None
+                return {k: d[k] for k in ("X", "r", "p", "rz", "it")}
+        except (OSError, KeyError, ValueError):
+            return None
+
+    def save(self, state: dict) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_name(self.path.name + ".tmp.npz")
+        np.savez(tmp, digest=self.digest, R=self.R, **state)
+        os.replace(tmp, self.path)
+
+    def remove(self) -> None:
+        self.path.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------- CG steps' tree reduction
+
+
+def step_part(res: dict) -> tuple[np.ndarray, np.ndarray]:
+    """A CG step's shard result as (levels, sums): what the tree adds up."""
+    return np.asarray(res["idx"]), res["S"]
+
+
+def step_strip(res: dict) -> dict:
+    """The rest of a step's result, for the coordinator (timing only)."""
+    return {k: v for k, v in res.items() if k not in ("idx", "S")}
+
+
+def step_combine(*parts):
+    """Sum shards' (levels, sums) on a worker: the union of the levels, sums added."""
+    parts = [p for p in parts if p is not None]
+    if not parts:
+        return None
+    idx = np.concatenate([p[0] for p in parts])
+    uniq, inv = np.unique(idx, return_inverse=True)
+    out = np.zeros((len(uniq), parts[0][1].shape[1]))
+    np.add.at(out, inv, np.concatenate([p[1] for p in parts]))
+    return uniq, out

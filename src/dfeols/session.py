@@ -812,6 +812,8 @@ def demean_once(
         from .crossing import LevelGram, level_space_budget
 
         plan.iter_token = f"{out}:{uuid.uuid4().hex}"
+        # beside the folder, which an interrupted build's rerun deletes
+        plan.cg_checkpoint = str(out.parent / f"{out.name}.cg_checkpoint.npz")
         plan.level_nnz = level_space_budget(executor, spec.level_space_gb)
         offs = np.r_[0, np.cumsum([L for *_, L in plan.global_fes])].astype(np.int64)
         acc["DR"] = np.zeros((int(offs[-1]), len(names)))

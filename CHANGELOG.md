@@ -51,6 +51,12 @@ break the API).
   names.
 
 ### Added
+- IV with `crossing_fe="iterate"` (plan C), in level space and with a pass per CG step:
+  equal to the dense path and to pyfixest; it was refused.
+- Plan C's pass-per-step CG sums the shards' results in a tree on the workers (one block per
+  step reaches the coordinator), and keeps its state after each step (`cg_checkpoint.npz` in
+  the workdir; beside a session's demeaned folder), so a rerun of a fit stopped by walltime
+  or `iter_maxiter` resumes where it stopped.
 - Wall-time estimates and one job vs demean-first in `dfeols plan` (planner steps 3-4): every
   `fit` appends its path, rows, columns, passes, seconds and workers to
   `<scratch>/timings/fits.jsonl` (`dfeols.timings`), and the report gives each key a wall-time

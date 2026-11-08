@@ -21,7 +21,7 @@ from scipy.linalg import cho_factor, cho_solve
 
 from . import iv as _iv
 from . import rowhash
-from .executors import SerialExecutor
+from .executors import Reduce, SerialExecutor
 from .formula import fe_components, parse
 from .linalg import absorbed, collinear_keep, reference_ss, solve_spd
 from .prep import Dataset
@@ -148,11 +148,6 @@ def build_plan(
     big = [(k, L) for k, _, L in glob if L > max_dummy_levels]
     n_dum = sum(L - 1 for *_, L in glob)
     iterate = _use_iterate(crossing_fe, local, glob, bool(big), n_dum)
-    if iterate and parse(formula).iv:
-        raise NotImplementedError(
-            "IV with crossing_fe='iterate' (plan C) is not built yet; crossing FEs this large "
-            "need it" + ("" if crossing_fe == "iterate" else f" ({n_dum:,} crossing-FE dummies)")
-        )
     if big and not iterate and not (local and crossing_fe != "dense"):
         big_fe, big_L = big[0]
         raise NotImplementedError(
@@ -515,6 +510,34 @@ def _ols_solve_iterate(plan: Plan, acc: dict, collin_tol: float) -> _iv.Solution
     return _iv.Solution(names, beta, [bread] * m, np.arange(len(kept)), lin, dropped)
 
 
+def _iv_solve_iterate(plan: Plan, acc: dict, N: int, estimator, fuller, collin_tol: float) -> _iv.Solution:
+    """Plan C IV: the CG solution Gamma covers every column, [Z~ (exogenous, instruments),
+    Y~ (outcomes, endogenous)], so their cross-products net of the crossing FEs are
+    Z^'W Z^ = Z~'W Z~ - (D~'W Z~)' Gamma_Z and the like (as _ols_solve_iterate), and the
+    k-class solve runs on those with no dummy block (iv.solve, as sessions do). Round 2
+    subtracts each map's dummy part, D~ Gamma_T A, from the residuals and scores (lin["G"],
+    lin["GH"], for the outcomes and the first stages)."""
+    import dataclasses
+
+    k = plan.k_x
+    Gam, R = acc["Gamma"], acc["DR"]
+    net = {
+        "ZtZ": (lambda a: (a + a.T) / 2)(acc["ZtZ"] - R[:, :k].T @ Gam[:, :k]),
+        "ZtY": acc["ZtY"] - R[:, :k].T @ Gam[:, k:],
+        "YtY": (lambda a: (a + a.T) / 2)(acc["YtY"] - R[:, k:].T @ Gam[:, k:]),
+        "ref": acc.get("ref"),
+        "ref_y": acc.get("ref_y"),
+    }
+    flat = dataclasses.replace(plan, sparse_global=False, crossing_iterate=False)
+    sol = _iv.solve(flat, net, N, estimator=estimator, fuller=fuller, collin_tol=collin_tol)
+    lin = sol.lin
+    gam_t = np.hstack([Gam[:, k:], Gam[:, lin["cols"]]])  # T = [Y block, kept Z columns]
+    for g in (lin, lin["fs"]):
+        H = g["H"] if np.ndim(g["H"]) == 2 else np.eye(gam_t.shape[1])[:, g["H"]]
+        g["G"], g["GH"] = gam_t @ g["A"], gam_t @ H
+    return sol
+
+
 def _tss(plan: Plan, acc: dict, m: int, collin_tol: float) -> np.ndarray:
     """Each outcome's weighted sum of squares net of all the FEs (as fixest's within R2,
     and the cell path's), so it does not depend on which FEs the partition makes local:
@@ -615,11 +638,20 @@ def _crossing_cg(
         def on(tid, res, Ap=Ap):
             Ap[res["idx"]] += res["S"]
 
+        def done(total, Ap=Ap):
+            if total is not None:
+                Ap[total[0]] += total[1]
+
         name = f"cg{step['it'] + 1}"
         tasks = [(s["id"], rows[s["id"]], (plan, s["id"], ds.shard_paths(s), p)) for s in ds.shards]
         prog.add_stage(name, rows, before="round2")
         prog.start(name)
-        executor.run(shard_matvec, tasks, on, prog, name)
+        if "reduce" in inspect.signature(executor.run).parameters:
+            # the shards' sums in a tree on the workers: one block reaches the coordinator
+            red = Reduce(get=cx.step_part, strip=cx.step_strip, combine=cx.step_combine, done=done)
+            executor.run(shard_matvec, tasks, lambda tid, res: None, prog, name, reduce=red)
+        else:
+            executor.run(shard_matvec, tasks, on, prog, name)
         prog.finish(name, log=False)
         return Ap
 
@@ -638,7 +670,27 @@ def _crossing_cg(
         if it == 1 or it % (100 if level else 10) == 0:
             log.info("fit %s: crossing-FE CG step %d, largest relative residual %.1e", label, it, rel.max())
 
-    X, it, rel = cx.pcg((lambda p: A @ p) if level else matvec_pass, R, M, act, tol, maxiter, on_step)
+    # a pass per step can take hours: its state is kept after each step, and a rerun of the
+    # same solve (same right-hand side, tolerance, preconditioner) resumes from it
+    ck = state = None
+    if not level and getattr(plan, "cg_checkpoint", None):
+        ck = cx.Checkpoint(plan.cg_checkpoint, R, tol, method)
+        state = ck.load()
+        if state is not None:
+            log.info("fit %s: crossing-FE CG resumes at step %d (%s)", label, int(state["it"]), ck.path)
+    X, it, rel = cx.pcg(
+        (lambda p: A @ p) if level else matvec_pass,
+        R,
+        M,
+        act,
+        tol,
+        maxiter,
+        on_step,
+        state=state,
+        on_state=ck.save if ck else None,
+    )
+    if ck is not None and rel <= tol:
+        ck.remove()
     prog.note, prog.extra_eta = "", None
     if rel > tol:
         raise RuntimeError(
@@ -654,7 +706,8 @@ def _crossing_cg(
         "max_relative_residual": rel,
         "mode": "level" if level else "pass",
         "preconditioner": method,
-        "passes": 0 if level else it,
+        "passes": 0 if level else it - (int(state["it"]) if state is not None else 0),
+        "resumed_from": int(state["it"]) if state is not None else None,
         "A_nnz": int(A.nnz) if level else None,
         "parts_nnz": int(gram.parts_nnz) if gram is not None else None,  # the shards' parts, summed
         "shipped_nnz": int(gram.shipped_nnz) if gram is not None else None,  # what reached the coordinator
@@ -1149,11 +1202,14 @@ def fit(
         check_sample(N, acc["rows_in"], acc["load"])
         _references(plan, acc)
         if plan.crossing_iterate:
+            plan.cg_checkpoint = str(wd / "cg_checkpoint.npz")
             _zero_absorbed(plan, acc, collin_tol)
             acc["Gamma"] = _crossing_cg(
                 plan, ds, executor, prog, rows, acc, label, iter_tol, iter_maxiter, crossing_precond
             )
-        if f.iv:
+        if f.iv and plan.crossing_iterate:
+            sol = _iv_solve_iterate(plan, acc, N, estimator, fuller, collin_tol)
+        elif f.iv:
             sol = _iv.solve(plan, acc, N, estimator=estimator, fuller=fuller, collin_tol=collin_tol)
         else:
             sol = _ols_solve(plan, acc, collin_tol)

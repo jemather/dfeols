@@ -75,6 +75,7 @@ class Plan:
     sparse_global: bool = False  # crossing FEs via per-level sums, no dense dummies
     crossing_iterate: bool = False  # plan C: crossing-FE coefficients by distributed CG
     iter_token: str | None = None  # plan C: names this fit's shard state in _ITER_CACHE
+    cg_checkpoint: str | None = None  # plan C with a pass per step: where its CG state is kept
     level_nnz: int = 0  # plan C: most nonzeros of A a shard returns (0: no level space)
     keep_dir: str | None = None  # per-shard singleton keep masks (when FEs cross the partition)
     row_key_cols: tuple[str, ...] = ()  # raw columns hashed into the record's row_key
