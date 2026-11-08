@@ -364,9 +364,30 @@ of earlier runs that `sessions.md` proposes (`<scratch>/dfeols/timings.jsonl`), 
 range; with no history, a wide range and a suggestion to calibrate on a few shards. Iterative
 paths multiply by the iteration range.
 
+*Built (steps 3 and 4, 2026-11-08; `src/dfeols/timings.py`).* Every `fit` appends a line to
+`<scratch>/timings/fits.jsonl` (the default profile's scratch, or `DFEOLS_TIMINGS`; nothing
+when neither names a folder): path (local, dense, sparse, iterate, cells), plan C's solve
+(level or fallback) and CG steps, rows, columns (outcomes, regressors, dense dummies),
+passes (2 + singleton passes + CG passes; cells 1), seconds, workers, shards. A run's rate
+is rows × columns × passes / (seconds × workers). For each candidate key the planner
+estimates rows × columns × passes over the range of rates of earlier runs on the same path
+(all runs when none), at the fit's worker count (linear in workers: the low end is
+optimistic). Passes: 2, plus singleton passes with crossing FEs (their range in earlier
+runs, else 1-4), plus on plan C's fallback the earlier fallback runs' CG steps (unknown
+without: the report says so). With no history the report says wall time is not estimated
+and that every fit adds to the record; no calibration run.
+
+The shape (step 4) follows "One job or demean-first": demean-first when the key's path is
+plan C, when the estimate's high end is over half the profile's `max_walltime`, or when
+`plan(..., specs=N)` (`dfeols plan --specs N`) says more than one specification shares the
+FEs; the report gives the reasons, the demeaning's estimate from earlier session builds,
+and the `dfeols session start` to run. Otherwise one job. `fit` warns, after a run, when the
+record holds another formula on the same dataset, FEs and weights (dense, sparse or plan C),
+naming the session command; a suggestion, not a switch.
+
 ## Interfaces
 
-- `dfeols plan SOURCE --fe ... [--cluster ...] [--vars ...] [--partition K1,K2] [--profile P]`:
+- `dfeols plan SOURCE --fe ... [--cluster ...] [--vars ...] [--partition K1,K2] [--profile P] [--specs N]`:
   prints the report; `--json` writes it for scripts. Runs on a login or interactive node
   (streaming, bounded memory), or as a short job for very large sources.
 - `dfeols.plan(source, formula, ...)` returns the same as a dict.
@@ -396,8 +417,8 @@ paths multiply by the iteration range.
 2. Crossing structure (fill, block structure, components); `partition="auto"` in prep; site
    profile additions (`max_walltime`, node classes, `scratch_purge_days`), `dfeols config init
    --from-slurm`, and ranked node-class options.
-3. Wall-time ranges from recorded runs.
-4. One job vs demean-first, once sessions' persisted demeaned data exists.
+3. Wall-time ranges from recorded runs. **Done** (2026-11-08, `timings.py`).
+4. One job vs demean-first, once sessions' persisted demeaned data exists. **Done** (2026-11-08).
 5. New paths as they are built (B, sparse direct, C), each added to the table with its own
    estimate.
 

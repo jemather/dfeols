@@ -29,6 +29,7 @@ import numpy as np
 import polars as pl
 import scipy.sparse as sp
 
+from . import timings as _timings
 from .crossing import NNZ_BYTES, profile_budget
 from .estimate import DENSE_SOLVE_LEVELS, coordinator_gb, worker_gb
 from .formula import Formula, fe_components, parse
@@ -43,6 +44,13 @@ PATHS = {
     "B": ("sparse path, several nested FEs projected in the shard (plan B)", "exists"),
     "C": ("conjugate gradient across shards (plan C; 2 passes + one round per step)", "exists"),
 }
+FIT_PATH = {
+    "local": "local",
+    "dense": "dense",
+    "sparse": "sparse",
+    "B": "sparse",
+    "C": "iterate",
+}  # as fit logs it
 LEVEL_SPACE = "plan C in level space: A built in round 1, CG on the coordinator (2 passes)"
 FALLBACK = "plan C, a pass over the shards per CG step (A over the budget; may converge slowly)"
 
@@ -209,6 +217,7 @@ def plan(
     level_space_gb: float | None = None,
     profile=None,
     workers: int | None = None,
+    specs: int = 1,
 ) -> dict:
     """Probe the FE structure of a specification and recommend a partition key and path.
 
@@ -221,8 +230,10 @@ def plan(
     level_space_gb  fit's budget for A on plan C (default: a quarter of the profile's
                 coordinator memory, else of this machine's)
     profile     site profile (name or Profile) to check worker and coordinator memory against
-    workers     workers the fit will run on, for shard balance (default: the profile's
-                max_workers, else DEFAULT_WORKERS)
+    workers     workers the fit will run on, for shard balance and the wall-time estimate
+                (default: the profile's max_workers, else DEFAULT_WORKERS)
+    specs       how many specifications will share these FEs, sample and weights (more
+                than one: demean-first, a session)
 
     Returns a JSON-serialisable dict; `format_report` prints it.
     """
@@ -237,6 +248,8 @@ def plan(
         from .site import profile as load_profile
 
         profile = load_profile(profile)
+    runs = _timings.history(profile)  # earlier fits on this site, for the wall-time estimate
+    n_specs = int(specs)
 
     specs = {name: _key(name) for name in [*fes, *([cl] if cl else []), *keys]}
     cats = sorted({t.cat for t in (*f.terms, *f.endog, *f.instruments) if t.cat})
@@ -445,6 +458,26 @@ def plan(
                 + ("fit falls back to" if solve == "fallback" else "If so, fit falls back to")
                 + " a pass over the shards per CG step, which may converge slowly"
             )
+        # wall time from earlier runs on this site (timings.py), and the job's shape
+        fit_path = FIT_PATH[path]
+        est = _timings.estimate_fit(
+            n,
+            m + k_x + (n_dummy if path == "dense" else 0),
+            fit_path,
+            solve=solve if path == "C" else None,
+            crossing=bool(g_levels),
+            workers=workers,
+            profile=profile,
+            runs=runs,
+        )
+        how = _timings.shape(
+            {"path": fit_path, "solve": solve},
+            est,
+            specs=n_specs,
+            max_walltime=_timings.walltime_seconds(getattr(profile, "max_walltime", None)),
+        )
+        if how["shape"] == "demean-first":
+            how["demean"] = _timings.estimate_demean(n, m + k_x, profile)
         fits = True
         if worker_mem is not None and w_gb > worker_mem:
             fits = False
@@ -487,6 +520,8 @@ def plan(
                 "coordinator_gb": round(c_gb, 1),
                 "fits": fits,
                 "warnings": warnings,
+                "estimate": est,
+                "shape": how,
             }
         )
 
@@ -546,10 +581,18 @@ def plan(
         "options": ranked,
         "recommended": rec["key"] if rec else None,
         "cells": cells,
+        "specs": n_specs,
+        "history_runs": len(runs),
         "seconds": round(time.time() - t0, 1),
     }
     log.info("plan: probed %s rows, %d keys in %.0fs", f"{n:,}", len(keys), report["seconds"])
     return report
+
+
+def _td(seconds: float) -> str:
+    from .progress import fmt_td
+
+    return fmt_td(seconds) if seconds >= 1 else f"{seconds:.1f} s"
 
 
 def format_report(r: dict) -> str:
@@ -596,6 +639,12 @@ def format_report(r: dict) -> str:
                 how = "lower bound" if a.get("lower") == a["nnz"] else "counted to the budget"
                 size = f"at least {a['nnz']:,} nonzeros ({how})"
             out.append(f"  {'':<{w}} A: {size}; budget {a['budget']:,}")
+        e = o.get("estimate")
+        if e:
+            out.append(
+                f"  {'':<{w}} wall time ~{_td(e['low'])} to {_td(e['high'])} ({e['basis']})"
+                + (f"; {e['unknown']}" if e.get("unknown") else "")
+            )
         for msg in o["warnings"]:
             out.append(f"  {'':<{w}} ! {msg}")
     out.append("")
@@ -605,6 +654,22 @@ def format_report(r: dict) -> str:
             f"  -> partition by {o['key']}: {o['path_text']}; ~{o['shards']:,} shards of up to "
             f"{o['largest_shard_rows']:,} rows"
         )
+        sh = o.get("shape") or {}
+        if sh.get("shape") == "demean-first":
+            d = sh.get("demean")
+            out.append(
+                "  -> demean-first: "
+                + "; ".join(sh["why"])
+                + (
+                    f". Demeaning estimated {_td(d[0])} to {_td(d[1])} from earlier session builds"
+                    if d
+                    else ""
+                )
+                + ". Run it as a session (dfeols session start <name> --data <shards> --fe ... "
+                "--vars <every variable the specifications use>), then fit each specification there"
+            )
+        elif sh:
+            out.append("  -> one job: dfeols submit running fit (fixed passes, within the walltime)")
     else:
         out.append("  -> no candidate key has a path dfeols runs today; see the [not built] paths above")
     c = r.get("cells")
@@ -618,5 +683,11 @@ def format_report(r: dict) -> str:
         elif not c["eligible"]:
             line += " (the cell path is OLS with FEs only)"
         out.append(line)
-    out.append(f"  (probe took {r['seconds']:.0f} s; memory is rough, wall time is not estimated yet)")
+    runs = r.get("history_runs", 0)
+    wall = (
+        f"wall time from {runs} earlier fit{'s' if runs != 1 else ''} on this site"
+        if runs
+        else "wall time not estimated: no earlier fits recorded on this site (fit records each run)"
+    )
+    out.append(f"  (probe took {r['seconds']:.0f} s; memory is rough; {wall})")
     return "\n".join(out)

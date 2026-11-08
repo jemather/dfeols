@@ -51,6 +51,13 @@ break the API).
   names.
 
 ### Added
+- Wall-time estimates and one job vs demean-first in `dfeols plan` (planner steps 3-4): every
+  `fit` appends its path, rows, columns, passes, seconds and workers to
+  `<scratch>/timings/fits.jsonl` (`dfeols.timings`), and the report gives each key a wall-time
+  range from earlier runs on the same path, then recommends demean-first (a session) for plan
+  C, for estimates over half the profile's `max_walltime`, or with `--specs N` > 1, else one
+  job. `fit` warns when another formula was fitted on the same data, FEs and weights before,
+  naming the session command.
 - Created variables in sessions (sessions step 4): `Session.add_variable(name, expression)`
   and `dfeols session add-variable`. The expression is on raw columns of the prepared data
   (`feat * posts`, `log(wt)`, `posts > 0`, `ifelse(x > 0, y, 0)`; R's `^`, `&`, `|`, `!`

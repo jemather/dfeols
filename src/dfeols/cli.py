@@ -125,6 +125,7 @@ def plan_cmd(args):
         level_space_gb=args.level_space_gb,
         profile=args.profile,
         workers=args.workers,
+        specs=args.specs,
     )
     print(json.dumps(r, indent=1) if args.json else format_report(r))
 
@@ -390,6 +391,9 @@ def main(argv=None):
     pl_.add_argument("--profile", help="check memory against this site profile")
     pl_.add_argument(
         "--workers", type=int, help="workers for shard balance (default: the profile's max_workers)"
+    )
+    pl_.add_argument(
+        "--specs", type=int, default=1, help="specifications that will share these FEs (>1: demean-first)"
     )
     pl_.add_argument("--json", action="store_true", help="print the report as JSON")
     r = sub.add_parser("results", help="benchmark results table")

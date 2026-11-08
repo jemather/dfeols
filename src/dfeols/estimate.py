@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
 import logging
@@ -778,6 +779,68 @@ def check_sample(n: int, rows_in: int, load: dict) -> None:
     raise ValueError(f"no rows left in the estimation sample ({load.get('rows', 0):,} rows read{why})")
 
 
+def _record_timing(res, plan, ds, executor, acc, sing, cells, f) -> None:
+    """Append this run to the local record (timings.py) for the planner's estimates, and
+    point to a session when the same FEs, data and weights were just absorbed for another
+    specification (planner.md: a suggestion, not a switch). Never fails the fit."""
+    from . import timings
+
+    try:
+        cg = acc.get("cg") or {}
+        dense = bool(plan.global_fes) and not plan.sparse_global
+        path = (
+            "cells"
+            if cells
+            else "iterate"
+            if plan.crossing_iterate
+            else "sparse"
+            if plan.sparse_global
+            else "dense"
+            if dense
+            else "local"
+        )
+        solve = ("level" if cg.get("mode") == "level" else "fallback") if plan.crossing_iterate else None
+        passes = 1 if cells else 2 + int(sing.get("passes", 0)) + int(cg.get("passes") or 0)
+        running, most = executor.slots()
+        meta_sha = hashlib.sha256((ds.root / "dfeols_meta.json").read_bytes()).hexdigest()
+        fe_key = hashlib.sha256(
+            json.dumps([meta_sha, sorted(res.fe), plan.weights], sort_keys=True).encode()
+        ).hexdigest()[:16]
+        entry = {
+            "path": path,
+            "solve": solve,
+            "crossing": bool(plan.global_fes),
+            "rows": int(acc.get("rows_in") or res.N),
+            "columns": len(f.depvars) + len(plan.endog_names) + plan.k_x + (plan.n_dummy if dense else 0),
+            "passes": passes,
+            "singleton_passes": int(sing.get("passes", 0)),
+            "cg_steps": cg.get("steps"),
+            "seconds": res.seconds,
+            "workers": int(running or most or 1),
+            "shards": len(ds.shards),
+            "iv": bool(res.iv),
+            "fe_key": fe_key,
+            "formula": res.formula,
+        }
+        earlier = [
+            e for e in timings.history() if e.get("fe_key") == fe_key and e.get("formula") != res.formula
+        ]
+        timings.log_fit(entry)
+        if earlier and path in ("iterate", "sparse", "dense"):
+            log.warning(
+                "fit %s: these FEs (%s) on this dataset were absorbed for another specification "
+                "before (%s); a session absorbs them once for many: dfeols session start <name> "
+                "--data %s --fe %r --vars <every variable you need>",
+                res.label,
+                " + ".join(res.fe),
+                earlier[-1]["formula"],
+                ds.root,
+                " + ".join(res.fe),
+            )
+    except Exception:
+        log.debug("fit: timing not recorded", exc_info=True)
+
+
 def fit(
     ds: Dataset | str,
     formula: str,
@@ -1315,6 +1378,7 @@ def fit(
         iv=iv_info,
     )
     res.save(wd / "result.json")
+    _record_timing(res, plan, ds, executor, acc, sing, cells, f)
     if record:
         rpath = wd / "result.estrec.json" if record is True else Path(record)
         try:
