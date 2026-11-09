@@ -48,7 +48,7 @@ def write_parts(
     parts = []
     for i, (lo, hi, rows) in enumerate(key_ranges(lf, key, n_parts)):
         p = data / f"part-{i:04d}.parquet"
-        part = (lf if scan_for is None else scan_for(lo, hi)).filter(pl.col(key).is_between(lo, hi))
+        part = (lf if scan_for is None else scan_for(lo, hi)).filter(pl.col(key).is_between(pl.lit(lo), pl.lit(hi)))  # lit: a str bound is a column name
         if transform is not None:
             part = transform(part)
         part.sort(key).sink_parquet(p, compression="zstd", statistics=True)
