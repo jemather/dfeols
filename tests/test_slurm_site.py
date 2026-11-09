@@ -124,3 +124,17 @@ def test_cli_from_saved_output(tmp_path, monkeypatch, capsys):
     assert "oscer" in load_config()["profiles"] and "cluster" in load_config()["profiles"]
     with pytest.raises(SystemExit):  # never overwrites a profile
         main(args + ["--profile", "oscer", "--write"])
+
+
+def test_exclude_marks_partitions_unused():
+    """Partitions the site does not list for batch work (Ted 2026-11-09: OSCER's ood_*, vscode,
+    interactive, mic) are drafted with use = false; the rest are unchanged."""
+    plain = draft_profile(_sinfo(), _scontrol(), "oscer", today=date(2026, 11, 9))
+    text = draft_profile(
+        _sinfo(), _scontrol(), "oscer", today=date(2026, 11, 9), exclude=["mixed*", "64gb_24core"]
+    )
+    block = text.split("[profiles.oscer.nodes.mixed2]")[1].split("[profiles")[0]
+    assert block.startswith("\nuse = false  # excluded (mixed*)")
+    assert "use = false  # excluded (64gb_24core)" in text.split("[profiles.oscer.nodes.64gb_24core]")[1]
+    assert "use = false" not in plain.split("[profiles.oscer.nodes.mixed2]")[1].split("[profiles")[0]
+    assert "excluded (" not in text.split("[profiles.oscer.nodes.longjobs]")[1].split("[profiles")[0]

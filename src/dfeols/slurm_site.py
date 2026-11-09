@@ -17,6 +17,7 @@ scratch, preempts) is left to the user (docs/design/planner.md).
 
 from __future__ import annotations
 
+import fnmatch
 import re
 import subprocess
 from dataclasses import dataclass, field
@@ -228,13 +229,26 @@ def _toml_str(s: str) -> str:
     return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def draft_profile(sinfo: str, scontrol: str, name: str = "slurm", today: date | None = None) -> str:
-    """The [profiles.<name>] TOML a site profile starts from."""
+def draft_profile(
+    sinfo: str,
+    scontrol: str,
+    name: str = "slurm",
+    today: date | None = None,
+    exclude: list[str] | tuple[str, ...] = (),
+) -> str:
+    """The [profiles.<name>] TOML a site profile starts from. `exclude`: partition names or
+    shell patterns the site does not offer for batch work (OSCER: ood_*, vscode, interactive,
+    mic are not on its list; Ted 2026-11-09), drafted with use = false."""
     classes = node_classes(parse_sinfo(sinfo), parse_scontrol(scontrol))
     if not classes:
         raise ValueError("sinfo listed no partitions")
-    today = today or date.today()
+    for c in classes:
+        hit = [pat for pat in exclude if fnmatch.fnmatchcase(c["partition"], pat)]
+        if hit:
+            c["excluded"].insert(0, f"excluded ({', '.join(hit)})")
     usable = [c for c in classes if not c["excluded"]]
+    classes.sort(key=lambda c: (bool(c["excluded"]), c["mixed"], -c["count"], c["name"]))
+    today = today or date.today()
     site = next((c for c in classes if c["default"]), usable[0] if usable else classes[0])
     site_wall = site["max_walltime"]
     weighted = any(c["billing_weights"] for c in classes)

@@ -11,7 +11,7 @@
                                        nesting, skew, solver path and memory per key
 
   dfeols config init [--force]         write a site config template
-  dfeols config init --from-slurm [--profile NAME] [--write] [--sinfo F --scontrol F]
+  dfeols config init --from-slurm [--profile NAME] [--write] [--sinfo F --scontrol F] [--exclude P]
                                        draft a profile's node classes from sinfo/scontrol
   dfeols config show [--profile P]     print the resolved profile
   dfeols jobscript "CMD" [--profile P] print a coordinator job script for CMD
@@ -167,7 +167,7 @@ def slurm_init(args):
         except RuntimeError as e:
             sys.exit(str(e))
     name = args.profile or "slurm"
-    text = draft_profile(sinfo, scontrol, name)
+    text = draft_profile(sinfo, scontrol, name, exclude=args.exclude or ())
     if not args.write:
         print(text)
         return
@@ -355,6 +355,12 @@ def main(argv=None):
     )
     c.add_argument("--sinfo", help="--from-slurm: saved sinfo output instead of running it")
     c.add_argument("--scontrol", help="--from-slurm: saved `scontrol show partition -o` output")
+    c.add_argument(
+        "--exclude",
+        action="append",
+        metavar="PATTERN",
+        help="--from-slurm: a partition (or shell pattern) not to use, drafted with use = false; repeatable",
+    )
     c.add_argument("--write", action="store_true", help="--from-slurm: add the draft to the config file")
     j = sub.add_parser("jobscript", help="print a coordinator job script")
     j.add_argument("command")
