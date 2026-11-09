@@ -155,6 +155,7 @@ def trips_frame(drv, car, nta) -> pl.LazyFrame:
     return t.select(keep)
 
 
+REF_DAY = date(2009, 7, 1)
 TRIP_FE = "driver_num + car_num + pkp_nta_id^drf_nta_id + pkp_date_hour"
 TRIP_SPECS = [
     ("duration", f"log_ride_duration ~ log_distance | {TRIP_FE}", None),
@@ -162,12 +163,37 @@ TRIP_SPECS = [
 ]
 
 
-def package_trips(out: Path, n_parts: int, commit: str) -> None:
+def package_trips(out: Path, n_parts: int, commit: str, reuse_parts: bool = False) -> None:
     drv, car, nta = id_maps()
     lf = trips_frame(drv, car, nta)
     name = "taxi2009_trips_v1"
     d = out / name
-    parts = write_parts(lf, "driver_num", d, n_parts)
+    if reuse_parts:  # parts already written by an earlier run of this script
+        parts = []
+        for p in sorted((d / "data").glob("part-*.parquet")):
+            st = (
+                pl.scan_parquet(p)
+                .select(
+                    pl.len().alias("rows"),
+                    pl.col("driver_num").min().alias("lo"),
+                    pl.col("driver_num").max().alias("hi"),
+                )
+                .collect()
+                .row(0, named=True)
+            )
+            parts.append(
+                {
+                    "file": f"data/{p.name}",
+                    "rows": st["rows"],
+                    "driver_num_min": st["lo"],
+                    "driver_num_max": st["hi"],
+                    "bytes": p.stat().st_size,
+                }
+            )
+        if not parts:
+            raise ValueError(f"no parts to reuse in {d / 'data'}")
+    else:
+        parts = write_parts(lf, "driver_num", d, n_parts)
     data = pl.scan_parquet(str(d / "data" / "*.parquet"))
     rows = sum(p["rows"] for p in parts)
     fes = {
@@ -181,7 +207,7 @@ def package_trips(out: Path, n_parts: int, commit: str) -> None:
         "pub_driver_id": ["pub_driver_id"],
     }
     levels = level_counts(data, fes)
-    sub = data.filter(pl.col("pkp_date").is_between(date(2009, 7, 1), date(2009, 7, 7)))
+    sub = data.filter(pl.col("pkp_date").is_between(REF_DAY, REF_DAY))
     fits = []
     for _, f, cond in TRIP_SPECS:
         s = sub.filter(pl.sql_expr(cond)) if cond else sub
@@ -198,9 +224,7 @@ def package_trips(out: Path, n_parts: int, commit: str) -> None:
         )
         pdf = s.select(cols).drop_nulls().collect().to_pandas()
         r = fit_reference(pdf, f, "driver_num")
-        r["subsample"] = (
-            "pkp_date 2009-07-01..2009-07-07" + (f" and {cond}" if cond else "") + ", nulls dropped"
-        )
+        r["subsample"] = f"pkp_date {REF_DAY}" + (f" and {cond}" if cond else "") + ", nulls dropped"
         fits.append(r)
     dump_json(
         d / "reference.json",
@@ -288,7 +312,10 @@ pickup × drop-off NTA and date × hour cross everything.
 |---|---|---|---:|---|
 {fit_rows}
 
-The reference subsample is pickups 2009-07-01 to 07-07 (rows with nulls in the model dropped).
+The reference subsample is one day of pickups, {REF_DAY} (rows with nulls in the model dropped):
+pyfixest's demeaning with driver and car (nearly collinear: most drivers keep one car) and the
+NTA pair didn't converge on 3 or 7 days (10,000 iterations, or 25 minutes at 1M). Within one day
+driver and car barely separate, so the reference checks the estimator, not the car effects.
 Full-precision values in `reference.json`. Then the full year; no reference outside dfeols.
 These specs are tests of the estimator, not the paper's.
 """)
@@ -448,6 +475,7 @@ def main(argv=None) -> int:
     ap.add_argument("--out", default="outbox")
     ap.add_argument("--trip-parts", type=int, default=8)
     ap.add_argument("--only", choices=["shifts", "trips"], default=None)
+    ap.add_argument("--reuse-trip-parts", action="store_true")
     a = ap.parse_args(argv)
     commit = (
         subprocess.run(
@@ -459,7 +487,7 @@ def main(argv=None) -> int:
     if a.only in (None, "shifts"):
         package_shifts(out, commit)
     if a.only in (None, "trips"):
-        package_trips(out, a.trip_parts, commit)
+        package_trips(out, a.trip_parts, commit, reuse_parts=a.reuse_trip_parts)
     return 0
 
 
