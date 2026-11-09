@@ -781,20 +781,40 @@ def _meat(plan: Plan, X: np.ndarray, E: np.ndarray, w: np.ndarray, cl, out: dict
     """RSS and the meats of the equations in E's columns, with score regressors X (n x k)."""
     m = E.shape[1]
     out[prefix + "rss"] = np.einsum("ij,ij,i->j", E, E, w)
-    S = [X * (w * E[:, j])[:, None] for j in range(m)]
     k = X.shape[1]
-    if "hetero" in plan.vcov_types:
-        out[prefix + "meat_hetero"] = np.array([s.T @ s for s in S]).reshape(m, k, k)
-    if "CRV1" in plan.vcov_types and plan.cluster:
+    hetero = "hetero" in plan.vcov_types
+    crv = "CRV1" in plan.vcov_types and plan.cluster
+    if not (hetero or crv):
+        return
+    # One equation's scores at a time: with many equations (IV first stages, one per
+    # endogenous regressor) all of them at once is m x n x k (tens of GB with ~100 dummies).
+    if hetero:
+        meat_h = np.empty((m, k, k))
+    if crv:
         order = np.argsort(cl, kind="stable")
         cls = cl[order]
         starts = np.flatnonzero(np.r_[True, cls[1:] != cls[:-1]])
         codes = cls[starts]
-        Sg = np.empty((m, len(codes), k))
-        for j in range(m):
-            Sg[j] = np.add.reduceat(S[j][order], starts, axis=0) if len(cls) else np.zeros((0, k))
         if plan.cluster_local:
-            out[prefix + "meat_crv"] = np.einsum("mgk,mgl->mkl", Sg, Sg)
+            meat_c = np.empty((m, k, k))
+        else:
+            Sg = np.empty((m, len(codes), k))
+    for j in range(m):
+        s = X * (w * E[:, j])[:, None]
+        if hetero:
+            meat_h[j] = s.T @ s
+        if crv:
+            sg = np.add.reduceat(s[order], starts, axis=0) if len(cls) else np.zeros((0, k))
+            if plan.cluster_local:
+                meat_c[j] = sg.T @ sg
+            else:
+                Sg[j] = sg
+        del s
+    if hetero:
+        out[prefix + "meat_hetero"] = meat_h
+    if crv:
+        if plan.cluster_local:
+            out[prefix + "meat_crv"] = meat_c
         else:
             out[prefix + "cluster_codes"] = codes
             out[prefix + "cluster_scores"] = Sg

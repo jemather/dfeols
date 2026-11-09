@@ -1220,10 +1220,9 @@ def fit(
         # ---------------- round 2 ----------------
         acc2: dict = {}
         kk = sol.bread[0].shape[0]
-        p_ = len(plan.endog_names)
         shapes = {"": (m, kk)}
         if f.iv:
-            shapes["fs_"] = (p_, sol.fs["q"])
+            shapes["fs_"] = (len(sol.lin["fs"]["index"]), sol.fs["q"])  # exact first stages skipped
         for pre, (ne, k_) in shapes.items():
             acc2[pre + "rss"] = np.zeros(ne)
             acc2[pre + "hetero"] = np.zeros((ne, k_, k_)) if "hetero" in plan.vcov_types else None

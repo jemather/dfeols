@@ -392,7 +392,9 @@ def test_time_dummies_exact_first_stage(ds, tmp_path):
     h = lpm_dthazard(ds, "y ~ x1 + i(t)", unit="uid", time="t", workdir=tmp_path / "a", log_every=1e9)
     fs = {e["endogenous"]: e for e in h.iv.iv["first_stage"]["per_endogenous"]}
     assert all(fs[f"t::{k}"].get("exact_fit") for k in (3, 4, 5)) and not fs["x1"].get("exact_fit")
-    assert fs["x1"]["f_stat"]
+    assert fs["x1"]["f_stat"] and fs["x1"]["vcov"]
+    # round 2 builds first-stage meats only for the non-exact first stage (x1)
+    assert all(not fs[f"t::{k}"]["vcov"] for k in (3, 4, 5))
     h2 = lpm_dthazard(ds, "y ~ x1 | t", unit="uid", time="t", workdir=tmp_path / "b", log_every=1e9)
     assert h.iv.coef()[h.iv.coefnames.index("x1")] == pytest.approx(h2.iv.coef()[0], rel=1e-9)
     assert h.summary()

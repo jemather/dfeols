@@ -152,7 +152,13 @@ def solve(plan, acc: dict, N: int, *, estimator: str = "2sls", fuller: float | N
     coefnames = [plan.colnames[zc[x1[i]]] for i in rep_x1] + [plan.endog_names[i] for i in ek]
     rep = np.r_[rep_x1, nx1 + np.arange(len(ek))]
 
-    lin = _round2_maps(plan, m, p, zc, x1, z2, ek, Pi, coef_x, A, B, A11)
+    rss_full = np.array([C[m + l, m + l] - B[:, m + l] @ AiB[:, m + l] for l in range(p)])
+    rss_x1 = np.array([C[m + l, m + l] - B1[:, m + l] @ np.linalg.solve(A11, B1[:, m + l]) for l in range(p)])
+    # Exact first stages (the instruments span the endogenous regressor, e.g. time or age
+    # dummies by their own differences in lpm_dthazard): no residual, so no F tests and no
+    # first-stage meat in round 2 (with ~100 such dummies that meat dominated the pass).
+    exact = rss_full <= 1e-10 * np.maximum(rss_x1, 0.0)
+    lin = _round2_maps(plan, m, p, zc, x1, z2, ek, Pi, coef_x, A, B, A11, np.flatnonzero(~exact))
     if plan.sparse_global:  # meat already has the dummies partialled out: reported basis only
         bread = [b_[np.ix_(rep, rep)] for b_ in bread]
         meat_idx = np.arange(len(rep))
@@ -163,10 +169,9 @@ def solve(plan, acc: dict, N: int, *, estimator: str = "2sls", fuller: float | N
         "k_fs": len(rep_x1) + q,  # first-stage K for the small-sample correction
         "Pi_z2": Pi[z2],  # q x p
         "bread_z2": Ainv[np.ix_(z2, z2)],  # (z2~'W z2~)^-1, z2~ = M_X1 Z2
-        "rss_full": np.array([C[m + l, m + l] - B[:, m + l] @ AiB[:, m + l] for l in range(p)]),
-        "rss_x1": np.array(
-            [C[m + l, m + l] - B1[:, m + l] @ np.linalg.solve(A11, B1[:, m + l]) for l in range(p)]
-        ),
+        "rss_full": rss_full,
+        "rss_x1": rss_x1,
+        "exact": exact,
         "inst_names": [plan.inst_names[zc[i] - k_rep] for i in z2],
         "ePZe": np.einsum("zj,zw,wj->j", Ze, Ainv, Ze),
         "overid_df": q - len(ek),
@@ -182,7 +187,7 @@ def _n_instruments(plan, zc) -> int:
     return int((zc < plan.k_x).sum())
 
 
-def _round2_maps(plan, m, p, zc, x1, z2, ek, Pi, coef_x, A, B, A11):
+def _round2_maps(plan, m, p, zc, x1, z2, ek, Pi, coef_x, A, B, A11, fs_keep=None):
     """Linear maps of T = [Y (m + p), Z[:, cols]] for worker.shard_round2: residuals
     y - X beta and score regressors Xh = [X1, Z Pi] of each outcome, and the first stage's
     residuals v = X2 - Z Pi with score regressors Z2~ = M_X1 Z2 (FWL: the Z2 block of the
@@ -227,6 +232,8 @@ def _round2_maps(plan, m, p, zc, x1, z2, ek, Pi, coef_x, A, B, A11):
     Afs = np.zeros((nT, p))
     Afs[m + np.arange(p), np.arange(p)] = 1.0
     Afs -= zrows(Pi)
+    fs_keep = np.arange(p) if fs_keep is None else np.asarray(fs_keep, int)
+    Afs = Afs[:, fs_keep]  # only the first stages whose meats are needed
     Gam = np.linalg.solve(A11, A[np.ix_(x1, z2)])  # X1 coefficients of Z2: |x1| x q
     Gz = np.zeros((len(zc), len(z2)))
     Gz[z2] = np.eye(len(z2))
@@ -234,7 +241,7 @@ def _round2_maps(plan, m, p, zc, x1, z2, ek, Pi, coef_x, A, B, A11):
     Hfs = zrows(Gz)
 
     lin = {"cols": zc[nd], "A": Ares, "H": H, "G": None, "GH": None}
-    fs = {"A": Afs, "H": Hfs, "G": None, "GH": None}
+    fs = {"A": Afs, "H": Hfs, "G": None, "GH": None, "index": fs_keep.tolist()}
     if sparse:
         dum = np.flatnonzero(zc >= k_x)
         _, _, P = _layout(plan)
@@ -247,7 +254,7 @@ def _round2_maps(plan, m, p, zc, x1, z2, ek, Pi, coef_x, A, B, A11):
         piT = np.linalg.solve(Add, DT)
         lin["G"] = _levels(plan, zc[dum], P, beta_x1[dum])
         lin["GH"] = _levels(plan, zc[dum], P, piT @ H)
-        fs["G"] = _levels(plan, zc[dum], P, Pi[dum])
+        fs["G"] = _levels(plan, zc[dum], P, Pi[dum][:, fs_keep])
         # M_D (Z2 - X1 Gam), which is M_X1 Z2 by FWL
         fs["GH"] = _levels(plan, zc[dum], P, piT @ Hfs)
     lin["fs"] = fs
@@ -270,6 +277,10 @@ def first_stage(plan, sol: Solution, acc: dict, acc2: dict, N: int, fe_levels, n
     bread = fs["bread_z2"]
     Q = np.linalg.inv(bread)
     dfk = df_k(k_fs, fe_levels, None)
+    # round 2 computed first-stage meats only for the non-exact first stages, in this order
+    meat_at = {
+        l: i for i, l in enumerate((sol.lin.get("fs") or {}).get("index", range(len(plan.endog_names))))
+    }
     out = []
     for l, name in enumerate(plan.endog_names):
         pi = fs["Pi_z2"][:, l]
@@ -282,7 +293,7 @@ def first_stage(plan, sol: Solution, acc: dict, acc2: dict, N: int, fe_levels, n
         # Exact fit: the instruments span the endogenous regressor (e.g. time dummies by their
         # own differences in lpm_dthazard). Its residual variance is zero, so the F statistics
         # are infinite or undefined: report the fit, leave the tests out.
-        exact = rss <= 1e-10 * max(tss, 0.0)
+        exact = bool(fs["exact"][l]) if "exact" in fs else rss <= 1e-10 * max(tss, 0.0)
         entry = {
             "endogenous": name,
             "instruments": fs["inst_names"],
@@ -296,16 +307,16 @@ def first_stage(plan, sol: Solution, acc: dict, acc2: dict, N: int, fe_levels, n
         if exact:
             entry["exact_fit"] = True
         for t in plan.vcov_types:
+            if exact:  # zero residual variance: no first-stage vcov, F or effective F
+                break
             if t == "iid":
                 V, df2 = vcov_iid(bread, rss, N, dfk), N - dfk
             elif t == "hetero":
-                V, df2 = vcov_hetero(bread, acc2["fs_hetero"][l], N, dfk), N - dfk
+                V, df2 = vcov_hetero(bread, acc2["fs_hetero"][meat_at[l]], N, dfk), N - dfk
             else:
                 dfk_cl = df_k(k_fs, fe_levels, nested)
-                V, df2 = vcov_crv1(bread, acc2["fs_crv"][l], N, dfk_cl, G), G - 1
+                V, df2 = vcov_crv1(bread, acc2["fs_crv"][meat_at[l]], N, dfk_cl, G), G - 1
             entry["vcov"][t] = V.tolist()
-            if exact:
-                continue
             if t != "iid":
                 wald = float(pi @ np.linalg.solve(V, pi)) / q
                 entry["f_stat"].append(_test(f"wald_{t}", wald, q, df2))

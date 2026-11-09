@@ -663,6 +663,10 @@ def _build_sample(ds: Dataset, spec: dict, out: Path, executor, label: str) -> b
         if out.exists():
             remove_dir(out)
         shards_dir = out / "shards"
+        # Create the folders here, before any worker does: on a network file system the
+        # coordinator may cache "does not exist" from the checks above and then fail to write
+        # the metadata into a folder only the workers created (OSCER job 35847346).
+        shards_dir.mkdir(parents=True, exist_ok=True)
         tasks = [
             (
                 s["id"],
