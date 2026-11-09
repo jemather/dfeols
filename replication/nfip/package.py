@@ -7,7 +7,8 @@
 Run from the project root. One row per policy transaction (no policy or building ID: FEMA redacts
 them, so there is no policy panel). Specs agreed 2026-11-09 (STATE.md Decisions):
 
-A. Risk Rating 2.0 event study: pre-FIRM against other policies in the same tract, by quarter
+A. Risk Rating 2.0 event study: pre-FIRM against other policies in the same block group (and,
+   as a second run, tract), by quarter
    relative to 2022Q2 (renewals moved to Risk Rating 2.0 from 2022-04-01; ref 2021Q3), 2018-2025,
    with two pre-FIRM definitions: subsidy eligible (``preFIRMConstructionIndicator``, which FEMA's
    dictionary says is misnamed) and built before the community's first FIRM (not
@@ -46,7 +47,8 @@ EVENT_LO, EVENT_HI = 2018 * 4 + 0 - RR2_RENEWALS_Q, 2025 * 4 + 3 - RR2_RENEWALS_
 REF_Q = -3  # 2021Q3, the last quarter before any policy was rated under Risk Rating 2.0
 REF_STATES = ["RI"]
 CONTROLS = "log_building_cov + log_contents_cov + elevated + primary_residence"
-FE_A = "tract^{d} + tract^quarter + flood_zone^quarter"
+FE_A = "{g}^{d} + {g}^quarter + flood_zone^quarter"
+GEOS = ["block_group", "tract"]  # block group first (Ted, 2026-11-09); tract as a second run
 FE_B = "county^month + flood_zone^month"  # community: CRS class is constant within one
 CLUSTER = "community"
 
@@ -55,10 +57,11 @@ def specs():
     """(label, dfeols formula, pyfixest formula) for every spec and sample."""
     out = []
     for y, sample in [("log_premium", "all"), ("log_premium_sf", "single-family")]:
-        for d in ["subsidy_eligible", "built_pre_firm"]:
-            fe = FE_A.format(d=d)
-            out.append((
-                f"A {d}, {sample}",
+        for g in GEOS:
+            for d in ["subsidy_eligible", "built_pre_firm"]:
+                fe = FE_A.format(g=g, d=d)
+                out.append((
+                f"A {g}, {d}, {sample}",
                 f"{y} ~ {d}:i(event_quarter, ref={REF_Q}) + {CONTROLS} | {fe}",
                 f"{y} ~ i(event_quarter, {d}, ref={REF_Q}) + {CONTROLS} | {fe}",
             ))  # fmt: skip
@@ -78,47 +81,44 @@ def frame(lf: pl.LazyFrame) -> pl.LazyFrame:
     sf = pl.col("occupancyType").is_in([1, 11])
     lp = pl.col("totalInsurancePremiumOfThePolicy").log()
     ev = q - RR2_RENEWALS_Q
-    return (
-        lf.filter(
-            (pl.col("totalInsurancePremiumOfThePolicy") > 0)
-            & d.is_between(FIRST, LAST)
-            & pl.col("censusGeoid").is_not_null()
-        )
-        .select(
-            id=pl.col("id"),
-            policy_effective_date=d,
-            month=((d.dt.year().cast(pl.Int32) - 2009) * 12 + d.dt.month().cast(pl.Int32) - 1).cast(pl.Int16),
-            quarter=(q - 2009 * 4).cast(pl.Int16),
-            event_quarter=pl.when(ev.is_between(EVENT_LO, EVENT_HI)).then(ev).cast(pl.Int16),
-            tract=pl.col("censusGeoid").str.slice(0, 11),
-            block_group=pl.col("censusGeoid"),
-            community=pl.col("nfipCommunityNumberCurrent"),
-            county=pl.col("censusGeoid").str.slice(0, 5),
-            state=pl.col("propertyState"),
-            flood_zone=zone,
-            sfha=sfha.cast(pl.Int8),
-            rate_method=pl.col("rateMethod"),
-            rr2=rr2.cast(pl.Int8),
-            occupancy_type=pl.col("occupancyType"),
-            single_family=sf.cast(pl.Int8),
-            subsidy_eligible=pl.col("preFIRMConstructionIndicator").cast(pl.Int8),
-            built_pre_firm=(~pl.col("postFIRMConstructionIndicator")).cast(pl.Int8),
-            crs_class=crs.cast(pl.Int16),
-            crs_class_pre=pl.when(~rr2 & (d < date(2021, 10, 1)) & sfha).then(crs).cast(pl.Int16),
-            crs_class_rr2=pl.when(rr2).then(crs).cast(pl.Int16),
-            premium=pl.col("totalInsurancePremiumOfThePolicy"),
-            policy_cost=pl.col("policyCost"),
-            full_risk_premium=pl.col("fullRiskPremium"),
-            log_premium=lp,
-            log_premium_sf=pl.when(sf).then(lp),
-            building_cov=pl.col("totalBuildingInsuranceCoverage"),
-            contents_cov=pl.col("totalContentsInsuranceCoverage"),
-            log_building_cov=pl.col("totalBuildingInsuranceCoverage").cast(pl.Float64).log1p(),
-            log_contents_cov=pl.col("totalContentsInsuranceCoverage").cast(pl.Float64).log1p(),
-            elevated=pl.col("elevatedBuildingIndicator").cast(pl.Int8),
-            primary_residence=pl.col("primaryResidenceIndicator").cast(pl.Int8),
-            policy_count=pl.col("policyCount"),
-        )
+    return lf.filter(
+        (pl.col("totalInsurancePremiumOfThePolicy") > 0)
+        & d.is_between(FIRST, LAST)
+        & pl.col("censusGeoid").is_not_null()
+    ).select(
+        id=pl.col("id"),
+        policy_effective_date=d,
+        month=((d.dt.year().cast(pl.Int32) - 2009) * 12 + d.dt.month().cast(pl.Int32) - 1).cast(pl.Int16),
+        quarter=(q - 2009 * 4).cast(pl.Int16),
+        event_quarter=pl.when(ev.is_between(EVENT_LO, EVENT_HI)).then(ev).cast(pl.Int16),
+        tract=pl.col("censusGeoid").str.slice(0, 11),
+        block_group=pl.col("censusGeoid"),
+        community=pl.col("nfipCommunityNumberCurrent"),
+        county=pl.col("censusGeoid").str.slice(0, 5),
+        state=pl.col("propertyState"),
+        flood_zone=zone,
+        sfha=sfha.cast(pl.Int8),
+        rate_method=pl.col("rateMethod"),
+        rr2=rr2.cast(pl.Int8),
+        occupancy_type=pl.col("occupancyType"),
+        single_family=sf.cast(pl.Int8),
+        subsidy_eligible=pl.col("preFIRMConstructionIndicator").cast(pl.Int8),
+        built_pre_firm=(~pl.col("postFIRMConstructionIndicator")).cast(pl.Int8),
+        crs_class=crs.cast(pl.Int16),
+        crs_class_pre=pl.when(~rr2 & (d < date(2021, 10, 1)) & sfha).then(crs).cast(pl.Int16),
+        crs_class_rr2=pl.when(rr2).then(crs).cast(pl.Int16),
+        premium=pl.col("totalInsurancePremiumOfThePolicy"),
+        policy_cost=pl.col("policyCost"),
+        full_risk_premium=pl.col("fullRiskPremium"),
+        log_premium=lp,
+        log_premium_sf=pl.when(sf).then(lp),
+        building_cov=pl.col("totalBuildingInsuranceCoverage"),
+        contents_cov=pl.col("totalContentsInsuranceCoverage"),
+        log_building_cov=pl.col("totalBuildingInsuranceCoverage").cast(pl.Float64).log1p(),
+        log_contents_cov=pl.col("totalContentsInsuranceCoverage").cast(pl.Float64).log1p(),
+        elevated=pl.col("elevatedBuildingIndicator").cast(pl.Int8),
+        primary_residence=pl.col("primaryResidenceIndicator").cast(pl.Int8),
+        policy_count=pl.col("policyCount"),
     )
 
 
@@ -165,6 +165,9 @@ def main(argv=None) -> int:
             "month": ["month"],
             "quarter": ["quarter"],
             "tract^quarter": ["tract", "quarter"],
+            "block_group^quarter": ["block_group", "quarter"],
+            "block_group^subsidy_eligible": ["block_group", "subsidy_eligible"],
+            "block_group^built_pre_firm": ["block_group", "built_pre_firm"],
             "tract^subsidy_eligible": ["tract", "subsidy_eligible"],
             "tract^built_pre_firm": ["tract", "built_pre_firm"],
             "flood_zone^quarter": ["flood_zone", "quarter"],
@@ -192,7 +195,7 @@ def main(argv=None) -> int:
         ref = data
     cols = ["log_premium", "log_premium_sf", "event_quarter", "subsidy_eligible", "built_pre_firm",
             "crs_class_pre", "crs_class_rr2", "log_building_cov", "log_contents_cov", "elevated",
-            "primary_residence", "tract", "quarter", "flood_zone", "community", "county", "month", "state"]  # fmt: skip
+            "primary_residence", "tract", "block_group", "quarter", "flood_zone", "community", "county", "month", "state"]  # fmt: skip
     pdf_all = ref.select(cols).collect().to_pandas()
     fits = []
     for label, f_dfeols, f_pyfixest in specs():
@@ -200,7 +203,11 @@ def main(argv=None) -> int:
         need = [y, "event_quarter" if label.startswith("A") else f_pyfixest.split("i(")[1].split(",")[0]]
         pdf = pdf_all.dropna(subset=need)
         r = fit_reference(pdf, f_pyfixest, CLUSTER)
-        r.update(label=label, dfeols_formula=f_dfeols, subsample=f"state in {REF_STATES}, rows with {need} non-null")
+        r.update(
+            label=label,
+            dfeols_formula=f_dfeols,
+            subsample=f"state in {REF_STATES}, rows with {need} non-null",
+        )
         fits.append(r)
         print(label, r["nobs"], flush=True)
     dump_json(
@@ -292,7 +299,7 @@ FEMA NFIP redacted policies (OpenFEMA V3), one row per policy transaction, effec
 
 ## Suggested partition key and specs
 
-Partition `tract` (spec A's FEs are all nested in it; spec B's county^month crosses it); cluster
+Partition `tract` (spec A's FEs, by block group or tract, are all nested in it; spec B's county^month crosses it); cluster
 `{CLUSTER}`. Sub-samples are nulls, which the fit drops (see the schema notes). Formulas in
 dfeols syntax (`x:i(c, ref=r)`); the pyfixest reference uses `i(c, x, ref=r)`, the same model.
 
