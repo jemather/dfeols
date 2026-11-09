@@ -51,6 +51,7 @@ FE_A = "{g}^{d} + {g}^quarter + flood_zone^quarter"
 GEOS = ["block_group", "tract"]  # block group first (Ted, 2026-11-09); tract as a second run
 FE_B = "county^month + flood_zone^month"  # community: CRS class is constant within one
 CLUSTER = "community"
+ACCESSED = "2026-10-23"  # Ted downloaded NfipPoliciesV3.parquet (FEMA asks for the access date)
 
 
 def specs():
@@ -265,10 +266,15 @@ FEMA NFIP redacted policies (OpenFEMA V3), one row per policy transaction, effec
 {FIRST} to {LAST}: {rows:,} rows. For a Risk Rating 2.0 event study and a CRS discount check
 (D3). No policy or building ID (redacted), so there is no policy panel.
 
-- **Source:** OpenFEMA "FIMA NFIP Redacted Policies – v3",
-  https://www.fema.gov/openfema-data-page/nfip-redacted-policies-v3, file `NfipPoliciesV3.parquet`
-  (as of 2026-09, sha256 b830cd23…; `docs/sources/nfip.md` on valiant). Public; FEMA asks for
-  citation and no implied endorsement.
+- **Source:** Federal Emergency Management Agency (FEMA), OpenFEMA Dataset: FIMA NFIP Redacted
+  Policies - v3, https://www.fema.gov/openfema-data-page/nfip-redacted-policies-v3, file
+  `NfipPoliciesV3.parquet` (data as of 2026-09, accessed {ACCESSED}, sha256 b830cd23…;
+  `docs/sources/nfip.md` on valiant).
+- **Terms:** This product uses the Federal Emergency Management Agency's OpenFEMA API, but is
+  not endorsed by FEMA. Use is under the OpenFEMA Terms and Conditions,
+  https://www.fema.gov/about/openfema/terms-conditions: statistical research only, no attempt
+  to reidentify individuals, no FEMA or DHS logos. FEMA cannot vouch for the data or analyses
+  derived from them.
 - **Build:** `repo/replication/nfip/package.py`, jemather/dfeols `{commit}`
 - **Built:** {date.today()} on valiant
 - **Rows:** {rows:,} in {len(parts)} parts by `tract`, of {pre["rows_in"]:,} in the file
