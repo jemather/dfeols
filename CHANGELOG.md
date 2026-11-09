@@ -7,6 +7,13 @@ break the API).
 
 ## [Unreleased]
 
+### Changed
+
+- Worker logs go in `<scratch>/logs/<coordinator job id>/` (outside a batch job,
+  `logs/local-<time>-<pid>/`), not all in `<scratch>/logs/`. Each file is still named by the
+  worker's own job id, so a run's worker logs could not be told apart from every other run's.
+  The coordinator logs the folder at start.
+
 ### Fixed
 
 - Plan C in level space no longer runs workers out of memory. Shards cap their part of A by

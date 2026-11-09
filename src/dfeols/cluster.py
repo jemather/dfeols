@@ -26,8 +26,10 @@ import os
 import shlex
 import socket
 import subprocess
+import time
 from pathlib import Path
 
+from .lock import _job_id
 from .site import Profile
 from .site import profile as load_profile
 
@@ -177,6 +179,19 @@ _JOBS = {
 
 
 # ------------------------------------------------------------- executors
+def worker_log_tag() -> str:
+    """Folder name for this coordinator's worker logs under <scratch>/logs/.
+
+    The coordinator's own job id, so a run's worker logs (each named by the
+    worker's job id) sit together and can be found from the parent job.
+    Outside a batch job: local-<YYYYmmdd-HHMMSS>-<pid>.
+    """
+    jid = _job_id()
+    if jid:
+        return jid.replace("/", "_")
+    return f"local-{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}"
+
+
 def make_cluster(p: Profile, log_directory: str | None = None):
     """Create (not scale) a Dask cluster for profile p."""
     w = p.worker
@@ -205,9 +220,10 @@ def make_cluster(p: Profile, log_directory: str | None = None):
     wall = walltime_seconds(w["walltime"], p.scheduler)
     life = max(wall - min(60 * int(w["retire_minutes"]), wall // 4), 300)
     if log_directory or p.scratch:
-        ld = Path(log_directory) if log_directory else p.scratch_dir("logs")
+        ld = Path(log_directory) if log_directory else p.scratch_dir("logs", worker_log_tag())
         ld.mkdir(parents=True, exist_ok=True)
         kw["log_directory"] = str(ld)
+        log.info("cluster: worker logs in %s", ld)
     cls = getattr(dask_jobqueue, _CLASSES[p.scheduler])
     return cls(
         job_name="dfeols-worker",

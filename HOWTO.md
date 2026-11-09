@@ -37,7 +37,7 @@ dfeols check                  # one worker starts through the scheduler and runs
 
 If it fails:
 - jobs pending: queue limits
-- jobs exit at once: check the worker logs in `<scratch>/logs`
+- jobs exit at once: check the worker logs in `<scratch>/logs/<coordinator job id>/`
 - "Timed out trying to connect": set `interface` in the profile
 
 ## 2. Prep the data once

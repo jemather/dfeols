@@ -27,7 +27,7 @@
 
 Where things go (under the profile's scratch directory):
   jobs/      coordinator job scripts and their output (dfeols submit)
-  logs/      worker logs
+  logs/<id>/ worker logs, in a folder named by the coordinator's job id
   bench/     benchmark data, shards, runs/<run_id>/ and results/
 """
 
