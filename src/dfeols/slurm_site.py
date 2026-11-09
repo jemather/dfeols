@@ -237,8 +237,9 @@ def draft_profile(
     exclude: list[str] | tuple[str, ...] = (),
 ) -> str:
     """The [profiles.<name>] TOML a site profile starts from. `exclude`: partition names or
-    shell patterns the site does not offer for batch work (OSCER: ood_*, vscode, interactive,
-    mic are not on its list; Ted 2026-11-09), drafted with use = false."""
+    shell patterns the site does not offer for this work (OSCER: ood_*, vscode, interactive,
+    mic are not on its list; long_sooner_test and largelongmem are for other tasks; Ted
+    2026-11-09), drafted with use = false."""
     classes = node_classes(parse_sinfo(sinfo), parse_scontrol(scontrol))
     if not classes:
         raise ValueError("sinfo listed no partitions")
