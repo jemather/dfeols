@@ -37,14 +37,18 @@ def key_ranges(lf: pl.LazyFrame, key: str, n_parts: int) -> list[tuple[object, o
     return ranges
 
 
-def write_parts(lf: pl.LazyFrame, key: str, out: Path, n_parts: int, transform=None) -> list[dict]:
-    """transform(lf) is applied after the key-range filter (for window functions within a key)."""
+def write_parts(
+    lf: pl.LazyFrame, key: str, out: Path, n_parts: int, transform=None, scan_for=None
+) -> list[dict]:
+    """transform(lf) is applied after the key-range filter (for window functions within a key).
+    scan_for(lo, hi), if given, returns a narrower frame holding every row of that key range
+    (e.g. only the source files that can contain it), used in place of lf for the part."""
     data = out / "data"
     data.mkdir(parents=True, exist_ok=True)
     parts = []
     for i, (lo, hi, rows) in enumerate(key_ranges(lf, key, n_parts)):
         p = data / f"part-{i:04d}.parquet"
-        part = lf.filter(pl.col(key).is_between(lo, hi))
+        part = (lf if scan_for is None else scan_for(lo, hi)).filter(pl.col(key).is_between(lo, hi))
         if transform is not None:
             part = transform(part)
         part.sort(key).sink_parquet(p, compression="zstd", statistics=True)
