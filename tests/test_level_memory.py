@@ -151,3 +151,72 @@ def test_shared_dict_of_arrays_scattered_once():
     tasks = [(i, 1, ("plan", i, [f"f{i}"], lin, small)) for i in range(5)]
     shared = ex._scatter_shared(tasks)
     assert list(shared) == [id(lin)] and ex.client.sent == [[lin]]
+
+
+def _shard(n_local: int, seed: int = 1):
+    rng = np.random.default_rng(seed)
+    n = 3000
+    local = [rng.integers(0, 600, n)] + [rng.integers(0, 900, n) for _ in range(n_local - 1)]
+    local = [wk.densify(c)[0] for c in local]
+    L = [1500, 900]
+    offs = np.r_[0, np.cumsum(L)]
+    gcodes = np.vstack([rng.integers(0, L[0], n) + offs[0], rng.integers(0, L[1], n) + offs[1]])
+    w = rng.random(n) + 0.5
+    Dm = sp.csr_matrix((np.ones(2 * n), (np.tile(np.arange(n), 2), gcodes.ravel())), shape=(n, int(offs[-1])))
+    return local, gcodes, w, Dm, int(offs[-1]), offs
+
+
+@pytest.mark.parametrize("n_local", [1, 2])
+def test_part_size_counts_the_part_before_building_it(n_local):
+    from types import SimpleNamespace
+
+    local, gcodes, w, Dm, P, offs = _shard(n_local)
+    plan = SimpleNamespace(global_fes=[("a", "a", 1500), ("b", "b", 900)])
+    DD = wk._dummy_gram(plan, local, w, Dm, gcodes, P, sparse_out=True).tocoo()
+    DD.sum_duplicates()
+    fe_of = np.repeat([0, 1], [1500, 900])
+    blocks = int((fe_of[DD.row] == fe_of[DD.col]).sum())
+    # the count is the pattern (crossing levels sharing a local group or component): at least
+    # what the part stores (entries that cancel exactly, and a Schur block's structural zeros,
+    # are counted), and close to it
+    g = wk._local_groups(local)
+    pat = wk._pattern_nnz(np.tile(g, 2), gcodes.ravel(), P, 10**12, exact=True)
+    bpat = sum(wk._pattern_nnz(g, gcodes[i], P, 10**12, exact=True) for i in range(2))
+    assert DD.nnz <= pat <= 1.05 * DD.nnz and blocks <= bpat <= 1.05 * blocks
+    assert wk._part_size(local, gcodes, P, 10**9)["full"]
+    at = wk._part_size(local, gcodes, P, pat)
+    assert at["full"] and at["nnz"] == pat
+    below = wk._part_size(local, gcodes, P, pat - 1)
+    assert not below["full"] and below["blocks"]
+    at = wk._part_size(local, gcodes, P, bpat)
+    assert not at["full"] and at["blocks"] and at["block_nnz"] == bpat
+    assert not wk._part_size(local, gcodes, P, bpat - 1)["blocks"]
+    # the blocks built one crossing FE at a time are the full part's diagonal blocks
+    B = sum(
+        wk._dummy_gram(plan, local, w, wk._fe_matrix(gcodes[i], P), gcodes[i : i + 1], P, True)
+        for i in range(2)
+    ).tocsr()
+    full = DD.tocsr()
+    keep = sp.csr_matrix((np.ones(DD.nnz), (DD.row, DD.col)), shape=(P, P)).multiply(
+        sp.csr_matrix(fe_of[:, None] == fe_of[None, :])
+    )
+    assert abs(B - full.multiply(keep != 0)).max() < 1e-10
+
+
+def test_part_over_the_cap_is_never_built(ds, tmp_path, monkeypatch):
+    calls = []
+    orig = wk._dummy_gram
+
+    def spy(*a, **kw):
+        calls.append(1)
+        return orig(*a, **kw)
+
+    monkeypatch.setattr(wk, "_dummy_gram", spy)
+    a = _fit(ds, tmp_path / "a")
+    assert calls and a.options["crossing_cg"]["mode"] == "level"
+    calls.clear()
+    monkeypatch.setattr(cx, "part_budget", lambda wb, fan_in=4: 1)
+    with pytest.warns(cx.SlowConvergenceWarning):
+        b = _fit(ds, tmp_path / "b")
+    assert not calls and b.options["crossing_cg"]["mode"] == "pass"
+    np.testing.assert_allclose(a.coef(), b.coef(), rtol=1e-9)

@@ -311,6 +311,90 @@ def _global_matrix(df, plan: Plan, n: int):
     )
 
 
+def _fe_matrix(codes: np.ndarray, P: int):
+    """n x P indicator of one crossing FE's levels (codes carry its offset)."""
+    import scipy.sparse as sp
+
+    n = len(codes)
+    return sp.csr_matrix((np.ones(n), (np.arange(n), codes)), shape=(n, P))
+
+
+def _local_groups(local_codes) -> np.ndarray:
+    """Each row's group for the pattern of D'W P_L D: the local FE's own groups with one, else
+    the connected components of the local FEs (each Schur block of _projected_dummy_gram is
+    dense over the crossing levels its component touches)."""
+    if len(local_codes) == 1:
+        return local_codes[0].astype(np.int64)
+    import scipy.sparse as sp
+    from scipy.sparse.csgraph import connected_components
+
+    offs = np.cumsum([0] + [int(c.max()) + 1 for c in local_codes])
+    a = local_codes[0].astype(np.int64)
+    r = np.concatenate([a] * (len(local_codes) - 1))
+    c = np.concatenate([b.astype(np.int64) + o for b, o in zip(local_codes[1:], offs[1:-1])])
+    G = sp.csr_matrix((np.ones(len(r), np.int8), (r, c)), shape=(offs[-1], offs[-1]))
+    _, lab = connected_components(G, directed=False)
+    return lab[a].astype(np.int64)
+
+
+CHUNK_FLOPS = 50_000_000  # products per chunk when a shard counts its part of A
+
+
+def _pattern_nnz(g: np.ndarray, lev: np.ndarray, P: int, lim: int, exact: bool = False) -> int:
+    """Nonzeros of the pattern of B'B, B the (group, level) incidence of the pairs (g, lev),
+    counted up to `lim` (a number above it once past): first the bounds, sum over groups of
+    (levels touched)^2 above and, per level, its largest group below, then by chunks of rows
+    (as the planner's _a_size). Within `lim` the result may be the upper bound, unless `exact`."""
+    import scipy.sparse as sp
+
+    if not len(g):
+        return 0
+    B = sp.csr_matrix((np.ones(len(g), np.float32), (g, lev)), shape=(int(g.max()) + 1, P))
+    B.sum_duplicates()
+    B.data[:] = 1
+    deg = np.diff(B.indptr).astype(np.int64)
+    Bt = B.T.tocsr()
+    present = np.flatnonzero(np.diff(Bt.indptr))
+    upper = min(int((deg * deg).sum()), len(present) ** 2)
+    if upper <= lim and not exact:
+        return upper
+    lower = int(np.maximum.reduceat(deg[Bt.indices], Bt.indptr[present]).sum())
+    if lower > lim:
+        return lower
+    work = np.asarray(Bt @ deg.astype(np.float64)).ravel()
+    cw = np.cumsum(work)
+    cuts = np.unique(
+        np.r_[0, np.searchsorted(cw, np.arange(1, int(cw[-1] // CHUNK_FLOPS) + 1) * CHUNK_FLOPS), P]
+    )
+    nnz = 0
+    for c0, c1 in zip(cuts[:-1], cuts[1:]):
+        nnz += int((Bt[c0:c1] @ B).nnz)
+        if nnz > lim:
+            return nnz
+    return nnz
+
+
+def _part_size(local_codes, gcodes: np.ndarray, P: int, lim: int) -> dict:
+    """Whether a shard's part of A = D~'W D~ fits in `lim` nonzeros, and else its diagonal
+    blocks, before building either (its pattern: crossing levels sharing a local group, or
+    component, plus D'WD's, which lies inside it)."""
+    g = _local_groups(local_codes)
+    k = len(gcodes)
+    nnz = _pattern_nnz(np.tile(g, k), gcodes.ravel(), P, lim)
+    if nnz <= lim:
+        return {"full": True, "blocks": True, "nnz": nnz}
+    if k == 1:  # one crossing FE: its block is all of A
+        return {"full": False, "blocks": False, "nnz": nnz, "block_nnz": nnz}
+    bn = sum(_pattern_nnz(g, gcodes[i], P, lim) for i in range(k))
+    if bn > lim:  # the blocks' bounds add up past the cap: count them
+        bn = 0
+        for i in range(k):
+            bn += _pattern_nnz(g, gcodes[i], P, lim - bn, exact=True)
+            if bn > lim:
+                break
+    return {"full": False, "blocks": bn <= lim, "nnz": nnz, "block_nnz": bn}
+
+
 def _projected_dummy_gram(local_codes, w, Dm, max_block: int = 20_000):
     """D'W P_L D for the n x P dummy block D (sparse Dm) and P_L the W-orthogonal
     projection on the local FEs' dummies, as a sparse P x P matrix.
@@ -393,8 +477,8 @@ def _dummy_gram(plan: Plan, local_codes, w, Dm, gcodes, P: int, sparse_out: bool
     nA = int(a.max()) + 1
     C = sp.csr_matrix(
         (
-            np.tile(w, len(plan.global_fes)),
-            (np.tile(a, len(plan.global_fes)), gcodes.ravel()),  # gcodes carry the offsets
+            np.tile(w, len(gcodes)),
+            (np.tile(a, len(gcodes)), gcodes.ravel()),  # gcodes carry the offsets
         ),
         shape=(nA, P),
     )
@@ -464,34 +548,55 @@ def _round1_sparse(plan: Plan, shard_id: int, df, n0: int, local_codes, w, T, t0
         sw = Dm.T @ w
         idx = np.flatnonzero(sw > 0)
         aux = {"idx": idx, "DR": np.hstack([DX, DY])[idx]}
-        part = None
+        part, d = None, None
         if plan.level_nnz:
-            try:
-                DD = _dummy_gram(plan, local_codes, w, Dm, gcodes, P, sparse_out=True).tocoo()
-            except ValueError:  # a local FE component too large for the Schur solve
-                DD = None
-            if DD is not None:
-                DD.sum_duplicates()
-                d = DD.diagonal()
-                r, c, v = DD.row, DD.col, DD.data
-                lim = min(plan.level_nnz, plan.part_nnz) if plan.part_nnz else plan.level_nnz
-                part = {"full": len(v) <= lim, "blocks": True, "nnz": int(len(v))}
-                if not part["full"]:
-                    fe_of = np.repeat(np.arange(len(plan.global_fes)), [L for *_, L in plan.global_fes])
-                    keep = fe_of[r] == fe_of[c]
-                    r, c, v = r[keep], c[keep], v[keep]
-                    part["blocks"] = len(v) <= lim
-                    part["block_nnz"] = int(len(v))
-                if lim < plan.level_nnz and not part["full"]:
-                    part["reason"] = (
-                        f"shard {shard_id}'s part has {part['nnz']:,} nonzeros, more than "
-                        f"{lim:,} (a worker sums {FAN_IN} parts within its memory)"
-                    )
-                if part["blocks"]:
-                    it = np.int32 if P < 2**31 else np.int64
-                    part.update(r=r.astype(it), c=c.astype(it), v=v)
+            lim = min(plan.level_nnz, plan.part_nnz) if plan.part_nnz else plan.level_nnz
+            # count the part before building it: building it whole and checking after took
+            # 110 GB on two days of D5 (A nearly dense over 60,720 zone pairs)
+            size = _part_size(local_codes, gcodes, P, lim) if n and local_codes else None
+            if size is not None and not size["blocks"]:
+                part = {"full": False, "blocks": False, "nnz": size["nnz"], "block_nnz": size["block_nnz"]}
+                part["reason"] = (
+                    f"shard {shard_id}'s part of A has more than {lim:,} nonzeros, its diagonal "
+                    f"blocks too"
+                    + (f" (a worker sums {FAN_IN} parts within its memory)" if lim < plan.level_nnz else "")
+                )
+            else:
+                blocks_only = size is not None and not size["full"]
+                try:
+                    if blocks_only:  # one crossing FE at a time: never all of the part at once
+                        DD = sum(
+                            _dummy_gram(
+                                plan, local_codes, w, _fe_matrix(gcodes[i], P), gcodes[i : i + 1], P, True
+                            )
+                            for i in range(len(plan.global_fes))
+                        ).tocoo()
+                    else:
+                        DD = _dummy_gram(plan, local_codes, w, Dm, gcodes, P, sparse_out=True).tocoo()
+                except ValueError:  # a local FE component too large for the Schur solve
+                    DD = None
+                if DD is not None:
+                    DD.sum_duplicates()
+                    d = DD.diagonal()
+                    r, c, v = DD.row, DD.col, DD.data
+                    full = not blocks_only and len(v) <= lim
+                    part = {"full": full, "blocks": True, "nnz": size["nnz"] if blocks_only else int(len(v))}
+                    if not full:
+                        fe_of = np.repeat(np.arange(len(plan.global_fes)), [L for *_, L in plan.global_fes])
+                        keep = fe_of[r] == fe_of[c]
+                        r, c, v = r[keep], c[keep], v[keep]
+                        part["blocks"] = len(v) <= lim
+                        part["block_nnz"] = int(len(v))
+                    if lim < plan.level_nnz and not full:
+                        part["reason"] = (
+                            f"shard {shard_id}'s part has more than {lim:,} nonzeros "
+                            f"(a worker sums {FAN_IN} parts within its memory)"
+                        )
+                    if part["blocks"]:
+                        it = np.int32 if P < 2**31 else np.int64
+                        part.update(r=r.astype(it), c=c.astype(it), v=v)
             aux["part"] = part
-        if part is None:
+        if d is None:
             # diag(D'W Q_A D), A the largest local FE (exact with one): Jacobi
             d = sw.copy()
             if n and local_codes:

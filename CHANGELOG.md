@@ -24,6 +24,10 @@ break the API).
 - Round 2 without a cache no longer rebuilds each shard's part of A when it recomputes
   round 1. The rebuild sat outside the task memory estimate, so several such tasks on one
   worker killed it.
+- Shards count their part of A before building it, not after. A part over the cap, and
+  diagonal blocks over it too, is never built. Blocks that fit are built one crossing FE at a
+  time. Building first took 110 GB on two days of NYC rideshare trips, where A is nearly
+  dense over 60,720 zone pairs; counting first takes 0.6 GB and 2 s.
 - `dfeols plan` caps A's budget at what the workers can sum (60% of a worker's memory), as
   fit does.
 - Arguments shared by every task that are dicts of large arrays (round 2's linear maps, with
