@@ -64,7 +64,10 @@ attach_session <- function(name, root = NULL, profile = NULL, timeout = NULL, pr
   t0 <- Sys.time()
   repeat {
     st <- .state(s)
-    if (!is.null(st) && identical(st$status, "ready")) break
+    if (!is.null(st) && identical(st$status, "ready")) {
+      if (!is.null(st$workers)) .say(s, "workers: ", .workers_text(st$workers))
+      break
+    }
     if (!is.null(st) && st$status %in% c("failed", "closed", "timed_out", "crashed"))
       stop("session ", name, " is ", st$status,
            if (!is.null(st$error)) paste0(": ", st$error), call. = FALSE)
@@ -98,6 +101,19 @@ attach_session <- function(name, root = NULL, profile = NULL, timeout = NULL, pr
   .say(s, sprintf("[%s] %s/%s shards", st$name %||% "stage", done, total))
 }
 
+# Workers running and requested, as the Python client shows them (Ted 2026-11-09).
+.workers_text <- function(w) {
+  r <- w$running; m <- w$requested
+  paste0(r, " of ", m, " running", if (r < m) paste0(" (", m - r, " queued or starting)") else "")
+}
+.workers_note <- function(w) {
+  if (is.null(w) || w$running >= w$requested) return("")
+  if (w$running == 0)
+    return(paste0("; 0 of ", w$requested, " workers running yet (their jobs are queued or starting),",
+                  " so it waits for them first"))
+  paste0("; on ", .workers_text(w))
+}
+
 .watch <- function(s, rid) {
   acc <- file.path(s$dir, "responses", paste0(rid, ".accepted.json"))
   if (!file.exists(acc)) return(invisible())
@@ -109,9 +125,10 @@ attach_session <- function(name, root = NULL, profile = NULL, timeout = NULL, pr
     rng <- a$estimate_range
     e <- if (!is.null(rng) && .secs(rng[[1]]) != .secs(rng[[2]]))
       paste(.secs(rng[[1]]), "to", .secs(rng[[2]])) else .secs(a$estimate_seconds %||% 0)
-    if (!is.null(a$what)) .say(s, a$what, ": estimated ", e, " (", a$basis, ")")
+    w <- .workers_note(a$workers)
+    if (!is.null(a$what)) .say(s, a$what, ": estimated ", e, " (", a$basis, ")", w)
     else if (!isTRUE(a$passes > 0)) .say(s, "no pass over the data (from the Gram matrix)")
-    else .say(s, "estimated ", e, ": ", a$passes, " pass over ", a$columns, " columns (", a$basis, ")")
+    else .say(s, "estimated ", e, ": ", a$passes, " pass over ", a$columns, " columns (", a$basis, ")", w)
   }
   .show_status(s, file.path(s$dir, a$model_dir, "status.json"))
 }

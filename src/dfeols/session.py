@@ -101,6 +101,24 @@ def _write_json(path: Path, obj: Any) -> None:
     os.replace(tmp, path)
 
 
+def workers_text(w: dict) -> str:
+    """'25 of 40 running (15 queued or starting)', from a session's worker counts."""
+    r, m = w["running"], w["requested"]
+    return f"{r} of {m} running" + (f" ({m - r} queued or starting)" if r < m else "")
+
+
+def workers_note(w: dict | None) -> str:
+    """What an estimate leaves out about the workers: nothing when all are up."""
+    if not w or w["running"] >= w["requested"]:
+        return ""
+    if not w["running"]:
+        return (
+            f"; 0 of {w['requested']} workers running yet (their jobs are queued or starting),"
+            " so it waits for them first"
+        )
+    return f"; on {workers_text(w)}"
+
+
 def _appeared(path: Path) -> bool:
     """Whether another node's file is there yet. Listing the folder, not stat on the name: a
     network filesystem can cache "no such file" for the name for its attribute-cache time
@@ -1555,7 +1573,7 @@ class Manager:
         hours: float | None = None,
         idle_minutes: float | None = 30.0,
         persist: bool = True,
-        poll: float = 1.0,
+        poll: float = 0.5,  # Ted 2026-11-09: sessions are for long work; 0.5 s is enough
         profile=None,
     ):
         if not _NAME.match(name):
@@ -1609,6 +1627,7 @@ class Manager:
             "spec": dataclasses.asdict(self.spec),
             "demeaned": str(self.data.root) if self.data else None,
             "models": len(self.models),
+            "workers": self._worker_counts(),
             "created": [{"name": c["name"], "expression": c["expression"]} for c in self.data.created]
             if self.data
             else [],
@@ -1914,7 +1933,12 @@ class Manager:
         if req.get("id"):
             _write_json(
                 self.dir / "responses" / f"{req['id']}.accepted.json",
-                {"model_dir": str(wd.relative_to(self.dir)), **est, "accepted": _now()},
+                {
+                    "model_dir": str(wd.relative_to(self.dir)),
+                    **est,
+                    "workers": self._worker_counts(),
+                    "accepted": _now(),
+                },
             )
         res = fit_model(
             self.data,
@@ -2058,6 +2082,7 @@ class Manager:
                             {
                                 "model_dir": str(prog_dir.relative_to(self.dir)),
                                 **self._create_estimate(len(build)),
+                                "workers": self._worker_counts(),
                                 "what": f"creating {what}",
                                 "accepted": _now(),
                             },
@@ -2244,6 +2269,17 @@ class Manager:
                 )
         lo = min(lo, hi)
         return {**out, "estimate_seconds": hi, "estimate_range": [lo, hi], "basis": basis}
+
+    def _worker_counts(self) -> dict | None:
+        """Workers running and requested (None on one process): shown at ready and with each
+        estimate, since a pass waits for the workers' jobs to start (Ted 2026-11-09)."""
+        try:
+            running, most = self.executor.slots()
+        except Exception:
+            return None
+        if not most or most <= 1:
+            return None
+        return {"running": int(running or 0), "requested": int(most)}
 
     def _workers(self) -> int:
         running, most = self.executor.slots()
@@ -2664,7 +2700,7 @@ class Session:
         hours: float | None = None,
         idle_minutes: float | None = 30.0,
         persist: bool = True,
-        poll: float = 0.2,
+        poll: float = 0.5,
         timeout: float | None = None,
         progress: bool = True,
         **spec_kw,
@@ -2706,6 +2742,8 @@ class Session:
         while True:
             st = self.state()
             if st and st["status"] == "ready":
+                if st.get("workers"):
+                    self._say("workers: " + workers_text(st["workers"]))
                 break
             if st and st["status"] in ("failed", "closed", "timed_out", "crashed"):
                 raise SessionError(
@@ -2773,13 +2811,14 @@ class Session:
                 if rng and _secs(rng[0]) != _secs(rng[1])
                 else _secs(a["estimate_seconds"])
             )
+            w = workers_note(a.get("workers"))
             if a.get("what"):
-                self._say(f"{a['what']}: estimated {e} ({a['basis']})")
+                self._say(f"{a['what']}: estimated {e} ({a['basis']}){w}")
             else:
                 self._say(
                     "no pass over the data (from the Gram matrix)"
                     if not a["passes"]
-                    else f"estimated {e}: {a['passes']} pass over {a['columns']} columns ({a['basis']})"
+                    else f"estimated {e}: {a['passes']} pass over {a['columns']} columns ({a['basis']}){w}"
                 )
         self._show_status(self.dir / a["model_dir"] / "status.json")
 
@@ -3299,6 +3338,8 @@ def cmd_start(args) -> None:
             st = s.state()
             if st and st.get("status") == "ready":
                 print(f"ready after {fmt_td(time.time() - t0)}; session {st['id']}")
+                if st.get("workers"):
+                    print("workers: " + workers_text(st["workers"]))
                 break
             if st and st.get("status") == "failed":
                 sys.exit(f"session failed: {st.get('error')}")
@@ -3329,6 +3370,7 @@ def cmd_status(args) -> None:
                     "host",
                     "job",
                     "models",
+                    "workers",
                     "demeaned",
                 )
                 if k in st

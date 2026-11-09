@@ -483,3 +483,35 @@ def test_empty_sample_is_an_error(tmp_path):
     for method in ("auto", "cells"):  # fit returned an empty result
         with pytest.raises(ValueError, match="no rows left"):
             dfeols.fit(d.root, "eng ~ feat | spell^week", workdir=tmp_path / method, fe_method=method)
+
+
+def test_worker_counts_shown(ds, tmp_path, capsys):
+    """Ted 2026-11-09 (OSCER 35849971: m1 waited 4:29 with 0 of 40 workers, estimate 5 s): the
+    session's state, its attach line and each estimate say how many workers are running."""
+    from dfeols.executors import SerialExecutor
+    from dfeols.session import workers_note, workers_text
+
+    class Queued(SerialExecutor):
+        up = 0
+
+        def slots(self):
+            return self.up, 40
+
+    assert workers_text({"running": 25, "requested": 40}) == "25 of 40 running (15 queued or starting)"
+    assert workers_note({"running": 40, "requested": 40}) == "" and workers_note(None) == ""
+    r = {"root": tmp_path / "s", "demeaned": tmp_path / "d"}
+    ex = Queued()
+    with Session.start(
+        "w1", ds.root, "spell + week", ["eng", "feat"], cluster="id_a", executor=ex, poll=0.05, **r
+    ) as s:
+        assert s.state()["workers"] == {"running": 0, "requested": 40}
+        capsys.readouterr()
+        a = Session.attach("w1", root=r["root"])
+        assert "workers: 0 of 40 running (40 queued or starting)" in capsys.readouterr().err
+        a.fit("eng ~ feat", cluster="id_a", label="m")
+        assert "0 of 40 workers running yet" in capsys.readouterr().err
+        ex.up = 25
+        a.fit("eng ~ feat", vcov="hetero", label="m2")
+        assert "; on 25 of 40 running (15 queued or starting)" in capsys.readouterr().err
+        a.fit("eng ~ feat", vcov="iid", label="m3")  # no pass: nothing about workers
+        assert "workers" not in capsys.readouterr().err
