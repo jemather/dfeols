@@ -255,7 +255,9 @@ def _encode_task(
     Returns rows and file names per shard, for this attempt only."""
     t = time.perf_counter()
     token = _attempt_token()
-    root = Path(root)
+    # absolute: Polars 2 reads a relative path from file_path_provider as relative
+    # to the PartitionBy base folder, so a relative shard_dir nests the pieces
+    root = Path(root).absolute()
     out = root / "shards"
     out.mkdir(parents=True, exist_ok=True)
     lf = pl.scan_parquet(files).select(cols).drop_nulls(subset=key_cols)
@@ -406,7 +408,7 @@ def _split_task(bucket, root, inputs):
     shards as a single piece (s<shard>_b<bucket>_<attempt>_<i>)."""
     t = time.perf_counter()
     token = _attempt_token()
-    root = Path(root)
+    root = Path(root).absolute()  # see _encode_task
     out = root / "shards"
     out.mkdir(parents=True, exist_ok=True)
     files = [str(root / "_buckets" / n) for n in inputs]

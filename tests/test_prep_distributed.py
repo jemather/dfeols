@@ -487,3 +487,23 @@ def test_mismatch_description_tells_write_side_from_read_side():
     assert d.startswith("1 of 50 outputs differ") and "bucket 7: 400,000 rows" in d
     read = {"rows": {-1 - b: 204_000 for b in range(50)}, "files": {-1 - b: ["f"] for b in range(50)}}
     assert "spread evenly" in _describe_mismatch(read)
+
+
+@pytest.mark.parametrize("two_level", [False, True], ids=["flat", "two_level"])
+def test_relative_shard_dir(tmp_path, monkeypatch, two_level):
+    """A relative shard_dir: Polars 2 reads a relative file_path_provider path
+    against the PartitionBy base folder, which nested the pieces under
+    shards/<shard_dir>/shards/ and failed the row check with 'no output'."""
+    d = PanelDGP(n_units=600, units_per_chunk=200, T=10, n_groups=10)
+    raw, truth = _gen(tmp_path, d, "p")
+    monkeypatch.chdir(tmp_path)
+    kw = dict(partition="unit", target_rows=2000, **truth["prep"])
+    if two_level:
+        kw.update(rows_per_task=2e3, max_files=0)
+    a = dfeols.prep(str(raw / "*.parquet"), shard_dir="single", **kw)
+    b = dfeols.prep("p/*.parquet", shard_dir="rel/dist", executor=dfeols.SerialExecutor(), **kw)
+    assert b.meta.get("prep_mode") == "distributed"
+    assert b.n_rows == a.n_rows == sum(s["rows"] for s in b.shards)
+    assert not (tmp_path / "rel" / "dist" / "shards" / "rel").exists()
+    if two_level:
+        assert b.meta["shuffle"].startswith("two-level")
