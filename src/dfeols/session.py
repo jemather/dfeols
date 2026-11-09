@@ -101,6 +101,16 @@ def _write_json(path: Path, obj: Any) -> None:
     os.replace(tmp, path)
 
 
+def _appeared(path: Path) -> bool:
+    """Whether another node's file is there yet. Listing the folder, not stat on the name: a
+    network filesystem can cache "no such file" for the name for its attribute-cache time
+    (about 30 s on OSCER's /scratch, 2026-11-08), while opening a folder revalidates it."""
+    try:
+        return path.name in os.listdir(path.parent)
+    except FileNotFoundError:
+        return False
+
+
 def _jsonable(o):
     if isinstance(o, np.ndarray):
         return o.tolist()
@@ -1830,6 +1840,7 @@ class Manager:
                 continue  # half-written by a client that didn't rename; next poll
             p.unlink(missing_ok=True)
             self.last_request = time.time()
+            received = _now()
             rid = req.get("id") or p.stem
             try:
                 resp = self.handle(req)
@@ -1842,7 +1853,7 @@ class Manager:
                     detail={"request": rid, "type": req.get("type")},
                 )
                 resp = {"id": rid, "ok": False, "error": f"{type(e).__name__}: {e}"}
-            resp["finished"] = _now()
+            resp["sent"], resp["received"], resp["finished"] = req.get("sent"), received, _now()
             _write_json(self.dir / "responses" / f"{rid}.json", resp)
             if self._stop.is_set():
                 break
@@ -2778,11 +2789,11 @@ class Session:
         _write_json(self.dir / "requests" / f"{rid}.json", req)
         resp_path = self.dir / "responses" / f"{rid}.json"
         t0 = time.time()
-        while not resp_path.exists():
+        while not _appeared(resp_path):
             if timeout is not None and time.time() - t0 > timeout:
                 raise TimeoutError(f"no response to {type} after {timeout:g} s")
             st = self.state()
-            if st and st["status"] not in ("ready", "starting") and not resp_path.exists():
+            if st and st["status"] not in ("ready", "starting") and not _appeared(resp_path):
                 raise SessionError(f"session {self.name} is {st['status']}")
             if watch:
                 watch(rid)
@@ -2790,6 +2801,7 @@ class Session:
         if watch:  # a quick request may finish before the first look
             watch(rid)
         resp = _read_json(resp_path)
+        self.last_trip = {k: resp.get(k) for k in ("sent", "received", "finished")} | {"seen": _now()}
         if not resp.get("ok"):
             raise SessionError(resp.get("error", "request failed"))
         return resp

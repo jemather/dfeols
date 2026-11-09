@@ -110,6 +110,14 @@ class Partition:
         cap = self.conf.get("MaxMemPerNode", "UNLIMITED")
         return min(node, int(cap)) if cap.isdigit() else node
 
+    @property
+    def max_cores(self) -> int:
+        """The most cores a job can have on every node: MaxCPUsPerNode, else the smallest node
+        (OSCER's largelongmem: 56-core nodes, at most 32 per job)."""
+        node = min(self.cores) if self.cores else 0
+        cap = self.conf.get("MaxCPUsPerNode", "UNLIMITED")
+        return min(node, int(cap)) if cap.isdigit() else node
+
 
 def parse_sinfo(text: str) -> dict[str, Partition]:
     parts: dict[str, Partition] = {}
@@ -178,7 +186,7 @@ def node_classes(parts: dict[str, Partition], conf: dict[str, dict]) -> list[dic
                 "aliases": sorted(p.name for p in members if p is not rep),
                 "count": len(rep.nodes),
                 "in_service": len(rep.in_service),
-                "cores": min(rep.cores),
+                "cores": rep.max_cores,
                 "memory": f"{rep.max_mem_mb}MB",
                 "mixed": len(rep.cores) > 1 or len(rep.memory_mb) > 1,
                 "interconnect": "/".join(nets),

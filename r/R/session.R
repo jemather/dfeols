@@ -116,6 +116,10 @@ attach_session <- function(name, root = NULL, profile = NULL, timeout = NULL, pr
   .show_status(s, file.path(s$dir, a$model_dir, "status.json"))
 }
 
+# Whether another node's file is there yet: list the folder rather than test the name, since a
+# network filesystem can cache "no such file" for a name (about 30 s on OSCER's /scratch).
+.appeared <- function(path) basename(path) %in% list.files(dirname(path), all.files = TRUE)
+
 .request <- function(s, type, ..., .timeout = NULL, .watch = FALSE) {
   rid <- sprintf("%s-%s", format(Sys.time(), "%Y%m%dT%H%M%S"),
                  paste(sample(c(0:9, letters[1:6]), 8, TRUE), collapse = ""))
@@ -123,11 +127,11 @@ attach_session <- function(name, root = NULL, profile = NULL, timeout = NULL, pr
   .write_json(req, file.path(s$dir, "requests", paste0(rid, ".json")))
   resp <- file.path(s$dir, "responses", paste0(rid, ".json"))
   t0 <- Sys.time()
-  while (!file.exists(resp)) {
+  while (!.appeared(resp)) {
     if (!is.null(.timeout) && as.numeric(Sys.time() - t0, units = "secs") > .timeout)
       stop("no response to ", type, " after ", .timeout, " s", call. = FALSE)
     st <- .state(s)
-    if (!is.null(st) && !st$status %in% c("ready", "starting") && !file.exists(resp))
+    if (!is.null(st) && !st$status %in% c("ready", "starting") && !.appeared(resp))
       stop("session ", s$name, " is ", st$status, call. = FALSE)
     if (.watch) .watch(s, rid)
     Sys.sleep(0.1)

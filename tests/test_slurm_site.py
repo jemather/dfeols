@@ -25,6 +25,7 @@ NODES = {
     "c[401-402]": "40|96000|cascadelake,fdr|(null)|down*",
     "g[01-02]": "64|257600|icelake|gpu:a100:2|idle",
     "d01": "20|32000|haswell,fdr10|(null)|idle",
+    "e01": "56|2063901|largemem|(null)|mixed",
 }
 PARTS = {  # partition: (nodes, time limit, scontrol extras)
     "32gb_20core": (["c[001-008]", "c[009-010]"], "2-00:00:00", "MaxMemPerNode=31916"),
@@ -40,6 +41,7 @@ PARTS = {  # partition: (nodes, time limit, scontrol extras)
     "mixed2": (["c[101-104]", "d01"], "2-00:00:00", ""),  # d01 is otherwise only in debug
     "gpu": (["g[01-02]"], "2-00:00:00", ""),
     "empty": ([""], "2-00:00:00", ""),  # sinfo's line for a partition with no nodes
+    "largelongmem": (["e01"], "7-00:00:00", "MaxCPUsPerNode=32"),  # OSCER: a job gets 32 of 56
 }
 
 
@@ -85,6 +87,7 @@ def test_node_classes():
     assert "empty" not in cls["normal"]["excluded"][0]
     assert cls["mixed2"]["only_here"] == ["d01"] and not cls["mixed2"]["excluded"]
     assert cls["empty"]["count"] == 0
+    assert cls["largelongmem"]["cores"] == 32  # MaxCPUsPerNode caps the node's 56
     lj = cls["longjobs"]  # mixed, but its 7-day limit is its own
     assert lj["mixed"] and not lj["excluded"] and (lj["cores"], lj["memory"]) == (20, "32000MB")
 
