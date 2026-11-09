@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -423,6 +424,20 @@ def main(argv=None):
         sys.exit(estrec_main(rest))
     if rest:
         ap.error(f"unrecognized arguments: {' '.join(rest)}")
+    try:
+        _dispatch(args)
+    except BrokenPipeError:
+        # output piped into head or less that stopped reading (OSCER 2026-11-09:
+        # `dfeols config show | head -30`): not an error, so no traceback
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+        sys.exit(141)
+
+
+def _dispatch(args) -> None:
+    from . import session as _session
+    from . import store as _store
+
     {
         "results": lambda: results_cmd(args),
         "status": lambda: status(args.path, args.watch),
