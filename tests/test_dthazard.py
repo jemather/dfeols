@@ -399,3 +399,14 @@ def test_time_dummies_exact_first_stage(ds, tmp_path):
     rec = est.read(tmp_path / "a" / "result.estrec.json", nonfinite="string")
     bad = [i for i in est.validate(rec, base_dir=tmp_path / "a") if i.level != "info"]
     assert not bad, "\n".join(map(str, bad))
+
+
+def test_time_invariant_fe_is_reported(ds, tmp_path):
+    """g is fixed per unit: its cell is its own predecessor, so absorbing it is not the
+    differenced-dummies estimator (that would drop it); reported, with a warning."""
+    h = lpm_dthazard(ds, "y ~ x1 | g", unit="uid", time="t", workdir=tmp_path, log_every=1e9)
+    c = h.fe_checks["g"]
+    assert c["same_cell_share"] == 1.0 and c["ambiguous_rows"] == 0
+    assert any("does not move with time" in w for w in h.warnings)
+    h2 = lpm_dthazard(ds, "y ~ x1 | g^t", unit="uid", time="t", workdir=tmp_path / "b", log_every=1e9)
+    assert h2.fe_checks["g^t"]["same_cell_rows"] == 0

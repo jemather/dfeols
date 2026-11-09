@@ -43,7 +43,7 @@ from .progress import Progress
 
 log = logging.getLogger("dfeols")
 
-SAMPLE_VERSION = 1
+SAMPLE_VERSION = 2  # 2: FE checks count rows whose cell is its own predecessor
 
 # Why a row of the at-risk data is not in the estimation sample, in the order the rules
 # are applied (a row is counted under the first that applies).
@@ -181,6 +181,7 @@ def _build_task(paths: list[str], out_file: str, spec: dict) -> dict:
             pl.col(f"__pred_{c}").max().alias("pmax"),
             pl.len().alias("rows"),
             pl.col(unit).n_unique().alias("units"),
+            (pl.col(f"__pred_{c}") == pl.col(c)).sum().alias("same"),
         )
         for c in spec["fe_cols"]
     }
@@ -469,6 +470,16 @@ def lpm_dthazard(
             )
             warnings.append(msg)
             log.warning("lpm_dthazard: %s", msg)
+        if c.get("same_cell_rows"):
+            msg = (
+                f"FE {fe}: {c['same_cell_share']:.2%} of sample rows stay in the cell they were in at "
+                "t-1 (the "
+                "FE does not move with time, e.g. a location). Absorbed as group effects in levels: that "
+                "assumes the group effects are exogenous in levels; differencing would remove them, so this "
+                "is not the differenced-dummies estimator (docs/design/hazard.md)"
+            )
+            warnings.append(msg)
+            log.warning("lpm_dthazard: %s", msg)
 
     # i() terms: fit expands them from the levels present in the sample (sorted, as
     # category_levels does), dropping ref= or the first; instrument exactly those levels
@@ -699,13 +710,21 @@ def _build_sample(ds: Dataset, spec: dict, out: Path, executor, label: str) -> b
                     "ambiguous_cells": 0,
                     "ambiguous_rows": 0,
                     "ambiguous_share": 0.0,
+                    "same_cell_rows": 0,
+                    "same_cell_share": 0.0,
                     "nested_in_unit": False,
                 }
                 continue
             g = (
                 pl.concat(parts)
                 .group_by(c)
-                .agg(pl.col("pmin").min(), pl.col("pmax").max(), pl.col("rows").sum(), pl.col("units").sum())
+                .agg(
+                    pl.col("pmin").min(),
+                    pl.col("pmax").max(),
+                    pl.col("rows").sum(),
+                    pl.col("units").sum(),
+                    pl.col("same").sum(),
+                )
             )
             amb = g.filter(pl.col("pmin") != pl.col("pmax"))
             n = int(g["rows"].sum())
@@ -714,6 +733,10 @@ def _build_sample(ds: Dataset, spec: dict, out: Path, executor, label: str) -> b
                 "ambiguous_cells": amb.height,
                 "ambiguous_rows": int(amb["rows"].sum()),
                 "ambiguous_share": float(amb["rows"].sum() / n) if n else 0.0,
+                # rows whose cell is the cell they came from (the FE does not move with time):
+                # differencing would remove these dummies, absorbing keeps them as level effects
+                "same_cell_rows": int(g["same"].sum()),
+                "same_cell_share": float(g["same"].sum() / n) if n else 0.0,
                 "nested_in_unit": bool((g["units"] == 1).all()),
             }
         rows = sum(r["rows"] for r in results.values())

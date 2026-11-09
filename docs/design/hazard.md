@@ -50,6 +50,13 @@ triangular, so the instrument spans agree and the just-identified b is identical
 (`/srv/dfeols/scripts/hazard_fecheck.py`, outside the repo): time FE and group × time with fixed groups agree
 to 1e-13; group × time with units moving between groups disagree (0.901 vs 0.953).
 
+Correction (2026-11-08): the cells must also move with time. P must have no fixed points;
+for an FE constant within a unit (an order's location, a firm's industry) each cell is its own
+predecessor, I - P = 0 and ΔD = 0, so differencing removes the FE entirely, while absorbing
+it keeps group effects in levels, an extra assumption (the group effects are exogenous in
+levels, which holds for the projection of a_i on the groups). `lpm_dthazard` reports the share
+of such rows (`same_cell_share`) and warns, as for movers.
+
 So the paper's specification (wave and age dummies, Table 3) is the same as absorbing `year`
 and `age` as FEs. A unit-level FE (or anything nested in the unit) must **not** be in the
 model: that is the within estimator again.
