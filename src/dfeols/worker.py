@@ -36,6 +36,7 @@ except ImportError:  # pragma: no cover (Windows)
     resource = None
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import polars as pl
@@ -86,6 +87,10 @@ class Plan:
     # from raw columns after it; rows where one is missing are counted, not dropped
     filter_vars: tuple[str, ...] | None = None
     created: tuple[tuple[str, str], ...] = ()
+    # two-way clustering: the second cluster (name, column, n_levels) and whether it is nested
+    # in the partition key; round 2 adds its meat and the intersection's (prefixes c1_, c2_)
+    cluster2: tuple[str, str, int] | None = None
+    cluster2_local: bool = False
 
     @property
     def k_x(self) -> int:
@@ -149,6 +154,8 @@ def _load(plan: Plan, files: list[str], dropped: dict | None = None):
     cols.update(c for _, c, _ in plan.global_fes)
     if plan.cluster:
         cols.add(plan.cluster[1])
+    if plan.cluster2:
+        cols.add(plan.cluster2[1])
     if plan.weights:
         cols.add(plan.weights)
     cols.update(plan.row_key_cols)
@@ -626,31 +633,16 @@ def _round1_dense(plan: Plan, df, n, local_codes, w, T, raw: dict | None = None)
 
 def _round1_finish(plan, shard_id, df, local_codes, w, Yt, Zt, out, T, t, t0, write_cache, extra):
     if plan.cluster:
-        cname, ccol, G = plan.cluster
-        cl = df[ccol].to_numpy().astype(np.int64)
-        out["cluster_present"] = np.unique(cl)
-        # is each local FE nested in the cluster? (exact: FE groups are local)
-        nested = []
-        for codes in local_codes:
-            if not len(codes):
-                nested.append(True)
-                continue
-            lo = np.full(codes.max() + 1, np.iinfo(np.int64).max)
-            hi = np.full(codes.max() + 1, np.iinfo(np.int64).min)
-            np.minimum.at(lo, codes.astype(np.int64), cl)
-            np.maximum.at(hi, codes.astype(np.int64), cl)
-            nested.append(bool((lo == hi).all()))
+        cl = df[plan.cluster[1]].to_numpy().astype(np.int64)
+        present, nested, gmm = _cluster_stats(plan, df, local_codes, cl)
+        out["cluster_present"] = present
         out["local_fe_nested_in_cluster"] = nested
-        # global FEs: per-level min/max cluster, reduced on the coordinator
-        gmm = []
-        for _, c, L in plan.global_fes:
-            codes = df[c].to_numpy().astype(np.int64)
-            lo = np.full(L, np.iinfo(np.int64).max)
-            hi = np.full(L, np.iinfo(np.int64).min)
-            np.minimum.at(lo, codes, cl)
-            np.maximum.at(hi, codes, cl)
-            gmm.append((lo, hi))
         out["global_cluster_minmax"] = gmm
+        if plan.cluster2:  # two-way: the same for the second, and both codes kept for round 2
+            cl2 = df[plan.cluster2[1]].to_numpy().astype(np.int64)
+            present, nested, gmm = _cluster_stats(plan, df, local_codes, cl2)
+            out["cluster2"] = {"present": present, "local_nested": nested, "global_minmax": gmm}
+            cl = np.column_stack([cl, cl2])
     else:
         cl = None
     T["crossprod"] = time.perf_counter() - t
@@ -668,6 +660,31 @@ def _round1_finish(plan, shard_id, df, local_codes, w, Yt, Zt, out, T, t, t0, wr
     out["timing"] = T
     arrays = (Yt, Zt, w, cl if cl is not None else np.zeros(0, np.int64), extra)
     return out, arrays
+
+
+def _cluster_stats(plan: Plan, df, local_codes, cl: np.ndarray):
+    """A shard's cluster codes present; whether each local FE is nested in the cluster (exact:
+    FE groups are local); and per global-FE level the min/max cluster, reduced on the
+    coordinator (nested iff equal at every level present)."""
+    nested = []
+    for codes in local_codes:
+        if not len(codes):
+            nested.append(True)
+            continue
+        lo = np.full(codes.max() + 1, np.iinfo(np.int64).max)
+        hi = np.full(codes.max() + 1, np.iinfo(np.int64).min)
+        np.minimum.at(lo, codes.astype(np.int64), cl)
+        np.maximum.at(hi, codes.astype(np.int64), cl)
+        nested.append(bool((lo == hi).all()))
+    gmm = []
+    for _, c, L in plan.global_fes:
+        codes = df[c].to_numpy().astype(np.int64)
+        lo = np.full(L, np.iinfo(np.int64).max)
+        hi = np.full(L, np.iinfo(np.int64).min)
+        np.minimum.at(lo, codes, cl)
+        np.maximum.at(hi, codes, cl)
+        gmm.append((lo, hi))
+    return np.unique(cl), nested, gmm
 
 
 def _iter_store(plan: Plan, shard_id: int, local_codes, Dm, w) -> tuple:
@@ -869,7 +886,20 @@ def shard_round2(plan: Plan, shard_id: int, files: list[str], lin: dict) -> dict
         if prefix in dterms:
             E = E - dterms[prefix][0]
             X = X - dterms[prefix][1]
-        _meat(plan, X, E, w, cl, out, prefix)
+        if plan.cluster2 is None:
+            _meat(plan, X, E, w, cl, out, prefix)
+            continue
+        # two-way (Cameron, Gelbach and Miller): the meats of a, b and the intersection a&b
+        # (codes a * levels_b + b, nested in the partition if either is), combined on the
+        # coordinator as V_a + V_b - V_ab
+        a, b = cl[:, 0], cl[:, 1]
+        _meat(plan, X, E, w, a, out, prefix)
+        crv_only = ("CRV1",)
+        nb = SimpleNamespace(vcov_types=crv_only, cluster=plan.cluster2, cluster_local=plan.cluster2_local)
+        _meat(nb, X, E, w, b, out, prefix + "c1_")
+        local_ab = plan.cluster_local or plan.cluster2_local
+        nab = SimpleNamespace(vcov_types=crv_only, cluster=("ab", None, None), cluster_local=local_ab)
+        _meat(nab, X, E, w, a * int(plan.cluster2[2]) + b, out, prefix + "c2_")
     T["meat"] = time.perf_counter() - t
     T["total"] = time.perf_counter() - t0
     T["maxrss_gb"] = _maxrss_gb()

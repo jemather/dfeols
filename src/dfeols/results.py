@@ -68,13 +68,17 @@ class Result:
 
     def summary(self, type: str | None = None) -> str:
         lines = []
+        ncl = (getattr(self, "run", None) or {}).get("n_clusters")
+        if ncl and len(ncl) > 1:  # two-way: each count (G, the smaller, sets the adjustment)
+            cl_text = "   Clusters: " + ", ".join(f"{c} {g:,}" for c, g in ncl.items())
+        else:
+            cl_text = f"   Clusters ({self.cluster}): {self.G:,}" if self.G else ""
         for y in self.outcomes:
             lines += [
                 f"Formula: {self.formula}",
                 f"Outcome: {y}",
                 f"Fixed effects: {', '.join(self.fe) or 'none'}  levels: {self.fe_levels}",
-                f"Obs: {self.N:,} (dropped {self.N_dropped:,})"
-                + (f"   Clusters ({self.cluster}): {self.G:,}" if self.G else ""),
+                f"Obs: {self.N:,} (dropped {self.N_dropped:,})" + cl_text,
                 f"Vcov: {type or self.vcov_default}   Time: {self.seconds:.1f}s",
                 "",
             ]

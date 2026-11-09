@@ -117,6 +117,28 @@ def category_levels(ds: Dataset, cols: list[str], executor=None) -> dict[str, li
     return out
 
 
+def cluster_names(cluster) -> list[str]:
+    """One cluster, or two for two-way clustering ("a+b" or ["a", "b"]), each normalised."""
+    if not cluster:
+        return []
+    parts = [p.strip() for p in cluster.split("+")] if isinstance(cluster, str) else list(cluster)
+    out = [_norm(p) for p in parts if p]
+    if len(out) > 2:
+        raise NotImplementedError(f"clustering on {len(out)} variables: one or two (two-way) only")
+    if len(set(out)) < len(out):
+        raise ValueError(f"cluster {cluster!r} names a variable twice")
+    return out
+
+
+def cluster_key(cluster) -> str | None:
+    """The cluster as fingerprints and records name it: as given for one (so one-way spec ids
+    are unchanged), "a+b" for two."""
+    names = cluster_names(cluster)
+    if len(names) < 2:
+        return cluster if isinstance(cluster, str) or cluster is None else (names[0] if names else None)
+    return "+".join(names)
+
+
 def build_plan(
     ds: Dataset,
     formula: str,
@@ -157,15 +179,14 @@ def build_plan(
             + (", and crossing_fe='dense'" if crossing_fe == "dense" else "")
             + "). Dense dummies would need about rows x levels x 8 bytes per shard."
         )
-    cl = None
-    cl_local = False
-    if cluster:
-        key = _norm(cluster)
+    names_cl = cluster_names(cluster)
+    resolved = []
+    for key in names_cl:
         if key not in ds.clusters:
-            raise KeyError(f"cluster {cluster!r} was not encoded by prep(); available: {list(ds.clusters)}")
+            raise KeyError(f"cluster {key!r} was not encoded by prep(); available: {list(ds.clusters)}")
         c = ds.clusters[key]
-        cl = (key, c["column"], c["n_levels"])
-        cl_local = bool(c["nested_in_partition"])
+        resolved.append(((key, c["column"], c["n_levels"]), bool(c["nested_in_partition"])))
+    (cl, cl_local), (cl2, cl2_local) = (resolved + [(None, False)] * 2)[:2]
     if vcov is None:
         vcov = ["CRV1"] if cluster else ["iid"]
     vcov = tuple([vcov] if isinstance(vcov, str) else vcov)
@@ -187,10 +208,10 @@ def build_plan(
     colnames = plan_columns(f, cat_levels, has_fe=bool(local or glob))
     # the spec's raw columns (FE and cluster components, not their codes) identify its rows
     key = set(f.variables) | ({weights} if weights else set())
-    for name in [*f.fes, *([cluster] if cluster else [])]:
+    for name in [*f.fes, *names_cl]:
         key.update(fe_components(name))
     row_key_cols = tuple(sorted(c for c in key if c in ds.columns))
-    spec_id = f.fingerprint(cluster=cluster, weights=weights, singletons=drop_singletons)
+    spec_id = f.fingerprint(cluster=cluster_key(cluster), weights=weights, singletons=drop_singletons)
     return Plan(
         formula=f,
         spec_id=spec_id,
@@ -198,6 +219,8 @@ def build_plan(
         global_fes=glob,
         cluster=cl,
         cluster_local=cl_local,
+        cluster2=cl2,
+        cluster2_local=cl2_local,
         weights=weights,
         cat_levels=cat_levels,
         colnames=colnames,
@@ -928,7 +951,9 @@ def fit(
 ) -> Result:
     """Estimate an HDFE OLS or IV model on a prepared, sharded dataset.
 
-    cluster    cluster variable (encoded in prep); default vcov is then CRV1
+    cluster    cluster variable (encoded in prep); default vcov is then CRV1. Two ("a+b" or
+               ["a", "b"]) for two-way clustering (Cameron, Gelbach and Miller: V_a + V_b - V_ab,
+               each scaled with G the smaller count, as fixest and pyfixest); not with cells=True
     vcov       "iid", "hetero", "CRV1" or a list of them (all computed in one pass)
     executor   SerialExecutor() (default) or DaskExecutor(client)
     workdir    where status.json and the demeaned cache go; defaults to
@@ -980,7 +1005,9 @@ def fit(
     iv_opts = {"estimator": estimator, "fuller": fuller} if probe.iv else {}
     if not probe.iv and (estimator != "2sls" or fuller is not None):
         raise ValueError("estimator= and fuller= apply to IV formulas (y ~ x | fe | d ~ z)")
-    spec_id = probe.fingerprint(cluster=cluster, weights=weights, singletons=drop_singletons, **iv_opts)
+    spec_id = probe.fingerprint(
+        cluster=cluster_key(cluster), weights=weights, singletons=drop_singletons, **iv_opts
+    )
     wd = Path(workdir) if workdir else ds.root / "runs" / spec_id
     wd.mkdir(parents=True, exist_ok=True)
     plan = build_plan(
@@ -1002,6 +1029,8 @@ def fit(
 
         if f_iv := plan.formula.iv:
             raise NotImplementedError(f"cells=True is OLS only ({f_iv})")
+        if plan.cluster2:
+            raise NotImplementedError("cells=True clusters on one variable; two-way needs cells=False")
         bad = [v for v in plan.vcov_types if v not in _cells.VCOV]
         if bad:
             raise ValueError(
@@ -1085,6 +1114,7 @@ def fit(
             cres["coefnames"],
         )
         iv_info = {}
+        two_way = None
         peak = {"rss": cres["peak_rss"]}
         timing = cres["timing"]
     else:
@@ -1116,6 +1146,17 @@ def fit(
                 np.zeros(plan.cluster[2], bool) if plan.cluster and not plan.cluster_local else None
             ),
             "G_local": 0,
+            "c2": (
+                {
+                    "cpresent": None if plan.cluster2_local else np.zeros(plan.cluster2[2], bool),
+                    "G_local": 0,
+                    "local_nested": np.ones(len(plan.local_fes), bool),
+                    "glo": [np.full(L, np.iinfo(np.int64).max) for *_, L in plan.global_fes],
+                    "ghi": [np.full(L, np.iinfo(np.int64).min, np.int64) for *_, L in plan.global_fes],
+                }
+                if plan.cluster2
+                else None
+            ),
             "row_n": {},
             "load": {"rows": 0, "missing": 0, "non_finite": 0, "zero_weights": 0},
             "row_key": [],
@@ -1171,6 +1212,17 @@ def fit(
                 for i, (lo, hi) in enumerate(r["global_cluster_minmax"]):
                     acc["glo"][i] = np.minimum(acc["glo"][i], lo)
                     acc["ghi"][i] = np.maximum(acc["ghi"][i], hi)
+            if plan.cluster2:
+                c2, rc = acc["c2"], r["cluster2"]
+                if plan.cluster2_local:
+                    c2["G_local"] += len(rc["present"])
+                else:
+                    c2["cpresent"][rc["present"]] = True
+                if r["n"]:
+                    c2["local_nested"] &= np.asarray(rc["local_nested"], bool)
+                for i, (lo, hi) in enumerate(rc["global_minmax"]):
+                    c2["glo"][i] = np.minimum(c2["glo"][i], lo)
+                    c2["ghi"][i] = np.maximum(c2["ghi"][i], hi)
 
         tasks = [(s["id"], rows[s["id"]], (plan, s["id"], ds.shard_paths(s))) for s in ds.shards]
         prog.start("round1")
@@ -1227,15 +1279,32 @@ def fit(
             acc2[pre + "rss"] = np.zeros(ne)
             acc2[pre + "hetero"] = np.zeros((ne, k_, k_)) if "hetero" in plan.vcov_types else None
             acc2[pre + "crv"] = np.zeros((ne, k_, k_)) if "CRV1" in plan.vcov_types else None
+        # CRV1 meats per cluster: "" the (first) cluster; two-way adds "c1_" the second and
+        # "c2_" the intersection, combined below as V_a + V_b - V_ab (the sandwich is linear in
+        # the meat). A cluster crossing the partition is summed by its scores per level: densely
+        # when its levels are known, else (the intersection) by the codes the shards return.
+        cps = [("", plan.cluster_local, plan.cluster[2] if plan.cluster else None)]
+        if plan.cluster2:
+            cps += [
+                ("c1_", plan.cluster2_local, plan.cluster2[2]),
+                ("c2_", plan.cluster_local or plan.cluster2_local, None),
+            ]
         scores: dict = {}
-        if "CRV1" in plan.vcov_types and not plan.cluster_local:
-            G_tot = plan.cluster[2]
-            need = G_tot * sum(ne * k_ for ne, k_ in shapes.values()) * 8
+        parts2: dict = {}
+        if "CRV1" in plan.vcov_types:
+            dense_levels = sum(L for _, loc, L in cps if not loc and L)
+            need = dense_levels * sum(ne * k_ for ne, k_ in shapes.values()) * 8
             if need > 8e9:
                 log.warning(
                     "fit %s: cluster-score accumulator needs %.1f GB on the coordinator", label, need / 1e9
                 )
-            scores = {pre: np.zeros((ne, G_tot, k_)) for pre, (ne, k_) in shapes.items()}
+            for pre, (ne, k_) in shapes.items():
+                for cp, loc, L in cps:
+                    acc2[pre + cp + "crv"] = np.zeros((ne, k_, k_))
+                    if not loc and L:
+                        scores[pre + cp] = np.zeros((ne, L, k_))
+                    elif not loc:
+                        parts2[pre + cp] = []
 
         def on2(tid, r):
             peak["rss"] = max(peak["rss"], r["timing"].get("maxrss_gb", 0.0))
@@ -1243,18 +1312,33 @@ def fit(
                 acc2[pre + "rss"] += r[pre + "rss"]
                 if acc2[pre + "hetero"] is not None:
                     acc2[pre + "hetero"] += r[pre + "meat_hetero"]
-                if pre + "meat_crv" in r:
-                    acc2[pre + "crv"] += r[pre + "meat_crv"]
-                if pre + "cluster_scores" in r:
-                    for j in range(len(scores[pre])):
-                        np.add.at(scores[pre][j], r[pre + "cluster_codes"], r[pre + "cluster_scores"][j])
+                for cp, *_ in cps:
+                    px = pre + cp
+                    if px + "meat_crv" in r:
+                        acc2[px + "crv"] += r[px + "meat_crv"]
+                    elif px + "cluster_scores" in r and px in scores:
+                        for j in range(len(scores[px])):
+                            np.add.at(scores[px][j], r[px + "cluster_codes"], r[px + "cluster_scores"][j])
+                    elif px + "cluster_scores" in r:
+                        parts2[px].append((r[px + "cluster_codes"], r[px + "cluster_scores"]))
 
         tasks2 = [(s["id"], rows[s["id"]], (plan, s["id"], ds.shard_paths(s), sol.lin)) for s in ds.shards]
         prog.start("round2")
         executor.run(shard_round2, tasks2, on2, prog, "round2")
-        for pre, sc in scores.items():
+        for px, sc in scores.items():
             for j in range(len(sc)):
-                acc2[pre + "crv"][j] = sc[j].T @ sc[j]
+                acc2[px + "crv"][j] = sc[j].T @ sc[j]
+        for px, pp in parts2.items():
+            if not pp:
+                continue
+            uniq, inv = np.unique(np.concatenate([c_ for c_, _ in pp]), return_inverse=True)
+            for j in range(acc2[px + "crv"].shape[0]):
+                sc = np.zeros((len(uniq), acc2[px + "crv"].shape[1]))
+                np.add.at(sc, inv, np.concatenate([s_[j] for _, s_ in pp]))
+                acc2[px + "crv"][j] = sc.T @ sc
+        if plan.cluster2 and "CRV1" in plan.vcov_types:
+            for pre in shapes:
+                acc2[pre + "crv"] = acc2[pre + "crv"] + acc2[pre + "c1_crv"] - acc2[pre + "c2_crv"]
         prog.finish("round2")
 
         # ---------------- inference ----------------
@@ -1267,6 +1351,25 @@ def fit(
             if plan.cluster:
                 nested.append(bool((acc["glo"][i][pres] == acc["ghi"][i][pres]).all()))
         G = (acc["G_local"] if plan.cluster_local else int(acc["cpresent"].sum())) if plan.cluster else None
+        two_way = None
+        if plan.cluster2:  # each count and nesting; G the smaller, an FE nested if in either
+            c2 = acc["c2"]
+            G2 = c2["G_local"] if plan.cluster2_local else int(c2["cpresent"].sum())
+            nested2 = list(map(bool, c2["local_nested"]))
+            for i in range(len(plan.global_fes)):
+                pres = acc["gpresent"][i]
+                nested2.append(bool((c2["glo"][i][pres] == c2["ghi"][i][pres]).all()))
+            fe_names = [n for n, _ in plan.local_fes] + [n for n, *_ in plan.global_fes]
+            a_, b_ = plan.cluster[0], plan.cluster2[0]
+            two_way = {
+                "n_clusters": {a_: G, b_: G2},
+                "fe_nested_in": {
+                    n: [c for c, ok in ((a_, n1), (b_, n2)) if ok]
+                    for n, n1, n2 in zip(fe_names, nested, nested2)
+                },
+            }
+            nested = [n1 or n2 for n1, n2 in zip(nested, nested2)]
+            G = min(G, G2)
 
         out = {}
         has_fe = bool(plan.local_fes or plan.global_fes)
@@ -1324,7 +1427,7 @@ def fit(
 
     t_end = time.time()
     options = {
-        "cluster": cluster,
+        "cluster": cluster_key(cluster),
         "vcov": list(plan.vcov_types),
         "weights": weights,
         "drop_singletons": bool(drop_singletons),
@@ -1385,6 +1488,8 @@ def fit(
         }
     run["converged"] = bool(acc["converged"])
     run["fe_nested_in_cluster"] = nested
+    if two_way:  # as sessions write it: each count, and which clusters each nested FE is in
+        run.update(two_way)
     run["n_local_fes"] = len(plan.local_fes)
     run["absorption"] = {
         **{
@@ -1414,7 +1519,7 @@ def fit(
         N=N,
         N_dropped=acc["rows_in"] - N,
         G=G,
-        cluster=plan.cluster[0] if plan.cluster else None,
+        cluster="+".join(c[0] for c in (plan.cluster, plan.cluster2) if c) or None,
         fe=[n for n, _ in plan.local_fes] + [n for n, *_ in plan.global_fes],
         fe_levels=fe_levels,
         collinear=dropped,
