@@ -30,7 +30,7 @@ import polars as pl
 import scipy.sparse as sp
 
 from . import timings as _timings
-from .crossing import NNZ_BYTES, profile_budget
+from .crossing import NNZ_BYTES, profile_budget, worker_a_budget, worker_bytes
 from .estimate import DENSE_SOLVE_LEVELS, coordinator_gb, worker_gb
 from .formula import Formula, fe_components, parse
 
@@ -367,7 +367,10 @@ def plan(
         worker_mem = _memory_bytes(profile.worker["memory"]) / 1e9
         coord_mem = _memory_bytes(profile.coordinator["memory"]) / 1e9
 
+    # A is summed on the workers before the coordinator gets it: within both memories
     budget = profile_budget(profile, level_space_gb)
+    if budget:
+        budget = min(budget, worker_a_budget(worker_bytes(prof=profile)))
     if workers is None:
         workers = (profile.worker.get("max_workers") if profile is not None else None) or DEFAULT_WORKERS
     max_group = max(target_rows, n / (SHARDS_PER_WORKER * workers))

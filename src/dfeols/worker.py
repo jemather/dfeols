@@ -34,13 +34,14 @@ try:
     import resource
 except ImportError:  # pragma: no cover (Windows)
     resource = None
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import polars as pl
 
+from .crossing import FAN_IN
 from .demean import demean, densify, drop_singletons
 from .formula import Formula, Term
 from .rowhash import rowset
@@ -78,6 +79,7 @@ class Plan:
     iter_token: str | None = None  # plan C: names this fit's shard state in _ITER_CACHE
     cg_checkpoint: str | None = None  # plan C with a pass per step: where its CG state is kept
     level_nnz: int = 0  # plan C: most nonzeros of A a shard returns (0: no level space)
+    part_nnz: int = 0  # and at most this many, for the workers' memory (0: level_nnz alone)
     keep_dir: str | None = None  # per-shard singleton keep masks (when FEs cross the partition)
     row_key_cols: tuple[str, ...] = ()  # raw columns hashed into the record's row_key
     endog_names: list[str] = field(default_factory=list)  # IV: endogenous columns (outcome block)
@@ -472,13 +474,19 @@ def _round1_sparse(plan: Plan, shard_id: int, df, n0: int, local_codes, w, T, t0
                 DD.sum_duplicates()
                 d = DD.diagonal()
                 r, c, v = DD.row, DD.col, DD.data
-                part = {"full": len(v) <= plan.level_nnz, "blocks": True, "nnz": int(len(v))}
+                lim = min(plan.level_nnz, plan.part_nnz) if plan.part_nnz else plan.level_nnz
+                part = {"full": len(v) <= lim, "blocks": True, "nnz": int(len(v))}
                 if not part["full"]:
                     fe_of = np.repeat(np.arange(len(plan.global_fes)), [L for *_, L in plan.global_fes])
                     keep = fe_of[r] == fe_of[c]
                     r, c, v = r[keep], c[keep], v[keep]
-                    part["blocks"] = len(v) <= plan.level_nnz
+                    part["blocks"] = len(v) <= lim
                     part["block_nnz"] = int(len(v))
+                if lim < plan.level_nnz and not part["full"]:
+                    part["reason"] = (
+                        f"shard {shard_id}'s part has {part['nnz']:,} nonzeros, more than "
+                        f"{lim:,} (a worker sums {FAN_IN} parts within its memory)"
+                    )
                 if part["blocks"]:
                     it = np.int32 if P < 2**31 else np.int64
                     part.update(r=r.astype(it), c=c.astype(it), v=v)
@@ -856,8 +864,11 @@ def shard_round2(plan: Plan, shard_id: int, files: list[str], lin: dict) -> dict
         with np.load(_cache_path(plan, shard_id)) as d:
             Yt, Zt, w, cl = d["Y"], d["Z"], d["w"], d["cl"]
         extra = None
-    else:  # no cache: recompute the round-1 transformation
-        _, (Yt, Zt, w, cl, extra) = _round1(plan, shard_id, files, write_cache=False)
+    else:  # no cache: recompute the round-1 transformation, without plan C's part of A
+        # (round 1 has summed it; taxi2009: rebuilding 100M+ nonzeros per shard here, outside
+        # the task memory estimate, killed 24 GB workers)
+        rplan = replace(plan, level_nnz=0, part_nnz=0) if plan.level_nnz else plan
+        _, (Yt, Zt, w, cl, extra) = _round1(rplan, shard_id, files, write_cache=False)
     T["read"] = time.perf_counter() - t0
 
     t = time.perf_counter()

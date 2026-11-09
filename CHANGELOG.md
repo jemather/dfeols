@@ -7,6 +7,22 @@ break the API).
 
 ## [Unreleased]
 
+### Fixed
+
+- Plan C in level space no longer runs workers out of memory. Shards cap their part of A by
+  the worker's memory, not the coordinator's, so four parts fit in one combine. Combines add
+  their inputs one at a time, and keep only the diagonal blocks (then nothing) before passing
+  60% of the worker's memory, so the fit falls back to a pass per CG step instead of losing
+  workers. A 162M-row fit with 51,844 crossing levels killed 24 GB workers in round 1.
+- Round 2 without a cache no longer rebuilds each shard's part of A when it recomputes
+  round 1. The rebuild sat outside the task memory estimate, so several such tasks on one
+  worker killed it.
+- `dfeols plan` caps A's budget at what the workers can sum (60% of a worker's memory), as
+  fit does.
+- Arguments shared by every task that are dicts of large arrays (round 2's linear maps, with
+  plan C's FE solution) go to the workers once instead of inside every task: a 758,405-level
+  fit sent a 46 MiB task graph.
+
 ## [0.8.0] - 2026-11-09
 
 Instrumental variables, two-way clustering, crossing FEs of any size, interactive sessions

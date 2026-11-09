@@ -34,6 +34,13 @@ log = logging.getLogger("dfeols")
 NNZ_BYTES = 40
 # A's share of the coordinator's memory when the profile does not say otherwise
 LEVEL_SPACE_SHARE = 0.25
+# A worker's memory a combine of parts of A may use (inputs and the sums it builds; the rest is
+# the process itself, Dask's buffers and the nanny's 95% limit)
+WORKER_SHARE = 0.6
+# Bytes per nonzero of a combine's inputs while it sums them, on top of the inputs themselves
+# (one at a time: the sum so far and its next copy; measured 21-24 on 4 x 5M random parts)
+MERGE_BYTES = 24
+FAN_IN = 4  # parts per combine (executors.Reduce.fan_in)
 
 
 class SlowConvergenceWarning(UserWarning):
@@ -62,6 +69,39 @@ def profile_budget(prof, level_space_gb: float | None) -> int:
     return int(level_space_gb * 1e9 / NNZ_BYTES)
 
 
+def worker_bytes(executor=None, prof=None) -> int:
+    """One worker's memory: the executor's (DaskExecutor.worker_memory), else the profile's
+    worker memory, else this machine's (SerialExecutor runs the combines here)."""
+    have = getattr(executor, "worker_memory", None)
+    if have:
+        return int(have)
+    prof = prof if prof is not None else getattr(executor, "profile", None)
+    mem = (getattr(prof, "worker", None) or {}).get("memory") if prof is not None else None
+    if mem:
+        from .cluster import _memory_bytes
+
+        return _memory_bytes(mem)
+    import psutil
+
+    return int(psutil.virtual_memory().total)
+
+
+def part_budget(wbytes: int, fan_in: int = FAN_IN) -> int:
+    """Most nonzeros of A one shard returns: fan_in such parts must fit in one combine on a
+    worker of `wbytes` (taxi2009: 4 parts of 100M+ nonzeros killed 24 GB workers, because the
+    shards' limit came from the coordinator's memory)."""
+    return int(WORKER_SHARE * wbytes / (NNZ_BYTES * fan_in))
+
+
+def worker_a_budget(wbytes: int) -> int:
+    """Most nonzeros of A the workers can sum: the last combine holds A and its inputs (the planner)."""
+    return int(WORKER_SHARE * wbytes / NNZ_BYTES)
+
+
+def _part_bytes(p: dict) -> int:
+    return sum(a.nbytes for a in p.values() if isinstance(a, np.ndarray))
+
+
 def diagonal_blocks(rows: np.ndarray, cols: np.ndarray, fe_of: np.ndarray) -> np.ndarray:
     """Mask of entries (rows, cols) inside one crossing FE's own block."""
     return fe_of[rows] == fe_of[cols]
@@ -80,16 +120,20 @@ def without_part(res: dict) -> dict:
     return {**res, "crossing": cr}
 
 
-def combine_parts(*parts, offs: np.ndarray, max_nnz: int) -> dict:
+def combine_parts(*parts, offs: np.ndarray, max_nnz: int, worker_bytes: int | None = None) -> dict:
     """Sum shards' parts of A (worker.shard_round1's `part`, or earlier sums) on a worker, by
     LevelGram's rules: past `max_nnz` keep only the diagonal blocks, past it again nothing.
     Round 1 sums the parts in a tree on the workers (DaskExecutor's `reduce`), so the
     coordinator receives A once rather than every shard's part (DB1B, 683M rows: 3.4e9
-    nonzeros shipped for an A of 5.7e7; round 1 took 755 s, most of it on the coordinator)."""
+    nonzeros shipped for an A of 5.7e7; round 1 took 755 s, most of it on the coordinator).
+
+    With `worker_bytes` the same rules hold for the worker's memory: the parts are added one
+    at a time, and once the inputs plus the sum (MERGE_BYTES a nonzero) would pass
+    WORKER_SHARE of it, only the diagonal blocks are kept, then nothing, instead of the
+    worker being killed."""
     fe_of = np.repeat(np.arange(len(offs) - 1), np.diff(offs))
     P = int(offs[-1])
     out = {"full": True, "blocks": True, "parts_nnz": 0, "shards": 0, "reason": None}
-    mats = []
     for p in parts:
         if p is None or p.get("none"):  # a shard could not form its part
             return {"none": True, "reason": (p or {}).get("reason") or "a shard could not form its part of A"}
@@ -103,17 +147,34 @@ def combine_parts(*parts, offs: np.ndarray, max_nnz: int) -> dict:
             out["reason"] = (
                 p.get("reason") or f"one shard's diagonal blocks alone have {p['block_nnz']:,} nonzeros"
             )
-        if out["blocks"]:
-            mats.append(part_matrix(p, P))
     if not out["blocks"]:
         out.update(nnz=0, block_nnz=0)
         return out
-    S = mats[0]
-    for M in mats[1:]:  # CSR + CSR merges sorted rows: no sort (2.5x the COO route on 4 x 20M)
-        S = S + M
-    del mats
-    if not out["full"]:
-        S = _blocks_only(S, fe_of)
+    room = WORKER_SHARE * worker_bytes - sum(map(_part_bytes, parts)) if worker_bytes else np.inf
+    S = None
+    for p in parts:  # one at a time: the sum so far and its next copy, not every part as CSR
+        M = part_matrix(p, P)
+        if not out["full"]:
+            M = _blocks_only(M, fe_of)
+        n_next = (S.nnz if S is not None else 0) + M.nnz
+        if out["full"] and MERGE_BYTES * n_next > room:
+            out["full"] = False
+            out["reason"] = (
+                f"summing the parts on a worker needs more than its memory "
+                f"({worker_bytes / 1e9:.0f} GB) allows"
+            )
+            M = _blocks_only(M, fe_of)
+            S = _blocks_only(S, fe_of) if S is not None else None
+            n_next = (S.nnz if S is not None else 0) + M.nnz
+        if MERGE_BYTES * n_next > room:
+            out.update(blocks=False, nnz=0, block_nnz=int(n_next))
+            out["reason"] = (
+                f"summing the diagonal blocks on a worker needs more than its memory "
+                f"({worker_bytes / 1e9:.0f} GB) allows"
+            )
+            return out
+        S = M if S is None else S + M  # CSR + CSR merges sorted rows (2.5x the COO route)
+        del M
     if out["full"] and S.nnz > max_nnz:
         out["full"] = False
         out["reason"] = f"the shards' parts summed have more than {max_nnz:,} nonzeros"

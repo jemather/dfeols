@@ -1046,10 +1046,11 @@ def fit(
         plan.cache_dir = None  # recomputing is cheap on this path
         cache = False
     if plan.crossing_iterate:
-        from .crossing import level_space_budget
+        from .crossing import level_space_budget, part_budget, worker_bytes
 
         plan.iter_token = f"{wd}:{uuid.uuid4().hex}"
         plan.level_nnz = level_space_budget(executor, level_space_gb)
+        plan.part_nnz = part_budget(worker_bytes(executor)) if plan.level_nnz else 0
     f = plan.formula
     label = label or spec_id
     m = len(f.depvars)
@@ -1230,7 +1231,7 @@ def fit(
         if plan.crossing_iterate and plan.level_nnz:
             import functools
 
-            from .crossing import combine_parts, part_of, without_part
+            from .crossing import combine_parts, part_of, without_part, worker_bytes
             from .executors import Reduce
 
             prog.task_gb = None  # each shard's part of A is not in the estimate: a whole worker
@@ -1238,7 +1239,9 @@ def fit(
             reduce = Reduce(
                 get=part_of,
                 strip=without_part,
-                combine=functools.partial(combine_parts, offs=gram.offs, max_nnz=plan.level_nnz),
+                combine=functools.partial(
+                    combine_parts, offs=gram.offs, max_nnz=plan.level_nnz, worker_bytes=worker_bytes(executor)
+                ),
                 done=lambda part: gram.add(part, None),  # None: a shard could not form its part
             )
         if reduce and "reduce" in inspect.signature(executor.run).parameters:

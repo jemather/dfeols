@@ -108,6 +108,19 @@ class _Pool:
         return self.ready[0] if self.ready else None
 
 
+def _nbytes(a) -> int:
+    """Bytes of an array, or of the arrays in a dict (nested dicts and lists included)."""
+    import numpy as np
+
+    if isinstance(a, np.ndarray):
+        return a.nbytes
+    if isinstance(a, dict):
+        return sum(_nbytes(v) for v in a.values())
+    if isinstance(a, (list, tuple)):
+        return sum(_nbytes(v) for v in a)
+    return 0
+
+
 def _order(tasks):
     """Largest-first (LPT) for load balance, but one small task first so the
     ETA calibrates quickly."""
@@ -192,20 +205,20 @@ class DaskExecutor:
             return set()
 
     def _scatter_shared(self, tasks) -> dict:
-        """Large arrays passed to every task (plan C's CG block) go to the workers once,
-        not once per task: {id(array): future}."""
-        import numpy as np
-
+        """Large arguments passed to every task go to the workers once, not once per task:
+        arrays (plan C's CG block) and dicts of them (round 2's linear maps, with plan C's FE
+        solution: D6, 758k levels, a 46 MiB graph). {id(argument): future}."""
         if not tasks:
             return {}
         ids = None
         for _tid, _rows, args in tasks:
-            mine = {id(a) for a in args if isinstance(a, np.ndarray) and a.nbytes >= self.scatter_min_bytes}
+            mine = {id(a) for a in args if _nbytes(a) >= self.scatter_min_bytes}
             ids = mine if ids is None else ids & mine
         if not ids:
             return {}
-        arrays = {id(a): a for a in tasks[0][2] if id(a) in ids}
-        return {i: self.client.scatter(a, broadcast=True, hash=False) for i, a in arrays.items()}
+        shared = {id(a): a for a in tasks[0][2] if id(a) in ids}
+        # in a list, so Dask sends a dict as one object rather than one future per key
+        return {i: self.client.scatter([a], broadcast=True, hash=False)[0] for i, a in shared.items()}
 
     def run(
         self,

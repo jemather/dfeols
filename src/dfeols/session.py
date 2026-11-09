@@ -631,17 +631,18 @@ class _MeatAcc:
 # ---------------------------------------------------------------- demean once
 
 
-def _level_reduce(gram, plan: Plan):
+def _level_reduce(gram, plan: Plan, executor=None):
     """Sum the shards' parts of A on the workers as they arrive (as fit's round 1)."""
     import functools
 
-    from .crossing import combine_parts, part_of, without_part
+    from .crossing import combine_parts, part_of, without_part, worker_bytes
     from .executors import Reduce
 
+    wb = worker_bytes(executor)
     return Reduce(
         get=part_of,
         strip=without_part,
-        combine=functools.partial(combine_parts, offs=gram.offs, max_nnz=plan.level_nnz),
+        combine=functools.partial(combine_parts, offs=gram.offs, max_nnz=plan.level_nnz, worker_bytes=wb),
         done=lambda part: gram.add(part, None),
     )
 
@@ -837,12 +838,13 @@ def demean_once(
     k_tot = plan.n_dummy
     reduce = None
     if plan.crossing_iterate:
-        from .crossing import LevelGram, level_space_budget
+        from .crossing import LevelGram, level_space_budget, part_budget, worker_bytes
 
         plan.iter_token = f"{out}:{uuid.uuid4().hex}"
         # beside the folder, which an interrupted build's rerun deletes
         plan.cg_checkpoint = str(out.parent / f"{out.name}.cg_checkpoint.npz")
         plan.level_nnz = level_space_budget(executor, spec.level_space_gb)
+        plan.part_nnz = part_budget(worker_bytes(executor)) if plan.level_nnz else 0
         offs = np.r_[0, np.cumsum([L for *_, L in plan.global_fes])].astype(np.int64)
         acc["DR"] = np.zeros((int(offs[-1]), len(names)))
         acc["ddiag"] = np.zeros(int(offs[-1]))
@@ -856,7 +858,7 @@ def demean_once(
             plan.level_nnz = 0
         elif plan.level_nnz:
             acc["gram_A"] = LevelGram(offs, [n for n, *_ in plan.global_fes], plan.level_nnz)
-            reduce = _level_reduce(acc["gram_A"], plan)
+            reduce = _level_reduce(acc["gram_A"], plan, executor)
     elif plan.global_fes:
         acc["ZtZ"] = np.zeros((k_tot, k_tot))
         acc["ZtY"] = np.zeros((k_tot, len(names)))
