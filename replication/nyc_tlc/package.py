@@ -11,7 +11,8 @@ pickup date, then README.md and reference.json (pyfixest on one day). Manifest a
 
 Sample: a trip is kept if both zones are known (not null, not 264 "Unknown" or 265 "Outside of
 NYC") and base_passenger_fare, trip_miles and trip_time are all > 0. log_wait is null where
-the request time is missing or not before pickup; such rows stay in the data (fits drop them).
+the request time is missing or not before pickup, and driver_share where driver_pay <= 0; such
+rows stay in the data (fits drop them).
 """
 
 from __future__ import annotations
@@ -79,7 +80,9 @@ def frame(lf: pl.LazyFrame) -> pl.LazyFrame:
             log_fare=pl.col("base_passenger_fare").log(),
             log_miles=pl.col("trip_miles").log(),
             log_time=pl.col("trip_time").cast(pl.Float64).log(),
-            driver_share=pl.col("driver_pay") / pl.col("base_passenger_fare"),
+            # null where driver_pay <= 0 (Decisions 2026-11-09): 87% of those are shared requests, mostly
+            # Via 2019-21 and Lyft 2019, so a recording convention rather than unpaid trips
+            driver_share=pl.when(pl.col("driver_pay") > 0).then(pl.col("driver_pay") / pl.col("base_passenger_fare")),
             shared_request=(pl.col("shared_request_flag") == "Y").cast(pl.Int8),
             shared_match=(pl.col("shared_match_flag") == "Y").cast(pl.Int8),
         )
@@ -222,7 +225,8 @@ def main(argv=None) -> int:
         "log_wait": "log wait_min; null if request missing or wait_min <= 0",
         "log_fare": "log base_passenger_fare (before tolls, fees, tax and tips)",
         "log_time": "log trip_time (seconds)",
-        "driver_share": "driver_pay / base_passenger_fare (not trimmed)",
+        "driver_share": "driver_pay / base_passenger_fare; null if driver_pay <= 0 (mostly shared rides, Via, "
+        "Lyft 2019: a recording convention); not trimmed otherwise",
         "shared_request": "shared_request_flag == 'Y'",
         "source_month": "month of the TLC file the trip came from",
     }
@@ -256,7 +260,7 @@ which crosses the partition.
 - **Rows:** {rows:,} in {len(parts)} parts by `pickup_date`, of {pre["rows_in"]:,} in the files
   ({dropped:,} dropped)
 - **Sample** (Decisions 2026-11-09): both zones known (not null, not 264 or 265), fare, miles and
-  time > 0. Rows failing each rule (they overlap): zone missing {pre["zone_missing"]:,}, zone
+  time > 0; driver_share null where driver_pay ≤ 0. Rows failing each rule (they overlap): zone missing {pre["zone_missing"]:,}, zone
   unknown {pre["zone_unknown"]:,}, fare ≤ 0 {pre["fare_le0"]:,}, miles ≤ 0 {pre["miles_le0"]:,},
   time ≤ 0 {pre["time_le0"]:,}
 - **Companies:** {comp}
