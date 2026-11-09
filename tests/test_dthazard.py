@@ -412,3 +412,42 @@ def test_time_invariant_fe_is_reported(ds, tmp_path):
     assert any("does not move with time" in w for w in h.warnings)
     h2 = lpm_dthazard(ds, "y ~ x1 | g^t", unit="uid", time="t", workdir=tmp_path / "b", log_every=1e9)
     assert h2.fe_checks["g^t"]["same_cell_rows"] == 0
+
+
+def test_fd_and_ols_records_and_estimates_files(ds, tmp_path):
+    """FD and pooled OLS get their own records (same hazard sample rules as the IV record);
+    estimates.csv holds every coefficient of every fit, first_stage_G.csv the G matrix;
+    the short summary shows main terms side by side and counts the i() levels."""
+    est = pytest.importorskip("estrec")
+    pytest.importorskip("jsonschema")
+    fml = "y ~ x1 + i(t)"
+    h = lpm_dthazard(ds, fml, unit="uid", time="t", cluster="uid", workdir=tmp_path, log_every=1e9)
+    assert set(h.files) == {"record_iv", "record_fd", "record_ols", "estimates", "first_stage_G"}
+    main = est.read(tmp_path / "result.estrec.json", nonfinite="string")
+    for name, r in (("fd", h.fd), ("ols", h.ols)):
+        path = tmp_path / f"{name}.estrec.json"
+        rec = est.read(path, nonfinite="string")
+        bad = [i for i in est.validate(rec, base_dir=tmp_path) if i.level != "info"]
+        assert not bad, "\n".join(map(str, bad))
+        assert rec["specification"]["call"] == main["specification"]["call"]
+        assert rec["specification"]["sample"]["dropped"]["first_periods"] > 0
+        hz = rec["extensions"]["dfeols"]["dthazard"]
+        assert hz["main_record"] == "result.estrec.json" and hz["role"] in ("first_differences", "pooled_ols")
+        pars = [p for p in rec["parameters"] if "component" not in p]
+        assert [p["term"] for p in pars] == list(r.coefnames)
+        np.testing.assert_allclose([p["estimate"] for p in pars], r.coef(), rtol=1e-12)
+    e = pl.read_csv(tmp_path / "estimates.csv")
+    assert e.height == len(h.iv.coefnames) + len(h.fd.coefnames) + len(h.ols.coefnames)
+    for k, r in (("iv", h.iv), ("fd", h.fd), ("ols", h.ols)):
+        sub = e.filter(pl.col("estimator") == k)
+        assert sub["term"].to_list() == list(r.coefnames)
+        np.testing.assert_allclose(sub["coef"].to_numpy(), r.coef(), rtol=1e-12)
+        np.testing.assert_allclose(sub["se"].to_numpy(), np.sqrt(np.diag(r.vcov())), rtol=1e-12)
+    fdx = e.filter((pl.col("estimator") == "fd") & (pl.col("term") == "D1_x1"))
+    assert fdx["regressor"].item() == "x1"
+    g = pl.read_csv(tmp_path / "first_stage_G.csv")
+    assert g.height == sum(len(v) for v in h.G.values())
+    s = h.summary()
+    assert "x1" in s and "t::3" not in s and "i() coefficients, not shown" in s
+    assert "first stage G" in s and str(tmp_path / "estimates.csv") in s
+    assert "t::3" in h.summary(full=True)

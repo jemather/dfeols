@@ -83,6 +83,15 @@ FEs partialled out as usual. What is new:
    first stage) and the first-stage diagnostics at no extra pass.
 3. **Record.** An `iv/0.1` record (endogenous = all x, instruments = their Δ^j), plus the
    method, j, the unit and time keys and the drop counts in the dfeols extension.
+4. **Output (Ted 2026-11-09: records are the main output; the log is a check).** In the
+   workdir: `result.estrec.json` (IV), `fd.estrec.json` and `ols.estrec.json` (the
+   comparisons, each with the same call, sample rules and drop counts, and a pointer to the
+   IV record), `estimates.csv` (every coefficient and SE of every fit, long: estimator,
+   term, regressor, coef, se, vcov_type, nobs; an FD term's `regressor` is the level it
+   differences) and `first_stage_G.csv` (regressor, instrument, coef). `summary()` is short:
+   sample accounting, the non-i() terms' IV, FD and OLS estimates side by side, counts of
+   the hidden i() coefficients and of G, warnings and the file paths; `summary(full=True)`
+   prints every fit and G.
 
 Built samples are cached like the demeaned data (keyed by dataset, unit, time, j and the
 columns), so refits and sessions don't rebuild.

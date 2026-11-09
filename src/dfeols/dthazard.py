@@ -217,6 +217,7 @@ class HazardResult:
     options: dict
     dataset: str
     warnings: list[str] = field(default_factory=list)
+    files: dict = field(default_factory=dict)  # records and estimates files written
 
     def coef(self):
         return self.iv.coef()
@@ -224,7 +225,130 @@ class HazardResult:
     def tidy(self, **kw):
         return self.iv.tidy(**kw)
 
-    def summary(self) -> str:
+    # ---- the estimates, one row per estimator and term
+    def _fits(self):
+        return [(k, r) for k, r in (("iv", self.iv), ("fd", self.fd), ("ols", self.ols)) if r is not None]
+
+    def estimates(self):
+        """All coefficients of the IV, FD and pooled OLS fits: a Polars frame with one row
+        per estimator and term (estimator, term, regressor, coef, se, vcov_type, nobs).
+        `regressor` is the levels term an FD coefficient belongs to (Δ^j of it)."""
+        import polars as pl
+
+        to_level = self._instrument_of(inverse=True)
+        rows = []
+        for k, r in self._fits():
+            se = np.sqrt(np.diag(r.vcov()))
+            for n, b, e in zip(r.coefnames, r.coef(), se):
+                rows.append(
+                    {
+                        "estimator": k,
+                        "term": n,
+                        "regressor": to_level.get(n, n) if k == "fd" else n,
+                        "coef": float(b),
+                        "se": float(e),
+                        "vcov_type": r.vcov_default,
+                        "nobs": int(r.N),
+                    }
+                )
+        return pl.DataFrame(rows)
+
+    def first_stage(self):
+        """G in long form (regressor, instrument, coef): b_FD ≈ G b_IV."""
+        import polars as pl
+
+        rows = [
+            {"regressor": e, "instrument": z, "coef": float(v)}
+            for e, col in self.G.items()
+            for z, v in col.items()
+        ]
+        schema = {"regressor": pl.String, "instrument": pl.String, "coef": pl.Float64}
+        return pl.DataFrame(rows, schema=schema)
+
+    def write_estimates(self, folder) -> dict:
+        """Write estimates.csv (estimates()) and first_stage_G.csv (first_stage()) to `folder`."""
+        folder = Path(folder)
+        out = {"estimates": folder / "estimates.csv", "first_stage_G": folder / "first_stage_G.csv"}
+        self.estimates().write_csv(out["estimates"])
+        self.first_stage().write_csv(out["first_stage_G"])
+        return {k: str(v) for k, v in out.items()}
+
+    def _instrument_of(self, inverse: bool = False) -> dict:
+        iv = self.iv.iv
+        m = dict(zip(iv["endogenous"], iv["instruments"]))
+        return {z: e for e, z in m.items()} if inverse else m
+
+    def _main_terms(self) -> tuple[list[str], dict[str, int]]:
+        """IV coefficient names shown in the short summary (not i() levels), and the
+        count of hidden coefficients by i() variable."""
+        main, hidden = [], {}
+        for n in self.iv.coefnames:
+            if "::" in n:
+                v = n.split("::")[0]
+                hidden[v] = hidden.get(v, 0) + 1
+            else:
+                main.append(n)
+        return main, hidden
+
+    def summary(self, full: bool = False) -> str:
+        """A short check that the fit worked: sample accounting, the main terms' IV, FD and
+        pooled OLS estimates side by side, warnings and where the full output is. i() levels
+        and G are in the estimates files and the records. full=True also prints every fit's
+        own summary and G."""
+        if full:
+            return self._summary_full()
+        s, o = self.sample, self.options
+        lines = [
+            "Discrete-time hazard LPM, Farbmacher-Tauchmann IV (lpm_dthazard)",
+            f"  formula      {o['formula']}",
+            f"  unit, time   {o['unit']}, {o['time']}    differences j = {o['diff']}"
+            f"    vcov {self.iv.vcov_default}" + (f" by {o['cluster']}" if o.get("cluster") else ""),
+            "",
+            "Sample (rows of the prepared data -> estimation sample)",
+            f"  rows in the data                 {s['rows_input']:>14,}",
+        ]
+        for r, n in s["dropped"].items():
+            lines.append(f"  - {r:<30} {n:>14,}   {DROP_REASONS.get(r, '')}")
+        lines += [
+            f"  = built sample                   {s['rows_built']:>14,}"
+            f"  ({s['units']:,} units, {s['events']:,.0f} events)",
+            f"  estimation sample (after fit's own drops: singletons etc.) {self.iv.N:,}",
+            "",
+        ]
+        main, hidden = self._main_terms()
+        to_z = self._instrument_of()
+
+        def est(r, name):
+            if r is None or name not in r.coefnames:
+                return "", ""
+            j = list(r.coefnames).index(name)
+            return f"{r.coef()[j]:.6g}", f"({np.sqrt(r.vcov()[j, j]):.3g})"
+
+        hdr = f"  {'term':<28}{'IV':>14}{'':>12}{'FD':>14}{'':>12}{'pooled OLS':>14}{'':>12}"
+        lines += ["Estimates (SE)", hdr]
+        for n in main:
+            b1, s1 = est(self.iv, n)
+            b2, s2 = est(self.fd, to_z.get(n, n))
+            b3, s3 = est(self.ols, n)
+            lines.append(f"  {n:<28}{b1:>14}{s1:>12}{b2:>14}{s2:>12}{b3:>14}{s3:>12}")
+        for v, k in hidden.items():
+            lines.append(f"  {v}: {k} i() coefficients, not shown")
+        if self.G:
+            n_z = len(next(iter(self.G.values())))
+            lines.append(f"  first stage G: {len(self.G)} regressors x {n_z} instruments, not shown")
+        for name, c in self.fe_checks.items():
+            if c["ambiguous_rows"]:
+                lines.append(
+                    f"FE {name}: {c['ambiguous_share']:.2%} of rows are in cells whose predecessor cell"
+                    " differs across units (movers); absorbed in levels"
+                )
+        for wmsg in self.warnings:
+            lines.append(f"Warning: {wmsg}")
+        if self.files:
+            lines += ["", "Full output"] + [f"  {k:<16} {v}" for k, v in self.files.items()]
+        return "\n".join(lines)
+
+    def _summary_full(self) -> str:
         s, o = self.sample, self.options
         lines = [
             "Discrete-time hazard LPM, Farbmacher-Tauchmann IV (lpm_dthazard)",
@@ -272,6 +396,7 @@ class HazardResult:
 
     def to_dict(self) -> dict:
         return {
+            "files": self.files,
             "options": self.options,
             "sample": self.sample,
             "fe_checks": self.fe_checks,
@@ -286,6 +411,13 @@ class HazardResult:
 
 
 # ---------------------------------------------------------------- the estimator
+
+
+COMPARISON_ROLES = {
+    "first_differences": "first differences of y's regressors (b_FD, the reduced form), same sample",
+    "pooled_ols": "pooled OLS of y on the levels, same sample",
+}
+ROLE_FILE = {"iv": "result", "first_differences": "fd", "pooled_ols": "ols"}
 
 
 def lpm_dthazard(
@@ -332,6 +464,10 @@ def lpm_dthazard(
               as in fit(); default vcov is "hetero" (the paper's), "CRV1" with a cluster
     after_event  rows after a unit's first y = 1: "error" (default) or "drop" (counted)
     compare   also fit first differences (the reduced form) and pooled OLS on the sample
+    record    write estimation records to <workdir>: result.estrec.json (the IV), and with
+              compare fd.estrec.json and ols.estrec.json, each with the hazard sample rules
+              (a path names the IV record; the others go beside it). Always written:
+              estimates.csv (every coefficient of every fit) and first_stage_G.csv
 
     The sample. Starting from the prepared data, a row is dropped (and counted, under the
     first reason that applies; see DROP_REASONS) if it comes after the unit's event
@@ -604,29 +740,49 @@ def lpm_dthazard(
         hz["warnings"] = warnings
     # Record facts: the hazard rules are part of the sample, so they go in the record's
     # sample section (rows input = the prepared data, drops by reason) and the extension.
-    run = res.run
-    run["call"] = f"dfeols.lpm_dthazard(ds, {', '.join(call_args)})"
-    run["restriction"] = restriction
-    fit_dropped = dict(run.get("sample", {}).get("dropped", {}))
-    merged = dict(sample["dropped"])
-    for k, v in fit_dropped.items():
-        merged[k] = merged.get(k, 0) + int(v)
+    call = f"dfeols.lpm_dthazard(ds, {', '.join(call_args)})"
     src_rows = (ds.meta.get("source") or {}).get("rows")
-    run["sample"] = {"rows_input": int(ds.n_rows), "dropped": merged}
-    if src_rows is not None and src_rows >= ds.n_rows:
-        run["sample"] = {
-            "rows_input": int(src_rows),
-            "dropped": {"missing_keys": int(src_rows - ds.n_rows), **merged},
-        }
-    run["dthazard"] = hz
-    res.save(Path(res.workdir) / "result.json")
-    if record:
-        rpath = base / "result.estrec.json" if record is True else Path(record)
+    rpath = (base / "result.estrec.json" if record is True else Path(record)) if record else None
+    files: dict[str, str] = {}
+    for role, r in (("iv", res), ("first_differences", fd), ("pooled_ols", ols)):
+        if r is None:
+            continue
+        # every record carries the hazard sample rules: rows input = the prepared data,
+        # drops by reason (hazard rules, then the fit's own singletons etc.)
+        run = r.run
+        run["call"] = call
+        run["restriction"] = restriction
+        merged = dict(sample["dropped"])
+        for k, v in dict(run.get("sample", {}).get("dropped", {})).items():
+            merged[k] = merged.get(k, 0) + int(v)
+        run["sample"] = {"rows_input": int(ds.n_rows), "dropped": merged}
+        if src_rows is not None and src_rows >= ds.n_rows:
+            run["sample"] = {
+                "rows_input": int(src_rows),
+                "dropped": {"missing_keys": int(src_rows - ds.n_rows), **merged},
+            }
+        if role == "iv":
+            run["dthazard"] = hz
+        else:
+            run["dthazard"] = {
+                "role": role,
+                "estimator": COMPARISON_ROLES[role],
+                "main_record": rpath.name if rpath is not None else None,
+                "unit": unit,
+                "time": time,
+                "diff": diff,
+                "sample": sample,
+            }
+        r.save(Path(r.workdir) / "result.json")
+        if rpath is None:
+            continue
+        p = rpath if role == "iv" else rpath.with_name(f"{ROLE_FILE[role]}.estrec.json")
         try:
-            res.write_estimation(rpath)
-            log.info("lpm_dthazard %s: record %s", label, rpath)
+            r.write_estimation(p)
+            files["record_iv" if role == "iv" else f"record_{ROLE_FILE[role]}"] = str(p)
+            log.info("lpm_dthazard %s: %s record %s", label, ROLE_FILE[role], p)
         except Exception:
-            log.exception("lpm_dthazard %s: writing the estimation record failed", label)
+            log.exception("lpm_dthazard %s: writing the %s estimation record failed", label, role)
 
     out = HazardResult(
         iv=res,
@@ -638,7 +794,12 @@ def lpm_dthazard(
         options=options,
         dataset=str(sample_dir),
         warnings=warnings,
+        files=files,
     )
+    try:
+        out.files.update(out.write_estimates(base))
+    except Exception:
+        log.exception("lpm_dthazard %s: writing the estimates files failed", label)
     (base / "dthazard.json").write_text(json.dumps(out.to_dict(), indent=1, default=str))
     log.info(
         "lpm_dthazard %s: done in %.0fs (sample %s; %s)",
