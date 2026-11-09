@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # Copyright (C) 2026 Ted Matherly
-"""dfeols: sharded, elastic high-dimensional fixed-effects OLS for HPC clusters."""
+"""dfeols: sharded, elastic high-dimensional fixed-effects OLS and IV for HPC clusters."""
 
 import logging as _logging
 
@@ -32,7 +32,7 @@ __all__ = [
     "Session",
     "lpm_dthazard",
 ]
-__version__ = "0.7.0"
+__version__ = "0.8.0"
 
 _log = _logging.getLogger("dfeols")
 if not _log.handlers:

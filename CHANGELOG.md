@@ -7,333 +7,222 @@ break the API).
 
 ## [Unreleased]
 
-### Fixed
-- Columns a local FE absorbs are dropped as collinear on every path. Net of the local FEs
-  such a column is rounding noise (~1e-29), and `collinear_keep` tested each pivot against
-  the column's own diagonal, so the noise looked independent and was kept: a regressor
-  constant within a local FE got b ~ 4e11 (dense and sparse crossing FEs), made plan C's and
-  the cell path's CG fail to converge, and was reported in sessions; crossing-FE dummies that
-  sum to a local FE (`spell + id_a^week + tbin^week`) left the dense solve singular, so b
-  moved 1.5e-6 with 5e-14 changes in the demeaned data. Each column is now tested against its
-  weighted centered sum of squares before the FEs (`linalg.reference_ss`, from per-shard sums
-  in round 1; with local FEs only), plan C and the cell path give absorbed columns a zero CG
-  right-hand side, and IV tests an absorbed endogenous regressor's fitted values the same way.
-  Session demeaned data move to format 2 (`raw_ss` in the manifest), so data from earlier
-  versions are rebuilt. Tests against pyfixest on each path.
-- An empty estimation sample is an error. When every row is a singleton (or missing, or
-  zero-weight), `fit` and session demeaning raise a ValueError that says where the rows went;
-  `drop_singletons` raised an IndexError on a shard with no rows left, and `fit` returned
-  an empty result.
-- Session model estimates keep the first pass apart: it reads files no node has cached
-  (OSCER 35828091: m1 took 17 s with 5 columns, then m2 6 s with 8, so m2 was estimated at
-  27 s). Before a later pass has been measured, the estimate is a range (`estimate_range` in
-  `responses/<id>.accepted.json`), taken from this session's first pass, the first passes of
-  earlier sessions (`<demeaned>/passes.jsonl`, new), or the shard read rate on one worker
-  up to all of them.
-- `session start`'s demeaned-size figure comes from the compressed size of earlier builds
-  (`timings.jsonl` now records columns and bytes), at most 8 bytes a value; it printed
-  rows x columns x 8 bytes, 44 GB where the flags data took 6.9 GB.
-- `Session.start` takes `progress=` as `Session.attach` does.
+## [0.8.0] - 2026-11-09
 
-### Changed
-- Created variables are stored in batches (`dfeols-created/2`; format 1 folders are ignored and
-  rebuilt).
-- Session demeaned data move to format 3: the singleton masks are kept in `sample/` (one bit
-  a row) so created variables get the same rows. Format 2 data are rebuilt by the next
-  session (none had been built on OSCER yet).
-- The estimation format is now **estrec** (github.com/estrec/estrec, clean break): dfeols
-  depends on `estrec` (pinned to b269d9f), imports `estrec`, and writes `estrec/0.1` records
-  as `result.estrec.json` (`result.<y>.estrec.json` per response) and collections as
-  `*.estrec-collection.json`, including `session.estrec-collection.json`. Records written
-  under the old names no longer validate. The subcommand is now `dfeols estrec ...` (it runs
-  the `estrec` command line) and the extra is `dfeols[estrec]`; `dfeols estimation` and
-  `dfeols[estimation]` are gone. `Result.write_estimation` and `write_collection` keep their
-  names.
+Instrumental variables, two-way clustering, crossing FEs of any size, interactive sessions
+with an R client, the planner, estrec records and discrete-time hazard models. dfeols is not
+on PyPI: it depends on [estrec](https://github.com/estrec/estrec) by a pinned git commit
+until estrec is there, so install from the tag
+(`pip install "dfeols[dask] @ git+https://github.com/jemather/dfeols@v0.8.0"`).
+
+Results can differ from 0.7.0 on the same data: singletons are now dropped over all FEs
+(N no longer depends on the partition), `r2_within` nets y of every FE, and regressors an FE
+absorbs are dropped as collinear (see Changed and Fixed).
 
 ### Added
-- IV with `crossing_fe="iterate"` (plan C), in level space and with a pass per CG step:
-  equal to the dense path and to pyfixest; it was refused.
-- Plan C's pass-per-step CG sums the shards' results in a tree on the workers (one block per
-  step reaches the coordinator), and keeps its state after each step (`cg_checkpoint.npz` in
-  the workdir; beside a session's demeaned folder), so a rerun of a fit stopped by walltime
-  or `iter_maxiter` resumes where it stopped.
-- Wall-time estimates and one job vs demean-first in `dfeols plan` (planner steps 3-4): every
-  `fit` appends its path, rows, columns, passes, seconds and workers to
-  `<scratch>/timings/fits.jsonl` (`dfeols.timings`), and the report gives each key a wall-time
-  range from earlier runs on the same path, then recommends demean-first (a session) for plan
-  C, for estimates over half the profile's `max_walltime`, or with `--specs N` > 1, else one
-  job. `fit` warns when another formula was fitted on the same data, FEs and weights before,
-  naming the session command.
-- Created variables in sessions (sessions step 4): `Session.add_variable(name, expression)`
-  and `dfeols session add-variable`. The expression is on raw columns of the prepared data
-  (`feat * posts`, `log(wt)`, `posts > 0`, `ifelse(x > 0, y, 0)`; R's `^`, `&`, `|`, `!`
-  with R's precedence), parsed by `dfeols.expr` through an allowlist of `ast` nodes (no
-  eval) into a Polars expression. It is computed on the session's rows (the declared
-  variables' sample and the singleton masks), demeaned on the session's FEs like a declared
-  variable (dense or plan C crossing FEs), and crossed with every column in the same passes,
-  so models use it with no extra pass. A row of the sample where it is missing or not finite
-  is an error with the count (the sample is fixed). It is kept in
-  `<key>/created/<digest>/` (`variable.json` last; `a * b` and `b * a` share a digest), and
-  a later session on the same demeaned data reuses it, under any name, with one pass for
-  cross-products with that session's other created variables if none are on file. Models
-  with created variables equal `dfeols.fit` with the column made before prep (or fit's own
-  `a:b` interaction) on dense and iterated crossing FEs. Records carry the definitions
-  (`extensions.dfeols.created_variables`, a derived data entry per column, and
-  `.add_variable(...)` in the replay call); the collection logs `variable_created`.
-- `Session.refit(model, vcov=, cluster=)` and `dfeols session refit`: an earlier model with
-  another vcov or cluster, the coefficients from the Gram matrix again and one pass for the
-  new SEs (none for iid); a CRV1 refit keeps the model's cluster. Logged as
-  `setting_changed` (old and new vcov and cluster) before the new model's `fit`; the index
-  entry has `refit_of`.
-- `dfeols demeaned list` shows each key's created variables.
-- Session exports (sessions step 5) through the estrec table tool (Ted 2026-11-08):
-  `s.export([m1, m2], "table2.tex")` / `export_table` / `dfeols session export --models`
-  write the table (.tex, .md, .html, .csv, .txt, .doc), its `estrec-table/0.1` spec and the
-  session collection it reads, so it renders again from the files alone.
-- The R client (sessions step 5), package `dfeols` in `r/`: `attach_session`, `fit`, `refit`,
-  `add_variable(s)`, `export_table`, ...; models come back as estrec records, so `tidy()`,
-  `glance()` and modelsummary work. `dfeols session where` gives clients the folder.
-  Tested from Python against a live session: R equals Python to 1e-12.
-- IV in sessions (step 6): `y ~ x | d ~ z`, 2SLS, LIML, Fuller, from the Gram matrix (b,
-  iid SEs, kappa, overidentification tests, first stage) and one pass for hetero/CRV1; OLS
-  and IV share the pass (linear maps of a block of columns). Equal to `dfeols.fit`'s IV.
-- Two-way clustering in sessions (Ted 2026-11-08): `cluster="a+b"`, Cameron-Gelbach-Miller
-  with pyfixest's conventions (G_min in each term and in the t df), equal to pyfixest to
-  1e-13; the intersection's codes are made per shard. Records list both clusters.
-- `i()` terms in session models: indicator columns created in one batch (one demeaning for
-  every level), named and dropped as `fit` does, equal to `fit`'s `i()`.
-- `Session.add_variables({name: expression})`: new columns demeaned together in one batch;
-  each column keeps its own digest and is reused alone.
-- `dfeols.session.replay` / `dfeols session replay`: a session collection's events run
-  again in a running session, each member compared with its record.
-- Plan C session builds keep the level-space A (`<key>/crossing/A.npz`); creating variables
-  then skips A in round 1 and solves on it.
-- `session start` warns when a demeaning task would not fit a worker thread's memory (no cap
-  on declared variables, Ted 2026-11-08).
-- `dfeols demeaned list` and `dfeols demeaned rm <key>` for persisted demeaned data (sessions
-  step 3): size, when written, purge date (`scratch_purge_days`), the running sessions using
-  each key, incomplete and old-format folders; `rm` asks (or `--yes`) and refuses while a
-  running session uses the key or a build holds its lock. `dfeols.store` (`entries`,
-  `find`, `remove`, `space`); `lock.holder()`.
-- Scratch checks for session demeaned data: `session start` prints the file system's free
-  space, stops when the size estimate's low end does not fit (the manager makes the same
-  check before demeaning) and warns when the high end does not. Profile settings
-  `demeaned_storage` (`"plentiful"`, the default, or `"confirm"`) and `demeaned_confirm_gb`
-  (default 500): with `"confirm"`, `session start` asks before a larger write, or needs
-  `--yes`. Reusing data prints when the site may purge it.
-- Disclosure levels for `estimation` records and collections (estimation spec 4.9, 11.7):
-  `fit(record_level=, purpose=)`, `write_estimation`, `prepare_estimation` and
-  `write_collection` take `level`/`purpose`; session models and the session collection use the
-  same level. The level is the argument, else the site profile's `record_level`, else
-  `$DFEOLS_RECORD_LEVEL`, else 4 (`record.record_level`). **Records are level 4 by default**:
-  no scheduler, timing, hosts, Dask block, shard folder or package list; set
-  `record_level = 5` in an HPC profile to keep them. estimation-format pinned to 3ecc14e,
-  where the journals' purpose profile is `dcas/0.1` (Data and Code Availability Standard;
-  drafted as `aea/0.1`).
-- Interactive sessions (`dfeols.Session`, `dfeols session start|serve|status|fit|export|persist|stop`;
-  `docs/design/sessions.md`, build order step 2): a manager demeans the declared variables on
-  the session's FEs once (local FEs, crossing FEs as dense dummies), keeps the residualised
-  columns per shard and their Gram matrix, and fits `y ~ x` models from request files: b and
-  iid SEs with no pass over the data, hetero/CRV1 with one. Results equal `dfeols.fit` on the
-  same sample. Each model writes an `estimation` record carrying the session id; the session
-  writes an `estimation-collection/0.1` file (`kind: "session"`, with events) on export and
-  when it ends. Demeaned data are kept under `<scratch>/demeaned/<dataset>/<key>/` and reused
-  by a session with the same inputs.
-  Crossing FEs above `max_dummy_levels` go by plan C: one CG solve, at start-up, for every
-  declared variable together (`crossing_fe`, `iter_tol`, `level_space_gb`, `crossing_precond`).
-  Estimates and progress: the demeaning's estimate from earlier runs and its live progress
-  while a client waits; per model, an estimate before it runs (no pass, or rows x columns over
-  the pass throughput measured in the session, calibrated on shard reads at first) and its
-  progress lines. `progress.status_line` formats a status snapshot.
-  `Session.persist()` / `dfeols session persist`: a session started with `persist=False`
-  (`--no-persist`) moves its demeaned data to the demeaned folder, keeps fitting from there,
-  and leaves them for later sessions with the same inputs.
-- `dfeols.write_collection(fits, path, kind=...)`: several fits (or records) as one
-  `estimation-collection/0.1` file, one member per response, with labels, locators,
-  publication, redaction and a members file above 16 MB; `record.prepare_estimation`.
-- Plan C in level space sums the shards' parts of A on the workers (Crossing-FE build): a
-  balanced tree of combine tasks (`crossing.combine_parts`, four parts at a time, CSR sums,
-  LevelGram's budget rules) runs as parts arrive, ahead of the shards still queued, and the
-  coordinator fetches only the root. On OSCER (job 35624287, 342 route shards) the shards
-  shipped 3.4e9 nonzeros for an A of 5.7e7 and round 1 took 755 s, most of it the
-  coordinator taking parts one at a time while finished results waited in worker memory
-  (15.8 GB). 21 realistic DB1B route shards on 4 local workers: the coordinator receives A
-  once (43M nonzeros, not 207M) and peaks at 2.5 GB, not 6.7; round 1 22 s against 20 s;
-  coefficients equal. Lost parts are recomputed by Dask from their tasks. Executors take an
-  optional `reduce` (`executors.Reduce`); fit uses the per-shard path with an executor
-  whose `run` does not. `crossing_cg.shipped_nnz` is what reached the coordinator.
-- Workers run several shards at once when they fit (Crossing-FE build, "workers using all
-  their cores"): a worker job gets a Dask thread per core and declares its memory as the
-  resource MEMORY, and each fit task asks for its worker-memory estimate (x1.25), so a 24 GB,
-  4-core OSCER worker runs up to 4 cells or round-2 tasks together. The tasks are mostly
-  single-threaded (DB1B 2005Q2-Q3: 4 threads made a task at most 15% faster while using
-  1.3-3 cores). Plan C's round 1 in level space, whose part of A the estimate leaves out, and
-  every prep task still take a whole worker. BLAS and OpenMP get one thread per task;
-  Polars and Rayon share the job's cores. A `DaskExecutor` on a plain Client (no
-  `worker_memory`) runs as before. Its slot count is now workers, not threads.
-- fit logs which dfeols runs at the start: version, commit (with uncommitted changes
-  flagged) and the folder it was imported from (OSCER job 35625064 ran a stale copy from a
-  venv while the reinstall had gone to ~/.local).
-- `dfeols plan` applies the partition rule (Ted, 2026-10-29): it recommends the key that makes
-  the crossing system smallest (fewest crossing levels; on plan C, level space before the
-  per-pass fallback) among keys whose largest group is within `target_rows` or 5% of the
-  sample. On plan C keys it sizes A = D~'W D~ against fit's level-space budget
-  (`--level-space-gb`, default a quarter of the profile's coordinator memory): a bound from
-  each local group's crossing levels, and above the budget an exact count of A's pattern,
-  stopped at the budget. Where A is over it, the report warns before the run that fit falls
-  back to a pass per CG step and may converge slowly, naming the crossing FEs and largest
-  blocks. It also counts the cells (every FE and the cluster constant) and recommends
-  `fit(cells=True)` at 10 or more rows per cell.
-- `fit(..., cells=True)`: the fit from per-cell sums (`dfeols.cells`; planner.md, decided
-  2026-10-30). One pass groups each shard's rows by every FE key and the cluster
-  (`worker.shard_cells`: rows, weight, means and cross-products about the cell means); the
-  coordinator drops singletons on the cells, absorbs the FE with most levels by group means and
-  solves the others with plan C's level-space CG, then b by Frisch-Waugh-Lovell, RSS and CRV1
-  scores from the cell moments. Exact. OLS; vcov CRV1 and iid. Equal to pyfixest (CRV1, iid,
-  weights, several outcomes, cells spanning shards). DB1B 2005Q2-Q3: 10.3M rows in 329k cells,
-  9.8 s against 27 s (level space) and 43 s (dense solve); b within 1e-11.
-- Plan C in level space (planner.md, "Crossing-FE solver"; decided 2026-10-30): round 1 also
-  returns each shard's part of A = D~'W D~ (`crossing.LevelGram` sums them within a budget),
-  and CG runs on the coordinator with no further passes. The preconditioner follows the
-  connected components of each crossing FE's own block: exact pinned or pseudo-inverse solves
-  (AP-sweep, i.e. symmetric block Gauss-Seidel, when all are exact), AMG V-cycles with plain
-  aggregation on large sparse components (block-Jacobi; optional `dfeols[amg]`, pyamg), else
-  Jacobi. Options `level_space_gb` (default a quarter of the coordinator's memory; 0 is the old
-  per-pass path) and `crossing_precond`. Above the budget each step is a pass over the shards,
-  with block-Jacobi from the diagonal blocks if those fit, and dfeols warns that convergence may
-  be slow (`crossing.SlowConvergenceWarning`, also logged), naming what made A too large.
-  DB1B 2005Q2-Q3 (10.3M rows): 7 steps in 0.14 s against 16 passes in 23 s; b within 8e-12 of
-  the dense solve. `Result.options["crossing_cg"]` gives the mode, preconditioner, passes and
-  sizes.
-- `dfeols plan SOURCE --formula ... [--cluster] [--partition K1,K2] [--profile P] [--json]` and
-  `dfeols.plan()`: probe a specification before prep (planner step 1, docs/design/planner.md).
-  Streaming aggregates on the source report rows and missingness, levels and singletons of
-  every FE, nesting of each FE and the cluster in each candidate key (default: every FE,
-  interaction component and the cluster), the largest groups per key, and for each key the
-  solver path fit would take (or the unbuilt plan B / C it needs), shard count and rough
-  worker and coordinator memory, checked against a profile; keys are ranked and one
-  recommended. 32 s and 7.5 GB peak on DB1B's 683M-row market table.
+
+#### Estimation
+- Instrumental variables: `fit(ds, "y ~ x | fe | d1 + d2 ~ z1 + z2")` (fixest syntax) with
+  `estimator="2sls"` (default) or `"liml"`, and `fuller=` for Fuller's modified LIML; any
+  number of endogenous regressors; iid, hetero and CRV1 standard errors on every FE path
+  (local, dense, sparse and iterated crossing FEs), from the same two passes over the shards.
+  First-stage statistics per endogenous regressor (`Result.iv["first_stage"]`): coefficients
+  on the instruments with their vcovs, R², partial R², the iid partial F, the Wald F under
+  each vcov and, with one endogenous regressor, the Montiel Olea-Pflueger effective F. An
+  endogenous regressor the instruments fit exactly (time dummies instrumented by their own
+  differences) is marked `exact_fit` and gets no F tests. Per outcome, Sargan's
+  overidentification test and, for LIML, the Anderson-Rubin tests
+  (`Result.outcomes[y]["overid"]`). Tested against pyfixest, fixest, linearmodels,
+  ivreghdfe and a direct LIML computation (docs/design/iv.md).
+- Two-way clustering: `fit(..., cluster="a+b")` (or `["a", "b"]`) and in sessions.
+  Cameron-Gelbach-Miller (V_a + V_b - V_ab) with pyfixest's and fixest's conventions: each
+  term scaled with G the smaller count, which is also the t df. Round 2 sums the scores of
+  a, b and their intersection (codes made per shard; summed by code when both clusters cross
+  the partition). Equal to pyfixest for each kind of pair (nested in the partition or
+  crossing it) on every crossing-FE path, with or without the cache, and for IV. Records list
+  both clusters and their counts; the summary shows each count. Not with `cells=True`.
+- `dfeols.lpm_dthazard`: discrete-time hazard linear probability models (an absorbing-state
+  outcome) by the Farbmacher-Tauchmann (2021) IV, levels instrumented by their differences
+  (Δ^j with `diff=`), with the first-difference and pooled OLS estimates and the G matrix
+  linking them (docs/design/hazard.md). The sample is built per shard, partitioned by unit,
+  and cached as a derived dataset; rows with gaps or missing lags are dropped and counted by
+  reason in the result and the record. Extra FEs are absorbed, with a warning and counts where
+  that is not equivalent to differencing their dummies (units that move between cells, or
+  FEs constant within a unit). `i()` terms: each level's dummy is instrumented by its own
+  difference, and levels absent from the sample are reported as `excluded_levels`.
+  Reproduces Farbmacher and Tauchmann's Table 3 (Brown and Laschever 2012) to the printed
+  digits.
 - Plan B: crossing FEs on the sparse path with several FEs nested in the partition. The
   dummy block's projection on the local FEs is a Schur complement solved per connected
   component (pseudo-inverse, so redundant local FEs are fine); round 2 demeans the dummy
   terms with all local FEs. `crossing_fe="auto"` takes it when a crossing FE exceeds
   `max_dummy_levels` (below that, several local FEs keep dense dummies); `"sparse"` forces it.
-  Equal to dense dummies and pyfixest (OLS, 2SLS, LIML; iid, hetero, CRV1).
-- Plan C: `crossing_fe="iterate"`, crossing-FE coefficients by Jacobi-preconditioned conjugate
-  gradient across shards (one map/reduce round per step, levels x columns blocks only;
-  `shard_matvec`), then OLS by Frisch-Waugh-Lovell and the sparse path's round 2. Works with
-  any number of local FEs, including none. `"auto"` takes it above 30,000 crossing-FE dummies
-  or for a crossing FE above `max_dummy_levels` with no FE nested in the partition. Options
-  `iter_tol`, `iter_maxiter`; `Result.options["crossing_cg"]` has the steps. Workers keep shard
-  codes between steps (`DFEOLS_ITER_CACHE_GB`). Not for IV yet.
-- `DaskExecutor` scatters large arrays that every task takes (once per round, broadcast)
-  instead of sending them with each task.
-- `dfeols config init --from-slurm [--profile NAME] [--write] [--sinfo F --scontrol F]`: draft a
-  profile's node classes from `sinfo` and `scontrol show partition` (on a login node, or saved
-  output). Partitions over the same nodes, limits and policy collapse to one class; each
-  records partition, total nodes, nodes in service, cores, memory (MaxMemPerNode or the
-  smallest node), interconnect and CPU features, and its walltime when it differs from the
-  default partition's. GPU, node-minimum, short-limit, down or hidden partitions, and mixed
-  partitions that only span other classes, get `use = false` with the reason. Prints by
-  default; `--write` appends to the config and never replaces a profile. Profiles now load
-  `max_walltime`, `billing`, `scratch_purge_days` and `nodes`.
-- Instrumental variables: `fit(ds, "y ~ x | fe | d1 + d2 ~ z1 + z2")` (fixest syntax) with
-  `estimator="2sls"` (default) or `"liml"`, and `fuller=` for Fuller's modified LIML; any number
-  of endogenous regressors; iid, hetero and CRV1 standard errors on every FE path (local,
-  dense and sparse crossing FEs), from the same two passes over the shards. First-stage
-  statistics per endogenous regressor (`Result.iv["first_stage"]`): coefficients on the
-  instruments with their vcovs, R², partial R², the iid partial F, the Wald F under each vcov
-  and, with one endogenous regressor, the Montiel Olea-Pflueger effective F. Per outcome,
-  Sargan's overidentification test and, for LIML, the Anderson-Rubin tests
-  (`Result.outcomes[y]["overid"]`). Records claim `iv/0.1`. Tested against pyfixest, fixest,
-  linearmodels and a direct LIML computation (docs/design/iv.md).
-- dfeols writes its own `estimation` records: `fit(..., record=True)` (the default) writes
-  `<workdir>/result.estimation.json` (one record per response) with provenance (software and
-  git commit, environment, invocation, SLURM job fields, Dask workers), the sample by drop
-  reason, canonical term names, each vcov's small-sample correction and the `dfeols/0.1`
-  extension; `publication=` and `redact=` options. `Result.to_estimation(y)` and
-  `Result.write_estimation(path)` build them later. Every record is validated against
-  estimation-format's schemas in `tests/test_record.py`.
-- `prep` records the source's sha256 (per file, plus a manifest hash for several files) or, for
-  an in-memory frame, a content hash, and its row count, in `dfeols_meta.json` (`checksum=False`
-  skips it). Records carry it, and `extensions.dfeols.row_key` identifies the exact sample with
-  a partition-independent hash of the rows used (`dfeols.rowhash`).
-- dfeols depends on [estimation-format](https://github.com/estimation-format/estimation) for
-  reading, writing, validating and redacting `estimation` records and for the format's schemas
-  and profile catalog (including `dfeols/0.1`), pinned to a commit until it is on PyPI;
-  `dfeols estimation {validate,redact,digest}` runs its command line. `dfeols.estimation`
-  re-exports it, deprecated. `redact=True` also removes the dfeols block's identifying fields
-  from records that don't claim `dfeols/0.1` (fits without FEs).
+- Plan C: `crossing_fe="iterate"`, crossing-FE coefficients by preconditioned conjugate
+  gradient, then OLS or IV by Frisch-Waugh-Lovell and the sparse path's round 2. Works with
+  any number of local FEs, including none; `"auto"` takes it above 30,000 crossing-FE dummies
+  or for a crossing FE above `max_dummy_levels` with no FE nested in the partition.
+  - In level space (the default): round 1 also returns each shard's part of A = D~'W D~,
+    summed on the workers in a tree as parts finish (only the root reaches the coordinator),
+    and CG runs on the coordinator with no further passes. The preconditioner follows the
+    connected components of each crossing FE's block: exact pinned or pseudo-inverse solves
+    (AP-sweep, i.e. symmetric block Gauss-Seidel, when all are exact), AMG V-cycles on large
+    sparse components (optional `dfeols[amg]`, pyamg), else Jacobi. DB1B 2005Q2-Q3 (10.3M
+    rows): 7 steps in 0.14 s against 16 passes in 23 s.
+  - Above `level_space_gb` (default a quarter of the coordinator's memory) each CG step is a
+    pass over the shards, summed in a tree on the workers, and dfeols warns that convergence
+    may be slow (`crossing.SlowConvergenceWarning`), naming what made A too large. The CG
+    state is kept after each step (`cg_checkpoint.npz`), so a fit stopped by walltime or
+    `iter_maxiter` resumes where it stopped.
+  - Options `iter_tol` (default 1e-8), `iter_maxiter`, `level_space_gb`, `crossing_precond`;
+    `Result.options["crossing_cg"]` gives the mode, preconditioner, steps and sizes, and the
+    progress line shows the step, the residual and roughly how many steps are left.
+- `fit(..., cells=True)`: the fit from per-cell sums (`dfeols.cells`). One pass groups each
+  shard's rows by every FE key and the cluster; the coordinator drops singletons on the
+  cells, absorbs the FE with most levels by group means and solves the others with plan C's
+  level-space CG, then b by Frisch-Waugh-Lovell, RSS and CRV1 scores from the cell moments.
+  Exact. OLS; vcov CRV1 (one-way) and iid. DB1B 2005Q2-Q3: 10.3M rows in 329k cells, 9.8 s
+  against 27 s (level space) and 43 s (dense solve); b within 1e-11.
 
-### Fixed
-- `fit(cells=True)` sized each worker as if it built the dense dummy columns, which the cell
-  path never does: on OSCER (job 35624287) the full DB1B fit was refused at "4601 GB" per
-  2M-row shard. The cell path now has its own estimate (`cells_worker_gb`: key, value and
-  deviation columns per row, then per cell the means and cross-products).
-  It also no longer warns that the coordinator needs a dense dummy Gram matrix (job 35625881:
-  "248 GB"); the full fit's coordinator peaked at 19.4 GB on 21.2M cells.
-- `dfeols plan` crashed when a candidate key shared a column with an FE (key `carrier`, FE
-  `carrier^route`), and counted NaN outcomes in its sample, which fit drops; its rows and
-  levels are now fit's sample.
-- Distributed prep into many shards ran workers out of memory: each encode task wrote every
-  shard it touched at once, and Polars keeps a buffer per open output (one 69M-row DB1B file
-  into 3,434 shards peaked at 23.5 GB; OSCER's 24 GB workers died). The two-level shuffle
-  through buckets now also starts when one task would open more than `max_open` (128) shards:
-  5.8 GB, and no slower.
-- The progress line during plan C's CG showed `round2 0/342 shards`, with a 6-second ETA,
-  for the whole CG run (90 minutes on the full DB1B market table). It now shows the step
-  (`cg57`), the residual against the tolerance, and roughly how many steps are left, and the
-  total ETA includes them. Steps no longer log a line each.
-- A regressor that a crossing FE absorbs (e.g. a carrier x quarter variable with a
-  `carrier^time` FE) is now dropped as collinear, as fixest does. The dense and sparse paths
-  tested columns in Z order, so they kept the regressor, dropped a dummy, and reported a
-  coefficient that is not identified. Dummies are now tested first (OLS and IV).
-- Plan C no longer keeps a regressor the crossing FEs absorb when its diagonal net of them is a
-  tiny positive rounding error (the CI failure of
-  `test_regressor_absorbed_by_crossing_fe_is_dropped[iterate]`): `collinear_keep(ref_diag=)`
-  tests each pivot against the column's diagonal before the crossing FEs.
+#### Interactive sessions
+- `dfeols.Session` and `dfeols session start|serve|status|where|fit|refit|add-variable|export|persist|replay|stop`
+  (docs/design/sessions.md). A manager demeans the declared variables on the session's FEs
+  once (local FEs, dense crossing FEs, or plan C with one CG solve for every declared
+  variable), keeps the residualised columns per shard and their Gram matrix, and fits models
+  from request files: b and iid SEs with no pass over the data, hetero and CRV1 (one- or
+  two-way) with one. OLS and IV (2SLS, LIML, Fuller) share the pass. Results equal
+  `dfeols.fit` on the same sample.
+- Created variables: `Session.add_variable(name, expression)` and `add_variables({...})`, on
+  raw columns of the prepared data (`feat * posts`, `log(wt)`, `posts > 0`,
+  `ifelse(x > 0, y, 0)`; R's `^`, `&`, `|`, `!` with R's precedence), parsed by `dfeols.expr`
+  through an allowlist of `ast` nodes (no eval). Each is computed on the session's rows,
+  demeaned like a declared variable in one batch, kept by digest and reused by later sessions
+  on the same demeaned data. `i()` terms in session models become indicator columns created
+  the same way.
+- `Session.refit(model, vcov=, cluster=)`: an earlier model with another vcov or cluster, one
+  pass for the new SEs (none for iid).
+- Exports through the estrec table tool: `s.export([m1, m2], "table2.tex")` writes the table
+  (.tex, .md, .html, .csv, .txt, .doc), its `estrec-table/0.1` spec and the session
+  collection, so it renders again from the files alone. `dfeols session replay` runs a
+  session collection's events again and compares each model with its record.
+- The R client, package `dfeols` in `r/`: `attach_session`, `fit`, `refit`, `add_variable`,
+  `export_table`, ...; it speaks the request files (no network path to the compute node, no
+  Python) and returns estrec records, so `tidy()`, `glance()` and modelsummary work. Equal to
+  the Python client to 1e-12 against a local session.
+- Estimates and progress: the demeaning's estimate from earlier runs and its live progress
+  while a client waits; per model, an estimate before it runs (a range until a pass has been
+  measured, from this session's first pass and earlier sessions' in `passes.jsonl`) and its
+  progress lines, with how many of the requested workers are running yet.
+- Demeaned data under `<scratch>/demeaned/<dataset>/<key>/`, reused by a session with the
+  same inputs; `Session.persist()` keeps a `--no-persist` session's. `dfeols demeaned list`
+  (size, when written, purge date from `scratch_purge_days`, sessions using each key, created
+  variables) and `dfeols demeaned rm <key>` (asks, refuses while in use). `session start`
+  checks free space on scratch against the size estimate; profile settings
+  `demeaned_storage` and `demeaned_confirm_gb` make it ask before a large write.
+
+#### Planning
+- `dfeols plan SOURCE --formula ... [--cluster] [--partition K1,K2] [--profile P] [--workers N] [--specs N] [--json]`
+  and `dfeols.plan()`: probe a specification before prep (docs/design/planner.md). Streaming
+  aggregates on the source report rows and missingness, levels and singletons of every FE,
+  nesting of each FE and the cluster in each candidate key, the largest groups, and per key
+  the solver path fit would take, shard count, and worker and coordinator memory against a
+  profile (on plan C, A's size against the level-space budget). It recommends the key that
+  makes the crossing system smallest among keys whose largest group is within `target_rows`
+  or half a worker's share of the rows, and `fit(cells=True)` from 2 rows per cell. DB1B's
+  683M-row market table probes in 72 s with 8.8 GB.
+- Wall-time estimates: every `fit` appends its path, rows, columns, passes, seconds and
+  workers to `<scratch>/timings/fits.jsonl` (`dfeols.timings`), and `dfeols plan` gives each
+  key a wall-time range from earlier runs on the same path. It recommends demeaning first in
+  a session for plan C, for estimates over half the profile's `max_walltime`, or with
+  `--specs N` > 1, else one job. `fit` warns when another formula was fitted on the same
+  data, FEs and weights before, naming the session command.
+- `prep(partition="auto", formula=...)` shards by the key `dfeols plan` recommends and keeps
+  the report in `dfeols_meta.json`.
+- `dfeols config init --from-slurm [--profile NAME] [--exclude PATTERN] [--write] [--sinfo F --scontrol F]`:
+  draft a profile's node classes from `sinfo` and `scontrol show partition`. Partitions over
+  the same nodes, limits and policy collapse to one class with its partition, nodes (total
+  and in service), cores (capped at MaxCPUsPerNode), memory (MaxMemPerNode or the smallest
+  node), interconnect, CPU features and walltime. GPU, node-minimum, short-limit, down,
+  hidden, redundant and `--exclude`d partitions get `use = false` with the reason. Prints by
+  default; `--write` appends and never replaces a profile. Profiles load `max_walltime`,
+  `billing`, `scratch_purge_days` and `nodes`.
+
+#### Records
+- Every fit writes an [estrec](https://github.com/estrec/estrec) record
+  (`fit(record=True)`, the default): `<workdir>/result.estrec.json`, one per response
+  (`result.<y>.estrec.json`), with provenance (software and git commit, environment,
+  invocation, scheduler fields, workers), the sample by drop reason, canonical term names,
+  each vcov's small-sample correction, IV's first-stage and overidentification tests, and
+  the `dfeols/0.1` extension; `publication=` and `redact=`. `Result.write_estimation(path)`
+  writes one later. Validated against estrec's schemas in the tests.
+- Disclosure levels (estrec spec 4.9): `fit(record_level=, purpose=)`, from the argument,
+  else the profile's `record_level`, else `$DFEOLS_RECORD_LEVEL`, else 4: no scheduler,
+  timing, hosts or package list unless `record_level = 5`. Purpose profiles such as
+  `dcas/0.1`.
+- `prep` records the source's sha256 (per file, plus a manifest hash) or an in-memory frame's
+  content hash, and its row count (`checksum=False` skips it); records carry it, and
+  `extensions.dfeols.row_key` identifies the exact sample with a partition-independent hash
+  of the rows used (`dfeols.rowhash`).
+- `dfeols.write_collection(fits, path, kind=...)`: several fits as one
+  `estrec-collection/0.1` file; sessions write theirs (`kind: "session"`, with events).
+- `dfeols estrec {validate,redact,digest}` runs estrec's command line; extra
+  `dfeols[estrec]` adds JSON Schema validation.
+
+#### Execution
+- Workers run several shards at once when they fit: a worker job gets a Dask thread per core
+  and declares its memory as the resource MEMORY, and each fit task asks for its memory
+  estimate, so a 24 GB, 4-core worker runs up to 4 tasks together. Prep tasks and plan C's
+  round 1 in level space still take a whole worker.
+- `DaskExecutor` scatters large arrays that every task takes once per round instead of
+  sending them with each task. Executors take an optional `reduce` (`executors.Reduce`).
+- `fit` logs which dfeols runs: version, commit (uncommitted changes flagged) and the folder
+  it was imported from.
 
 ### Changed
-- `dfeols plan` is faster on large tables: DB1B's 683M rows probe in 72 s, not 475 s
-  (OSCER: 468 s), with the same report and peak memory (8.8 GB). Every column set inside
-  the cell key (every FE and cluster column) is answered from one scan's rows per cell,
-  not one scan per set (16 scans of ~5 s; a HyperLogLog estimate first, so a table that
-  does not compress keeps the scans). A's sizes take each key's (group, level) pairs from
-  those cells, once per FE, and are shared by keys with the same groups and crossing FEs;
-  a lower bound (each level's row of A holds at least its largest group's levels) settles
-  keys far over the budget without counting; the count itself covers A's upper triangle,
-  busiest levels first, by cheap row slices. The cells line's coordinator memory is now 6
-  copies of the cells, not 3 (OSCER job 35625881: 19.4 GB on 21.2M cells against 10.2
-  estimated). Top groups are listed largest first.
-- `r2_within` (and `tss`) take y net of all the FEs, as fixest does, on every path. With a
-  crossing FE they were net of the FEs local to the partition only, so the same spec reported
-  a different within R2 under a different partition. Fits whose FEs all cross the partition
-  report `r2_within` instead of `r2` (about the mean).
-- The estimation-format pin is cdda37c (the dfeols/0.1 profile's `crossing_iterate` and
-  `cells`).
-- Plan C's default `iter_tol` is 1e-8 (was 1e-10, next to the floating-point floor; Ted,
-  2026-10-28).
-- Records of plan C fits describe its numerics (CG, preconditioner, mode, steps, tolerance);
-  they said one-pass demeaning, Cholesky and not iterative. Their `absorption` method
-  `crossing_iterate` needs estimation-format at 20a640c or later (the dfeols/0.1 profile's enum).
-- Crossing FEs above `max_dummy_levels` are fitted when the spec has exactly one FE nested in
-  the partition (the sparse path); `max_dummy_levels` now limits only dense dummy columns.
-  Above 2,000 levels shards return their Gram matrix sparse, and collinearity detection is
-  blocked (same columns kept; a fit with 3,000 dummies went from 26 s to 2 s). Coordinator
-  memory is logged above 4 GB (about 11 GB at 15,000 levels).
-- Singletons are dropped over all fixed effects, iterating across shards, as fixest and reghdfe
-  do (previously only in the FE local to the partition, so N could depend on the partition).
+- Singletons are dropped over all fixed effects, iterating across shards, as fixest and
+  reghdfe do (previously only in the FE local to the partition, so N could depend on the
+  partition).
+- `r2_within` (and `tss`) take y net of all the FEs, as fixest does, on every path; with a
+  crossing FE they were net of the local FEs only. Fits whose FEs all cross the partition
+  report `r2_within` instead of `r2`.
+- Crossing FEs above `max_dummy_levels` are fitted on the sparse path when the spec has one
+  FE nested in the partition; `max_dummy_levels` now limits only dense dummy columns. Above
+  2,000 levels shards return their Gram matrix sparse (a fit with 3,000 dummies went from
+  26 s to 2 s).
+- The NumPy demeaning fallback sweeps all columns at once with Irons-Tuck acceleration
+  (419 s to 97 s on a 500k-row panel with 1% movers). pyfixest's compiled demeaner stays
+  the default and a requirement.
+- `prep` uses a two-level shuffle through buckets when one encode task would open more than
+  `max_open` (128) shards (one 69M-row file into 3,434 shards peaked at 23.5 GB; now 5.8 GB).
 
 ### Fixed
-- Folder locks: two jobs that found the same stale lock could both take it, the second
-  deleting the first's fresh lock (seen on OSCER, where the second job then crashed). A
-  takeover now sets the stale lock aside and deletes it only if it is the file it judged
-  stale, and new locks are hard-linked into place fully written, so a fresh lock is never
-  read as empty.
-- `dfeols submit SCRIPT.py --profile P -- ARGS` passed `--profile P` to the script instead of
-  using it; options after the script and before `--` now go to `submit`.
+- Regressors an FE absorbs are dropped as collinear, as fixest does, on every path. A column
+  constant within a local FE is rounding noise net of it, and was kept (b ~ 4e11, plan C and
+  the cell path failed to converge); a regressor a crossing FE absorbs (carrier x quarter
+  with `carrier^time`) was kept while a dummy was dropped. Each column is now tested against
+  its sum of squares before the FEs, dummies first (OLS and IV).
+- IV round 2 builds one equation's scores at a time, and none for exact first stages: with
+  ~100 endogenous regressors all at once was tens of GB per shard (EVE order-days: now
+  3:54 and 7.9 GB for 2.6M rows).
+- An empty estimation sample (every row a singleton, missing or zero-weight) is a ValueError
+  saying where the rows went; `fit` returned an empty result.
 - The sparse path crashed with two or more crossing FEs (offsets applied twice).
+- Folder locks: two jobs that found the same stale lock could both take it, the second
+  deleting the first's fresh lock. A takeover now sets the stale lock aside and deletes it
+  only if it is the file it judged stale, and new locks are hard-linked into place fully
+  written.
+- `dfeols submit SCRIPT.py --profile P -- ARGS` passed `--profile P` to the script; options
+  after the script and before `--` now go to `submit`.
 - `executor(profile, **overrides)` ignored the overrides when given a Profile.
+- `fit(cells=True)` sized workers as if it built dense dummy columns (the full DB1B fit was
+  refused at "4601 GB" per shard) and warned of a dense coordinator Gram matrix it never
+  builds.
+- `dfeols plan` crashed when a candidate key shared a column with an FE, and counted NaN
+  outcomes that fit drops.
+- Plan C's progress line showed round 2 with a 6-second ETA for the whole CG run.
+- The CLI exits 141 without a traceback when its output is piped into `head`.
+- Distributed prep with a relative `shard_dir` wrote its pieces under the PartitionBy base
+  folder (Polars 2 reads relative paths against it) and failed its row check; task roots
+  are now absolute.
 
 ## [0.7.0] - 2026-10-22
 
@@ -515,5 +404,6 @@ Fixes from the first 1e10 attempts on OSCER (a snapshot, not published).
 - Two-round map/reduce fit, Serial and Dask executors, ETA, agreement with
   pyfixest.
 
-[Unreleased]: https://github.com/jemather/dfeols/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/jemather/dfeols/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/jemather/dfeols/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/jemather/dfeols/releases/tag/v0.7.0

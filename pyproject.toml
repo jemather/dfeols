@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "dfeols"
 dynamic = ["version"]
-description = "Sharded, elastic high-dimensional fixed-effects OLS for HPC clusters (Slurm, PBS, SGE, LSF)"
+description = "Sharded, elastic high-dimensional fixed-effects OLS and IV for HPC clusters (Slurm, PBS, SGE, LSF)"
 readme = "README.md"
 license = "GPL-3.0-or-later"
 license-files = ["LICENSE"]

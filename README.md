@@ -4,17 +4,25 @@
 [![License: GPL v3+](https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg)](https://github.com/jemather/dfeols/blob/main/LICENSE)
 ![Python 3.10–3.14](https://img.shields.io/badge/python-3.10%E2%80%933.14-blue.svg)
 
-**Sharded, elastic high-dimensional fixed-effects OLS for HPC clusters.**
+**Sharded, elastic high-dimensional fixed-effects OLS and IV for HPC clusters.**
 
 dfeols estimates `y ~ x | fe1 + fe2^fe3` models on datasets far larger than
-one machine's memory (benchmarked at 1e9 rows) by splitting the data into
+one machine's memory (benchmarked at 1e10 rows) by splitting the data into
 shards and running two map/reduce rounds over a pool of cluster workers that
 grows as the scheduler starts them.
 
-- **General HDFE.** fixest-style formulas; iid, heteroskedasticity-robust
-  (HC1) or one-way cluster-robust (CRV1) SEs; analytic weights; several
-  outcomes on a common sample. Unit × time panels are the typical case;
-  nothing is tied to a particular dataset.
+- **General HDFE.** fixest-style formulas; OLS and IV (2SLS, LIML, Fuller);
+  iid, heteroskedasticity-robust (HC1), and one- or two-way cluster-robust
+  (CRV1) SEs; analytic weights; several outcomes on a common sample. FEs that
+  cross the shards are absorbed directly or, when they have too many levels,
+  by conjugate gradient across shards. Unit × time panels are the typical
+  case; nothing is tied to a particular dataset.
+- **Interactive sessions.** Absorb a set of FEs once, then fit many models
+  against it from Python, the command line or R: coefficients and iid SEs with
+  no pass over the data, robust SEs with one.
+- **Plans before it runs.** `dfeols plan` probes a specification before prep:
+  which shard key to use, the solver path, worker and coordinator memory, and
+  a wall-time range from earlier runs, with advice on one job vs a session.
 - **Any scheduler.** Site details (scheduler, queue, modules, scratch, worker
   sizes, network interface) live in one profile file. Slurm, PBS/Torque,
   SGE/UGE, LSF and local are supported through dask-jobqueue.
@@ -24,6 +32,9 @@ grows as the scheduler starts them.
 - **Exact.** Matches pyfixest/fixest to about 1e-8 or better (coefficients,
   SEs, small-sample corrections), and recovers known parameters on synthetic
   data.
+- **Records.** Every fit writes an [estrec](https://github.com/estrec/estrec)
+  record: estimates, sample, small-sample corrections and provenance, in a
+  form other tools and journals can check.
 
 See **[HOWTO.md](https://github.com/jemather/dfeols/blob/main/HOWTO.md)** for the step-by-step workflow with a real
 dataset, and [docs/ARCHITECTURE.md](https://github.com/jemather/dfeols/blob/main/docs/ARCHITECTURE.md) for how it works
@@ -32,10 +43,15 @@ inside.
 ## Install
 
 ```bash
-pip install "dfeols[dask]"          # [dask] adds dask, distributed and dask-jobqueue
+pip install "dfeols[dask] @ git+https://github.com/jemather/dfeols@v0.8.0"
 # development version:
 pip install "dfeols[dask] @ git+https://github.com/jemather/dfeols"
 ```
+
+`[dask]` adds dask, distributed and dask-jobqueue. dfeols is not on PyPI
+until its dependency [estrec](https://github.com/estrec/estrec) is (see
+[Limitations](#limitations)). The R session client installs from `r/` (see
+[its README](https://github.com/jemather/dfeols/blob/main/r/README.md)).
 
 Python 3.10–3.14. Linux HPC clusters are the target; CI also runs the test
 suite on macOS for local use. Without `[dask]`,
@@ -56,7 +72,12 @@ ds = dfeols.prep("/data/panel/*.parquet", shard_dir="/scratch/me/shards/panel",
 res = dfeols.fit(ds, "y ~ x1 + x2:i(size) | unit + time", cluster="state", executor=ex)
 print(res.summary())
 res.tidy(); res.coef(); res.vcov()
+
+iv = dfeols.fit(ds, "y ~ x1 | unit + time | d ~ z", cluster="unit+state", executor=ex)
 ```
+
+`cluster="unit+state"` clusters two ways (Cameron, Gelbach and Miller), as
+pyfixest's `vcov={"CRV1": "unit+state"}`.
 
 On a cluster, run that script as a batch job so it outlives your login
 session:
@@ -77,11 +98,15 @@ never span shards. Each FE is classified:
 |---|---|
 | nested in it (e.g. `unit` when partitioning by unit) | demeaned inside each shard: exactly for one or two such FEs, iterated for three or more |
 | crossing (e.g. `time`; `carrier^quarter`) | dummy regressors; with one local FE (or several, when a crossing FE exceeds `max_dummy_levels`) their cross-products come from per-level sums, so no dummy columns are built, and the coordinator solves the dummy block (practical to about 30,000 levels; 15,000 take under a minute and 11 GB). Otherwise dense dummy columns, up to `max_dummy_levels`=2000 |
-| crossing, many levels | not yet supported (see [Limitations](#limitations)) |
+| crossing, many levels (above 30,000 dummies, or above `max_dummy_levels` with no local FE) | conjugate gradient across shards (`crossing_fe="iterate"`, "plan C"): A = D'WD is built in round 1 and solved on the coordinator when it fits `level_space_gb`, else one map/reduce round per step |
 
 A fit is two map/reduce rounds over shards: (1) demean and return `X'WX`,
 `X'Wy`; solve for β on the coordinator; (2) residuals and the sandwich meat.
 Worker memory scales with shard size, not total N.
+
+When the data compress (many rows per combination of every FE and the
+cluster), `fit(..., cells=True)` instead fits exactly from per-cell sums in
+one pass (10.3M DB1B rows in 329,000 cells: 9.8 s against 27 s).
 
 **Choosing the partition key.** Pick the key the most FEs are nested in.
 Unit × time: partition by unit (unit FE local, time as dummies). With
@@ -91,7 +116,7 @@ local). The same model under different keys gives identical results
 
 ### Formula syntax
 
-`y1 + y2 ~ x + a:b + i(c) + x:i(c) + x:i(c, ref=0) | fe1 + fe2^fe3`
+`y1 + y2 ~ x + a:b + i(c) + x:i(c) + x:i(c, ref=0) | fe1 + fe2^fe3 | d1 + d2 ~ z1 + z2`
 
 | Term | Meaning | Stata | fixest/pyfixest |
 |---|---|---|---|
@@ -101,14 +126,86 @@ local). The same model under different keys gives identical results
 | `x:i(c)` | x times every level of c | `c.x#ibn.c` | `i(c, x)` |
 | `x:i(c, ref=0)` | same, level 0 dropped | `c.x#i.c` | `i(c, x, ref=0)` |
 | `\| a + b^d` | absorbed FEs | `absorb(a b#d)` | `\| a + b^d` |
+| `\| d ~ z` | IV: d endogenous, z excluded instruments | `ivreghdfe y (d = z), absorb(...)` | `\| d ~ z` |
 
 Multiple outcomes share one pass and a common sample (rows missing any
-outcome are dropped).
+outcome are dropped). IV takes `estimator="2sls"` (default) or `"liml"`, and
+`fuller=` for Fuller's modified LIML; `Result.iv["first_stage"]` has each
+endogenous regressor's first stage (partial R², F tests under each vcov, the
+effective F with one endogenous regressor), and each outcome the
+overidentification tests.
+
+## Planning a run
+
+```bash
+dfeols plan /data/panel/*.parquet --formula "y ~ x | unit + time" --cluster state \
+    --profile mycluster
+```
+
+`dfeols plan` (or `dfeols.plan()`) reads the source with streaming aggregates
+before anything is written: rows and missingness, levels and singletons of
+each FE, which FEs and the cluster each candidate shard key nests, the largest
+groups, and for each key the solver path `fit` would take, shard count and
+worker and coordinator memory, checked against the profile. It recommends a
+key (`prep(partition="auto", formula=...)` takes it), and `fit(cells=True)`
+where the data compress.
+
+It also estimates **wall time**. Every `fit` appends its path, size, passes,
+seconds and workers to `<scratch>/timings/fits.jsonl`, and the report gives
+each key a range from earlier runs on the same path. It then advises one job,
+or demeaning first in a session: for plan C, when the estimate is over half
+the profile's `max_walltime`, or when `--specs N` says several specifications
+will share the FEs.
+
+## Interactive sessions
+
+A session demeans a set of declared variables on its FEs once, keeps the
+residualised columns on scratch, and fits models from them while it runs:
+coefficients and iid SEs from their Gram matrix with no pass over the data,
+hetero and CRV1 (one- or two-way) with one pass. Results equal `dfeols.fit`
+on the same sample.
+
+```bash
+dfeols session start flags --data /scratch/me/shards/db1b --fe "route + carrier^quarter" \
+    --vars lfare,hhi,dist,entrants --cluster route,carrier --hours 12 --profile mycluster --wait
+dfeols session fit flags "lfare ~ hhi + dist" --cluster route+carrier
+```
+
+```python
+s = dfeols.Session.attach("flags", profile="mycluster")
+s.add_variable("hhi_x_dist", "hhi * dist")           # from raw columns, demeaned like the rest
+m1 = s.fit("lfare ~ hhi + hhi_x_dist + i(qtr)", cluster="route")
+m2 = s.refit(m1, vcov="hetero")                      # b again; one pass for the SEs
+m3 = s.fit("lfare ~ dist | hhi ~ entrants", estimator="liml")
+s.export([m1, m2, m3], "table2.tex")                 # through estrec's table tool
+```
+
+The **R client** in [`r/`](https://github.com/jemather/dfeols/tree/main/r)
+attaches to the same session through its request files (no network path to the
+compute node, no Python) and returns each model as an estrec record, so
+`tidy()`, `glance()` and modelsummary work. Each model's record carries the
+session id, and the session's collection logs every model, created variable
+and setting change, so `dfeols session replay` can run them again. Demeaned
+data are kept under `<scratch>/demeaned/` and reused by a later session with
+the same inputs; `dfeols demeaned list` and `dfeols demeaned rm` manage them.
+Design: [docs/design/sessions.md](https://github.com/jemather/dfeols/blob/main/docs/design/sessions.md).
+
+## Discrete-time hazard models
+
+`dfeols.lpm_dthazard(ds, "exit ~ x1 + i(age) | fe", unit="id", time="t")`
+fits a discrete-time hazard linear probability model (an absorbing outcome) by
+the Farbmacher and Tauchmann (2021) IV: levels instrumented by their
+differences, with the first-difference and pooled OLS estimates for
+comparison. It builds the sample per shard (gaps and missing lags dropped and
+counted), absorbs extra FEs with a warning where that is not equivalent, and
+reproduces the published estimates of Farbmacher and Tauchmann's Table 3.
+Design: [docs/design/hazard.md](https://github.com/jemather/dfeols/blob/main/docs/design/hazard.md).
 
 ## Site profiles (any HPC system)
 
 ```bash
 dfeols config init          # writes ~/.config/dfeols/config.toml; edit [profiles.cluster]
+dfeols config init --from-slurm --profile mysite --exclude 'interactive*'   # draft node classes
 dfeols config show          # resolved profile
 dfeols check                # start one worker through the scheduler, run a task
 dfeols jobscript "python run.py"         # print the coordinator job script
@@ -124,6 +221,15 @@ SGE, LSF, local; untested on real systems). Select one with
 `dfeols.executor("name")`, `--profile name`, `$DFEOLS_PROFILE`, or `default`.
 Walltimes are written once in any form (`12:00:00`, `2-00:00:00`) and
 converted to each scheduler's native format.
+
+On Slurm, `dfeols config init --from-slurm` drafts a profile's node classes
+from `sinfo` and `scontrol show partition` (run on a login node, or from saved
+output with `--sinfo`/`--scontrol`): partitions over the same nodes, limits
+and policy collapse to one class, with cores (capped at `MaxCPUsPerNode`),
+memory, walltime and nodes in service. GPU, down, hidden or redundant
+partitions, and any matching `--exclude PATTERN`, are drafted with
+`use = false` and the reason. It prints the draft; `--write` appends it to the
+config and never replaces a profile.
 
 Built-in site workarounds: on configless Slurm sites, a `/proc` `SLURM_CONF`
 inside a job breaks `sbatch` and is cleared; the coordinator listens on a
@@ -198,11 +304,17 @@ python -m dfeols.bench --rows 1e7 1e8 --profile cluster
 
 | Test file | Checks |
 |---|---|
-| `test_vs_pyfixest.py` | equals pyfixest on hard FE structures, weights, multiple outcomes, clusters crossing shards, only-dummy FEs, Dask executor |
+| `test_vs_pyfixest.py` | equals pyfixest on hard FE structures, weights, multiple outcomes, clusters crossing shards, only-dummy FEs, every crossing-FE path including `cells=True`, Dask executor |
 | `test_panel.py` | generic panel: each spec finds what it should, unit- vs group-partitioned fits identical, group clustering matters, weights, pyfixest agreement |
 | `test_influencer.py` | influencer DGP: recovery, negative controls, shard and executor invariance, Monte Carlo coverage (`-m slow`) |
 | `test_prep_distributed.py` | distributed prep equals single-node prep under every strategy (merge, two-level shuffle, hash ids, range shards, multi-column keys) |
 | `test_demean.py` | compiled and NumPy demeaning agree; exact two-way equals iteration |
+| `test_iv.py`, `test_iv_iterate.py` | 2SLS, LIML and Fuller equal pyfixest, fixest, linearmodels and ivreghdfe on every FE path |
+| `test_crossing.py` | plan C's pieces: block pseudo-inverses, the bounded sum of the shards' parts of A, the preconditioner choice, CG |
+| `test_fit_twoway.py` | two-way clustering equals pyfixest for each kind of cluster pair on every crossing-FE path, and for IV |
+| `test_session*.py` | session models equal `fit` (OLS, IV, created variables, `i()`, two-way clustering); the R client equals Python |
+| `test_dthazard.py` | `lpm_dthazard` equals hand-built IV samples fitted with pyfixest and `fit` |
+| `test_record.py` | every record and collection validates against estrec's schemas |
 
 In a Monte Carlo of 40 replications, CRV1 intervals covered the truth 95.8%
 of the time (iid: 85.8%, as expected with clustered errors).
@@ -231,14 +343,17 @@ of the time (iid: 85.8%, as expected with clustered errors).
 
 ## Limitations
 
-- **Not yet supported:** two-way clustering, heterogeneous slopes (`fe[x]`), and
-  IV with crossing FEs that need the iterative path.
-- **Crossing FEs too large for a direct solve** (more than 30,000 dummies, or above
-  `max_dummy_levels` with no FE nested in the partition) are absorbed by conjugate
-  gradient across shards (`crossing_fe="iterate"`, plan C): one extra map/reduce round
-  per step, with only levels x columns blocks moving. Steps depend on how well the FEs
-  connect; `iter_tol` (1e-10) and `iter_maxiter` (5,000) control it, and the step count
-  is in `Result.options["crossing_cg"]`. `dfeols plan` shows which path a key gets.
+- **Not yet supported:** heterogeneous slopes (`fe[x]`) and clustering on three or
+  more variables.
+- **The cell path** (`cells=True`) is OLS only, with iid or one-way CRV1 SEs.
+- **`i()` in sessions** takes numeric variables only, and not interacted with another
+  variable (`x:i(c)`); create the interaction with `add_variable` instead. `fit` takes both.
+- **Plan C's speed depends on the FE graph.** Crossing FEs too large for a direct solve
+  are absorbed by conjugate gradient; when A does not fit `level_space_gb` each step is
+  a pass over the shards, and steps grow as the FEs connect less well. `iter_tol` (1e-8)
+  and `iter_maxiter` (5,000) control it, the step count is in
+  `Result.options["crossing_cg"]`, and a fit stopped by walltime resumes from its
+  checkpoint. `dfeols plan` shows which path a key gets and warns before a slow one.
 - **Two local FEs plus crossing FEs** build dense dummy columns up to
   `max_dummy_levels` (a warning is logged above 300 columns; `crossing_fe="sparse"`
   avoids them). Above it they take the sparse path, which needs each connected
@@ -250,7 +365,11 @@ of the time (iid: 85.8%, as expected with clustered errors).
 - **The ETA cannot foresee workers that have not started yet.** The "if all
   workers start" figure is a lower bound.
 - **Schedulers:** Slurm is tested on a real cluster; the PBS, SGE and LSF
-  templates are not yet.
+  templates are not yet. A fit's workers are single-node jobs; there is no
+  multi-node launch.
+- **The R client** is tested against a local session, not yet on a cluster.
+- **Not on PyPI yet:** dfeols depends on estrec by a pinned git commit until estrec
+  is on PyPI; install from GitHub.
 - **Upstream APIs:** dfeols uses polars' `PartitionBy` sink (marked unstable
   by polars) and pyfixest's compiled demeaner (a private API, with a NumPy
   fallback). Supported version ranges are pinned in `pyproject.toml` and a
