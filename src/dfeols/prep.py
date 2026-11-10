@@ -298,7 +298,7 @@ def _auto_partition(source, formula, fixed_effects, clusters, target_rows, execu
         raise ValueError('partition="auto" needs formula=, the specification the shards are for')
     f = parse(formula)
     have = {"^".join(fe_components(x)) for x in fixed_effects}
-    missing = ["^".join(fe_components(x)) for x in f.fes if "^".join(fe_components(x)) not in have]
+    missing = [t.base for t in f.fe_terms if t.base not in have]
     if missing:
         raise ValueError(f"the formula's FEs {missing} are not in fixed_effects")
     if len(clusters) > 1:

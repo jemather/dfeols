@@ -155,20 +155,37 @@ def build_plan(
     executor=None,
 ) -> Plan:
     f = parse(formula)
-    local, glob = [], []
-    for name in f.fes:
-        key = _norm(name)
+    local, glob, slopes = [], [], {}
+    for t in f.fe_terms:
+        key = t.base
         if key not in ds.fes:
-            raise KeyError(f"FE {name!r} was not encoded by prep(); available: {list(ds.fes)}")
+            raise KeyError(f"FE {t.base!r} was not encoded by prep(); available: {list(ds.fes)}")
         m = ds.fes[key]
         if m["nested_in_partition"]:
             local.append((key, m["column"]))
         else:
             glob.append((key, m["column"], m["n_levels"]))
+        if t.slopes:
+            slopes[key] = (t.slopes, t.intercept)
     # Dense dummies cost rows x levels x 8 bytes per shard; the sparse path keeps
     # per-level sums instead, so only it takes crossing FEs above max_dummy_levels
     big = [(k, L) for k, _, L in glob if L > max_dummy_levels]
-    n_dum = sum(L - 1 for *_, L in glob)
+    n_dum = _n_dummy(local, glob, slopes)
+    if slopes and glob:
+        # varying slopes with crossing FEs: dense dummies only (Decisions 2026-11-10); the
+        # per-level sums of the sparse path and plan C have no slope columns yet
+        if crossing_fe in ("sparse", "iterate"):
+            raise NotImplementedError(
+                f"crossing_fe={crossing_fe!r} does not take varying slopes (fe[x]) yet; "
+                "with slopes, crossing FEs are dense dummies (crossing_fe='dense' or 'auto')"
+            )
+        if big:
+            raise NotImplementedError(
+                f"FE {big[0][0]!r} crosses partitions and has {big[0][1]:,} levels (> "
+                f"max_dummy_levels={max_dummy_levels}); with varying slopes (fe[x]) in the "
+                "model, crossing FEs are dense dummies only, so they must fit max_dummy_levels"
+            )
+        crossing_fe = "dense"
     iterate = _use_iterate(crossing_fe, local, glob, bool(big), n_dum)
     if big and not iterate and not (local and crossing_fe != "dense"):
         big_fe, big_L = big[0]
@@ -208,7 +225,7 @@ def build_plan(
     colnames = plan_columns(f, cat_levels, has_fe=bool(local or glob))
     # the spec's raw columns (FE and cluster components, not their codes) identify its rows
     key = set(f.variables) | ({weights} if weights else set())
-    for name in [*f.fes, *names_cl]:
+    for name in [*(t.base for t in f.fe_terms), *names_cl]:
         key.update(fe_components(name))
     row_key_cols = tuple(sorted(c for c in key if c in ds.columns))
     spec_id = f.fingerprint(cluster=cluster_key(cluster), weights=weights, singletons=drop_singletons)
@@ -224,7 +241,7 @@ def build_plan(
         weights=weights,
         cat_levels=cat_levels,
         colnames=colnames,
-        n_dummy=sum(L - 1 for *_, L in glob) + (1 if glob and not local else 0),
+        n_dummy=n_dum,
         vcov_types=vcov,
         cache_dir=str(cache_dir) if cache_dir else None,
         drop_singletons=drop_singletons,
@@ -235,7 +252,20 @@ def build_plan(
         row_key_cols=row_key_cols,
         endog_names=term_names(f.endog, cat_levels),
         inst_names=term_names(f.instruments, cat_levels),
+        slopes=slopes,
     )
+
+
+def _n_dummy(local, glob, slopes) -> int:
+    """Columns of the dummy block: each crossing FE's dummies (first level dropped; none for a
+    slope-only FE), each slope variable times every level, and the hidden constant when no
+    local FE has an intercept (worker.Plan.const_hidden)."""
+    n = 0
+    for key, _, L in glob:
+        v, ic = slopes.get(key, ((), True))
+        n += (L - 1 if ic else 0) + L * len(v)
+    has_fe = bool(local or glob)
+    return n + int(has_fe and not any(slopes.get(k, ((), True))[1] for k, _ in local))
 
 
 def _build_text() -> str:
@@ -428,6 +458,10 @@ def _references(plan: Plan, acc: dict) -> None:
     if not plan.local_fes:
         acc["ref"] = acc["ref_y"] = None
         return
+    if not any(plan.local_intercept):  # slope-only local FEs (fe[[x]]) keep the mean
+        acc["ref"] = np.asarray(acc["raw_s2"], np.float64)
+        acc["ref_y"] = np.asarray(acc["sum_wy2"], np.float64)
+        return
     acc["ref"] = reference_ss(acc["raw_s1"], acc["raw_s2"], acc["sumw"])
     acc["ref_y"] = reference_ss(acc["sum_wy"], acc["sum_wy2"], acc["sumw"])
 
@@ -569,7 +603,7 @@ def _tss(plan: Plan, acc: dict, m: int, collin_tol: float) -> np.ndarray:
     if not (plan.local_fes or plan.global_fes):
         return acc["sum_wy2"][:m] - acc["sum_wy"][:m] ** 2 / acc["sumw"]
     yy = np.diag(acc["YtY"])[:m].copy()
-    if not plan.global_fes:
+    if not plan.n_dummy:  # (with slope-only local FEs, the dummy block is the hidden constant)
         return yy
     k = plan.k_x
     if plan.crossing_iterate:
@@ -998,7 +1032,7 @@ def fit(
         # exact one-pass demean is cheaper than writing and re-reading
         # n x k doubles on shared scratch.
         n_local = sum(
-            1 for f in probe.fes if ds.fes.get("^".join(fe_components(f)), {}).get("nested_in_partition")
+            1 for t in probe.fe_terms if ds.fes.get(t.base, {}).get("nested_in_partition")
         )
         cache = n_local >= 3 or (n_local == 2 and fe_method == "iterate")
     cache = bool(cache)
@@ -1039,6 +1073,8 @@ def fit(
             )
         if not (plan.local_fes or plan.global_fes):
             raise ValueError("cells=True needs at least one fixed effect")
+        if plan.slopes:
+            raise NotImplementedError("cells=True does not take varying slopes (fe[x]); use cells=False")
         plan.crossing_iterate = plan.sparse_global = False
         plan.cache_dir = None
         cache = False
@@ -1119,7 +1155,7 @@ def fit(
         peak = {"rss": cres["peak_rss"]}
         timing = cres["timing"]
     else:
-        if plan.drop_singletons and plan.global_fes:
+        if plan.drop_singletons and any(plan.fe_intercept(n) for n, *_ in plan.global_fes):
             plan.keep_dir = str(wd / "singletons")
             sing = _drop_singletons(plan, ds, executor, prog, rows, label)
         prog.add_stage("round1", rows)
@@ -1362,7 +1398,7 @@ def fit(
             for i in range(len(plan.global_fes)):
                 pres = acc["gpresent"][i]
                 nested2.append(bool((c2["glo"][i][pres] == c2["ghi"][i][pres]).all()))
-            fe_names = [n for n, _ in plan.local_fes] + [n for n, *_ in plan.global_fes]
+            fe_names = plan.fe_labels
             a_, b_ = plan.cluster[0], plan.cluster2[0]
             two_way = {
                 "n_clusters": {a_: G, b_: G2},
@@ -1376,6 +1412,12 @@ def fit(
 
         out = {}
         has_fe = bool(plan.local_fes or plan.global_fes)
+        # varying slopes: per FE its slope count and intercept, for the df (vcov.df_k)
+        fe_shape = (
+            ([len(plan.fe_slopes(n)) for n in plan.fe_keys], [plan.fe_intercept(n) for n in plan.fe_keys])
+            if plan.slopes
+            else ()
+        )
         tss_all = _tss(plan, acc, len(f.depvars), collin_tol)
         meat_idx = sol.meat_idx
         overid = _iv.overid(sol, acc2["rss"], N) if f.iv else None
@@ -1383,13 +1425,13 @@ def fit(
             b = sol.coef[:, j]
             bread_use = sol.bread[j]
             V = {}
-            dfk_plain = _df_k(k, fe_levels, None)
+            dfk_plain = _df_k(k, fe_levels, None, *fe_shape)
             if "iid" in plan.vcov_types:
                 V["iid"] = (vcov_iid(bread_use, acc2["rss"][j], N, dfk_plain), N - dfk_plain)
             if "hetero" in plan.vcov_types:
                 V["hetero"] = (vcov_hetero(bread_use, acc2["hetero"][j], N, dfk_plain), N - dfk_plain)
             if "CRV1" in plan.vcov_types:
-                dfk_cl = _df_k(k, fe_levels, nested)
+                dfk_cl = _df_k(k, fe_levels, nested, *fe_shape)
                 V["CRV1"] = (vcov_crv1(bread_use, acc2["crv"][j], N, dfk_cl, G), G - 1)
             V = {t: (v[np.ix_(meat_idx, meat_idx)], df) for t, (v, df) in V.items()}
             tss = tss_all[j]
@@ -1410,7 +1452,7 @@ def fit(
                 "fuller": fuller,
                 "endogenous": list(plan.endog_names),
                 "instruments": list(plan.inst_names),
-                "first_stage": _iv.first_stage(plan, sol, acc, acc2, N, fe_levels, nested, G),
+                "first_stage": _iv.first_stage(plan, sol, acc, acc2, N, fe_levels, nested, G, fe_shape),
             }
         coefnames = sol.coefnames
         timing = {
@@ -1494,13 +1536,14 @@ def fit(
     if two_way:  # as sessions write it: each count, and which clusters each nested FE is in
         run.update(two_way)
     run["n_local_fes"] = len(plan.local_fes)
+    labels = dict(zip(plan.fe_keys, plan.fe_labels))
     run["absorption"] = {
         **{
-            n: {"method": "cells" if cells else "local", "nested_in_partition": True}
+            labels[n]: {"method": "cells" if cells else "local", "nested_in_partition": True}
             for n, _ in plan.local_fes
         },
         **{
-            n: {
+            labels[n]: {
                 "method": "cells"
                 if cells
                 else "crossing_iterate"
@@ -1523,7 +1566,7 @@ def fit(
         N_dropped=acc["rows_in"] - N,
         G=G,
         cluster="+".join(c[0] for c in (plan.cluster, plan.cluster2) if c) or None,
-        fe=[n for n, _ in plan.local_fes] + [n for n, *_ in plan.global_fes],
+        fe=plan.fe_labels,
         fe_levels=fe_levels,
         collinear=dropped,
         vcov_default=plan.vcov_types[0],

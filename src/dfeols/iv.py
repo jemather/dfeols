@@ -267,7 +267,7 @@ def _layout(plan):
     return _global_layout(plan)
 
 
-def first_stage(plan, sol: Solution, acc: dict, acc2: dict, N: int, fe_levels, nested, G) -> dict:
+def first_stage(plan, sol: Solution, acc: dict, acc2: dict, N: int, fe_levels, nested, G, fe_shape=()) -> dict:
     """`structures.first_stage` contents per endogenous regressor: coefficients on the
     excluded instruments with their vcovs, R², partial R², F statistics (iid partial F,
     Wald F under each vcov), and the effective F with one endogenous regressor."""
@@ -276,7 +276,7 @@ def first_stage(plan, sol: Solution, acc: dict, acc2: dict, N: int, fe_levels, n
     q, k_fs = fs["q"], fs["k_fs"]
     bread = fs["bread_z2"]
     Q = np.linalg.inv(bread)
-    dfk = df_k(k_fs, fe_levels, None)
+    dfk = df_k(k_fs, fe_levels, None, *fe_shape)
     # round 2 computed first-stage meats only for the non-exact first stages, in this order
     meat_at = {
         l: i for i, l in enumerate((sol.lin.get("fs") or {}).get("index", range(len(plan.endog_names))))
@@ -314,7 +314,7 @@ def first_stage(plan, sol: Solution, acc: dict, acc2: dict, N: int, fe_levels, n
             elif t == "hetero":
                 V, df2 = vcov_hetero(bread, acc2["fs_hetero"][meat_at[l]], N, dfk), N - dfk
             else:
-                dfk_cl = df_k(k_fs, fe_levels, nested)
+                dfk_cl = df_k(k_fs, fe_levels, nested, *fe_shape)
                 V, df2 = vcov_crv1(bread, acc2["fs_crv"][meat_at[l]], N, dfk_cl, G), G - 1
             entry["vcov"][t] = V.tolist()
             if t != "iid":

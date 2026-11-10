@@ -117,6 +117,111 @@ def exact_two_way(
     return xA - _one_way(gamma[b], a, nA, w)
 
 
+class _MeanProjector:
+    """z less its weighted group means (one plain FE), all columns at once."""
+
+    def __init__(self, f: np.ndarray, w: np.ndarray):
+        import scipy.sparse as sp
+
+        n = len(f)
+        ng = int(f.max()) + 1 if n else 0
+        self.f = f
+        self.Dt = sp.csr_matrix((w, (f, np.arange(n))), shape=(ng, n))
+        sw = np.bincount(f, weights=w, minlength=ng)
+        self.isw = np.divide(1.0, sw, out=np.zeros(ng), where=sw > 0)
+
+    def __call__(self, z: np.ndarray) -> np.ndarray:
+        return z - ((self.Dt @ z) * self.isw[:, None])[self.f]
+
+
+class SlopeProjector:
+    """Residuals of z on an FE with varying slopes (fe[x], fe[[x]]): per group g, the weighted
+    least-squares residual of every column on [1, S_g] (with the FE's intercept) or [S_g]
+    (slopes only). Exact, no iteration.
+
+    With an intercept, z and S are first centered within groups, so each group's s x s Gram
+    is of centered slopes. A singular Gram (x constant in a group, or one row) takes the
+    pseudo-inverse, which leaves the residuals of dropping the unidentified slope."""
+
+    def __init__(self, f: np.ndarray, S: np.ndarray, w: np.ndarray, intercept: bool, rtol: float = 1e-12):
+        import scipy.sparse as sp
+
+        n, s = S.shape
+        ng = int(f.max()) + 1 if n else 0
+        self.f, self.intercept = f, intercept
+        self.mean = _MeanProjector(f, w) if intercept else None
+        raw = np.zeros((ng, s))
+        for a in range(s):
+            raw[:, a] = np.bincount(f, weights=w * S[:, a] * S[:, a], minlength=ng)
+        if intercept:
+            S = self.mean(S)
+        self.S = S
+        Sw = S * w[:, None]
+        G = np.zeros((ng, s, s))
+        for a in range(s):
+            for b in range(a, s):
+                G[:, a, b] = G[:, b, a] = np.bincount(f, weights=Sw[:, a] * S[:, b], minlength=ng)
+        self.M = [sp.csr_matrix((Sw[:, a], (f, np.arange(n))), shape=(ng, n)) for a in range(s)]
+        # pseudo-inverse per group: eigenvalues at most rtol of the group's raw (uncentered)
+        # sum of squares are rounding noise
+        ev, V = np.linalg.eigh(G)
+        cut = rtol * np.maximum(raw.max(1), ev.max(1, initial=0.0))[:, None]
+        inv = np.divide(1.0, ev, out=np.zeros_like(ev), where=ev > cut)
+        self.Ginv = np.einsum("gij,gj,gkj->gik", V, inv, V)
+
+    def __call__(self, z: np.ndarray) -> np.ndarray:
+        if self.intercept:
+            z = self.mean(z)
+        else:
+            z = np.array(z, dtype=np.float64)
+        if not len(z):
+            return z
+        R = np.stack([M @ z for M in self.M], axis=1)  # ng x s x k: S'W z per group
+        C = np.einsum("gab,gbk->gak", self.Ginv, R)
+        for a in range(self.S.shape[1]):
+            z = z - self.S[:, a : a + 1] * C[self.f, a, :]
+        return z
+
+
+def _iterate(x, ops, tol, maxiter):
+    """Alternating projections over the projectors `ops` (callables z -> residual), accelerated
+    as fixest does (Irons-Tuck): every iteration takes two sweeps, extrapolates along the last
+    step per column, and sweeps once more; it stops when that last sweep moves no entry by
+    more than tol."""
+
+    def sweep(z):
+        for op in ops:
+            z = op(z)
+        return z
+
+    x0 = np.array(x, dtype=np.float64)
+    for _ in range(maxiter):
+        x1 = sweep(x0)
+        x2 = sweep(x1)
+        d1 = x2 - x1
+        d2 = d1 - (x1 - x0)
+        den = (d2 * d2).sum(0)
+        c = np.divide((d1 * d2).sum(0), den, out=np.zeros_like(den), where=den > 0)
+        x3 = sweep(x2 - c * d1)
+        if np.max(np.abs(x3 - x2), initial=0.0) < tol:
+            return x3, True
+        x0 = x3
+    return x0, False
+
+
+def demean_slopes(x, dense, slopes, intercept, w, tol, maxiter):
+    """Demeaning with varying slopes: one FE exactly (SlopeProjector), several by alternating
+    projections, each plain FE's projection a group-mean sweep (pyfixest's compiled core has
+    no slopes)."""
+    ops = [
+        SlopeProjector(g, S, w, ic) if S is not None else _MeanProjector(g, w)
+        for (g, _), S, ic in zip(dense, slopes, intercept)
+    ]
+    if len(ops) == 1:
+        return ops[0](x), True
+    return _iterate(x, ops, tol, maxiter)
+
+
 def _map_numpy(x, flist, w, tol, maxiter):
     """Alternating projections in NumPy/SciPy (fallback when pyfixest's compiled demeaner is
     unavailable), accelerated as fixest does (Irons-Tuck).
@@ -165,6 +270,8 @@ def demean(
     tol: float = 1e-10,
     maxiter: int = 100_000,
     method: str = "auto",
+    slopes: list | None = None,
+    intercept: list[bool] | None = None,
 ) -> tuple[np.ndarray, bool]:
     """Demean the columns of x by the given FEs.
 
@@ -172,10 +279,16 @@ def demean(
     "auto"/"exact"), falling back to alternating projections if a connected
     component is too large or numerically singular. Three or more, or
     method="iterate": alternating projections (pyfixest's compiled core).
+
+    `slopes` (one entry per FE: None, or an (n, s) array of its slope variables) and
+    `intercept` (per FE; False for fe[[x]]) give FEs with varying slopes: demean_slopes.
     """
     if not fe_codes:
         return x, True
     dense = [densify(c) for c in fe_codes]
+    if slopes is not None and any(S is not None for S in slopes):
+        ic = list(intercept) if intercept is not None else [True] * len(dense)
+        return demean_slopes(x, dense, slopes, ic, w, tol, maxiter)
     if len(dense) == 1:
         g, ng = dense[0]
         return _one_way(x, g.astype(np.int64), ng, w), True

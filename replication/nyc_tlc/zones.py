@@ -99,7 +99,8 @@ def one(src: Path, dst: Path, zones_path: Path) -> dict:
     rec = {"source": str(src), "source_bytes": src.stat().st_size, "source_mtime": src.stat().st_mtime,
            "rows": df.height}  # fmt: skip
     cols = {}
-    for end, lon, lat in [("pu", "pickup_longitude", "pickup_latitude"), ("do", "dropoff_longitude", "dropoff_latitude")]:
+    ends = [("pu", "pickup_longitude", "pickup_latitude"), ("do", "dropoff_longitude", "dropoff_latitude")]
+    for end, lon, lat in ends:
         z, c = assign(df[lon].to_numpy().astype(float), df[lat].to_numpy().astype(float), ids, tree, tf)
         cols[f"{end}_location_id"] = pl.Series(z).replace(0, None).cast(pl.Int16)
         rec |= {f"{end}_{k}": v for k, v in c.items()}
@@ -146,9 +147,12 @@ def main(argv=None) -> int:
         for f in as_completed(futs):
             try:
                 r = f.result()
-                print(f"{futs[f].name}: {r['rows']:,} rows, pu {r['pu_matched']:,} do {r['do_matched']:,} "
-                      f"zoned, boundary {r['pu_boundary']}/{r['do_boundary']}, {r['seconds']} s", flush=True)  # fmt: skip
-            except Exception as e:  # noqa: BLE001
+                print(
+                    f"{futs[f].name}: {r['rows']:,} rows, pu {r['pu_matched']:,} do {r['do_matched']:,}"
+                    f" zoned, boundary {r['pu_boundary']}/{r['do_boundary']}, {r['seconds']} s",
+                    flush=True,
+                )
+            except Exception as e:
                 failed += 1
                 print(f"FAILED {futs[f].name}: {e!r}", flush=True)
     print(f"{len(todo) - failed} written, {failed} failed", flush=True)

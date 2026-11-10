@@ -29,6 +29,42 @@ from dataclasses import dataclass
 
 _I_RE = re.compile(r"^i\(\s*([A-Za-z_][\w]*)\s*(?:,\s*ref\s*=\s*([^)]+?)\s*)?\)$")
 _NAME_RE = re.compile(r"^[A-Za-z_][\w]*$")
+# an FE term: fe, a^b, fe[x], fe[[x]] (slope only), fe[x, z]
+_FE_RE = re.compile(r"^([^\[\]]+?)\s*(?:\[\[([^\[\]]*)\]\]|\[([^\[\]]*)\])?$")
+
+
+@dataclass(frozen=True)
+class FETerm:
+    """One FE term of the formula: the FE (`base`, as prep() encoded it, e.g. "unit" or
+    "a^b") and its varying slopes. `intercept` is False for fe[[x]] (slopes only)."""
+
+    base: str
+    slopes: tuple[str, ...] = ()
+    intercept: bool = True
+
+    @property
+    def label(self) -> str:
+        if not self.slopes:
+            return self.base
+        inner = ", ".join(self.slopes)
+        return f"{self.base}[{inner}]" if self.intercept else f"{self.base}[[{inner}]]"
+
+
+def split_fe(term: str) -> FETerm:
+    """Parse an FE term (fixest syntax): fe, a^b, fe[x], fe[[x]], fe[x, z], a^b[x]."""
+    m = _FE_RE.match(term.strip())
+    if not m:
+        raise ValueError(f"Bad fixed-effect term {term!r}")
+    base = "^".join(fe_components(m.group(1)))
+    inner = m.group(2) if m.group(2) is not None else m.group(3)
+    if inner is None:
+        return FETerm(base)
+    slopes = tuple(v.strip() for v in inner.split(","))
+    if not slopes or not all(_NAME_RE.match(v) for v in slopes):
+        raise ValueError(f"Bad slope variables in fixed-effect term {term!r}")
+    if len(set(slopes)) < len(slopes):
+        raise ValueError(f"A slope variable appears twice in {term!r}")
+    return FETerm(base, slopes, intercept=m.group(2) is None)
 
 
 @dataclass(frozen=True)
@@ -51,7 +87,7 @@ class Formula:
     text: str
     depvars: tuple[str, ...]
     terms: tuple[Term, ...]
-    fes: tuple[str, ...]  # FE names, e.g. "spell", "id_a^week"
+    fes: tuple[str, ...]  # FE terms, e.g. "spell", "id_a^week", "unit[t]" (split_fe)
     intercept: bool = True
     endog: tuple[Term, ...] = ()  # IV: endogenous regressors
     instruments: tuple[Term, ...] = ()  # IV: excluded instruments
@@ -61,13 +97,21 @@ class Formula:
         return bool(self.endog)
 
     @property
+    def fe_terms(self) -> tuple[FETerm, ...]:
+        return tuple(split_fe(x) for x in self.fes)
+
+    @property
+    def slope_vars(self) -> set[str]:
+        return {v for t in self.fe_terms for v in t.slopes}
+
+    @property
     def variables(self) -> set[str]:
         out = set(self.depvars)
         for t in (*self.terms, *self.endog, *self.instruments):
             out.update(t.conts)
             if t.cat:
                 out.add(t.cat)
-        return out
+        return out | self.slope_vars
 
     def fingerprint(self, **extra) -> str:
         s = repr((self.text, sorted(extra.items())))
@@ -160,8 +204,13 @@ def parse(text: str) -> Formula:
     rhs = parts[0]
     fe_part = parts[1] if len(parts) == 2 else ""
     fes = tuple(_split_top(fe_part, "+")) if fe_part.strip() else ()
-    for f in fes:
-        fe_components(f)
+    bases = [split_fe(x).base for x in fes]
+    twice = sorted({b for b in bases if bases.count(b) > 1})
+    if twice:
+        raise ValueError(
+            f"Fixed effect {twice[0]!r} appears in more than one term; write it once "
+            "(fe[x] is the FE with a slope on x)"
+        )
 
     intercept = True
     terms: list[Term] = []
@@ -199,6 +248,8 @@ def to_pyfixest(text: str) -> str:
     """Translate a dfeols formula to pyfixest syntax (for validation).
     x:i(c) -> i(c, x); x:i(c, ref=r) -> i(c, x, ref=r); i(c) -> C(c)."""
     f = parse(text)
+    if f.slope_vars:
+        raise ValueError("pyfixest has no varying slopes (fe[x]); compare with fixest instead")
 
     def term(t: Term) -> str:
         base = ":".join(t.conts)

@@ -39,6 +39,7 @@ from typing import Any
 import estrec as ef
 import numpy as np
 
+from .formula import fe_components, split_fe
 from .vcov import df_k as _df_k
 
 PROFILES = ["inference/0.1", "linear-fe/0.1", "dfeols/0.1"]
@@ -632,8 +633,14 @@ def to_estimation(
     run = r.run or {}
     k = len(r.coefnames)
     nested_cl = list(run.get("fe_nested_in_cluster") or [])
-    dfk_plain = _df_k(k, r.fe_levels, None)
-    dfk_cl = _df_k(k, r.fe_levels, nested_cl) if r.cluster else None
+    fe_terms = [split_fe(n) for n in r.fe]
+    fe_shape = (
+        ([len(t.slopes) for t in fe_terms], [t.intercept for t in fe_terms])
+        if any(t.slopes for t in fe_terms)
+        else ()
+    )
+    dfk_plain = _df_k(k, r.fe_levels, None, *fe_shape)
+    dfk_cl = _df_k(k, r.fe_levels, nested_cl, *fe_shape) if r.cluster else None
     df_resid = r.N - dfk_plain
     n_sing = int(r.N_dropped) if opts.get("drop_singletons", True) else 0
     has_fe = bool(r.fe)
@@ -774,6 +781,12 @@ def to_estimation(
             "kind": "object",
             "name": name,
             "levels": int(L),
+            # varying slopes: the FE's components, then its slope variables (fe[x])
+            **(
+                {"components": [*fe_components(fe_terms[i].base), *fe_terms[i].slopes]}
+                if fe_terms[i].slopes
+                else {}
+            ),
             **(
                 {"nested_in": (run.get("fe_nested_in") or {}).get(name) or _clusters(r)}
                 if r.cluster and i < len(nested_cl) and nested_cl[i]
@@ -788,9 +801,18 @@ def to_estimation(
         for i, (name, L) in enumerate(zip(r.fe, r.fe_levels))
     ]
     n_local = sum(1 for a in absorption.values() if a.get("method") == "local")
+    local_slopes = any(
+        split_fe(n).slopes for n, a in absorption.items() if a.get("method") == "local"
+    )
     numerics: dict[str, Any] = {
         "kind": "object",
-        "algorithm": {0: "none", 1: "one-pass group demeaning"}.get(
+        "algorithm": (
+            "one-pass group projection on each group's varying slopes"
+            if n_local == 1
+            else "alternating projections (NumPy, Irons-Tuck), varying slopes projected per group"
+        )
+        if local_slopes
+        else {0: "none", 1: "one-pass group demeaning"}.get(
             n_local,
             "exact two-way (Schur complement), alternating projections as fallback"
             if n_local == 2 and opts.get("fe_method", "auto") != "iterate"

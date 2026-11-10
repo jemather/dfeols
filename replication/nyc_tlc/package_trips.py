@@ -47,7 +47,8 @@ FE3 = "pu_location_id^date_hour + do_location_id^date_hour + pu_location_id^do_l
 SVC = 'i(service, ref="yellow")'
 SPECS = [  # (name, formula, services it runs on)
     ("duration", f"log_time ~ {SVC} | {FE}", None),
-    ("fare", f"log_fare ~ log_miles + log_time + {SVC} | {FE}", ["yellow", "green", "HV0002", "HV0003", "HV0004", "HV0005"]),
+    ("fare", f"log_fare ~ log_miles + log_time + {SVC} | {FE}",
+     ["yellow", "green", "HV0002", "HV0003", "HV0004", "HV0005"]),
     ("duration, pair x year", f"log_time ~ {SVC} | {FE3}", None),
 ]  # fmt: skip
 CLUSTER = "od_pair"
@@ -99,7 +100,8 @@ def common(lf: pl.LazyFrame, service: str) -> pl.LazyFrame:
 
 def zones_ok() -> pl.Expr:
     return pl.all_horizontal(
-        pl.col(c).is_not_null() & ~pl.col(c).is_in(UNKNOWN_ZONES) for c in ["pu_location_id", "do_location_id"]
+        pl.col(c).is_not_null() & ~pl.col(c).is_in(UNKNOWN_ZONES)
+        for c in ["pu_location_id", "do_location_id"]
     )
 
 
@@ -114,7 +116,7 @@ def keep() -> pl.Expr:
 
 def frame(lf: pl.LazyFrame) -> pl.LazyFrame:
     """Sample rules and model columns on the common schema."""
-    pos_log = lambda c: pl.when(pl.col(c) > 0).then(pl.col(c).cast(pl.Float64).log())  # noqa: E731
+    pos_log = lambda c: pl.when(pl.col(c) > 0).then(pl.col(c).cast(pl.Float64).log())
     return lf.filter(keep()).with_columns(
         pickup_date=pl.col("pickup_datetime").dt.date(),
         year=pl.col("pickup_datetime").dt.year().cast(pl.Int16),
@@ -251,8 +253,11 @@ def main(argv=None) -> int:
         need = [y, "log_time"] + (["log_miles"] if "log_miles" in f else [])
         pdf = day.select(cols).drop_nulls(need).collect().to_pandas()
         r = fit_reference(pdf, f, CLUSTER)
-        r["subsample"] = f"pickup_date in {[str(x) for x in days]}" + (f", service in {svcs}" if svcs else "") + \
-            ", rows with a model variable null dropped"  # fmt: skip
+        r["subsample"] = (
+            f"pickup_date in {[str(x) for x in days]}"
+            + (f", service in {svcs}" if svcs else "")
+            + ", rows with a model variable null dropped"
+        )
         r["spec"] = name
         fits.append(r)
         print(name, r["nobs"], r["coef"], flush=True)
@@ -294,7 +299,7 @@ def write_readme(d, name, commit, files, rows, parts, sample_counts, levels, by_
         "log_miles": "log trip_miles; null for fhv",
         "log_fare": "log fare; null for fhv",
     }
-    esc = lambda s: s.replace("|", chr(92) + "|")  # noqa: E731
+    esc = lambda s: s.replace("|", chr(92) + "|")
     fit_rows = "\n".join(
         f"| {r['spec']} | `{esc(r['formula'])}` | {r['subsample'].split(', rows')[0]} | {r['nobs']:,} | "
         + ", ".join(f"{t} {v[0]:.6f} ({v[1]:.6f})" for t, v in r["coef"].items())
@@ -303,7 +308,8 @@ def write_readme(d, name, commit, files, rows, parts, sample_counts, levels, by_
     )
     lv = "\n".join(f"| {k} | {v:,} |" for k, v in levels.items())
     pt = "\n".join(
-        f"| {p['file']} | {p['rows']:,} | {p['pickup_date_min']} to {p['pickup_date_max']} | {p['bytes'] / 1e9:.2f} GB |"
+        f"| {p['file']} | {p['rows']:,} | {p['pickup_date_min']} to {p['pickup_date_max']} | "
+        f"{p['bytes'] / 1e9:.2f} GB |"
         for p in parts
     )
     sv = "\n".join(

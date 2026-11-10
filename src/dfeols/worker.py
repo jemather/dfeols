@@ -93,11 +93,51 @@ class Plan:
     # in the partition key; round 2 adds its meat and the intersection's (prefixes c1_, c2_)
     cluster2: tuple[str, str, int] | None = None
     cluster2_local: bool = False
+    # varying slopes (fe[x], fe[[x]]): FE key -> (slope variables, whether the FE keeps its
+    # intercept); FEs not in it are plain
+    slopes: dict[str, tuple[tuple[str, ...], bool]] = field(default_factory=dict)
 
     @property
     def k_x(self) -> int:
         """Regressor-block columns before the crossing-FE dummies."""
         return len(self.colnames) + len(self.inst_names)
+
+    def fe_slopes(self, key: str) -> tuple[str, ...]:
+        return self.slopes.get(key, ((), True))[0]
+
+    def fe_intercept(self, key: str) -> bool:
+        return self.slopes.get(key, ((), True))[1]
+
+    @property
+    def fe_keys(self) -> list[str]:
+        """Every FE, local then crossing (the order of fe_levels and nesting flags)."""
+        return [n for n, _ in self.local_fes] + [n for n, *_ in self.global_fes]
+
+    @property
+    def fe_labels(self) -> list[str]:
+        """Each FE as the formula names it, with its slopes: unit, unit[t], unit[[t]]."""
+        from .formula import FETerm
+
+        return [FETerm(k, self.fe_slopes(k), self.fe_intercept(k)).label for k in self.fe_keys]
+
+    @property
+    def local_intercept(self) -> list[bool]:
+        return [self.fe_intercept(n) for n, _ in self.local_fes]
+
+    @property
+    def const_hidden(self) -> bool:
+        """A constant column after the dummies, not reported: with FEs but none local with an
+        intercept, it stands in for the crossing dummies' dropped first levels, or (slope-only
+        FEs, as fixest) for the intercept the slopes leave in the model."""
+        return bool(self.local_fes or self.global_fes) and not any(self.local_intercept)
+
+    def local_slope_columns(self, df) -> list:
+        """Per local FE, its slope variables as an (n, s) array, or None for a plain FE."""
+        out = []
+        for name, _ in self.local_fes:
+            v = self.fe_slopes(name)
+            out.append(np.column_stack([df[c].to_numpy().astype(np.float64) for c in v]) if v else None)
+        return out
 
 
 def plan_columns(f: Formula, cat_levels: dict[str, list], has_fe: bool):
@@ -242,8 +282,9 @@ def shard_singletons(plan: Plan, shard_id: int, files: list[str], gcount, first:
     df = _load(plan, files)  # the same rows round 1 sees (listwise deletion included)
     n0 = df.height
     keep = np.ones(n0, bool) if first else np.load(_keep_path(plan, shard_id))
-    local = [densify(df[c].to_numpy())[0] for _, c in plan.local_fes]
-    glob = [(df[c].to_numpy().astype(np.int64), L) for _, c, L in plan.global_fes]
+    # only FEs with an intercept have singletons (fixest: a slope-only FE drops none)
+    local = [densify(df[c].to_numpy())[0] for n, c in plan.local_fes if plan.fe_intercept(n)]
+    glob = [(df[c].to_numpy().astype(np.int64), L) for n, c, L in plan.global_fes if plan.fe_intercept(n)]
     before = int(keep.sum())
     others = None
     if gcount is not None:
@@ -652,8 +693,9 @@ def _prepare(plan: Plan, shard_id: int, files: list[str], loaded: dict | None = 
         if not keep.all():
             df = df.filter(pl.Series(keep))
     local_codes = [densify(df[c].to_numpy())[0] for _, c in plan.local_fes]
-    if plan.drop_singletons and local_codes and not plan.keep_dir:
-        keep = drop_singletons(local_codes)
+    with_int = [c for c, ok in zip(local_codes, plan.local_intercept) if ok]
+    if plan.drop_singletons and with_int and not plan.keep_dir:
+        keep = drop_singletons(with_int)
         if not keep.all():
             df = df.filter(pl.Series(keep))
             local_codes = [densify(c[keep])[0] for c in local_codes]
@@ -716,15 +758,21 @@ def _round1_dense(plan: Plan, df, n, local_codes, w, T, raw: dict | None = None)
         cols.append(np.ones(n))
     for term in (*f.terms, *f.instruments):
         cols.extend(_term_columns(term, df, plan.cat_levels))
-    # Global (low-cardinality) FEs enter as dummies, first level dropped.
-    for _, c, L in plan.global_fes:
+    # Global (low-cardinality) FEs enter as dummies, first level dropped; then each slope
+    # variable times every level's dummy (fe[x]; all levels, as the intercept is not theirs)
+    for name, c, L in plan.global_fes:
         codes = df[c].to_numpy().astype(np.int64)
-        D = np.zeros((n, L - 1))
-        m = codes > 0
-        D[np.nonzero(m)[0], codes[m] - 1] = 1.0
-        cols.append(D)
-    if plan.global_fes and not plan.local_fes:
-        cols.append(np.ones(n))  # hidden constant: the dummies' dropped level
+        if plan.fe_intercept(name):
+            D = np.zeros((n, L - 1))
+            m = codes > 0
+            D[np.nonzero(m)[0], codes[m] - 1] = 1.0
+            cols.append(D)
+        for v in plan.fe_slopes(name):
+            D = np.zeros((n, L))
+            D[np.arange(n), codes] = df[v].to_numpy().astype(np.float64)
+            cols.append(D)
+    if plan.const_hidden:
+        cols.append(np.ones(n))  # hidden constant: the dummies' dropped level, or slopes' intercept
     Z = np.column_stack([c if c.ndim == 2 else c[:, None] for c in cols]) if cols else np.zeros((n, 0))
     T["build"] = time.perf_counter() - t
     if raw is not None:  # before the FEs: the collinearity test's scale (_round1_sparse)
@@ -734,7 +782,11 @@ def _round1_dense(plan: Plan, df, n, local_codes, w, T, raw: dict | None = None)
     YZ = np.hstack([Y, Z])
     converged = True
     if local_codes and n:
-        YZ, converged = demean(YZ, local_codes, w, plan.fe_tol, plan.fe_maxiter, plan.fe_method)
+        YZ, converged = demean(
+            YZ, local_codes, w, plan.fe_tol, plan.fe_maxiter, plan.fe_method,
+            slopes=plan.local_slope_columns(df) if plan.slopes else None,
+            intercept=plan.local_intercept,
+        )
     m = Y.shape[1]
     Yt, Zt = YZ[:, :m], YZ[:, m:]
     T["demean"] = time.perf_counter() - t

@@ -82,7 +82,7 @@ def _candidates(f: Formula, cluster: str | None, partition) -> list[str]:
         keys = [partition] if isinstance(partition, str) else list(partition)
     else:
         keys = []
-        for name in [*f.fes, *([cluster] if cluster else [])]:
+        for name in [*(t.base for t in f.fe_terms), *([cluster] if cluster else [])]:
             keys.append(name)
             comps = fe_components(name)
             if len(comps) > 1:
@@ -241,7 +241,7 @@ def plan(
 
     t0 = time.time()
     f = _formula(formula, fe, vars)
-    fes = ["^".join(_key(x)) for x in f.fes]
+    fes = [t.base for t in f.fe_terms]
     cl = "^".join(_key(cluster)) if cluster else None
     keys = _candidates(f, cl, partition)
     if profile is not None and not hasattr(profile, "worker"):
