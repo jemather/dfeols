@@ -222,7 +222,9 @@ def build_plan(
     if missing:
         raise KeyError(f"Variables not in the prepared data: {sorted(missing)}")
 
-    colnames = plan_columns(f, cat_levels, has_fe=bool(local or glob))
+    # an FE with an intercept absorbs the constant; with slope-only FEs (fe[[x]]) the model
+    # keeps it as a reported regressor, as fixest does
+    colnames = plan_columns(f, cat_levels, has_fe=any(t.intercept for t in f.fe_terms))
     # the spec's raw columns (FE and cluster components, not their codes) identify its rows
     key = set(f.variables) | ({weights} if weights else set())
     for name in [*(t.base for t in f.fe_terms), *names_cl]:
@@ -258,14 +260,14 @@ def build_plan(
 
 def _n_dummy(local, glob, slopes) -> int:
     """Columns of the dummy block: each crossing FE's dummies (first level dropped; none for a
-    slope-only FE), each slope variable times every level, and the hidden constant when no
-    local FE has an intercept (worker.Plan.const_hidden)."""
-    n = 0
+    slope-only FE), each slope variable times every level, and the hidden constant when a
+    crossing FE has dummies and no local FE an intercept (worker.Plan.const_hidden)."""
+    n, dummies = 0, False
     for key, _, L in glob:
         v, ic = slopes.get(key, ((), True))
         n += (L - 1 if ic else 0) + L * len(v)
-    has_fe = bool(local or glob)
-    return n + int(has_fe and not any(slopes.get(k, ((), True))[1] for k, _ in local))
+        dummies = dummies or ic
+    return n + int(dummies and not any(slopes.get(k, ((), True))[1] for k, _ in local))
 
 
 def _build_text() -> str:
@@ -1031,9 +1033,7 @@ def fit(
         # expensive: iterative (3+ local FEs, or 2 with fe_method="iterate"). With one local FE the
         # exact one-pass demean is cheaper than writing and re-reading
         # n x k doubles on shared scratch.
-        n_local = sum(
-            1 for t in probe.fe_terms if ds.fes.get(t.base, {}).get("nested_in_partition")
-        )
+        n_local = sum(1 for t in probe.fe_terms if ds.fes.get(t.base, {}).get("nested_in_partition"))
         cache = n_local >= 3 or (n_local == 2 and fe_method == "iterate")
     cache = bool(cache)
     iv_opts = {"estimator": estimator, "fuller": fuller} if probe.iv else {}
@@ -1579,7 +1579,7 @@ def fit(
             "worker_seconds": sum(sum(st.done.values()) for st in prog.stages.values()),
         },
         options=options,
-        terms=_record.term_rows(f, plan.cat_levels, has_fe=bool(plan.local_fes or plan.global_fes)),
+        terms=_record.term_rows(f, plan.cat_levels, has_fe=any(t.intercept for t in f.fe_terms)),
         run=run,
         iv=iv_info,
     )

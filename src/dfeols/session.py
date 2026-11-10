@@ -185,9 +185,11 @@ class Spec:
         split = lambda v, sep: (
             [s.strip() for s in v.split(sep) if s.strip()] if isinstance(v, str) else list(v)
         )
+        fes = split(fe, "+")
+        _no_slopes(fes)
         return cls(
             data=str(Path(data).resolve()),
-            fe=split(fe, "+"),
+            fe=fes,
             variables=split(variables, ","),
             clusters=split(clusters or [], ","),
             **kw,
@@ -253,6 +255,7 @@ def _session_plan(spec: Spec, ds: Dataset, keep_dir: Path | None) -> tuple[Plan,
     if missing:
         raise KeyError(f"not in the prepared data: {sorted(missing)}")
     local, glob = [], []
+    _no_slopes(spec.fe)
     for name in spec.fe:
         key = "^".join(fe_components(name))
         if key not in ds.fes:
@@ -1139,6 +1142,7 @@ def _model_terms(formula: str, spec_fe: list[str], factors: dict | None = None):
     them)."""
     factors = factors or {}
     f = parse(formula)
+    _no_slopes(f.fes)
     if f.fes and {"^".join(fe_components(x)) for x in f.fes} != {"^".join(fe_components(x)) for x in spec_fe}:
         raise ValueError(
             f"the session's FEs are fixed ({' + '.join(spec_fe)}); leave the FE part out of the formula"
@@ -1162,6 +1166,15 @@ def _model_terms(formula: str, spec_fe: list[str], factors: dict | None = None):
         return out
 
     return f, list(f.depvars), single(f.terms), single(f.endog), single(f.instruments)
+
+
+def _no_slopes(fes) -> None:
+    """Sessions do not take varying slopes yet (fit does: docs/design/slopes.md)."""
+    bad = [x for x in fes if "[" in x]
+    if bad:
+        raise NotImplementedError(
+            f"sessions do not take varying slopes (fe[x]) yet: {', '.join(bad)}; use dfeols.fit"
+        )
 
 
 def _cluster_names(cluster) -> list[str]:

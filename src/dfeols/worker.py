@@ -126,10 +126,10 @@ class Plan:
 
     @property
     def const_hidden(self) -> bool:
-        """A constant column after the dummies, not reported: with FEs but none local with an
-        intercept, it stands in for the crossing dummies' dropped first levels, or (slope-only
-        FEs, as fixest) for the intercept the slopes leave in the model."""
-        return bool(self.local_fes or self.global_fes) and not any(self.local_intercept)
+        """A constant column after the dummies, not reported: it stands in for the crossing
+        dummies' dropped first levels when no local FE has an intercept. (With only slope-only
+        FEs, fe[[x]], the constant is a reported regressor instead, as in fixest.)"""
+        return any(self.fe_intercept(n) for n, *_ in self.global_fes) and not any(self.local_intercept)
 
     def local_slope_columns(self, df) -> list:
         """Per local FE, its slope variables as an (n, s) array, or None for a plain FE."""
@@ -783,7 +783,12 @@ def _round1_dense(plan: Plan, df, n, local_codes, w, T, raw: dict | None = None)
     converged = True
     if local_codes and n:
         YZ, converged = demean(
-            YZ, local_codes, w, plan.fe_tol, plan.fe_maxiter, plan.fe_method,
+            YZ,
+            local_codes,
+            w,
+            plan.fe_tol,
+            plan.fe_maxiter,
+            plan.fe_method,
             slopes=plan.local_slope_columns(df) if plan.slopes else None,
             intercept=plan.local_intercept,
         )

@@ -29,6 +29,11 @@ SPECS = [
     ("eng ~ feat | spell + id_a + id_f", "id_a", 100),
     # no FE nested in tbin, crossing FEs above max_dummy_levels: plan C
     ("eng ~ feat | spell + week", "tbin", 20),
+    # varying slopes: crossing FEs as dense dummies (with slope columns), hidden constant, or
+    # the constant reported when every FE is slope-only
+    ("eng ~ feat | spell[tenure] + week[[posts]]", "id_a", 2000),
+    ("eng ~ feat | spell[[tenure]] + week", "id_a", 2000),
+    ("eng ~ feat | id_a[[week]]", "id_a", 2000),
 ]
 
 

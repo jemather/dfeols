@@ -801,9 +801,7 @@ def to_estimation(
         for i, (name, L) in enumerate(zip(r.fe, r.fe_levels))
     ]
     n_local = sum(1 for a in absorption.values() if a.get("method") == "local")
-    local_slopes = any(
-        split_fe(n).slopes for n, a in absorption.items() if a.get("method") == "local"
-    )
+    local_slopes = any(split_fe(n).slopes for n, a in absorption.items() if a.get("method") == "local")
     numerics: dict[str, Any] = {
         "kind": "object",
         "algorithm": (

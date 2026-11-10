@@ -14,8 +14,8 @@ so results match a fit that absorbs them.
 
 Varying slopes (fe[x]) as fixest counts them: every slope coefficient (levels x slope
 variables) adds 1, identified or not and nested in the cluster or not; a slope-only FE
-(fe[[x]]) has no levels of its own, and with no FE intercept at all the model's constant
-adds 1.
+(fe[[x]]) has no levels of its own (with no FE intercept at all, the constant is a reported
+regressor, in k).
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ def df_k(
     if slopes is not None and (any(slopes) or (intercept is not None and not all(intercept))):
         ic = list(intercept) if intercept is not None else [True] * len(fe_levels)
         nested = fe_nested_in_cluster or [False] * len(fe_levels)
-        extra = sum(L * s for L, s in zip(fe_levels, slopes)) + int(bool(fe_levels) and not any(ic))
+        extra = sum(L * s for L, s in zip(fe_levels, slopes))
         keep = [i for i, ok in enumerate(ic) if ok]
         return extra + df_k(
             k,

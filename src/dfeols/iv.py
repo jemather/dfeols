@@ -267,7 +267,9 @@ def _layout(plan):
     return _global_layout(plan)
 
 
-def first_stage(plan, sol: Solution, acc: dict, acc2: dict, N: int, fe_levels, nested, G, fe_shape=()) -> dict:
+def first_stage(
+    plan, sol: Solution, acc: dict, acc2: dict, N: int, fe_levels, nested, G, fe_shape=()
+) -> dict:
     """`structures.first_stage` contents per endogenous regressor: coefficients on the
     excluded instruments with their vcovs, R², partial R², F statistics (iid partial F,
     Wald F under each vcov), and the effective F with one endogenous regressor."""

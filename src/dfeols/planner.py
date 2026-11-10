@@ -31,7 +31,7 @@ import scipy.sparse as sp
 
 from . import timings as _timings
 from .crossing import NNZ_BYTES, profile_budget, worker_a_budget, worker_bytes
-from .estimate import DENSE_SOLVE_LEVELS, coordinator_gb, worker_gb
+from .estimate import DENSE_SOLVE_LEVELS, _n_dummy, coordinator_gb, worker_gb
 from .formula import Formula, fe_components, parse
 
 log = logging.getLogger("dfeols")
@@ -43,6 +43,7 @@ PATHS = {
     "sparse": ("sparse path, dense solve on the coordinator", "exists"),
     "B": ("sparse path, several nested FEs projected in the shard (plan B)", "exists"),
     "C": ("conjugate gradient across shards (plan C; 2 passes + one round per step)", "exists"),
+    "none": ("varying slopes (fe[x]) with a crossing FE above max_dummy_levels", "not built"),
 }
 FIT_PATH = {
     "local": "local",
@@ -50,6 +51,7 @@ FIT_PATH = {
     "sparse": "sparse",
     "B": "sparse",
     "C": "iterate",
+    "none": None,
 }  # as fit logs it
 LEVEL_SPACE = "plan C in level space: A built in round 1, CG on the coordinator (2 passes)"
 FALLBACK = "plan C, a pass over the shards per CG step (A over the budget; may converge slowly)"
@@ -356,7 +358,8 @@ def plan(
                 k += cat_levels[t.cat] - (1 if (t.ref is not None or t.drop_first) else 0)
         return k
 
-    k_x = term_cols(f.terms) + term_cols(f.instruments) + (1 if f.intercept and not fes else 0)
+    const = f.intercept and not any(t.intercept for t in f.fe_terms)  # reported (slope-only FEs too)
+    k_x = term_cols(f.terms) + term_cols(f.instruments) + int(const)
     m = len(f.depvars) + term_cols(f.endog)
     n_cols = len(set(f.variables) | ({weights} if weights else set())) + len(specs)
 
@@ -388,16 +391,20 @@ def plan(
             cell_frame["f"] = sample.select(list(cell_cols)).unique().collect(engine="streaming")
         return cell_frame["f"].lazy()
 
+    slopes = {t.base: (t.slopes, t.intercept) for t in f.fe_terms if t.slopes}
     options = []
     for k in keys:
         local = [a for a in fes if nested(a, k)]
         glob = [a for a in fes if a not in local]
         g_levels = {a: levels[a]["levels"] for a in glob}
-        n_dummy = sum(L - 1 for L in g_levels.values()) + (1 if glob and not local else 0)
+        n_dummy = _n_dummy([(a, None) for a in local], [(a, None, L) for a, L in g_levels.items()], slopes)
         big = [a for a, L in g_levels.items() if L > max_dummy_levels]
-        # as estimate._use_iterate and _use_sparse with crossing_fe="auto"
+        # as estimate._use_iterate and _use_sparse with crossing_fe="auto"; with varying slopes
+        # crossing FEs are dense dummies only (estimate.build_plan)
         if not glob:
             path = "local"
+        elif slopes:
+            path = "none" if big else "dense"
         elif n_dummy > DENSE_SOLVE_LEVELS or (big and not local):
             path = "C"
         elif len(local) == 1:

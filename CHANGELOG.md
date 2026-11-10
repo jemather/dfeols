@@ -7,6 +7,20 @@ break the API).
 
 ## [Unreleased]
 
+### Added
+
+- Varying slopes in `fit`, in fixest's syntax: `unit[t]` (unit FE plus a slope on t per
+  unit), `unit[[t]]` (slopes only), `unit[t, z]`, `a^b[x]`. Slopes on an FE nested in the
+  partition key are projected out in the shard, exactly with one local FE and by
+  alternating projections with several. With slopes, crossing FEs are dense dummy columns
+  (each slope variable times every level), up to `max_dummy_levels`. As fixest: only FEs with
+  an intercept drop singletons, K counts every slope coefficient (also unidentified ones,
+  and with no discount for nesting in the cluster), and a model with only slope-only FEs
+  reports its intercept. Equal to fixest 0.14.2 (coefficients 1e-9, SEs 1e-8) on 19 specs:
+  local and crossing slopes, weights, iid, HC1, one- and two-way CRV1, IV
+  (`tests/test_slopes.py`). The sparse path, plan C, `cells=True` and sessions refuse
+  slopes with a message; `dfeols plan` counts slope columns and marks such keys not built.
+
 ### Changed
 
 - Worker logs go in `<scratch>/logs/<coordinator job id>/` (outside a batch job,
