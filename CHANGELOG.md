@@ -44,6 +44,11 @@ break the API).
   OSCER's record it held 80% of fits at a median width of 10x, where the old range of earlier
   runs' rates was 57x wide (up to 5,600x) and 3x off at its midpoint.
 
+- The R client is tested on a cluster: on OSCER (R 4.5.2, login node, a 40-worker session on
+  DB1B market flags) fit, refit, a created variable, two outcomes and LIML IV equal the same
+  fits from Python to 1e-10; requests wait a median 0.6 s beyond the session's work. Its
+  README and DESCRIPTION name broom, which modelsummary needs for the records.
+
 ### Fixed
 
 - The IV first-stage R² is net of every FE, as the outcomes' within R² is. It was net of the
