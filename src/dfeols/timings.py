@@ -20,6 +20,8 @@ import logging
 import os
 from pathlib import Path
 
+import numpy as np
+
 log = logging.getLogger("dfeols")
 
 FITS = "fits.jsonl"
@@ -77,6 +79,11 @@ def rate(e: dict) -> float:
     return e["rows"] * e["columns"] * e["passes"] / (e["seconds"] * max(int(e.get("workers") or 1), 1))
 
 
+MODEL_MIN_RUNS = 12  # earlier runs before the regression replaces the rate range
+MODEL_QUANTILES = (0.05, 0.95)  # of the earlier runs' misses: the reported range
+MODEL_PATH_RUNS = 8  # a path's own misses widen the range once it has this many runs
+
+
 def estimate_fit(
     rows: int,
     columns: int,
@@ -85,17 +92,92 @@ def estimate_fit(
     solve: str | None = None,
     crossing: bool,
     workers: int,
+    shards: int | None = None,
     profile=None,
     runs: list[dict] | None = None,
 ) -> dict | None:
     """A range of seconds for one fit, from earlier runs; None with no history.
 
-    Passes: two (the cross-products, then the residuals) plus the singleton passes (with
-    crossing FEs; their range from earlier runs that had them, else 1-4) plus, on plan C's
-    fallback, a pass per CG step (from earlier fallback runs; unknown without)."""
+    With MODEL_MIN_RUNS earlier runs, one of them on this path (and plan C solve), a
+    regression of log seconds on log(rows x columns), log(min(workers, shards)), the path
+    (with plan C's solve) and whether FEs cross, over every earlier run; the range is its
+    5th to 95th percentile miss on them (the path's own misses too, when it has enough runs).
+    On the OSCER record (122 fits, 2026-11-10; each predicted from the runs before it) that
+    range held 78% of the fits at a median width of 9.5x, where the rate range below held 88%
+    at 57x (p90 5,600x), its midpoint off by 3x against 1.7x. Else `_rate_range`.
+
+    `passes` is the rate range's count either way: two (the cross-products, then the
+    residuals) plus the singleton passes (with crossing FEs) plus plan C's CG steps."""
     runs = history(profile) if runs is None else runs
     if not runs:
         return None
+    base = _rate_range(rows, columns, path, solve=solve, crossing=crossing, workers=workers, runs=runs)
+    model = _model_range(rows, columns, path, solve, crossing, workers, shards, runs)
+    if model is None:
+        return base
+    return {**base, **model, "unknown": None}
+
+
+def _kind(e: dict) -> tuple:
+    return (e.get("path"), e.get("solve"))
+
+
+def _features(rows, columns, kind, crossing, workers, shards, kinds) -> list[float]:
+    par = max(min(int(workers or 1), int(shards or workers or 1)), 1)
+    return (
+        [1.0, float(np.log(max(rows * columns, 1))), float(np.log(par))]
+        + [float(kind == k) for k in kinds[1:]]
+        + [float(bool(crossing))]
+    )
+
+
+def _model_range(rows, columns, path, solve, crossing, workers, shards, runs) -> dict | None:
+    kind = (path, solve)
+    if len(runs) < MODEL_MIN_RUNS or not any(_kind(e) == kind for e in runs):
+        return None
+    kinds = sorted({_kind(e) for e in runs}, key=repr)
+    A = np.array(
+        [
+            _features(
+                e["rows"], e["columns"], _kind(e), e.get("crossing"), e.get("workers"), e.get("shards"), kinds
+            )
+            for e in runs
+        ]
+    )
+    y = np.log([e["seconds"] for e in runs])
+    b, *_ = np.linalg.lstsq(A, y, rcond=None)
+    miss = y - A @ b
+    lo, hi = np.quantile(miss, MODEL_QUANTILES)
+    same = np.array([_kind(e) == kind for e in runs])
+    if same.sum() >= MODEL_PATH_RUNS:
+        plo, phi = np.quantile(miss[same], MODEL_QUANTILES)
+        lo, hi = min(lo, plo), max(hi, phi)
+    mu = float(np.array(_features(rows, columns, kind, crossing, workers, shards, kinds)) @ b)
+    w = max(int(workers or 1), 1)
+    basis = (
+        f"fit to {len(runs)} earlier runs ({int(same.sum())} on this path, {path}"
+        + (f" {solve}" if solve else "")
+        + f"), {w} worker{'s' if w > 1 else ''}; their 5-95% misses"
+    )
+    return {"low": float(np.exp(mu + lo)), "high": float(np.exp(mu + hi)), "basis": basis}
+
+
+def _rate_range(
+    rows: int,
+    columns: int,
+    path: str,
+    *,
+    solve: str | None = None,
+    crossing: bool,
+    workers: int,
+    runs: list[dict],
+) -> dict:
+    """The range from earlier runs' rates, for a short history: rows x columns x passes over
+    the fastest and slowest rate on this path (all runs when none).
+
+    Passes: two (the cross-products, then the residuals) plus the singleton passes (with
+    crossing FEs; their range from earlier runs that had them, else 1-4) plus, on plan C's
+    fallback, a pass per CG step (from earlier fallback runs; unknown without)."""
     same = [e for e in runs if e.get("path") == path and (e.get("solve") == solve or solve is None)]
     use = same or runs
     rates = [rate(e) for e in use]

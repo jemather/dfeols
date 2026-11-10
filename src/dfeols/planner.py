@@ -496,6 +496,7 @@ def plan(
             solve=solve if path == "C" else None,
             crossing=bool(g_levels),
             workers=workers,
+            shards=min(kst["levels"], n_bins),
             profile=profile,
             runs=runs,
         )

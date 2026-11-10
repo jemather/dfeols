@@ -8,6 +8,7 @@ import types
 import warnings
 from pathlib import Path
 
+import numpy as np
 import polars as pl
 import pytest
 
@@ -153,3 +154,41 @@ def test_plan_reports_wall_time_and_shape(record):
     r = dfeols.plan(data, "eng ~ feat | spell + week", cluster="id_a", profile=prof)
     if r["options"][0]["path"] != "C":
         assert "-> one job" in format_report(r)
+
+
+def test_estimate_fit_model():
+    """With enough earlier runs the range comes from a regression of log seconds on the fit's
+    size, parallelism and path: on runs that follow such a law it is narrow and holds a new
+    run; with a short history, or none on the path, the rate range as before."""
+    rng = np.random.default_rng(0)
+
+    def law(rows, cols, w, path):
+        return 3.0 * (rows * cols / 1e6) ** 0.8 / min(w, 40) ** 0.6 * (4.0 if path == "sparse" else 1.0)
+
+    runs = []
+    for _ in range(40):
+        rows, cols, w = int(10 ** rng.uniform(5, 9)), int(rng.integers(2, 20)), int(rng.integers(1, 40))
+        path = ["local", "sparse"][rng.integers(2)]
+        sec = law(rows, cols, w, path) * float(np.exp(rng.normal(0, 0.2)))
+        runs.append(
+            _run(
+                path,
+                rows=rows,
+                columns=cols,
+                workers=w,
+                shards=40,
+                seconds=sec,
+                crossing=path == "sparse",
+                singleton_passes=1 if path == "sparse" else 0,
+            )
+        )
+    want = law(5e7, 8, 20, "sparse")
+    e = timings.estimate_fit(50_000_000, 8, "sparse", crossing=True, workers=20, shards=40, runs=runs)
+    assert "fit to 40 earlier runs" in e["basis"] and e["unknown"] is None
+    assert e["low"] < want < e["high"] and e["high"] / e["low"] < 3
+    assert e["passes"] == [3, 3]  # still the rate range's count
+    # fewer than MODEL_MIN_RUNS, or no run on the path: the rate range
+    short = timings.estimate_fit(50_000_000, 8, "sparse", crossing=True, workers=20, runs=runs[:5])
+    assert "fit to" not in short["basis"]
+    other = timings.estimate_fit(50_000_000, 8, "dense", crossing=True, workers=20, runs=runs)
+    assert "none on this path" in other["basis"]

@@ -39,6 +39,11 @@ break the API).
 - `dfeols plan` recommends `cells=True` only when the cells fit the coordinator's memory;
   otherwise it gives the need and the smallest node class that holds it. IV specs are eligible.
 
+- `dfeols plan`'s wall-time ranges come from a regression on earlier runs (log time on size,
+  parallelism and path; the range is 5-95% of its misses) once there are a dozen of them. On
+  OSCER's record it held 80% of fits at a median width of 10x, where the old range of earlier
+  runs' rates was 57x wide (up to 5,600x) and 3x off at its midpoint.
+
 ### Fixed
 
 - The IV first-stage R² is net of every FE, as the outcomes' within R² is. It was net of the

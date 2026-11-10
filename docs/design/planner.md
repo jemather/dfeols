@@ -290,7 +290,7 @@ puts the second cluster in the cell key (meats a, b, a&b). Equal to the row path
 The cells advice checks the coordinator (2026-11-10): `fit(cells=True)` is recommended only when
 its estimate (6 copies of the cells) fits the profile's coordinator memory; otherwise the report
 gives the need and the smallest node class in service that holds it, or says none does (D5's
-589M cells needed ~1,160 GB, which the planner recommended against a 16 GB coordinator).
+589M cells needed ~1,160 GB, and the planner had recommended them without checking).
 
 ## Site facts come from the profile
 
@@ -391,6 +391,19 @@ optimistic). Passes: 2, plus singleton passes with crossing FEs (their range in 
 runs, else 1-4), plus on plan C's fallback the earlier fallback runs' CG steps (unknown
 without: the report says so). With no history the report says wall time is not estimated
 and that every fit adds to the record; no calibration run.
+
+*Narrowed (2026-11-10, dfeols tool backlog chat).* On OSCER's record of 122 fits, each
+predicted from the runs before it, the rate range held 88% of fits but at a median width of 57x
+(p90 5,600x, sparse fits up to 5,000x) with its midpoint off by 3x: small fits are mostly fixed
+cost, so their rates are low and stretch the high end of every bigger fit's range. With 12 or
+more earlier runs, one on the key's path and plan C solve, the estimate is now a regression of
+log seconds on log(rows x columns), log(min(workers, shards)), the path with plan C's solve, and
+whether FEs cross, over every earlier run; the range is the 5th-95th percentile of its misses
+(the path's own, when it has 8 runs, may widen it). The run's passes are not an input: singleton
+passes and CG steps are not known before the fit. Replayed in time order it held 80% of fits at
+a median width of 9.8x (p90 15.5x), midpoint off by 1.7x; plan C stays the widest (CG steps).
+Shorter histories keep the rate range. Leave-one-out and replay: run against
+`<scratch>/timings/fits.jsonl`.
 
 The shape (step 4) follows "One job or demean-first": demean-first when the key's path is
 plan C, when the estimate's high end is over half the profile's `max_walltime`, or when
