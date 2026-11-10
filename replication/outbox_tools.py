@@ -17,9 +17,16 @@ import polars as pl
 
 def key_ranges(lf: pl.LazyFrame, key: str, n_parts: int) -> list[tuple[object, object, int]]:
     """Split the key's sorted values into n_parts contiguous ranges of about equal rows."""
-    counts = (
-        lf.group_by(key).len().sort(key).collect(engine="streaming").with_columns(cum=pl.col("len").cum_sum())
-    )
+    counts = lf.group_by(key).len().sort(key).collect(engine="streaming")
+    return split_counts(counts[key], counts["len"], n_parts)
+
+
+def split_counts(keys: pl.Series, lens: pl.Series, n_parts: int) -> list[tuple[object, object, int]]:
+    """key_ranges on (sorted key, rows per key). Counts are cast to Int64 first: polars-runtime-32
+    counts in UInt32, so a sum or cum_sum over 2^32 rows wraps (nyc_tlc_trips_v1, 4.4B rows, got
+    80 parts of the first ~131M rows and one of the rest)."""
+    counts = pl.DataFrame({"key": keys, "len": lens.cast(pl.Int64)}).with_columns(cum=pl.col("len").cum_sum())
+    key = "key"
     total = int(counts["len"].sum())
     ranges, start, done = [], 0, 0
     for i in range(1, n_parts + 1):
@@ -34,6 +41,12 @@ def key_ranges(lf: pl.LazyFrame, key: str, n_parts: int) -> list[tuple[object, o
             ranges.append((counts[key][start], counts[key][end - 1], rows))
             done += rows
         start = end
+    if sum(r[2] for r in ranges) != total:
+        raise ValueError(f"ranges hold {sum(r[2] for r in ranges)} rows, keys {total}")
+    # a range of several keys holds about total / n_parts rows; far more means the split failed
+    big = [r for r in ranges if r[0] != r[1] and r[2] > 3 * total / n_parts]
+    if big:
+        raise ValueError(f"lopsided split: {big[0]} of {total} rows in {n_parts} parts")
     return ranges
 
 

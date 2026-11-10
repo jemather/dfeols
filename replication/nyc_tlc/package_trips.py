@@ -215,17 +215,23 @@ def main(argv=None) -> int:
     )
     by_service = (
         data.group_by("service")
-        .agg(rows=pl.len(), first=pl.col("pickup_date").min(), last=pl.col("pickup_date").max(),
+        .agg(rows=pl.len().cast(pl.Int64), first=pl.col("pickup_date").min(),
+             last=pl.col("pickup_date").max(),
              log_fare_null=pl.col("log_fare").is_null().sum())  # fmt: skip
         .sort("rows", descending=True)
         .collect(engine="streaming")
         .rows(named=True)
     )
-    # quantiles on every 1000th row: exact ones would hold whole multi-billion-row columns in memory
+    # quantiles on every 1000th row: exact ones would hold whole multi-billion-row columns in memory.
+    # Sampled per part: a row position over all 4.4B rows would pass 2^32 (polars-runtime-32)
+    sampled = pl.concat(
+        [
+            pl.scan_parquet(d / p["file"]).select("trip_time", "trip_miles", "fare").gather_every(1000)
+            for p in parts
+        ]
+    )
     stats = (
-        data.select("trip_time", "trip_miles", "fare")
-        .gather_every(1000)
-        .select(
+        sampled.select(
             **{f"{c}_p{int(q * 100):02d}": pl.col(c).quantile(q) for c in ["trip_time", "trip_miles", "fare"]
                for q in (0.01, 0.5, 0.99)}  # fmt: skip
         )
