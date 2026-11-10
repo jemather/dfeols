@@ -27,7 +27,9 @@ VARS = ["eng", "posts", "feat"]
 
 
 def _data():
-    return sim_panel().drop_nulls().filter(pl.col("eng").is_finite())
+    # grp: tbin as text (session i() on a non-numeric variable)
+    d = sim_panel().drop_nulls().filter(pl.col("eng").is_finite())
+    return d.with_columns(grp=pl.format("g {}", pl.col("tbin")))
 
 
 @pytest.fixture(scope="module")
@@ -339,8 +341,6 @@ def test_factor_terms(ds, tmp_path, spec):
         assert a.coefnames == b.coefnames
         assert len(s._manager.data.created) == len(made) + 1  # only tbin::1 was new
         rec = s.record(a)
-        with pytest.raises(SessionError, match="interacted"):
-            s.fit("eng ~ i(tbin):feat")
         with pytest.raises(SessionError, match="not a level"):
             s.fit("eng ~ i(tbin, ref=99)")
     issues = [i for i in estimation.validate(rec) if i.level != "info"]
@@ -348,3 +348,32 @@ def test_factor_terms(ds, tmp_path, spec):
     assert "add_variable" not in rec["specification"]["call"]
     fac = [t for t in rec["parameters"] if t["term"].startswith("tbin::")]
     assert fac and fac[0]["canonical"]["factors"][0]["variable"] == "tbin"
+
+
+@pytest.mark.parametrize("spec", [{}, {"max_dummy_levels": 10, "iter_tol": 1e-12}], ids=["dense", "iterate"])
+def test_factor_terms_text_and_interacted(ds, tmp_path, spec):
+    """i() on a text variable (levels compared as strings) and x:i(c) (each level's indicator
+    times x, every level, or all but ref=), named as fit names them and equal to fit."""
+    r = _roots(tmp_path)
+    tol = {} if not spec else {"rtol": 1e-6, "vtol": 1e-6}
+    cases = [
+        ("eng ~ posts + i(grp)", {"cluster": "id_a"}),
+        ("eng ~ posts + i(grp, ref='g 3')", {"vcov": "hetero"}),
+        ("eng ~ posts + feat:i(tbin)", {"cluster": "id_a"}),
+        ("eng ~ posts + i(grp, ref='g 0'):feat", {"cluster": "week"}),
+        ("eng ~ i(tbin) + feat:i(tbin, ref=2)", {"vcov": "iid"}),
+        ("eng ~ posts:feat:i(grp)", {"cluster": "id_a"}),
+    ]
+    with _start("fac2", ds, r, **spec) as s:
+        for i, (f, kw) in enumerate(cases):
+            a = s.fit(f, **kw)
+            b = _fit(ds, tmp_path / f"f{i}", f + " | spell + week", **kw)
+            _same(a, b, **tol)
+            assert a.coefnames == b.coefnames, f
+            rec = s.record(a)
+            issues = [i for i in estimation.validate(rec) if i.level != "info"]
+            assert not issues, "\n".join(map(str, issues))
+        names = [c["name"] for c in s._manager.data.created]
+        assert "grp::g 1" in names and "tbin::0:feat" in names and "grp::g 1:feat" in names
+        with pytest.raises(SessionError, match="not a level"):
+            s.fit("eng ~ i(grp, ref='g 9')")

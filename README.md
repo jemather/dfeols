@@ -184,7 +184,7 @@ dfeols session fit flags "lfare ~ hhi + dist" --cluster route+carrier
 ```python
 s = dfeols.Session.attach("flags", profile="mycluster")
 s.add_variable("hhi_x_dist", "hhi * dist")           # from raw columns, demeaned like the rest
-m1 = s.fit("lfare ~ hhi + hhi_x_dist + i(qtr)", cluster="route")
+m1 = s.fit("lfare ~ hhi + hhi_x_dist + i(qtr) + dist:i(region)", cluster="route")
 m2 = s.refit(m1, vcov="hetero")                      # b again; one pass for the SEs
 m3 = s.fit("lfare ~ dist | hhi ~ entrants", estimator="liml")
 s.export([m1, m2, m3], "table2.tex")                 # through estrec's table tool
@@ -358,8 +358,6 @@ of the time (iid: 85.8%, as expected with clustered errors).
   FE must fit `max_dummy_levels`; not on the sparse path, plan C, `cells=True` or in
   sessions yet.
 - **The cell path** (`cells=True`) is OLS only, with iid or one-way CRV1 SEs.
-- **`i()` in sessions** takes numeric variables only, and not interacted with another
-  variable (`x:i(c)`); create the interaction with `add_variable` instead. `fit` takes both.
 - **Plan C's speed depends on the FE graph.** Crossing FEs too large for a direct solve
   are absorbed by conjugate gradient; when A does not fit `level_space_gb` each step is
   a pass over the shards, and steps grow as the FEs connect less well. `iter_tol` (1e-8)

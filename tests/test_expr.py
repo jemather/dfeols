@@ -63,7 +63,14 @@ def test_canonical_digest_columns():
 @pytest.mark.parametrize(
     "text, msg",
     [
-        ("__import__('os')", "characters not allowed"),
+        ("__import__('os')", "unknown function __import__"),
+        ("open('f').read()", "unknown function"),
+        ("r > 'west'", "only be compared with == or !="),
+        ("x + 'a'", "only numbers are allowed"),
+        ("'a' == 'b'", "to a column"),
+        ("r == 'a' == r", "only be compared"),
+        ("r == 'a\\b'", "characters not allowed"),
+        ("__dfeols_lit0__ + 1", "reserved"),
         ("x.y", "Attribute"),
         ("x if y else 1", "IfExp"),
         ("foo(x)", "unknown function foo"),
@@ -80,3 +87,26 @@ def test_canonical_digest_columns():
 def test_refused(text, msg):
     with pytest.raises(E.ExpressionError, match=msg):
         E.compile(text)
+
+
+def test_string_comparisons():
+    """A quoted string against a column (== or !=), read as text: categorical too; nulls stay
+    missing; its text is not rewritten (& | ! ^ inside it are kept)."""
+    df = pl.DataFrame(
+        {
+            "r": ["west", "east", None, "a&b|c!^"],
+            "c": pl.Series(["u", "v", "u", "v"]).cast(pl.Categorical),
+            "x": [1.0, 2.0, 3.0, 4.0],
+        }
+    )
+
+    def ev(t):
+        return df.select(E.compile(t).alias("v"))["v"].to_list()
+
+    assert ev('r == "west"') == [1.0, 0.0, None, 0.0]
+    assert ev("'west' != r") == [0.0, 1.0, None, 1.0]
+    assert ev("r == 'a&b|c!^'") == [0.0, 0.0, None, 1.0]
+    assert ev('(c == "u") * x') == [1.0, 0.0, 3.0, 0.0]
+    assert ev('x > 1 & r == "east"') == [0.0, 1.0, None, 0.0]
+    assert E.columns('(c == "u") * x') == ["c", "x"]
+    assert E.digest("r == 'west'") == E.digest('r == "west"') != E.digest('r == "east"')

@@ -20,6 +20,10 @@ break the API).
   local and crossing slopes, weights, iid, HC1, one- and two-way CRV1, IV
   (`tests/test_slopes.py`). The sparse path, plan C, `cells=True` and sessions refuse
   slopes with a message; `dfeols plan` counts slope columns and marks such keys not built.
+- Sessions take `i()` on text variables and interacted, `x:i(c)` and `x:i(c, ref=...)`, as
+  `fit` does (columns `c::level:x`), equal to `fit` on dense and iterated crossing FEs.
+- Created-variable expressions compare a column with a quoted string, `region == "west"`
+  (`==` and `!=` only; the column is read as text, categoricals too).
 
 ### Changed
 

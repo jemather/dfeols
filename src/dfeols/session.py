@@ -2137,45 +2137,48 @@ class Manager:
     def _factors(self, formula: str) -> tuple[dict, dict]:
         """A formula's i() terms as created indicator columns, made (in one batch) if this
         session has not made them: `i(year)` is year == level for each level but the first,
-        `i(year, ref=2000)` each level but 2000, named `year::level` as fit names them. The
-        levels are the prepared data's (fit's `category_levels`, cached with the shards); a
-        level absent from the sample gives an all-zero column, which is dropped as collinear."""
+        `i(year, ref=2000)` each level but 2000, named `year::level` as fit names them;
+        `x:i(year)` is (year == level) * x for every level (but ref=), named `year::level:x`.
+        Levels may be numbers or text (`region == "west"`). They are the prepared data's
+        (fit's `category_levels`, cached with the shards); a level absent from the sample
+        gives an all-zero column, which is dropped as collinear."""
         from .estimate import category_levels
 
         f = parse(formula)
         cats = [t for t in (*f.terms, *f.endog, *f.instruments) if t.cat is not None]
         if not cats:
             return {}, {}
-        for t in cats:
-            if t.conts:
-                raise NotImplementedError(
-                    f"{t.label}: i() interacted with a variable in sessions; create the products with "
-                    f"add_variable (e.g. '{t.cat}_x_{t.conts[0]}' as '({t.cat} == level) * {t.conts[0]}')"
-                )
         ds = Dataset.open(self.spec.data)
-        missing = sorted({t.cat for t in cats} - set(ds.columns))
+        missing = sorted(({t.cat for t in cats} | {c for t in cats for c in t.conts}) - set(ds.columns))
         if missing:
             raise KeyError(f"i(): not columns of the prepared data: {missing}")
         levels = category_levels(ds, sorted({t.cat for t in cats}), self.executor)
         factors, want = {}, {}
         for t in cats:
             levs = list(levels[t.cat])
-            bad = [l for l in levs if isinstance(l, bool) or not isinstance(l, int | float)]
-            if bad:
-                raise NotImplementedError(
-                    f"{t.label}: i() in sessions takes numeric variables ({t.cat} has {bad[0]!r})"
-                )
+            for l in levs:
+                if isinstance(l, bool) or not isinstance(l, int | float | str):
+                    raise NotImplementedError(
+                        f"{t.label}: i() in sessions takes numbers or text ({t.cat} has {l!r})"
+                    )
+                if isinstance(l, str) and ('"' in l or "\\" in l or any(ord(ch) < 32 for ch in l)):
+                    raise NotImplementedError(
+                        f"{t.label}: level {l!r} of {t.cat} holds a quote, backslash or control "
+                        "character, which an expression cannot spell; recode it before prep"
+                    )
             if t.ref is not None:
                 if t.ref not in levs:
                     raise ValueError(f"{t.label}: {t.ref!r} is not a level of {t.cat}")
                 keep = [l for l in levs if l != t.ref]
             else:
                 keep = levs[1:] if t.drop_first else levs
-            names = [f"{t.cat}::{l}" for l in keep]
+            tail = (":" + ":".join(t.conts)) if t.conts else ""
+            names = [f"{t.cat}::{l}{tail}" for l in keep]
             factors[t.label] = names
             for nm, l in zip(names, keep):
                 if nm not in self.data.names:
-                    want[nm] = f"{t.cat} == {l!r}"
+                    lit = f'"{l}"' if isinstance(l, str) else repr(l)
+                    want[nm] = f"({t.cat} == {lit})" + "".join(f" * {c}" for c in t.conts)
         if want:
             self.add_variables({"variables": want}, internal=True)
         return factors, {t.cat: list(levels[t.cat]) for t in cats}

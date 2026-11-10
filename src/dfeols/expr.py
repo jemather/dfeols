@@ -8,6 +8,10 @@ types is compiled; anything else is an error. R's spelling is accepted where it 
 `^` is a power (binding tightest, as in R), `&`, `|`, `!` are and, or, not (binding looser
 than comparisons, as in R). The result is Float64; a comparison is 1.0 or 0.0. A null or a
 non-finite result (log of 0, a division by 0) counts as missing.
+
+A quoted string is allowed as one side of `==` or `!=` against a column, `region == "west"`,
+for non-numeric columns (session i() terms on them). Its text may not hold its own quote
+character, a backslash or control characters.
 """
 
 from __future__ import annotations
@@ -43,18 +47,51 @@ class ExpressionError(ValueError):
     pass
 
 
+_STRING = re.compile(r"\"([^\"\\\x00-\x1f]*)\"|'([^'\\\x00-\x1f]*)'")
+_LIT = "__dfeols_lit{}__"
+
+
 def _python(text: str) -> str:
-    """R spelling to Python's, so precedence matches R's."""
+    """R spelling to Python's, so precedence matches R's. String literals are set aside
+    first, so their text is neither checked against the allowed characters nor rewritten."""
     if not isinstance(text, str) or not text.strip():
         raise ExpressionError("an expression is needed, e.g. 'log(x)' or 'a * b'")
-    if not _ALLOWED_CHARS.match(text):
-        bad = sorted(set(re.sub(r"[A-Za-z0-9_.+\-*/^()<>=!&|,\s]", "", text)))
+    lits: list[str] = []
+
+    def keep(m):
+        lits.append(m.group(1) if m.group(1) is not None else m.group(2))
+        return _LIT.format(len(lits) - 1)
+
+    s = _STRING.sub(keep, text)
+    if "__dfeols_lit" in text:
+        raise ExpressionError(f"{text!r}: names starting with __dfeols_lit are reserved")
+    if not _ALLOWED_CHARS.match(s):
+        bad = sorted(set(re.sub(r"[A-Za-z0-9_.+\-*/^()<>=!&|,\s]", "", s)))
         raise ExpressionError(f"{text!r}: characters not allowed in an expression: {' '.join(bad)}")
-    s = text.replace("^", "**")
+    s = s.replace("^", "**")
     s = re.sub(r"&&?", " and ", s)
     s = re.sub(r"\|\|?", " or ", s)
     s = re.sub(r"!(?!=)", " not ", s)
+    for i, v in enumerate(lits):
+        s = s.replace(_LIT.format(i), repr(v))
     return s
+
+
+def _string_compare(n: ast.AST) -> bool:
+    return isinstance(n, ast.Compare) and any(
+        isinstance(v, ast.Constant) and isinstance(v.value, str) for v in [n.left, *n.comparators]
+    )
+
+
+def string_columns(tree: ast.AST) -> set[str]:
+    """Columns compared with a string (read as text, not as numbers)."""
+    return {
+        v.id
+        for n in ast.walk(tree)
+        if _string_compare(n)
+        for v in [n.left, *n.comparators]
+        if isinstance(v, ast.Name)
+    }
 
 
 def parse(text: str) -> ast.expr:
@@ -84,6 +121,20 @@ def _check(node: ast.AST, text: str) -> None:
         *_ARITH,
         *_CMP,
     )
+    in_string_compare = set()
+    for n in ast.walk(node):
+        if _string_compare(n):
+            sides = [n.left, *n.comparators]
+            if (
+                len(n.ops) != 1
+                or not isinstance(n.ops[0], ast.Eq | ast.NotEq)
+                or not any(isinstance(v, ast.Name) for v in sides)
+            ):
+                raise ExpressionError(
+                    f"{text!r}: a string can only be compared with == or != to a column, e.g. "
+                    'region == "west"'
+                )
+            in_string_compare.update(id(v) for v in sides)
     for n in ast.walk(node):
         if not isinstance(n, ok):
             raise ExpressionError(f"{text!r}: {type(n).__name__} is not allowed in an expression")
@@ -92,8 +143,11 @@ def _check(node: ast.AST, text: str) -> None:
             if isinstance(n, ast.Constant)
             else True
         )
-        if not number:
-            raise ExpressionError(f"{text!r}: only numbers are allowed as constants")
+        if not number and not (isinstance(n.value, str) and id(n) in in_string_compare):
+            raise ExpressionError(
+                f"{text!r}: only numbers are allowed as constants (a string only in == or != "
+                "against a column)"
+            )
         if isinstance(n, ast.Call):
             if not isinstance(n.func, ast.Name) or n.func.id not in (*FUNCTIONS, "ifelse"):
                 name = n.func.id if isinstance(n.func, ast.Name) else "?"
@@ -148,12 +202,22 @@ def _ordered(n: ast.AST) -> str:
 def compile(text: str) -> pl.Expr:
     """The Polars expression, Float64. Null wherever a column it reads is null or not
     finite, so `x > 0 & y > 0` or `ifelse(c > 0, a, b)` cannot hide a missing input."""
-    e, _ = _compile(parse(text), text)
+    tree = parse(text)
+    texts = string_columns(tree)
+    e, _ = _compile(tree, text)
     e = e.cast(pl.Float64)
     cols = columns(text)
     if not cols:
         return e
-    bad = pl.any_horizontal([pl.col(c).is_null() | ~pl.col(c).cast(pl.Float64).is_finite() for c in cols])
+
+    def missing(c):  # a column compared with a string is text: only null is missing
+        return (
+            pl.col(c).is_null()
+            if c in texts
+            else pl.col(c).is_null() | ~pl.col(c).cast(pl.Float64).is_finite()
+        )
+
+    bad = pl.any_horizontal([missing(c) for c in cols])
     return pl.when(bad).then(None).otherwise(e)
 
 
@@ -188,6 +252,12 @@ def _compile(n: ast.AST, text: str) -> tuple[pl.Expr, str]:
         for p in parts[1:]:
             out = (out & p) if isinstance(n.op, ast.And) else (out | p)
         return out, "bool"
+    if _string_compare(n):  # column == "text" (checked: one == or !=, a column on one side)
+        a, b = (
+            pl.col(v.id).cast(pl.String) if isinstance(v, ast.Name) else pl.lit(str(v.value))
+            for v in (n.left, n.comparators[0])
+        )
+        return (a == b) if isinstance(n.ops[0], ast.Eq) else (a != b), "bool"
     if isinstance(n, ast.Compare):
         terms = [_num(*_compile(v, text)) for v in [n.left, *n.comparators]]
         out = None

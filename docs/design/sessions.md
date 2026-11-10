@@ -326,7 +326,8 @@ within 5e-15.
 - **Created variables** (step 4, 2026-11-08). `s.add_variable(name, expression)` (CLI
   `dfeols session add-variable <session> <name> <expression>`; it returns the session, so
   calls chain). The expression is on raw columns of the prepared data: numbers, `+ - * /`,
-  `^` (or `**`), comparisons (1.0 or 0.0), `&`, `|`, `!` (or `and`, `or`, `not`), and
+  `^` (or `**`), comparisons (1.0 or 0.0; a quoted string only in `==` or `!=` against a
+  column, `region == "west"`, read as text, 2026-11-10), `&`, `|`, `!` (or `and`, `or`, `not`), and
   `log`, `log2`, `log10`, `log1p`, `exp`, `sqrt`, `abs`, `ifelse(cond, a, b)`, with R's
   precedence. `dfeols.expr` turns R's spelling into Python's, parses it with `ast` (which
   runs nothing), refuses any node outside an allowlist and compiles the tree to a Polars
@@ -404,8 +405,11 @@ within 5e-15.
   created indicator columns (`year == level`, named `year::level` as `fit` names them; the
   first level dropped without `ref`), made in one batch the first time (one demeaning
   however many levels) and reused after; levels from fit's `category_levels` (cached with
-  the shards). Equal to `fit`'s `i()`. `i(x):z` interactions are refused with the
-  `add_variable` that makes them.
+  the shards). Equal to `fit`'s `i()`. Since 2026-11-10 (dfeols tool backlog chat) also on
+  text columns (`grp == "g 1"`) and interacted, `x:i(c)` (`(c == level) * x` for every level,
+  or all but `ref=`, named `c::level:x`), equal to `fit` on the dense and iterated paths.
+  Levels holding a double quote, backslash or control character are refused (an expression
+  cannot spell them).
 - **Created-variable batches** (format `dfeols-created/2`). `s.add_variables({name: expr})`
   demeans every new column together, into one `created/<batch>/` folder whose
   `variable.json` lists each column (expression, digest, file column, Gram entry, raw sums,
