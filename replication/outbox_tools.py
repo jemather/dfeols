@@ -61,7 +61,9 @@ def write_parts(
     parts = []
     for i, (lo, hi, rows) in enumerate(key_ranges(lf, key, n_parts)):
         p = data / f"part-{i:04d}.parquet"
-        part = (lf if scan_for is None else scan_for(lo, hi)).filter(pl.col(key).is_between(pl.lit(lo), pl.lit(hi)))  # lit: a str bound is a column name
+        part = (lf if scan_for is None else scan_for(lo, hi)).filter(
+            pl.col(key).is_between(pl.lit(lo), pl.lit(hi))
+        )  # lit: a str bound is a column name
         if transform is not None:
             part = transform(part)
         part.sort(key).sink_parquet(p, compression="zstd", statistics=True)
@@ -89,6 +91,25 @@ def level_counts(lf: pl.LazyFrame, fes: dict[str, list[str]]) -> dict[str, int]:
             e.filter(pl.all_horizontal([pl.col(c).is_not_null() for c in cols])).n_unique().alias(name)
         )
     return {k: int(v) for k, v in lf.select(exprs).collect(engine="streaming").row(0, named=True).items()}
+
+
+def level_counts_parts(files: list[Path], fes: dict[str, list[str]], within: set[str]) -> dict[str, int]:
+    """level_counts one part file at a time, for data too big for one pass: a struct n_unique
+    does not stream, so level_counts loads every column (nyc_tlc_trips_v1, 4.4B rows, was
+    killed). FEs in `within` never span two parts (they nest in the partition key), so their
+    counts add up over parts; the others keep each part's distinct levels and take the union."""
+    sums = dict.fromkeys(within & fes.keys(), 0)
+    seen: dict[str, list[pl.DataFrame]] = {k: [] for k in fes if k not in within}
+    for f in files:
+        lf = pl.scan_parquet(f)
+        names = list(fes)
+        got = pl.collect_all([lf.select(fes[k]).drop_nulls().unique() for k in names], engine="streaming")
+        for k, df in zip(names, got):
+            if k in sums:
+                sums[k] += df.height
+            else:
+                seen[k] = [pl.concat(seen[k] + [df]).unique()]
+    return {k: sums[k] if k in sums else seen[k][0].height for k in fes}
 
 
 def fit_reference(pdf, formula: str, cluster: str, **kw) -> dict:

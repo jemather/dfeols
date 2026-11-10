@@ -32,7 +32,7 @@ os.environ.setdefault("POLARS_MAX_THREADS", "8")
 import polars as pl
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from outbox_tools import dump_json, fit_reference, level_counts, schema_table, write_parts
+from outbox_tools import dump_json, fit_reference, level_counts_parts, schema_table, write_parts
 
 NAME = "nyc_tlc_trips_v1"
 T0 = datetime(2009, 1, 1)  # date_hour = hours since the first yellow file's month
@@ -112,16 +112,20 @@ def keep() -> pl.Expr:
 def frame(lf: pl.LazyFrame) -> pl.LazyFrame:
     """Sample rules and model columns on the common schema."""
     pos_log = lambda c: pl.when(pl.col(c) > 0).then(pl.col(c).cast(pl.Float64).log())
-    return lf.filter(keep()).with_columns(
-        pl.col("pu_location_id", "do_location_id").fill_null(MISSING_ZONE)
-    ).with_columns(
-        pickup_date=pl.col("pickup_datetime").dt.date(),
-        year=pl.col("pickup_datetime").dt.year().cast(pl.Int16),
-        date_hour=((pl.col("pickup_datetime") - T0).dt.total_hours()).cast(pl.Int32),
-        od_pair=(pl.col("pu_location_id").cast(pl.Int32) * 1000 + pl.col("do_location_id")).cast(pl.Int32),
-        log_time=pos_log("trip_time"),
-        log_miles=pos_log("trip_miles"),
-        log_fare=pos_log("fare"),
+    return (
+        lf.filter(keep())
+        .with_columns(pl.col("pu_location_id", "do_location_id").fill_null(MISSING_ZONE))
+        .with_columns(
+            pickup_date=pl.col("pickup_datetime").dt.date(),
+            year=pl.col("pickup_datetime").dt.year().cast(pl.Int16),
+            date_hour=((pl.col("pickup_datetime") - T0).dt.total_hours()).cast(pl.Int32),
+            od_pair=(pl.col("pu_location_id").cast(pl.Int32) * 1000 + pl.col("do_location_id")).cast(
+                pl.Int32
+            ),
+            log_time=pos_log("trip_time"),
+            log_miles=pos_log("trip_miles"),
+            log_fare=pos_log("fare"),
+        )
     )
 
 
@@ -159,6 +163,8 @@ def main(argv=None) -> int:
     ap.add_argument("--parts", type=int, default=80)
     ap.add_argument("--months", default=None, help="FROM,TO (YYYY-MM): test on these stage files")
     ap.add_argument("--name", default=NAME)
+    # keep the data/ parts a killed run already wrote; only redo the summary
+    ap.add_argument("--reuse-parts", action="store_true")
     a = ap.parse_args(argv)
     commit = (
         subprocess.run(["git", "-C", "repo", "rev-parse", "--short", "HEAD"], capture_output=True, text=True)
@@ -195,11 +201,16 @@ def main(argv=None) -> int:
     if not DROP_OFF_MONTH:
         raise SystemExit("scan_for assumes DROP_OFF_MONTH")
     d = a.out / a.name
-    parts = write_parts(frame(raw), "pickup_date", d, a.parts, scan_for=scan_for)
+    if a.reuse_parts:
+        parts = reuse_parts(d, a.parts, sum(r["kept"] for r in sample_counts.values()))
+    else:
+        parts = write_parts(frame(raw), "pickup_date", d, a.parts, scan_for=scan_for)
     data = pl.scan_parquet(str(d / "data" / "*.parquet"))
     rows = sum(p["rows"] for p in parts)
-    levels = level_counts(
-        data,
+    print(f"{len(parts)} parts, {rows:,} rows; level counts", flush=True)
+    within = {"pickup_date", "date_hour", "pu_location_id^date_hour", "do_location_id^date_hour"}
+    levels = level_counts_parts(
+        [d / p["file"] for p in parts],
         {
             "service": ["service"],
             "base": ["base"],
@@ -212,32 +223,40 @@ def main(argv=None) -> int:
             "pu_location_id^do_location_id": ["pu_location_id", "do_location_id"],
             "pu_location_id^do_location_id^year": ["pu_location_id", "do_location_id", "year"],
         },
+        within,  # date_hour and pickup_date nest in the part key
     )
+    print(levels, flush=True)
     by_service = (
         data.group_by("service")
-        .agg(rows=pl.len().cast(pl.Int64), first=pl.col("pickup_date").min(),
-             last=pl.col("pickup_date").max(),
-             log_fare_null=pl.col("log_fare").is_null().sum())  # fmt: skip
+        .agg(
+            rows=pl.len().cast(pl.Int64),
+            first=pl.col("pickup_date").min(),
+            last=pl.col("pickup_date").max(),
+            log_fare_null=pl.col("log_fare").is_null().sum(),
+        )  # fmt: skip
         .sort("rows", descending=True)
         .collect(engine="streaming")
         .rows(named=True)
     )
     # quantiles on every 1000th row: exact ones would hold whole multi-billion-row columns in memory.
     # Sampled per part: a row position over all 4.4B rows would pass 2^32 (polars-runtime-32)
+    # Sampled per part and collected per part (~55k rows each): a row position over all 4.4B
+    # rows would pass 2^32 (polars-runtime-32), and a lazy concat would not stream the gather
     sampled = pl.concat(
         [
-            pl.scan_parquet(d / p["file"]).select("trip_time", "trip_miles", "fare").gather_every(1000)
+            pl.scan_parquet(d / p["file"]).select("trip_time", "trip_miles", "fare")
+            .collect(engine="streaming").gather_every(1000)
             for p in parts
         ]
-    )
-    stats = (
-        sampled.select(
-            **{f"{c}_p{int(q * 100):02d}": pl.col(c).quantile(q) for c in ["trip_time", "trip_miles", "fare"]
-               for q in (0.01, 0.5, 0.99)}  # fmt: skip
-        )
-        .collect(engine="streaming")
-        .row(0, named=True)
-    )
+    )  # fmt: skip
+    stats = sampled.select(
+        **{
+            f"{c}_p{int(q * 100):02d}": pl.col(c).quantile(q)
+            for c in ["trip_time", "trip_miles", "fare"]
+            for q in (0.01, 0.5, 0.99)
+        }  # fmt: skip
+    ).row(0, named=True)
+    print(stats, flush=True)
     cols = ["log_time", "log_fare", "log_miles", "service", "pu_location_id", "do_location_id", "date_hour",
             "year", CLUSTER]  # fmt: skip
 
@@ -284,6 +303,31 @@ def main(argv=None) -> int:
     return 0
 
 
+def reuse_parts(d: Path, n_parts: int, kept: int) -> list[dict]:
+    """The parts list write_parts returns, rebuilt from the files: each was checked against its
+    expected row count when written, and together they must hold every kept row."""
+    files = sorted((d / "data").glob("part-*.parquet"))
+    if len(files) != n_parts:
+        raise SystemExit(f"--reuse-parts: {len(files)} part files in {d / 'data'}, expected {n_parts}")
+    parts = []
+    for p in files:
+        r = (
+            pl.scan_parquet(p)
+            .select(
+                rows=pl.len().cast(pl.Int64), lo=pl.col("pickup_date").min(), hi=pl.col("pickup_date").max()
+            )
+            .collect()
+            .row(0, named=True)
+        )
+        parts.append({"file": f"data/{p.name}", "rows": r["rows"], "pickup_date_min": r["lo"],
+                      "pickup_date_max": r["hi"], "bytes": p.stat().st_size})  # fmt: skip
+    if sum(p["rows"] for p in parts) != kept:
+        raise SystemExit(f"--reuse-parts: parts hold {sum(p['rows'] for p in parts):,} rows, kept {kept:,}")
+    if any(a["pickup_date_max"] >= b["pickup_date_min"] for a, b in zip(parts, parts[1:])):
+        raise SystemExit("--reuse-parts: part date ranges overlap")
+    return parts
+
+
 def write_readme(d, name, commit, files, rows, parts, sample_counts, levels, by_service, stats, fits, data):
     notes = {
         "service": "yellow, green, fhv, or the fhvhv company licence: HV0003 Uber, HV0005 Lyft, HV0004 Via, "
@@ -319,9 +363,7 @@ def write_readme(d, name, commit, files, rows, parts, sample_counts, levels, by_
         f"{p['bytes'] / 1e9:.2f} GB |"
         for p in parts
     )
-    sv = "\n".join(
-        f"| {r['service']} | {r['rows']:,} | {r['first']} to {r['last']} |" for r in by_service
-    )
+    sv = "\n".join(f"| {r['service']} | {r['rows']:,} | {r['first']} to {r['last']} |" for r in by_service)
     sc = "\n".join(
         f"| {s} | {c['rows_in']:,} | {c['off_month']:,} | {c['kept']:,} | {c['zone_missing']:,} | "
         f"{c['zone_bad']:,} | {c['time_le0']:,} | "
