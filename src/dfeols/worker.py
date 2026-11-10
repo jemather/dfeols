@@ -914,16 +914,18 @@ def shard_cells(plan: Plan, shard_id: int, files: list[str]) -> dict:
     f = plan.formula
     Y = _outcome_block(plan, df, n)
     cols = []
-    for term in f.terms:
+    for term in (*f.terms, *f.instruments):  # the row path's Z block (IV: instruments after)
         cols.extend(_term_columns(term, df, plan.cat_levels) if n else [])
     X = np.column_stack(cols) if cols else np.zeros((n, 0))
-    Z = np.hstack([Y, X]) if n else np.zeros((0, Y.shape[1] + len(plan.colnames)))
+    Z = np.hstack([Y, X]) if n else np.zeros((0, Y.shape[1] + plan.k_x))
     p = Z.shape[1]
     w = df[plan.weights].to_numpy().astype(np.float64) if plan.weights else np.ones(n)
     keys = {f"l{i}": densify(df[c].to_numpy())[0].astype(np.int64) for i, (_, c) in enumerate(plan.local_fes)}
     keys.update({f"g{i}": df[c].to_numpy().astype(np.int64) for i, (_, c, _) in enumerate(plan.global_fes)})
     if plan.cluster:
         keys["cl"] = df[plan.cluster[1]].to_numpy().astype(np.int64)
+    if plan.cluster2:  # two-way: the second cluster is constant within a cell too
+        keys["cl2"] = df[plan.cluster2[1]].to_numpy().astype(np.int64)
     kn = list(keys)
     frame = pl.DataFrame({**keys, "w": w, **{f"z{j}": Z[:, j] for j in range(p)}})
     W = pl.col("w").sum().over(kn)

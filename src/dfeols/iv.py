@@ -287,9 +287,12 @@ def first_stage(
     for l, name in enumerate(plan.endog_names):
         pi = fs["Pi_z2"][:, l]
         rss, rss_x1 = fs["rss_full"][l], fs["rss_x1"][l]
+        # net of every FE (estimate._tss), so the R2 does not depend on the partition
         tss = (
-            acc["YtY"][m + l, m + l]
-            if plan.local_fes
+            acc["fs_tss"][l]
+            if "fs_tss" in acc
+            else acc["YtY"][m + l, m + l]
+            if plan.local_fes or acc.get("all_absorbed")
             else acc["sum_wy2"][m + l] - acc["sum_wy"][m + l] ** 2 / acc["sumw"]
         )
         # Exact fit: the instruments span the endogenous regressor (e.g. time dummies by their

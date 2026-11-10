@@ -16,8 +16,11 @@ is c_xy - c_xx b + W_c x~_c e~_c. Exact, not an approximation.
 
 On the cells the FE with the most levels is absorbed exactly (group means) and the others are
 solved as crossing FEs by conjugate gradient (dfeols.crossing): in level space when A fits the
-budget, else with a product over the cells each step. OLS only; vcov CRV1 and iid (HC1 needs the
-rows' own residuals).
+budget, else with a product over the cells each step. The cells give round 1's Gram matrix of
+every column net of the FEs exactly (`absorb`), so OLS and IV (2SLS, LIML, Fuller) are solved by
+the row path's own solvers, and round 2's RSS and CRV1 meats (one- or two-way, IV first stages
+too) come from the solve's linear maps applied to each cell's sums (`meats`). vcov CRV1 and iid;
+HC1 needs the rows' own residuals.
 """
 
 from __future__ import annotations
@@ -31,9 +34,7 @@ import polars as pl
 import scipy.sparse as sp
 
 from . import crossing as cx
-from .linalg import absorbed, collinear_keep, solve_spd
-from .vcov import df_k as _df_k
-from .vcov import vcov_crv1, vcov_iid
+from .linalg import absorbed
 
 log = logging.getLogger("dfeols")
 
@@ -49,7 +50,9 @@ def _upper(p: int) -> dict:
     return out
 
 
-def combine(parts: list[dict], n_local: int, cluster_local: bool) -> pl.DataFrame:
+def combine(
+    parts: list[dict], n_local: int, cluster_local: bool, cluster2_local: bool = False
+) -> pl.DataFrame:
     """The shards' cells as one frame with global keys. Local FE codes and a local cluster are
     dense within a shard, so the shard id joins their key. Without a local FE a cell can span
     shards; those are merged (weighted means, cross-products by the parallel-variance formula)."""
@@ -65,12 +68,12 @@ def combine(parts: list[dict], n_local: int, cluster_local: bool) -> pl.DataFram
         cols.update({f"c{q}": r["c"][:, q] for q in range(r["c"].shape[1])})
         frames.append(pl.DataFrame(cols))
     df = pl.concat(frames)
-    keys = [c for c in df.columns if c[0] in "lg" or c == "cl"]
-    if n_local or cluster_local:
+    keys = [c for c in df.columns if c[0] in "lg" or c in ("cl", "cl2")]
+    if n_local or cluster_local or cluster2_local:
         return df
     # merge cells that span shards
     ms = [c for c in df.columns if c.startswith("m")]
-    cs = [c for c in df.columns if c.startswith("c") and c != "cl"]
+    cs = [c for c in df.columns if c.startswith("c") and c not in ("cl", "cl2")]
     p = len(ms)
     up = _upper(p)
     tot = df.group_by(keys).agg(
@@ -135,17 +138,12 @@ def _block(W, g, Ng, f, P):
     return B
 
 
-def solve(
+def absorb(
     df: pl.DataFrame,
     *,
     fe_names: list[str],
     fe_cols: list[list[str]],
-    cluster_cols: list[str] | None,
-    m: int,
-    k: int,
-    colnames: list[str],
-    depvars: list[str],
-    vcov_types,
+    p: int,
     drop_singletons: bool,
     collin_tol: float,
     tol: float,
@@ -154,9 +152,14 @@ def solve(
     precond: str,
     label: str,
 ) -> dict:
-    """The fit from the combined cells: estimates, vcov, RSS, levels and the solve's facts."""
+    """Every FE out of the combined cells: singletons dropped, the FE with the most levels
+    absorbed exactly and the others by conjugate gradient. Returns the cells' facts for the
+    solve and the meats: the cells kept (`df`), N, the cell weights W, the cell means net of
+    every FE `Zh` (C x p), the within-cell cross-products (`cmat`, `up`, summed in `Ctot`),
+    the Gram matrix of all p columns net of every FE `ZZ` (round 1's Z'WZ, exact), each
+    column's centered sum of squares before the FEs `ref` (the collinearity scale), the FE
+    codes and levels, and the solve's `info`."""
     t0 = time.time()
-    p = m + k
     up = _upper(p)
     n = df["n"].to_numpy().astype(np.int64)
     codes = [_dense(df, c) for c in fe_cols]
@@ -187,16 +190,6 @@ def solve(
         for j in range(p):
             Ctot[i, j] = cmat[:, up[(i, j)]].sum()
     levels = [int(f.max()) + 1 if C else 0 for f in codes]
-    cl = _dense(df, cluster_cols) if cluster_cols else None
-    G = int(cl.max()) + 1 if cl is not None and C else None
-    nested = []
-    if cl is not None:
-        for f, L in zip(codes, levels):
-            lo = np.full(L, np.iinfo(np.int64).max)
-            hi = np.full(L, np.iinfo(np.int64).min)
-            np.minimum.at(lo, f, cl)
-            np.maximum.at(hi, f, cl)
-            nested.append(bool((lo == hi).all()))
 
     # absorb the FE with most levels exactly; the others cross
     a = int(np.argmax(levels))
@@ -303,50 +296,76 @@ def solve(
         Zh = Zq
         RG = np.zeros((p, p))
         info.update(mode="none", steps=0)
-    Z0 = Ctot + Zq.T @ (W[:, None] * Zq)  # net of the absorbed FE only: the collinearity scale
+    Z0 = Ctot + Zq.T @ (W[:, None] * Zq)  # net of the absorbed FE only
     ZZ = Z0 - RG
     ZZ = (ZZ + ZZ.T) / 2
-    xs, ys = np.arange(m, p), np.arange(m)
-    XX = ZZ[np.ix_(xs, xs)]
-    keepx = collinear_keep(XX, collin_tol, ref_diag=ref[xs])
-    kept = np.flatnonzero(keepx)
-    beta, bread = solve_spd(XX[np.ix_(kept, kept)], ZZ[np.ix_(xs[kept], ys)])  # (kk x m)
-    xk = xs[kept]
-    E = Zh[:, ys] - Zh[:, xk] @ beta  # (C x m) cell residual means net of every FE
-    out = {}
-    kk = len(kept)
-    nested_all = nested if cl is not None else []
-    fe_levels = levels
-    for j, y in enumerate(depvars):
-        b = beta[:, j]
-        Cxx = Ctot[np.ix_(xk, xk)]
-        Cxy = Ctot[xk, j]
-        rss = float(Ctot[j, j] - 2 * b @ Cxy + b @ Cxx @ b + (W * E[:, j] ** 2).sum())
-        tss = float(Ctot[j, j] + (W * Zh[:, j] ** 2).sum())
-        V = {}
-        if "iid" in vcov_types:
-            dfk = _df_k(kk, fe_levels, None)
-            V["iid"] = (vcov_iid(bread, rss, N, dfk), N - dfk)
-        if "CRV1" in vcov_types:
-            sc = np.empty((C, kk))
-            for q, xq in enumerate(xk):
-                s = cmat[:, up[(xq, j)]].copy()
-                for l_, xl in enumerate(xk):
-                    s -= cmat[:, up[(xq, xl)]] * b[l_]
-                sc[:, q] = s + W * Zh[:, xq] * E[:, j]
-            Sg = np.column_stack([np.bincount(cl, weights=sc[:, q], minlength=G) for q in range(kk)])
-            dfk = _df_k(kk, fe_levels, nested_all)
-            V["CRV1"] = (vcov_crv1(bread, Sg.T @ Sg, N, dfk, G), G - 1)
-        out[y] = {"coef": b, "vcov": V, "rss": rss, "tss": tss, "r2_within": float(1 - rss / tss)}
     info.update(seconds=time.time() - t0, singleton_passes=passes)
     return {
-        "out": out,
+        "df": df,
         "N": N,
         "rows": rows_in,
-        "G": G,
-        "fe_levels": fe_levels,
-        "nested": nested_all,
-        "coefnames": [colnames[i] for i in kept],
-        "dropped": [colnames[i] for i in range(k) if not keepx[i]],
+        "W": W,
+        "Zh": Zh,
+        "cmat": cmat,
+        "up": up,
+        "Ctot": Ctot,
+        "ZZ": ZZ,
+        "ref": ref,
+        "codes": codes,
+        "levels": levels,
         "info": info,
     }
+
+
+def cluster_codes(df: pl.DataFrame, cols: list[str], codes: list[np.ndarray], levels: list[int]):
+    """A cluster's dense codes over the cells, its count G, and whether each FE is nested in it
+    (one cluster per FE level)."""
+    cl = _dense(df, cols)
+    G = int(cl.max()) + 1 if len(cl) else 0
+    nested = []
+    for f, L in zip(codes, levels):
+        lo = np.full(L, np.iinfo(np.int64).max)
+        hi = np.full(L, np.iinfo(np.int64).min)
+        np.minimum.at(lo, f, cl)
+        np.maximum.at(hi, f, cl)
+        nested.append(bool((lo == hi).all()))
+    return cl, G, nested
+
+
+def meats(group: dict, cols, m: int, a: dict, clusters: list[np.ndarray]) -> dict:
+    """Round 2 on the cells (worker.shard_round2 on rows), exact: for the linear maps of T =
+    [Y (m columns), Z[:, cols]] in `group` (residuals E = T A, score regressors X = T H, from
+    the solve), each equation's RSS and, per cluster code array in `clusters`, its meat.
+
+    Within a cell the FEs are constant, so row i's T_i is the cell's within deviation plus the
+    cell mean net of every FE, t~_c. Then sum_i w_i T_i T_i' over the cell is the within
+    cross-products c_c plus W_c t~_c t~_c', and a cell's score sum_i w_i X_i E_ij is
+    H'(c_c a_j) + W_c (H't~_c)(t~_c'a_j); the RSS is a_j'(C + sum_c W_c t~_c t~_c')a_j."""
+    idx = np.r_[np.arange(m), m + np.asarray(cols, np.int64)]
+    nT = len(idx)
+    A = np.asarray(group["A"], np.float64)
+    H = group["H"]
+    if np.asarray(H).ndim == 1:
+        Hm = np.zeros((nT, len(H)))
+        Hm[np.asarray(H, np.int64), np.arange(len(H))] = 1.0
+    else:
+        Hm = np.asarray(H, np.float64)
+    W, Zt, cmat, up = a["W"], a["Zh"][:, idx], a["cmat"], a["up"]
+    CT = a["Ctot"][np.ix_(idx, idx)] + Zt.T @ (W[:, None] * Zt)
+    ne, k = A.shape[1], Hm.shape[1]
+    rss = np.einsum("ij,ik,kj->j", A, CT, A)
+    crv = [np.zeros((ne, k, k)) for _ in clusters]
+    if clusters:
+        ZH = Zt @ Hm
+        # each cell's within cross-products of T, row r: columns cmat[:, ucol[r]]
+        ucol = [np.array([up[(idx[r], idx[c])] for c in range(nT)]) for r in range(nT)]
+        for j in range(ne):
+            aj = A[:, j]
+            nz = np.flatnonzero(aj)
+            v = np.column_stack([cmat[:, ucol[r][nz]] @ aj[nz] for r in range(nT)])  # c_c a_j
+            sc = v @ Hm + (W * (Zt @ aj))[:, None] * ZH
+            for q, cl in enumerate(clusters):
+                G = int(cl.max()) + 1 if len(cl) else 0
+                Sg = np.column_stack([np.bincount(cl, weights=sc[:, t], minlength=G) for t in range(k)])
+                crv[q][j] = Sg.T @ Sg
+    return {"rss": rss, "crv": crv}

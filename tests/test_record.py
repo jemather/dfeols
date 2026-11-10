@@ -145,6 +145,13 @@ def test_cells_record(ds, tmp_path):
     assert {a["method"] for a in rec["extensions"]["dfeols"]["absorption"].values()} == {"cells"}
 
 
+def test_cells_iv_twoway_record(ds, tmp_path):
+    """IV and two-way clustering on cells: the record validates and has the first stage."""
+    r, rec = _fit(ds, tmp_path, "eng ~ posts | spell + week | feat ~ tbin", cluster="id_a+week", cells=True)
+    assert r.options["crossing_fe"] == "cells"
+    assert rec["structures"]["first_stage"]["per_endogenous"][0]["endogenous"] == "feat"
+
+
 def test_fe_nested_in_cluster(ds, tmp_path):
     r, rec = _fit(ds, tmp_path, "eng ~ feat + posts | id_a + week", cluster="id_a")
     fe = {f["name"]: f for f in rec["structures"]["fixed_effects"]}

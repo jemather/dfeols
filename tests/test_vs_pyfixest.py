@@ -365,8 +365,57 @@ def test_cells_limits(ds_cw):
     _, ds = ds_cw
     with pytest.raises(ValueError, match="HC1 needs each row"):
         dfeols.fit(ds, "eng ~ feat | spell + week", vcov="hetero", cells=True, log_every=1e9)
-    with pytest.raises(NotImplementedError, match="OLS only"):
-        dfeols.fit(ds, "eng ~ posts | spell + week | feat ~ eng2", cluster="id_a", cells=True, log_every=1e9)
+    with pytest.raises(ValueError, match="HC1 needs each row"):
+        dfeols.fit(ds, "eng ~ posts | spell + week | feat ~ eng2", vcov="hetero", cells=True, log_every=1e9)
+
+
+def _close(a, b, path=""):
+    """Every number in two nested results equal to 1e-7 (relative), structure included."""
+    if isinstance(a, dict):
+        assert set(a) == set(b), path
+        for k in a:
+            _close(a[k], b[k], f"{path}.{k}")
+    elif isinstance(a, list | tuple) and not (a and isinstance(a[0], int | float)):
+        assert len(a) == len(b), path
+        for i, (x, y) in enumerate(zip(a, b)):
+            _close(x, y, f"{path}[{i}]")
+    elif isinstance(a, int | float | np.ndarray | list) and not isinstance(a, bool):
+        np.testing.assert_allclose(
+            np.asarray(a, float), np.asarray(b, float), rtol=1e-7, atol=1e-11, err_msg=path
+        )
+    else:
+        assert a == b, path
+
+
+@pytest.mark.parametrize(
+    "f, cl, kw",
+    [
+        ("eng ~ posts | spell + week | feat ~ tbin + eng2", "id_a", {}),
+        ("eng ~ posts | spell + week | feat ~ tbin + eng2", "week", {"estimator": "liml"}),
+        ("eng ~ posts | spell + week | feat ~ tbin + eng2", "id_a", {"estimator": "liml", "fuller": 1.0}),
+        ("eng ~ posts | id_a + week | feat ~ tbin", "week", {}),  # compresses
+        ("eng ~ posts | week + fw | feat ~ tbin + eng2", "week", {"weights": "wt"}),  # cells merged
+        ("eng ~ feat + posts | spell + week", "id_a+week", {}),  # two-way: local + crossing
+        ("eng ~ feat + posts | week + fw", "id_a+week", {}),  # two-way, no local FE
+        ("eng + eng2 ~ feat + posts | spell + fw + cw", "week+id_a", {"weights": "wt"}),
+        ("eng ~ posts | spell + week | feat ~ tbin + eng2", "id_a+week", {"estimator": "liml"}),
+    ],
+)
+def test_cells_iv_and_twoway_equal_rows(ds_cw, f, cl, kw):
+    """cells=True beyond OLS one-way: IV (2SLS, LIML, Fuller; first stages and overid tests)
+    and two-way CRV1 equal the row path's fit, every number of the result."""
+    _, ds = ds_cw
+    opts = dict(cluster=cl, vcov=["CRV1", "iid"], log_every=1e9, record=False, iter_tol=1e-13, **kw)
+    a = dfeols.fit(ds, f, cells=True, **opts)
+    b = dfeols.fit(ds, f, **opts)
+    assert a.options["crossing_fe"] == "cells"
+    assert a.N == b.N and a.G == b.G and a.coefnames == b.coefnames and a.fe_levels == b.fe_levels
+    for y in a.outcomes:
+        _close(a.outcomes[y], b.outcomes[y], y)
+    _close(a.iv, b.iv, "iv")
+    if "+" in cl:
+        assert a.run["n_clusters"] == b.run["n_clusters"]
+        assert a.run["fe_nested_in"] == b.run["fe_nested_in"]
 
 
 def test_iterate_equals_sparse_two_outcomes(ds_cw):

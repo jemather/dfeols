@@ -597,20 +597,24 @@ def _iv_solve_iterate(plan: Plan, acc: dict, N: int, estimator, fuller, collin_t
     return sol
 
 
-def _tss(plan: Plan, acc: dict, m: int, collin_tol: float) -> np.ndarray:
+def _tss(plan: Plan, acc: dict, m: int, collin_tol: float, cols=None) -> np.ndarray:
     """Each outcome's weighted sum of squares net of all the FEs (as fixest's within R2,
     and the cell path's), so it does not depend on which FEs the partition makes local:
     Y~'W Y~ less its projection on the crossing-FE dummies D~ (from the CG solution on
-    plan C, else from the dummy block of Z'WZ). With no FEs, about the weighted mean."""
+    plan C, else from the dummy block of Z'WZ). With no FEs, about the weighted mean. `cols`
+    (default the first m) picks other outcome-block columns: IV's endogenous regressors."""
+    cols = np.arange(m) if cols is None else np.asarray(cols, np.int64)
     if not (plan.local_fes or plan.global_fes):
-        return acc["sum_wy2"][:m] - acc["sum_wy"][:m] ** 2 / acc["sumw"]
-    yy = np.diag(acc["YtY"])[:m].copy()
-    if not plan.n_dummy:  # (with slope-only local FEs, the dummy block is the hidden constant)
+        return acc["sum_wy2"][cols] - acc["sum_wy"][cols] ** 2 / acc["sumw"]
+    yy = np.diag(acc["YtY"])[cols].copy()
+    # cells: Y~ is net of every FE; with slope-only local FEs the dummy block may be only the
+    # hidden constant
+    if acc.get("all_absorbed") or not plan.n_dummy:
         return yy
     k = plan.k_x
     if plan.crossing_iterate:
-        return yy - np.einsum("ij,ij->j", acc["DR"][:, k : k + m], acc["Gamma"][:, k : k + m])
-    DD, DY = acc["ZtZ"][k:, k:], acc["ZtY"][k:, :m]
+        return yy - np.einsum("ij,ij->j", acc["DR"][:, k + cols], acc["Gamma"][:, k + cols])
+    DD, DY = acc["ZtZ"][k:, k:], acc["ZtY"][k:, cols]
     d = collinear_keep(DD, collin_tol, ref_diag=_at(acc.get("ref"), slice(k, None)))
     g = cho_solve(cho_factor(DD[np.ix_(d, d)], lower=True), DY[d])
     return yy - np.einsum("ij,ij->j", DY[d], g)
@@ -784,14 +788,18 @@ def _fit_cells(
     rows: dict,
     label: str,
     *,
-    cluster_local: bool,
     collin_tol: float,
     tol: float,
     maxiter: int,
     level_space_gb: float | None,
     precond: str,
+    estimator: str = "2sls",
+    fuller: float | None = None,
 ) -> dict:
-    """fit(cells=True): one pass of worker.shard_cells, then dfeols.cells on the coordinator."""
+    """fit(cells=True): one pass of worker.shard_cells; on the coordinator dfeols.cells absorbs
+    every FE from the cells, giving round 1's Gram matrices exactly, so OLS and IV are solved
+    as on rows (_ols_solve, iv.solve), and round 2's RSS and CRV1 meats (one- or two-way, IV
+    first stages) are the solve's linear maps applied to each cell's sums (cells.meats)."""
     from . import cells as _cells
     from .crossing import level_space_budget
 
@@ -819,22 +827,19 @@ def _fit_cells(
     executor.run(shard_cells, tasks, on, prog, "cells")
     prog.finish("cells")
     t1 = time.time()
-    df = _cells.combine(parts, len(plan.local_fes), bool(plan.cluster and cluster_local))
+    c1_local = bool(plan.cluster and plan.cluster_local)
+    c2_local = bool(plan.cluster2 and plan.cluster2_local)
+    df = _cells.combine(parts, len(plan.local_fes), c1_local, c2_local)
     parts.clear()  # the cells live in df now
     nl = len(plan.local_fes)
     fe_cols = [["shard", f"l{i}"] for i in range(nl)] + [[f"g{i}"] for i in range(len(plan.global_fes))]
-    cl_cols = (["shard", "cl"] if cluster_local else ["cl"]) if plan.cluster else None
     f = plan.formula
-    r = _cells.solve(
+    mY = len(f.depvars) + len(plan.endog_names)
+    a = _cells.absorb(
         df,
-        fe_names=[n for n, _ in plan.local_fes] + [n for n, *_ in plan.global_fes],
+        fe_names=plan.fe_labels,
         fe_cols=fe_cols,
-        cluster_cols=cl_cols,
-        m=len(f.depvars),
-        k=len(plan.colnames),
-        colnames=plan.colnames,
-        depvars=list(f.depvars),
-        vcov_types=plan.vcov_types,
+        p=mY + plan.k_x,
         drop_singletons=plan.drop_singletons,
         collin_tol=collin_tol,
         tol=tol,
@@ -843,14 +848,66 @@ def _fit_cells(
         precond=precond,
         label=label,
     )
-    acc["sumw"] = float(df["W"].sum())
-    acc["rows_in"] = r["rows"]
-    check_sample(int(r["N"]), acc["rows_in"], acc["load"])
-    info = r["info"]
+    df = a["df"]
+    N = a["N"]
+    acc["rows_in"] = a["rows"]
+    check_sample(int(N), acc["rows_in"], acc["load"])
+    ZZ, ref = a["ZZ"], a["ref"]
+    # round 1's accumulators, net of every FE (no dummy block: the cells absorb them all)
+    acc.update(
+        n=N,
+        sumw=float(a["W"].sum()),
+        ZtZ=ZZ[mY:, mY:],
+        ZtY=ZZ[mY:, :mY],
+        YtY=ZZ[:mY, :mY],
+        ref=ref[mY:],
+        ref_y=ref[:mY],
+        all_absorbed=True,
+    )
+    if f.iv:
+        sol = _iv.solve(plan, acc, N, estimator=estimator, fuller=fuller, collin_tol=collin_tol)
+    else:
+        sol = _ols_solve(plan, acc, collin_tol)
+
+    # clusters over the cells: codes, counts, FE nesting; two-way adds the second and a&b
+    fe_levels = a["levels"]
+    clusters, G, nested, two_way = [], None, [], None
+    if plan.cluster:
+        c1_cols = ["shard", "cl"] if c1_local else ["cl"]
+        c1, G, nested = _cells.cluster_codes(df, c1_cols, a["codes"], fe_levels)
+        clusters = [c1]
+        if plan.cluster2:
+            c2, G2, nested2 = _cells.cluster_codes(
+                df, ["shard", "cl2"] if c2_local else ["cl2"], a["codes"], fe_levels
+            )
+            ab = np.unique(c1 * max(G2, 1) + c2, return_inverse=True)[1]
+            clusters = [c1, c2, ab]
+            a_, b_ = plan.cluster[0], plan.cluster2[0]
+            two_way = {
+                "n_clusters": {a_: G, b_: G2},
+                "fe_nested_in": {
+                    n: [c for c, ok in ((a_, n1), (b_, n2)) if ok]
+                    for n, n1, n2 in zip(plan.fe_labels, nested, nested2)
+                },
+            }
+            nested = [n1 or n2 for n1, n2 in zip(nested, nested2)]
+            G = min(G, G2)
+    crv = "CRV1" in plan.vcov_types
+    acc2: dict = {}
+    groups = [("", sol.lin)] + ([("fs_", sol.lin["fs"])] if sol.lin.get("fs") else [])
+    for pre, g in groups:
+        r = _cells.meats(g, sol.lin["cols"], mY, a, clusters if crv else [])
+        acc2[pre + "rss"] = r["rss"]
+        acc2[pre + "hetero"] = None
+        if crv:
+            acc2[pre + "crv"] = r["crv"][0] + (r["crv"][1] - r["crv"][2] if plan.cluster2 else 0.0)
+        else:
+            acc2[pre + "crv"] = None
+    info = a["info"]
     log.info(
         "fit %s: %s rows in %s cells; %s absorbed, crossing %s (%s, %s steps); solve %s",
         label,
-        f"{r['N']:,}",
+        f"{N:,}",
         f"{info['cells']:,}",
         info["absorbed"],
         ", ".join(info["crossing"]) or "none",
@@ -860,8 +917,15 @@ def _fit_cells(
     )
     st = prog.stages["cells"]
     return {
-        **r,
         "acc": acc,
+        "sol": sol,
+        "acc2": acc2,
+        "N": N,
+        "G": G,
+        "fe_levels": fe_levels,
+        "nested": nested,
+        "two_way": two_way,
+        "info": info,
         "peak_rss": peak["rss"],
         "timing": {
             "cells_seconds": st.finished - st.started,
@@ -1019,7 +1083,8 @@ def fit(
                (AP-sweep, level space only)
     cells      fit from per-cell sums (dfeols.cells): one pass groups each shard's rows by every
                FE key and the cluster, and the coordinator solves on the cells, exactly. Pays
-               when the data compress (DB1B's market table: 32x). OLS; vcov CRV1 and iid
+               when the data compress (DB1B's market table: 32x). OLS and IV (2SLS, LIML,
+               Fuller); vcov CRV1 (one- or two-way) and iid; not HC1 (it needs each row's residual)
     """
     if not isinstance(ds, Dataset):
         ds = Dataset.open(ds)
@@ -1061,10 +1126,6 @@ def fit(
     if cells:
         from . import cells as _cells
 
-        if f_iv := plan.formula.iv:
-            raise NotImplementedError(f"cells=True is OLS only ({f_iv})")
-        if plan.cluster2:
-            raise NotImplementedError("cells=True clusters on one variable; two-way needs cells=False")
         bad = [v for v in plan.vcov_types if v not in _cells.VCOV]
         if bad:
             raise ValueError(
@@ -1136,22 +1197,19 @@ def fit(
             prog,
             rows,
             label,
-            cluster_local=plan.cluster_local,
             collin_tol=collin_tol,
             tol=iter_tol,
             maxiter=iter_maxiter,
             level_space_gb=level_space_gb,
             precond=crossing_precond,
+            estimator=estimator,
+            fuller=fuller,
         )
-        acc, out, N, G = cres["acc"], cres["out"], cres["N"], cres["G"]
-        fe_levels, nested, dropped, coefnames = (
-            cres["fe_levels"],
-            cres["nested"],
-            cres["dropped"],
-            cres["coefnames"],
-        )
-        iv_info = {}
-        two_way = None
+        acc, sol, acc2, N, G = cres["acc"], cres["sol"], cres["acc2"], cres["N"], cres["G"]
+        fe_levels, nested, two_way = cres["fe_levels"], cres["nested"], cres["two_way"]
+        dropped = sol.dropped
+        if dropped:
+            log.info("fit %s: dropped collinear regressors: %s", label, dropped)
         peak = {"rss": cres["peak_rss"]}
         timing = cres["timing"]
     else:
@@ -1380,8 +1438,7 @@ def fit(
                 acc2[pre + "crv"] = acc2[pre + "crv"] + acc2[pre + "c1_crv"] - acc2[pre + "c2_crv"]
         prog.finish("round2")
 
-        # ---------------- inference ----------------
-        k = len(sol.coefnames)
+        # FE levels, their nesting in the cluster(s) and the cluster counts, from round 1
         fe_levels = list(map(int, acc["fe_levels"]))
         nested = list(map(bool, acc["local_nested"])) if plan.cluster else []
         for i in range(len(plan.global_fes)):
@@ -1410,51 +1467,6 @@ def fit(
             nested = [n1 or n2 for n1, n2 in zip(nested, nested2)]
             G = min(G, G2)
 
-        out = {}
-        has_fe = bool(plan.local_fes or plan.global_fes)
-        # varying slopes: per FE its slope count and intercept, for the df (vcov.df_k)
-        fe_shape = (
-            ([len(plan.fe_slopes(n)) for n in plan.fe_keys], [plan.fe_intercept(n) for n in plan.fe_keys])
-            if plan.slopes
-            else ()
-        )
-        tss_all = _tss(plan, acc, len(f.depvars), collin_tol)
-        meat_idx = sol.meat_idx
-        overid = _iv.overid(sol, acc2["rss"], N) if f.iv else None
-        for j, y in enumerate(f.depvars):
-            b = sol.coef[:, j]
-            bread_use = sol.bread[j]
-            V = {}
-            dfk_plain = _df_k(k, fe_levels, None, *fe_shape)
-            if "iid" in plan.vcov_types:
-                V["iid"] = (vcov_iid(bread_use, acc2["rss"][j], N, dfk_plain), N - dfk_plain)
-            if "hetero" in plan.vcov_types:
-                V["hetero"] = (vcov_hetero(bread_use, acc2["hetero"][j], N, dfk_plain), N - dfk_plain)
-            if "CRV1" in plan.vcov_types:
-                dfk_cl = _df_k(k, fe_levels, nested, *fe_shape)
-                V["CRV1"] = (vcov_crv1(bread_use, acc2["crv"][j], N, dfk_cl, G), G - 1)
-            V = {t: (v[np.ix_(meat_idx, meat_idx)], df) for t, (v, df) in V.items()}
-            tss = tss_all[j]
-            out[y] = {
-                "coef": b,
-                "vcov": V,
-                "rss": float(acc2["rss"][j]),
-                "tss": float(tss),
-                "r2_within" if has_fe else "r2": float(1 - acc2["rss"][j] / tss),
-            }
-            if f.iv:
-                out[y]["kappa"] = float(sol.kappa[j])
-                out[y]["overid"] = overid[j]
-        iv_info = {}
-        if f.iv:
-            iv_info = {
-                "estimator": "fuller" if fuller is not None else estimator,
-                "fuller": fuller,
-                "endogenous": list(plan.endog_names),
-                "instruments": list(plan.inst_names),
-                "first_stage": _iv.first_stage(plan, sol, acc, acc2, N, fe_levels, nested, G, fe_shape),
-            }
-        coefnames = sol.coefnames
         timing = {
             "round1_seconds": prog.stages["round1"].finished - prog.stages["round1"].started,
             "round2_seconds": prog.stages["round2"].finished - prog.stages["round2"].started,
@@ -1462,6 +1474,58 @@ def fit(
             "singleton_passes": sing["passes"],
             "singleton_seconds": sing["seconds"],
         }
+
+    # ---------------- inference ----------------
+    k = len(sol.coefnames)
+    out = {}
+    has_fe = bool(plan.local_fes or plan.global_fes)
+    # varying slopes: per FE its slope count and intercept, for the df (vcov.df_k)
+    fe_shape = (
+        ([len(plan.fe_slopes(n)) for n in plan.fe_keys], [plan.fe_intercept(n) for n in plan.fe_keys])
+        if plan.slopes
+        else ()
+    )
+    tss_all = _tss(plan, acc, len(f.depvars), collin_tol)
+    if f.iv:  # the first stages' R2 net of every FE too, whichever the partition makes local
+        acc["fs_tss"] = _tss(
+            plan, acc, len(f.depvars), collin_tol, cols=len(f.depvars) + np.arange(len(plan.endog_names))
+        )
+    meat_idx = sol.meat_idx
+    overid = _iv.overid(sol, acc2["rss"], N) if f.iv else None
+    for j, y in enumerate(f.depvars):
+        b = sol.coef[:, j]
+        bread_use = sol.bread[j]
+        V = {}
+        dfk_plain = _df_k(k, fe_levels, None, *fe_shape)
+        if "iid" in plan.vcov_types:
+            V["iid"] = (vcov_iid(bread_use, acc2["rss"][j], N, dfk_plain), N - dfk_plain)
+        if "hetero" in plan.vcov_types:
+            V["hetero"] = (vcov_hetero(bread_use, acc2["hetero"][j], N, dfk_plain), N - dfk_plain)
+        if "CRV1" in plan.vcov_types:
+            dfk_cl = _df_k(k, fe_levels, nested, *fe_shape)
+            V["CRV1"] = (vcov_crv1(bread_use, acc2["crv"][j], N, dfk_cl, G), G - 1)
+        V = {t: (v[np.ix_(meat_idx, meat_idx)], df) for t, (v, df) in V.items()}
+        tss = tss_all[j]
+        out[y] = {
+            "coef": b,
+            "vcov": V,
+            "rss": float(acc2["rss"][j]),
+            "tss": float(tss),
+            "r2_within" if has_fe else "r2": float(1 - acc2["rss"][j] / tss),
+        }
+        if f.iv:
+            out[y]["kappa"] = float(sol.kappa[j])
+            out[y]["overid"] = overid[j]
+    iv_info = {}
+    if f.iv:
+        iv_info = {
+            "estimator": "fuller" if fuller is not None else estimator,
+            "fuller": fuller,
+            "endogenous": list(plan.endog_names),
+            "instruments": list(plan.inst_names),
+            "first_stage": _iv.first_stage(plan, sol, acc, acc2, N, fe_levels, nested, G, fe_shape),
+        }
+    coefnames = sol.coefnames
 
     if cache and not keep_cache:
         shutil.rmtree(wd / "cache", ignore_errors=True)

@@ -106,7 +106,8 @@ Worker memory scales with shard size, not total N.
 
 When the data compress (many rows per combination of every FE and the
 cluster), `fit(..., cells=True)` instead fits exactly from per-cell sums in
-one pass (10.3M DB1B rows in 329,000 cells: 9.8 s against 27 s).
+one pass (10.3M DB1B rows in 329,000 cells: 9.8 s against 27 s): OLS and IV, with iid and
+one- or two-way CRV1 SEs.
 
 **Choosing the partition key.** Pick the key the most FEs are nested in.
 Unit × time: partition by unit (unit FE local, time as dummies). With
@@ -357,7 +358,8 @@ of the time (iid: 85.8%, as expected with clustered errors).
 - **Varying slopes (`fe[x]`)** with crossing FEs take dense dummies only, so every crossing
   FE must fit `max_dummy_levels`; not on the sparse path, plan C, `cells=True` or in
   sessions yet.
-- **The cell path** (`cells=True`) is OLS only, with iid or one-way CRV1 SEs.
+- **The cell path** (`cells=True`) has no HC1 SEs (they need each row's residual) and no
+  varying slopes.
 - **Plan C's speed depends on the FE graph.** Crossing FEs too large for a direct solve
   are absorbed by conjugate gradient; when A does not fit `level_space_gb` each step is
   a pass over the shards, and steps grow as the FEs connect less well. `iter_tol` (1e-8)

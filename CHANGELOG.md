@@ -24,6 +24,10 @@ break the API).
   `fit` does (columns `c::level:x`), equal to `fit` on dense and iterated crossing FEs.
 - Created-variable expressions compare a column with a quoted string, `region == "west"`
   (`==` and `!=` only; the column is read as text, categoricals too).
+- `fit(cells=True)` takes IV (2SLS, LIML, Fuller, with first stages and overidentification
+  tests) and two-way CRV1. The cells give round 1's Gram matrices net of every FE exactly, so
+  the row path's own solvers run on them, and round 2's RSS and meats are the solve's linear
+  maps applied to each cell's sums. Equal to the row path in every number of the result.
 
 ### Changed
 
@@ -34,6 +38,8 @@ break the API).
 
 ### Fixed
 
+- The IV first-stage R² is net of every FE, as the outcomes' within R² is. It was net of the
+  FEs nested in the partition only (or of none), so it changed with the partition key.
 - Plan C in level space no longer runs workers out of memory. Shards cap their part of A by
   the worker's memory, not the coordinator's, so four parts fit in one combine. Combines add
   their inputs one at a time, and keep only the diagonal blocks (then nothing) before passing

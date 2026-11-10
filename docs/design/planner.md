@@ -281,7 +281,12 @@ cross-products. DB1B's 669M rows are 21.3M cells; the whole fit took 2.5 min on 
 (one streaming pass 58 s, system 81 s, solve 14 s; peak 15 GB). The gain is data-dependent:
 NFIP compresses 3-14x, the worker-firm panels not at all. The probe could report the cell count
 (one group-by) and recommend it when the ratio is large. *Decided:* pursue it, with CRV1 at a
-cluster in the cell key; HC1 is not needed (users of large FE fits cluster).
+cluster in the cell key; HC1 is not needed (users of large FE fits cluster). *Extended
+2026-11-10 (dfeols tool backlog chat):* the cells give round 1's Gram matrices net of every FE
+exactly, so OLS and IV (2SLS, LIML, Fuller) run through the row path's solvers, and round 2's
+RSS and CRV1 meats are the solve's linear maps (E = T A, X = T H) applied to each cell's sums:
+sum_i w_i T_i T_i' over a cell is its within cross-products plus W_c t~_c t~_c'. Two-way CRV1
+puts the second cluster in the cell key (meats a, b, a&b). Equal to the row path in every number.
 
 ## Site facts come from the profile
 

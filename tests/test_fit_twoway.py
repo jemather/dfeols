@@ -131,5 +131,5 @@ def test_refusals(ds, tmp_path):
         _fit(ds, tmp_path, "eng ~ posts | spell + week", cluster="id_a+id_a")
     with pytest.raises(KeyError, match="not encoded"):
         _fit(ds, tmp_path, "eng ~ posts | spell + week", cluster="id_a+nope")
-    with pytest.raises(NotImplementedError, match="two-way needs cells=False"):
-        _fit(ds, tmp_path, "eng ~ posts | spell + week", cluster="id_a+week", cells=True)
+    with pytest.raises(ValueError, match="HC1 needs each row"):
+        _fit(ds, tmp_path, "eng ~ posts | spell + week", cluster="id_a+week", vcov="hetero", cells=True)
