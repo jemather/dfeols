@@ -11,9 +11,9 @@ point-in-polygon on the TLC taxi zone shapefile (EPSG:2263, NY State Plane feet;
 are WGS84 lon/lat, projected with pyproj), and a ``.json`` sidecar with the counts. Every
 other column is unchanged and rows out equal rows in.
 
-Rules (Decisions 2026-11-09): a point in no zone (outside every polygon, including the 0/0 and
-other junk coordinates, or a missing coordinate) gets a null zone, so the package drops the
-trip. A point on a shared boundary (in two or more zones) gets the lowest LocationID; the
+Rules (Decisions 2026-11-09, 2026-11-10): a point in no zone (outside every polygon, including
+the 0/0 and other junk coordinates, or a missing coordinate) gets a null zone, which the package
+codes as 0 (missing). A point on a shared boundary (in two or more zones) gets the lowest LocationID; the
 sidecar counts them. A file whose sidecar matches its stage file's size and mtime is skipped.
 """
 

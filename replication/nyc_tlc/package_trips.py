@@ -53,13 +53,12 @@ SPECS = [  # (name, formula, services it runs on)
 ]  # fmt: skip
 CLUSTER = "od_pair"
 
-# SAMPLE: a trip is kept if
-#   - both zones are known (not null, not 264/265; 2009-10 points in no zone are null);
-#   - the pickup lies in its file's month (DROP_OFF_MONTH);
-#   - trip_time > 0 (every spec needs log_time), and where the service records them, fare > 0
-#     and miles > 0 (V1_RULES: nyc_fhvhv_v1's rule, so the fhvhv rows equal that dataset's).
+# SAMPLE (Decisions 2026-11-10): every trip whose pickup lies in its file's month (DROP_OFF_MONTH).
+# Zones are not filtered: a missing zone (null in the files, or a 2009-10 point in no polygon) is
+# coded MISSING_ZONE, and 264 "Unknown" and 265 "Outside of NYC" stay as levels. trip_time, fare
+# and miles <= 0 rows stay too, with that log null, so each fit drops only what it must.
 DROP_OFF_MONTH = True
-V1_RULES = True
+MISSING_ZONE = 0
 
 
 def month_offset() -> pl.Expr:
@@ -99,6 +98,7 @@ def common(lf: pl.LazyFrame, service: str) -> pl.LazyFrame:
 
 
 def zones_ok() -> pl.Expr:
+    """Both zones are real TLC zones 1-263 (counted, not filtered)."""
     return pl.all_horizontal(
         pl.col(c).is_not_null() & ~pl.col(c).is_in(UNKNOWN_ZONES)
         for c in ["pu_location_id", "do_location_id"]
@@ -106,18 +106,15 @@ def zones_ok() -> pl.Expr:
 
 
 def keep() -> pl.Expr:
-    k = zones_ok() & (pl.col("trip_time") > 0)
-    if DROP_OFF_MONTH:
-        k &= month_offset() == 0
-    if V1_RULES:  # null fare/miles (fhv) pass
-        k &= (pl.col("fare") > 0).fill_null(True) & (pl.col("trip_miles") > 0).fill_null(True)
-    return k
+    return month_offset() == 0 if DROP_OFF_MONTH else pl.lit(True)
 
 
 def frame(lf: pl.LazyFrame) -> pl.LazyFrame:
     """Sample rules and model columns on the common schema."""
     pos_log = lambda c: pl.when(pl.col(c) > 0).then(pl.col(c).cast(pl.Float64).log())
     return lf.filter(keep()).with_columns(
+        pl.col("pu_location_id", "do_location_id").fill_null(MISSING_ZONE)
+    ).with_columns(
         pickup_date=pl.col("pickup_datetime").dt.date(),
         year=pl.col("pickup_datetime").dt.year().cast(pl.Int16),
         date_hour=((pl.col("pickup_datetime") - T0).dt.total_hours()).cast(pl.Int32),
@@ -159,7 +156,7 @@ def main(argv=None) -> int:
     ap.add_argument("--stage", type=Path, default=Path("build/nyc_tlc/stage"))
     ap.add_argument("--zoned", type=Path, default=Path("build/nyc_tlc/zoned"))
     ap.add_argument("--out", type=Path, default=Path("outbox"))
-    ap.add_argument("--parts", type=int, default=70)
+    ap.add_argument("--parts", type=int, default=80)
     ap.add_argument("--months", default=None, help="FROM,TO (YYYY-MM): test on these stage files")
     ap.add_argument("--name", default=NAME)
     a = ap.parse_args(argv)
@@ -176,6 +173,7 @@ def main(argv=None) -> int:
         raw.group_by(grp.alias("svc"))
         .agg(
             rows_in=pl.len(),
+            zone_missing=(pl.col("pu_location_id").is_null() | pl.col("do_location_id").is_null()).sum(),
             zone_bad=(~zones_ok()).sum(),
             off_month=(month_offset() != 0).sum(),
             time_le0=(pl.col("trip_time") <= 0).sum(),
@@ -285,7 +283,10 @@ def write_readme(d, name, commit, files, rows, parts, sample_counts, levels, by_
         "service": "yellow, green, fhv, or the fhvhv company licence: HV0003 Uber, HV0005 Lyft, HV0004 Via, "
         "HV0002 Juno (TLC dictionary)",
         "base": "dispatching base licence (fhv, fhvhv); null for yellow and green",
-        "pu_location_id": "TLC taxi zone 1-263; yellow 2009-10 by point-in-polygon on the TLC shapefile",
+        "pu_location_id": "TLC taxi zone 1-263, 264 Unknown, 265 Outside of NYC, 0 missing "
+        "(null in the file, or a yellow 2009-10 point in no zone); 2009-10 by point-in-polygon on "
+        "the TLC shapefile",
+        "do_location_id": "as pu_location_id",
         "trip_miles": "trip_distance (yellow, green) or trip_miles (fhvhv); null for fhv",
         "trip_time": "seconds: dropoff minus pickup, except fhvhv's recorded trip_time",
         "fare": "fare_amount (yellow, green: metered fare) or base_passenger_fare (fhvhv: before tolls, "
@@ -316,8 +317,9 @@ def write_readme(d, name, commit, files, rows, parts, sample_counts, levels, by_
         f"| {r['service']} | {r['rows']:,} | {r['first']} to {r['last']} |" for r in by_service
     )
     sc = "\n".join(
-        f"| {s} | {c['rows_in']:,} | {c['zone_bad']:,} | {c['off_month']:,} | {c['time_le0']:,} | "
-        f"{c['fare_le0']:,} | {c['miles_le0']:,} | {c['kept']:,} |"
+        f"| {s} | {c['rows_in']:,} | {c['off_month']:,} | {c['kept']:,} | {c['zone_missing']:,} | "
+        f"{c['zone_bad']:,} | {c['time_le0']:,} | "
+        f"{c['fare_le0']:,} | {c['miles_le0']:,} |"
         for s, c in sample_counts.items()
     )
     nfiles = sum(len(v) for v in files.values())
@@ -329,7 +331,9 @@ NYC TLC trip records from every service, one row per trip: yellow taxis, green (
 for-hire vehicles (fhv) and high-volume for-hire rideshare (fhvhv), {rows:,} trips. A scale
 test for dfeols (D5 at full scale), not a replication: two FEs of zone × hour (tens of millions
 of levels, nested in the date partition) plus the zone pair (or zone pair × year), which crosses
-the partition. `nyc_fhvhv_v1` is the fhvhv rows alone, with more columns.
+the partition. Unknown and missing zones are levels of their own (0, 264, 265), so a few
+levels are very large (all fhv trips without zones share pair 0-0). `nyc_fhvhv_v1` holds the
+fhvhv trips with both zones known and positive fare, miles and time, with more columns.
 
 - **Source:** NYC TLC trip records, `{{yellow,green,fhv,fhvhv}}_tripdata_YYYY-MM.parquet` from
   https://www.nyc.gov/site/tlc/about/tlc-trip-record-data.page ({nfiles} monthly files,
@@ -339,19 +343,20 @@ the partition. `nyc_fhvhv_v1` is the fhvhv rows alone, with more columns.
   zones), `package_trips.py`, jemather/dfeols `{commit}`
 - **Built:** {date.today()} on valiant
 - **Rows:** {rows:,} in {len(parts)} parts by `pickup_date`, of {rows_in:,} in the files
-- **Sample** (STATE.md Decisions 2026-11-09 and 2026-11-10): both zones known (not null, not
-  264 "Unknown" or 265 "Outside of NYC"; a 2009-10 point in no zone counts as unknown); pickup in
-  its file's month; trip_time > 0; fare > 0 and miles > 0 where the service records them
-  (yellow, green, fhvhv). No trimming otherwise (trips over a day are kept).
+- **Sample** (STATE.md Decisions 2026-11-10): every trip whose pickup is in its file's month.
+  Zones are kept as recorded: 264 "Unknown" and 265 "Outside of NYC" as levels, a missing zone
+  (null, or a yellow 2009-10 point in no zone) as 0. Trips with trip_time, fare or miles ≤ 0
+  are kept with that log null, so fits drop them. No trimming (trips over a day are kept). fhv
+  dropoffs before 2017-06 are the TLC's placeholder 1989-01-01, so log_time is null there.
 - **fare is not one concept:** taxi `fare_amount` is the metered fare; fhvhv
   `base_passenger_fare` is the base fare before tolls, fees, tax and tips. Spec 2's `i(service)`
   absorbs the level difference only.
 - **Distributions** (every 1000th row): {st}
 
-Rows failing each rule (they overlap):
+Rows in the files by condition (they overlap; only off-month rows are dropped):
 
-| Service | Rows in files | Zone unknown | Off month | Time ≤ 0 | Fare ≤ 0 | Miles ≤ 0 | Kept |
-|---|---:|---:|---:|---:|---:|---:|---:|
+| Service | In files | Off month | Kept | Zone null | Zone not 1-263 | Time ≤ 0 | Fare ≤ 0 | Miles ≤ 0 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
 {sc}
 
 ## Services
