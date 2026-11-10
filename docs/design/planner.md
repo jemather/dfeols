@@ -287,6 +287,10 @@ exactly, so OLS and IV (2SLS, LIML, Fuller) run through the row path's solvers, 
 RSS and CRV1 meats are the solve's linear maps (E = T A, X = T H) applied to each cell's sums:
 sum_i w_i T_i T_i' over a cell is its within cross-products plus W_c t~_c t~_c'. Two-way CRV1
 puts the second cluster in the cell key (meats a, b, a&b). Equal to the row path in every number.
+The cells advice checks the coordinator (2026-11-10): `fit(cells=True)` is recommended only when
+its estimate (6 copies of the cells) fits the profile's coordinator memory; otherwise the report
+gives the need and the smallest node class in service that holds it, or says none does (D5's
+589M cells needed ~1,160 GB, which the planner recommended against a 16 GB coordinator).
 
 ## Site facts come from the profile
 

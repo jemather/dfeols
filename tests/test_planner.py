@@ -191,7 +191,8 @@ def test_plan_cells(data):
     cells = data.filter(pl.col("eng").is_finite()).select("id_a", "week").n_unique()
     assert c["key"] == ["id_a", "week"] and c["cells"] == cells
     assert c["recommended"] == (r["sample_rows"] >= CELLS_RATIO * c["cells"]) and "cells" in format_report(r)
-    assert not dfeols.plan(data, "eng ~ posts | spell | feat ~ eng2")["cells"]["eligible"]
+    assert dfeols.plan(data, "eng ~ posts | spell | feat ~ eng2")["cells"]["eligible"]  # IV too
+    assert not dfeols.plan(data, "eng ~ posts | spell[tenure]")["cells"]["eligible"]  # not slopes
 
 
 def test_stats_from_cells_equal_scans(data, monkeypatch):
@@ -245,3 +246,49 @@ def test_prep_partition_auto(tmp_path):
             formula="y ~ x | firm + year",
             fixed_effects=["firm"],
         )
+
+
+def test_cells_advice_checks_the_coordinator_memory(data):
+    """cells=True is recommended only when the cells fit the coordinator's memory; otherwise the
+    report names the smallest node class that holds them, or says none does (D5: ~1,160 GB)."""
+    from dfeols.site import Profile
+
+    def prof(coord, nodes):
+        return Profile(
+            name="t",
+            scheduler="local",
+            queue=None,
+            account=None,
+            project=None,
+            scratch=None,
+            prologue=[],
+            interface=None,
+            extra_directives=[],
+            env={},
+            worker={"cores": 1, "memory": "64GB"},
+            coordinator={"cores": 1, "memory": coord},
+            nodes=nodes,
+        )
+
+    f = "eng ~ feat + posts | id_a + week"
+    data = data.filter(pl.col("eng").is_finite())
+    big = dfeols.plan(data, f, cluster="id_a", profile=prof("64GB", {}))
+    assert big["cells"]["recommended"] and big["cells"]["fits"]
+    nodes = {
+        "small": {"memory": "1MB", "count": 10},
+        "large": {"memory": "512GB", "count": 2, "partition": "largemem"},
+        "huge": {"memory": "2TB", "count": 1},
+        "gone": {"memory": "4GB", "count": 1, "in_service": 0},
+    }
+    tiny = dfeols.plan(data, f, cluster="id_a", profile=prof("1MB", nodes))
+    c = tiny["cells"]
+    assert c["fits"] is False and not c["recommended"] and c["compresses"]
+    assert c["node_class"]["name"] == "large"
+    text = format_report(tiny)
+    assert "would need" in text and "node class large" in text
+    none = dfeols.plan(data, f, cluster="id_a", profile=prof("1MB", {"small": {"memory": "1MB"}}))
+    assert none["cells"]["node_class"] is None and "no node class" in format_report(none)
+    iv = dfeols.plan(
+        data, "eng ~ posts | id_a + week | feat ~ tbin", cluster="id_a", profile=prof("64GB", {})
+    )
+    assert iv["cells"]["eligible"]

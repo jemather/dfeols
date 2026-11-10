@@ -36,6 +36,9 @@ break the API).
   worker's own job id, so a run's worker logs could not be told apart from every other run's.
   The coordinator logs the folder at start.
 
+- `dfeols plan` recommends `cells=True` only when the cells fit the coordinator's memory;
+  otherwise it gives the need and the smallest node class that holds it. IV specs are eligible.
+
 ### Fixed
 
 - The IV first-stage R² is net of every FE, as the outcomes' within R² is. It was net of the

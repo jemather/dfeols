@@ -63,6 +63,25 @@ EXACT_PAIRS = 200_000_000  # most (group, level) pairs collected to count A's no
 CHUNK_FLOPS = 50_000_000  # products per chunk of that count
 
 
+def _node_for(profile, need_gb: float) -> dict | None:
+    """The smallest node class in service whose memory holds need_gb, or None."""
+    from .cluster import _memory_bytes
+
+    best = None
+    for name, nc in (getattr(profile, "nodes", None) or {}).items():
+        try:
+            gb = _memory_bytes(str(nc.get("memory"))) / 1e9
+        except Exception:
+            continue
+        if (
+            nc.get("in_service", nc.get("count", 1))
+            and gb >= need_gb
+            and (best is None or gb < best["memory_gb"])
+        ):
+            best = {"name": name, "memory_gb": gb, "partition": nc.get("partition")}
+    return best
+
+
 def _key(name: str) -> tuple[str, ...]:
     return tuple(fe_components(name))
 
@@ -556,16 +575,24 @@ def plan(
         n_cells = st(cell_cols)["levels"]
         p = k_x + m
         floats = 2 + p + p * (p + 1) // 2 + len(cell_cols)
-        ok = bool(fes) and not f.iv
+        ok = bool(fes) and not slopes  # OLS and IV; not varying slopes
+        # the shards' cells, their concatenation, the merged frame and the solve's copies:
+        # 6 copies (OSCER job 35625881: 21.2M cells, 20 floats each -> 19.4 GB peak)
+        c_raw = n_cells * floats * 8 * 6 / 1e9
+        c_need = round(c_raw, 1)
+        fits = None if coord_mem is None else c_raw <= coord_mem
         cells = {
             "key": list(cell_cols),
             "cells": n_cells,
             "rows_per_cell": round(n / max(n_cells, 1), 1),
-            # the shards' cells, their concatenation, the merged frame and the solve's copies:
-            # 6 copies (OSCER job 35625881: 21.2M cells, 20 floats each -> 19.4 GB peak)
-            "coordinator_gb": round(n_cells * floats * 8 * 6 / 1e9, 1),
+            "coordinator_gb": c_need,
+            "coordinator_memory_gb": coord_mem,
+            "fits": fits,
+            # a node class whose memory holds the cells, when the coordinator's does not
+            "node_class": _node_for(profile, c_raw) if fits is False else None,
             "eligible": ok,
-            "recommended": ok and n >= CELLS_RATIO * n_cells,
+            "compresses": n >= CELLS_RATIO * n_cells,
+            "recommended": ok and n >= CELLS_RATIO * n_cells and fits is not False,
         }
     report = {
         "formula": f.text,
@@ -687,11 +714,25 @@ def format_report(r: dict) -> str:
         line = f"  cells ({', '.join(c['key'])}): {c['cells']:,}, {c['rows_per_cell']:,} rows per cell"
         if c["recommended"]:
             line += (
-                f" -> fit(cells=True) is exact here (CRV1, iid) from one pass; "
+                f" -> fit(cells=True) is exact here (iid, CRV1) from one pass; "
                 f"coordinator ~{c['coordinator_gb']:.1f} GB"
+                + (f" of {c['coordinator_memory_gb']:.0f}" if c.get("coordinator_memory_gb") else "")
             )
         elif not c["eligible"]:
-            line += " (the cell path is OLS with FEs only)"
+            line += " (the cell path needs FEs, and takes no varying slopes)"
+        elif c.get("compresses") and c.get("fits") is False:
+            have = c["coordinator_memory_gb"]
+            line += (
+                f" -> fit(cells=True) would need ~{c['coordinator_gb']:,.0f} GB on the coordinator; "
+                f"the profile gives it {have:,.0f} GB"
+            )
+            nc = c.get("node_class")
+            line += (
+                f" (node class {nc['name']} has {nc['memory_gb']:,.0f} GB: set the coordinator's "
+                "memory to run it there)"
+                if nc
+                else " and no node class has that much: use the row path"
+            )
         out.append(line)
     runs = r.get("history_runs", 0)
     wall = (
