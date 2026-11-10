@@ -29,6 +29,8 @@ Functions: `attach_session`, `fit`, `refit`, `add_variable`, `variables`, `persi
 `detach_session`, `stop_session`.
 
 Installing: `R CMD INSTALL r` from the dfeols repository, after estrec's R package
-(`R CMD INSTALL r` in the estrec repository; it is not on CRAN yet). The tests run from
+(`R CMD INSTALL r` in the estrec repository; it is not on CRAN yet). For modelsummary tables,
+install broom as well: modelsummary reads the records through it, and only suggests it, so
+installing modelsummary alone leaves it out (found on OSCER, 2026-11-10). The tests run from
 Python (`tests/test_session_r.py`), which starts a session and drives
 `inst/tests/session_client.R` against it.
