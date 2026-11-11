@@ -101,7 +101,7 @@ Small-sample corrections follow fixest/pyfixest (`vcov.py`).
 - Site profiles (TOML) hold everything scheduler-specific. Built-in fixes:
   - clear a `/proc` `SLURM_CONF` (configless Slurm breaks nested `sbatch`);
   - bind the coordinator to a private/internal interface;
-  - set `POLARS_TEMP_DIR` to scratch;
+  - set `POLARS_TEMP_DIR` and `POLARS_OOC_SPILL_DIR` (Polars 2's streaming spill) to scratch;
   - pin `POLARS_OVERRIDE_TOTAL_MEMORY_MB` to the job allocation.
 
 ## Progress and ETA

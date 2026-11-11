@@ -123,11 +123,13 @@ def _env_lines(p: Profile, cores: int, memory: str | None = None, worker: bool =
     # task (no oversubscription); Polars and Rayon share one pool of the job's cores
     lines = [f"export {v}={1 if worker and v in TASK_THREAD_VARS else cores}" for v in THREAD_VARS]
     # Polars sizes its memory budget from the node's RAM, not the job's limit,
-    # and spills to /var/tmp, which is small on many compute nodes. Pin both.
+    # and spills to /var/tmp, which is small on many compute nodes. Pin both. Polars 2's
+    # streaming engine spills to POLARS_OOC_SPILL_DIR (default /var/tmp/polars-$USER/spill)
+    # and ignores POLARS_TEMP_DIR, so set both.
     if memory:
         lines.append(f"export POLARS_OVERRIDE_TOTAL_MEMORY_MB={int(_memory_bytes(memory) * 0.9 / 2**20)}")
     spill = str(p.scratch_dir("tmp", "polars")) if p.scratch else "${TMPDIR:-/tmp}/polars-$USER"
-    lines += [f"mkdir -p {spill}", f"export POLARS_TEMP_DIR={spill}"]
+    lines += [f"mkdir -p {spill}", f"export POLARS_TEMP_DIR={spill}", f"export POLARS_OOC_SPILL_DIR={spill}/spill"]
     lines += [f"export {k}={shlex.quote(str(v))}" for k, v in p.env.items()]
     return lines
 

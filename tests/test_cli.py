@@ -71,3 +71,19 @@ def test_submit_options_after_script(monkeypatch, tmp_path, argv, profile, name,
     main(argv)
     assert seen["p"] == profile and seen["job_name"] == name
     assert seen["cmd"].endswith(cmd_end)
+
+
+def test_env_lines_pin_polars_spill_to_scratch(tmp_path):
+    """Polars 2's streaming engine spills to POLARS_OOC_SPILL_DIR, not POLARS_TEMP_DIR; both
+    must point at scratch, not the node's /var/tmp (OSCER job 35945151 ran out of disk)."""
+    from dfeols.cluster import _env_lines
+    from dfeols.site import Profile
+
+    p = Profile(name="t", scheduler="slurm", queue=None, account=None, project=None,
+                scratch=str(tmp_path), prologue=[], interface=None, extra_directives=[],
+                env={}, worker={}, coordinator={})
+    lines = _env_lines(p, 4, "24GB", worker=True)
+    spill = str(tmp_path / "tmp" / "polars")
+    assert f"export POLARS_TEMP_DIR={spill}" in lines
+    assert f"export POLARS_OOC_SPILL_DIR={spill}/spill" in lines
+    assert lines.index(f"mkdir -p {spill}") < lines.index(f"export POLARS_OOC_SPILL_DIR={spill}/spill")
