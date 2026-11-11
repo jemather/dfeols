@@ -48,6 +48,10 @@ SPECS = {  # the v1 OSCER runs (scripts/oscer_eve_fit.py), r3 left out (its adde
     "r2": dict(fe=FE_BASE, vcov=[{"CRV1": "type_id+location_id"}]),
     "r4": dict(fe=FE_R4, vcov=[{"CRV1": "type_id"}]),
 }
+SAMPLES = {  # Ted 2026-11-10: fit both; duration-365 orders are ~1/3 of rows, likely NPC seed orders
+    "all": None,
+    "duration<365": pl.col("duration") < 365,
+}
 DROP = ["first_seq", "last_seq"]  # build-internal snapshot sequence numbers
 FES = {
     "order_id": ["order_id"], "type_id": ["type_id"], "region_id": ["region_id"],
@@ -98,19 +102,28 @@ def fits(data_files: list[Path]) -> list[dict]:
     cols = ["exit", "exit_vanished", "exit_expired", "log_rel_price", "log_volume_remain",
             "log_age_days", "n_price_changes", "is_buy", "type_id", "region_id", "day_index",
             "location_id"]
-    pdf = (pl.scan_parquet(data_files).filter(pl.col("day").is_between(*REF)).select(cols)
-           .drop_nulls().collect().to_pandas())
+    week = pl.scan_parquet(data_files).filter(pl.col("day").is_between(*REF))
+    out = []
+    for sample, cond in SAMPLES.items():
+        out += _fits(week if cond is None else week.filter(cond), cols, sample)
+    return out
+
+
+def _fits(lf: pl.LazyFrame, cols: list[str], sample: str) -> list[dict]:
+    import pyfixest as pf
+
+    pdf = lf.select(cols).drop_nulls().collect().to_pandas()
     out = []
     for spec, s in SPECS.items():
         for y, label in OUTCOMES:
             for v in s["vcov"]:
                 m = pf.feols(f"{y} ~ {X} | {s['fe']}", data=pdf, vcov=v)
                 coef, se = m.coef(), m.se()
-                out.append({"spec": spec, "outcome": y, "label": label,
+                out.append({"sample": sample, "spec": spec, "outcome": y, "label": label,
                             "formula": f"{y} ~ {X} | {s['fe']}", "vcov": v, "nobs": int(m._N),
                             "subsample": f"day {REF[0]}..{REF[1]}, nulls dropped",
                             "coef": {k: [float(coef[k]), float(se[k])] for k in coef.index}})
-                print(f"ref {spec} {y} {v}: N {int(m._N):,}", flush=True)
+                print(f"ref {sample} {spec} {y} {v}: N {int(m._N):,}", flush=True)
     return out
 
 
@@ -168,11 +181,18 @@ def main(argv=None) -> int:
     levels = {"order_id": 0, **level_counts_parts(data_files, fes, WITHIN_DAY)}
     sums = {k: 0 for k in ("exit", "exit_vanished", "exit_partly_filled", "exit_expired",
                            "right_censored", "left_censored", "new_order")}
+    d365 = {"rows": 0, "exits": 0, "right_censored": 0}
     for f in data_files:  # an order's first order-day in the window counts it once
         r = (pl.scan_parquet(f).select(
             first=(pl.col("day") == pl.col("first_day")).sum().cast(pl.Int64),
+            d365_rows=(pl.col("duration") >= 365).sum().cast(pl.Int64),
+            d365_exits=((pl.col("duration") >= 365) & (pl.col("exit") == 1)).sum().cast(pl.Int64),
+            d365_right_censored=((pl.col("duration") >= 365) & pl.col("right_censored")).sum()
+            .cast(pl.Int64),
             **{k: pl.col(k).cast(pl.Int64).sum() for k in sums}).collect().row(0, named=True))
         levels["order_id"] += r.pop("first")
+        for k in d365:
+            d365[k] += r.pop(f"d365_{k}")
         for k in sums:
             sums[k] += r[k]
     stats = {k: v / rows for k, v in sums.items()}
@@ -183,10 +203,10 @@ def main(argv=None) -> int:
         "dataset": a.name, "build": f"jemather/dfeols {commit}",
         "order_day_build": summary.get("build_commit"), "tool": "pyfixest (in memory, valiant)",
         "rows": rows, "rows_dropped_by_region_rule": dropped, "regions_kept": keep,
-        "fe_levels": levels, "means": stats, "fits": ref_fits, "parts": parts,
+        "fe_levels": levels, "means": stats, "duration_365": d365, "fits": ref_fits, "parts": parts,
     })
     write_readme(d, a, commit, summary, files, rows, dropped, keep, regions, parts, levels,
-                 stats, ref_fits, data)
+                 stats, d365, ref_fits, data)
     return 0
 
 
@@ -212,7 +232,7 @@ NOTES = {
 
 
 def write_readme(d, a, commit, summary, files, rows, dropped, keep, regions, parts, levels, stats,
-                 ref_fits, data) -> None:
+                 d365, ref_fits, data) -> None:
     def esc(s: str) -> str:
         return s.replace("|", "\\|")
 
@@ -223,9 +243,9 @@ def write_readme(d, a, commit, summary, files, rows, dropped, keep, regions, par
                    + ", ".join(f"CRV1 {v['CRV1']}" if isinstance(v, dict) else v for v in s["vcov"])
                    + " |" for k, s in SPECS.items())
     fr = "\n".join(
-        f"| {r['spec']} | {r['outcome']} | {r['vcov']['CRV1'] if isinstance(r['vcov'], dict) else r['vcov']} "
+        f"| {r['sample']} | {r['spec']} | {r['outcome']} | {r['vcov']['CRV1'] if isinstance(r['vcov'], dict) else r['vcov']} "
         f"| {r['nobs']:,} | " + ", ".join(f"{t} {v[0]:.6f} ({v[1]:.6f})" for t, v in r["coef"].items())
-        + " |" for r in ref_fits) or "| (not run) | | | | |"
+        + " |" for r in ref_fits) or "| (not run) | | | | | |"
     gone = regions.filter(~pl.col("kept"))
     gb = sum(p["bytes"] for p in parts) / 1e9
     (d / "README.md").write_text(f"""# {a.name}
@@ -259,6 +279,10 @@ v1 (`eve_order_day_v1`) is the same panel on 147 days of EVE Ref's own snapshots
 - **Means:** exit {stats['exit']:.4f}; vanished {stats['exit_vanished']:.4f}, partly filled
   {stats['exit_partly_filled']:.4f}, expired {stats['exit_expired']:.4f}; new order
   {stats['new_order']:.4f}, right-censored {stats['right_censored']:.4f}
+- **365-day orders:** {d365['rows']:,} rows ({d365['rows'] / rows:.0%}) are orders with `duration`
+  365, almost all open for the whole window ({d365['right_censored']:,} of them right-censored,
+  {d365['exits']:,} exits): long-lived orders that rarely change, likely NPC seed orders. They are
+  kept, as in v1 (34% of its rows); the specs are run on all rows and on `duration < 365`
 - **Not in v2** (Fuzzwork lacks them): system_id, constellation_id, http_last_modified
 
 ## Parts
@@ -286,7 +310,8 @@ Contiguous ranges of `day`, sorted by day and order_id within a part.
 Partition `day` (the parts' key; `type_id^region_id^day_index` and `location_id^day_index` nest
 in it); cluster `type_id`. The risk set is every order-day; right-censored orders never exit.
 The specs are v1's OSCER runs r1, r2 and r4 (Decisions 2026-11-09), each on the three outcomes
-`exit`, `exit_vanished`, `exit_expired`, with `{X}`:
+`exit`, `exit_vanished`, `exit_expired`, with `{X}`, on two samples
+(Ted 2026-11-10): all rows, and `duration < 365` (without the 365-day orders):
 
 | Spec | FE | vcov |
 |---|---|---|
@@ -295,8 +320,8 @@ The specs are v1's OSCER runs r1, r2 and r4 (Decisions 2026-11-09), each on the 
 Reference (pyfixest, days {REF[0]} to {REF[1]}, rows with nulls in the model dropped; full
 precision in `reference.json`):
 
-| Spec | Outcome | vcov | N | b (se) |
-|---|---|---|---:|---|
+| Sample | Spec | Outcome | vcov | N | b (se) |
+|---|---|---|---|---:|---|
 {fr}
 
 Then the full window; no reference outside dfeols.
