@@ -189,3 +189,33 @@ def test_pcg_resumes_from_a_checkpoint(tmp_path):
     assert cx.Checkpoint(tmp_path / "cg.npz", R * (1 + 1e-14), 1e-10, "jacobi").load() is not None
     assert cx.Checkpoint(tmp_path / "cg.npz", R * 1.01, 1e-10, "jacobi").load() is None
     assert cx.Checkpoint(tmp_path / "cg.npz", R, 1e-8, "jacobi").load() is None
+
+
+def test_iter_cache_budget_and_earlier_fits(monkeypatch):
+    # a worker keeps one fit's shard state (D5 job 35888031: fare's 8 GB stayed through
+    # pair x year's round 1), within its plan's budget, counting every array it holds
+    from dfeols import worker as wk
+
+    monkeypatch.delenv("DFEOLS_ITER_CACHE_GB", raising=False)
+    monkeypatch.setattr(wk, "_ITER_CACHE", type(wk._ITER_CACHE)())
+    n, P = 1000, 50
+    Dm = sp.csr_matrix((np.ones(n), (np.arange(n), np.arange(n) % P)), shape=(n, P))
+    codes, w = [np.zeros(n, np.int32)], np.ones(n)
+    arrays = (codes[0], Dm.data, Dm.indices, Dm.indptr, w, np.arange(P, dtype=Dm.indices.dtype))
+    one = sum(a.nbytes for a in arrays)
+    assert cx.iter_cache_budget(24_000_000_000) == 6_000_000_000
+
+    old = wk.Plan.__new__(wk.Plan)
+    old.iter_token, old.iter_cache_bytes = "fare", 10 * one
+    for sid in range(3):
+        wk._iter_store(old, sid, codes, Dm, w)
+    assert wk._iter_store(old, 9, codes, Dm, w)[-1] == one
+    new = wk.Plan.__new__(wk.Plan)
+    new.iter_token, new.iter_cache_bytes = "pairyear", int(2.5 * one)
+    for sid in range(4):
+        wk._iter_store(new, sid, codes, Dm, w)
+    assert list(wk._ITER_CACHE) == [("pairyear", 2), ("pairyear", 3)]  # fare's gone, LRU kept 2
+    monkeypatch.setenv("DFEOLS_ITER_CACHE_GB", str(3.5 * one / 1e9))
+    for sid in range(4, 8):
+        wk._iter_store(new, sid, codes, Dm, w)
+    assert len(wk._ITER_CACHE) == 3

@@ -49,9 +49,21 @@ from .rowhash import rowset
 # Sparse path: above this many crossing-FE levels a shard returns its Gram matrix sparse
 SPARSE_GRAM_LEVELS = 2000
 
-# Plan C: shard state kept between conjugate-gradient steps, least recently used first out
+# Plan C: shard state kept between conjugate-gradient steps, least recently used first out.
+# Its budget is the plan's (crossing.iter_cache_budget: a share of a worker's memory), or
+# DFEOLS_ITER_CACHE_GB if set, else ITER_CACHE_DEFAULT_GB. A fit's first entry on a worker
+# drops every earlier fit's: the module outlives fits, and D5 (job 35888031) ran pair x year
+# after fare on workers still holding fare's 8 GB of state, 15-17 GB idle of 22 GiB, until
+# round-1 tasks pushed them past the nanny's 95% limit.
 _ITER_CACHE: OrderedDict = OrderedDict()
-ITER_CACHE_GB = float(os.environ.get("DFEOLS_ITER_CACHE_GB", "8"))
+ITER_CACHE_DEFAULT_GB = 8.0
+
+
+def _iter_cache_bytes(plan) -> float:
+    env = os.environ.get("DFEOLS_ITER_CACHE_GB")
+    if env:
+        return float(env) * 1e9
+    return float(plan.iter_cache_bytes or ITER_CACHE_DEFAULT_GB * 1e9)
 
 
 @dataclass
@@ -77,6 +89,7 @@ class Plan:
     sparse_global: bool = False  # crossing FEs via per-level sums, no dense dummies
     crossing_iterate: bool = False  # plan C: crossing-FE coefficients by distributed CG
     iter_token: str | None = None  # plan C: names this fit's shard state in _ITER_CACHE
+    iter_cache_bytes: int = 0  # plan C: a worker's budget for that state (0: the default)
     cg_checkpoint: str | None = None  # plan C with a pass per step: where its CG state is kept
     level_nnz: int = 0  # plan C: most nonzeros of A a shard returns (0: no level space)
     part_nnz: int = 0  # and at most this many, for the workers' memory (0: level_nnz alone)
@@ -859,12 +872,22 @@ def _cluster_stats(plan: Plan, df, local_codes, cl: np.ndarray):
 
 def _iter_store(plan: Plan, shard_id: int, local_codes, Dm, w) -> tuple:
     idx = np.unique(Dm.indices)  # levels present in the shard
-    nbytes = sum(c.nbytes for c in local_codes) + Dm.data.nbytes + Dm.indices.nbytes + w.nbytes
+    nbytes = (
+        sum(c.nbytes for c in local_codes)
+        + Dm.data.nbytes
+        + Dm.indices.nbytes
+        + Dm.indptr.nbytes
+        + w.nbytes
+        + idx.nbytes
+    )
     entry = (local_codes, Dm, w, idx, nbytes)
     if plan.iter_token:
+        for k in [k for k in _ITER_CACHE if k[0] != plan.iter_token]:  # earlier fits' state
+            del _ITER_CACHE[k]
         _ITER_CACHE[(plan.iter_token, shard_id)] = entry
         used = sum(v[-1] for v in _ITER_CACHE.values())
-        while _ITER_CACHE and used > ITER_CACHE_GB * 1e9:
+        budget = _iter_cache_bytes(plan)
+        while _ITER_CACHE and used > budget:
             used -= _ITER_CACHE.popitem(last=False)[1][-1]
     return entry
 

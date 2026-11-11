@@ -841,9 +841,10 @@ def demean_once(
     k_tot = plan.n_dummy
     reduce = None
     if plan.crossing_iterate:
-        from .crossing import LevelGram, level_space_budget, part_budget, worker_bytes
+        from .crossing import LevelGram, iter_cache_budget, level_space_budget, part_budget, worker_bytes
 
         plan.iter_token = f"{out}:{uuid.uuid4().hex}"
+        plan.iter_cache_bytes = iter_cache_budget(worker_bytes(executor))
         # beside the folder, which an interrupted build's rerun deletes
         plan.cg_checkpoint = str(out.parent / f"{out.name}.cg_checkpoint.npz")
         plan.level_nnz = level_space_budget(executor, spec.level_space_gb)

@@ -37,6 +37,9 @@ LEVEL_SPACE_SHARE = 0.25
 # A worker's memory a combine of parts of A may use (inputs and the sums it builds; the rest is
 # the process itself, Dask's buffers and the nanny's 95% limit)
 WORKER_SHARE = 0.6
+# A worker's memory plan C keeps shard state in between CG steps (worker._ITER_CACHE); it
+# sits beside every task's own peak, so it takes less than a combine
+ITER_CACHE_SHARE = 0.25
 # Bytes per nonzero of a combine's inputs while it sums them, on top of the inputs themselves
 # (one at a time: the sum so far and its next copy; measured 21-24 on 4 x 5M random parts)
 MERGE_BYTES = 24
@@ -84,6 +87,11 @@ def worker_bytes(executor=None, prof=None) -> int:
     import psutil
 
     return int(psutil.virtual_memory().total)
+
+
+def iter_cache_budget(wbytes: int) -> int:
+    """Bytes of shard state a worker keeps between CG steps (DFEOLS_ITER_CACHE_GB overrides)."""
+    return int(ITER_CACHE_SHARE * wbytes)
 
 
 def part_budget(wbytes: int, fan_in: int = FAN_IN) -> int:

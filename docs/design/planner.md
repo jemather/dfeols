@@ -127,8 +127,9 @@ fewer rounds. Round 1 returns D'W[X~ Y~] (per-level sums of the locally demeaned
 Jacobi diagonal; the coordinator solves (D~'W D~) Gamma = D~'W[X~ Y~], one column per regressor
 and outcome, where each step broadcasts a levels x columns block p and every shard returns
 D'W Q D p (Q its exact local demeaning: one FE closed form, two Schur, more iterate). Shards
-keep their codes and weights, not the data, in worker memory between steps (`DFEOLS_ITER_CACHE_GB`,
-default 8; a worker without them re-reads the shard), and the Dask executor scatters p once
+keep their codes and weights, not the data, in worker memory between steps (a quarter of the
+worker's memory, or `DFEOLS_ITER_CACHE_GB`; a fit's first entry drops earlier fits' state; a
+worker without them re-reads the shard), and the Dask executor scatters p once
 per step instead of once per task. beta follows by Frisch-Waugh-Lovell on the coordinator, and
 round 2 is the sparse path's, so every vcov works. Equal to pyfixest and to the dense-solve
 path; on a 1M-row worker panel with 8,000 firms it took 13 steps (5 s, against 11 s for plan

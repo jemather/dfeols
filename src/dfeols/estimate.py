@@ -1143,9 +1143,10 @@ def fit(
         plan.cache_dir = None  # recomputing is cheap on this path
         cache = False
     if plan.crossing_iterate:
-        from .crossing import level_space_budget, part_budget, worker_bytes
+        from .crossing import iter_cache_budget, level_space_budget, part_budget, worker_bytes
 
         plan.iter_token = f"{wd}:{uuid.uuid4().hex}"
+        plan.iter_cache_bytes = iter_cache_budget(worker_bytes(executor))
         plan.level_nnz = level_space_budget(executor, level_space_gb)
         plan.part_nnz = part_budget(worker_bytes(executor)) if plan.level_nnz else 0
     f = plan.formula
