@@ -282,6 +282,13 @@ def _read_keep(plan: Plan, shard_id: int, n: int) -> np.ndarray:
     return np.unpackbits(np.load(p.with_suffix(".bits.npy")), count=n).astype(bool)
 
 
+def _sparse_count(lv: np.ndarray, inv: np.ndarray, keep: np.ndarray):
+    """Kept rows per level as (levels, counts), levels with none left out."""
+    cnt = np.bincount(inv[keep], minlength=len(lv))
+    nz = cnt > 0
+    return lv[nz], cnt[nz]
+
+
 def shard_singletons(plan: Plan, shard_id: int, files: list[str], gcount, first: bool) -> dict:
     """One pass of singleton removal over every FE, as fixest and reghdfe do.
 
@@ -290,18 +297,29 @@ def shard_singletons(plan: Plan, shard_id: int, files: list[str], gcount, first:
     singletons only). Other shards only drop rows, so gcount minus this shard's
     own rows plus its current rows is an upper bound on a level's true count: a
     row is dropped only if it is truly alone, and anything missed is caught on a
-    later pass. Writes the keep mask and returns this shard's level counts."""
+    later pass. Writes the keep mask and returns this shard's level counts.
+
+    Works in the shard's own levels (np.unique) and returns them sparse, (levels, counts):
+    a dense count per crossing level made every task allocate and ship L int64s (D6 r4,
+    15.5M location x day levels: 124 MB per shard, 540 GB to the coordinator over 4,355
+    shards; singletons1 ran at a third of r1's speed)."""
     t0 = time.perf_counter()
     df = _load(plan, files)  # the same rows round 1 sees (listwise deletion included)
     n0 = df.height
     keep = np.ones(n0, bool) if first else np.load(_keep_path(plan, shard_id))
     # only FEs with an intercept have singletons (fixest: a slope-only FE drops none)
     local = [densify(df[c].to_numpy())[0] for n, c in plan.local_fes if plan.fe_intercept(n)]
-    glob = [(df[c].to_numpy().astype(np.int64), L) for n, c, L in plan.global_fes if plan.fe_intercept(n)]
+    glob = []  # (this shard's levels, each row's index into them)
+    for n, c, _L in plan.global_fes:
+        if plan.fe_intercept(n):
+            lv, inv = np.unique(df[c].to_numpy().astype(np.int64), return_inverse=True)
+            glob.append((lv, inv.ravel()))
     before = int(keep.sum())
     others = None
     if gcount is not None:
-        others = [gc - np.bincount(g[keep], minlength=L) for gc, (g, L) in zip(gcount, glob)]
+        others = [
+            np.asarray(gc)[lv] - np.bincount(inv[keep], minlength=len(lv)) for gc, (lv, inv) in zip(gcount, glob)
+        ]
     changed = n0 > 0
     while changed:
         changed = False
@@ -311,9 +329,9 @@ def shard_singletons(plan: Plan, shard_id: int, files: list[str], gcount, first:
             if bad.any():
                 keep &= ~bad
                 changed = True
-        for i, (g, L) in enumerate(glob if others is not None else ()):
-            cnt = others[i] + np.bincount(g[keep], minlength=L)
-            bad = keep & (cnt[g] <= 1)
+        for i, (lv, inv) in enumerate(glob if others is not None else ()):
+            cnt = others[i] + np.bincount(inv[keep], minlength=len(lv))
+            bad = keep & (cnt[inv] <= 1)
             if bad.any():
                 keep &= ~bad
                 changed = True
@@ -325,7 +343,7 @@ def shard_singletons(plan: Plan, shard_id: int, files: list[str], gcount, first:
     return {
         "shard": shard_id,
         "dropped": before - int(keep.sum()),
-        "gcount": [np.bincount(g[keep], minlength=L) for g, L in glob],
+        "gcount": [_sparse_count(lv, inv, keep) for lv, inv in glob],
         "timing": {"total": time.perf_counter() - t0, "maxrss_gb": _maxrss_gb()},
     }
 

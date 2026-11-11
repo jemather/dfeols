@@ -424,8 +424,8 @@ def _drop_singletons(plan: Plan, ds: Dataset, executor, prog: Progress, rows: di
 
         def on(tid, r, acc=acc):
             acc["dropped"] += r["dropped"]
-            for i, c in enumerate(r["gcount"]):
-                acc["g"][i] += c
+            for i, (lv, c) in enumerate(r["gcount"]):  # sparse: this shard's levels
+                np.add.at(acc["g"][i], lv, c)
 
         tasks = [
             (s["id"], rows[s["id"]], (plan, s["id"], ds.shard_paths(s), gcount, p == 1)) for s in ds.shards
