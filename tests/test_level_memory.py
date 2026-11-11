@@ -139,18 +139,23 @@ class _Client:
     def __init__(self):
         self.sent = []
 
-    def scatter(self, data, broadcast=False, hash=True):
-        self.sent.append(data)
-        return [f"future-{len(self.sent)}"]
+    def submit(self, fn, *args, key=None, **kw):
+        self.sent.append((fn, args, key))
+        return f"future-{len(self.sent)}"
 
 
-def test_shared_dict_of_arrays_scattered_once():
+def test_shared_dict_of_arrays_sent_once_as_a_task():
+    """A task, not scatter(broadcast=True): see DaskExecutor._scatter_shared."""
+    from dfeols.executors import _unbox
+
     lin = {"A": np.zeros((10, 2)), "G": np.zeros((200_000, 3)), "fs": {"G": np.zeros(10)}}
     small = {"A": np.zeros(3)}
     ex = DaskExecutor(_Client())
     tasks = [(i, 1, ("plan", i, [f"f{i}"], lin, small)) for i in range(5)]
-    shared = ex._scatter_shared(tasks)
-    assert list(shared) == [id(lin)] and ex.client.sent == [[lin]]
+    shared = ex._scatter_shared(tasks, "r1")
+    assert list(shared) == [id(lin)] and len(ex.client.sent) == 1
+    fn, args, key = ex.client.sent[0]
+    assert fn(*args) is lin and key == "dfeols-shared-r1-0" and fn is _unbox
 
 
 def _shard(n_local: int, seed: int = 1):

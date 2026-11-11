@@ -140,3 +140,40 @@ def test_parts_summed_on_workers_equal_per_shard(tmp_path, level_space_gb):
     if level_space_gb is None:
         assert cb["shipped_nnz"] == cb["A_nnz"] < ca["shipped_nnz"]  # the coordinator got A once
     np.testing.assert_allclose(a.coef(), b.coef(), rtol=1e-10)
+
+
+def _sum_shared(i, big):
+    return {"x": float(big.sum()) + i, "timing": {"total": 0.0}}
+
+
+def test_shared_argument_survives_losing_its_worker():
+    """A shared argument (DaskExecutor._scatter_shared) is a task: when the worker holding it
+    dies before the tasks run, Dask recomputes it rather than logging "can't be recovered" and
+    leaving them waiting (D5 35923333, D6 35924356). No broadcast either: no Scheduler.replicate."""
+    import numpy as np
+
+    distributed = pytest.importorskip("distributed")
+    big = np.ones(300_000)  # over scatter_min_bytes
+    with (
+        distributed.LocalCluster(n_workers=2, threads_per_worker=1, dashboard_address=None) as lc,
+        distributed.Client(lc) as c,
+    ):
+        ex = DaskExecutor(c, max_workers=2, tick=0.1)
+        tasks = [(i, 1, (i, big)) for i in range(4)]
+        shared = ex._scatter_shared(tasks, "t")
+        (fut,) = shared.values()
+        distributed.wait(fut)
+        holder = next(iter(c.who_has(fut)[fut.key]))
+        import os
+
+        try:  # the worker dies mid-call (its nanny starts a fresh one, without the data)
+            c.run(os._exit, 1, workers=[holder])
+        except Exception:
+            pass
+        assert holder not in c.who_has(fut).get(fut.key, ())
+        got = {}
+        prog = Progress(None, label="t", every=1e9)
+        prog.add_stage("s", {i: 1 for i in range(4)})
+        prog.start("s")
+        ex.run(_sum_shared, tasks, lambda t, r: got.setdefault(t, r["x"]), prog, "s")
+    assert got == {i: 300_000.0 + i for i in range(4)}

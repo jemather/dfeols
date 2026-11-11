@@ -121,6 +121,12 @@ def _nbytes(a) -> int:
     return 0
 
 
+def _unbox(box):
+    """A shared argument's task: returns the one object it was submitted with (see
+    DaskExecutor._share)."""
+    return box[0]
+
+
 def _order(tasks):
     """Largest-first (LPT) for load balance, but one small task first so the
     ETA calibrates quickly."""
@@ -204,10 +210,20 @@ class DaskExecutor:
         except Exception:
             return set()
 
-    def _scatter_shared(self, tasks) -> dict:
+    def _scatter_shared(self, tasks, run_id: str = "") -> dict:
         """Large arguments passed to every task go to the workers once, not once per task:
         arrays (plan C's CG block) and dicts of them (round 2's linear maps, with plan C's FE
-        solution: D6, 758k levels, a 46 MiB graph). {id(argument): future}."""
+        solution: D6, 758k levels, a 46 MiB graph). {id(argument): future}.
+
+        Each is a task returning it (_unbox), not client.scatter: scatter(broadcast=True)
+        calls Scheduler.replicate, which loops until every worker holds a copy while the
+        Active Memory Manager (on by default) drops the extra copies, so it can spin for
+        hours (D5 pairyear 35923333 at its first CG step, D6 35924356 at singletons2:
+        2 h each, until the workers reached their walltime). And scattered data has no
+        recipe: when its last holder left, Dask logged that it "can't be recovered" and the
+        tasks waiting on it never started. A task's argument stays in the scheduler's graph,
+        so Dask recomputes it on a lost worker, and workers fetch it from each other as they
+        need it."""
         if not tasks:
             return {}
         ids = None
@@ -217,8 +233,16 @@ class DaskExecutor:
         if not ids:
             return {}
         shared = {id(a): a for a in tasks[0][2] if id(a) in ids}
-        # in a list, so Dask sends a dict as one object rather than one future per key
-        return {i: self.client.scatter([a], broadcast=True, hash=False)[0] for i, a in shared.items()}
+        import warnings
+
+        out = {}
+        with warnings.catch_warnings():  # "Sending large graph": by design, once per run
+            warnings.filterwarnings("ignore", message=".*[Ll]arge graph.*")
+            for j, (i, a) in enumerate(shared.items()):
+                # in a list, so Dask passes a dict as one object rather than walking its keys
+                key = f"dfeols-shared-{run_id or uuid.uuid4().hex[:8]}-{j}"
+                out[i] = self.client.submit(_unbox, [a], key=key, pure=False, retries=self.retries)
+        return out
 
     def run(
         self,
@@ -243,7 +267,7 @@ class DaskExecutor:
         futs, fargs = {}, {}
         n = len(ordered)
         run_id = uuid.uuid4().hex[:8]  # task keys must never repeat across runs (e.g. two preps)
-        shared = self._scatter_shared(ordered)
+        shared = self._scatter_shared(ordered, run_id)
         pool = self._pool(reduce, stage, run_id, n + 2) if reduce else None
         part_futs: set = set()
         kw = {}
