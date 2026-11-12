@@ -1,7 +1,8 @@
 """D11: CZ CELLxGENE Census (2025-01-30) to long cell x gene Parquet, nonzero counts only.
 
 Reads the local SOMA copy (`raw/cellxgene/soma_2025-01-30/`, docs/sources/cellxgene.md) and
-writes one row per (cell, gene) with count > 0, for primary cells with a known cell type.
+writes one row per (cell, gene) with count > 0, for primary cells with a known cell type,
+Smart-seq3 cells dropped.
 Rules and columns: docs/cellxgene.md (Ted 2026-11-11/12).
 
     cd /srv/dfeols && .venv/bin/python -I repo/replication/cellxgene/build.py --tier R0 --out build/cellxgene/R0
@@ -45,7 +46,8 @@ R1_DATASETS = [
 ]
 R0_PER_1000 = 3  # R0: cells of R1 with hash(soma_joinid) % 1000 < 3
 TIERS = {"R0": "homo_sapiens", "R1": "homo_sapiens", "H": "homo_sapiens", "M": "mus_musculus"}
-FULL_LENGTH_ASSAYS = ("Smart-seq2", "Smart-seq v4")
+FULL_LENGTH_ASSAYS = ("Smart-seq", "Smart-seq2", "Smart-seq v4")
+DROP_ASSAYS = ("Smart-seq3",)  # mixed full-length and 5' UMI reads; dropped (Ted 2026-11-12)
 
 OBS_COLS = [
     "soma_joinid", "dataset_id", "assay", "assay_ontology_term_id", "cell_type",
@@ -81,7 +83,8 @@ def load_tables(soma: Path, organism: str, tier: str):
     with ts.open(str(soma / "census_data" / organism)) as e:
         obs = e.obs.read(column_names=OBS_COLS).concat().to_pandas()
         var = e.ms["RNA"].var.read().concat().to_pandas()
-    obs = obs[obs.is_primary_data & (obs.cell_type.astype(str) != "unknown")].copy()
+    obs = obs[obs.is_primary_data & (obs.cell_type.astype(str) != "unknown")
+              & ~obs.assay.astype(str).isin(DROP_ASSAYS)].copy()
     # codes over the organism's whole kept sample, so tiers share them
     obs["cell_type_code"], ct_levels = codes(obs.cell_type_ontology_term_id)
     obs["dataset_code"], ds_levels = codes(obs.dataset_id)
