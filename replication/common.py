@@ -162,8 +162,15 @@ def crossing_levels(ds, formula: str) -> int:
 
 
 def fit_dfeols(
-    ds, spec: Spec, dataset: str, executor=None, workdir: Path | None = None, max_dummy_levels: int = 2000
+    ds,
+    spec: Spec,
+    dataset: str,
+    executor=None,
+    workdir: Path | None = None,
+    max_dummy_levels: int = 2000,
+    **fit_kwargs,
 ) -> dict:
+    """`fit_kwargs` go to dfeols.fit unchanged (e.g. level_space_gb=0)."""
     import dfeols
 
     need = crossing_levels(ds, spec.formula)
@@ -185,6 +192,7 @@ def fit_dfeols(
         label=spec.run_label(dataset),
         max_dummy_levels=max(max_dummy_levels, need),
         log_every=1e9,
+        **fit_kwargs,
     )
     coefs = {}
     for v in spec.vcov:
