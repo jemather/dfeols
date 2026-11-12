@@ -102,6 +102,7 @@ class Progress:
         self.order: list[str] = []
         self.t0 = time.time()
         self._last = 0.0
+        self._header = HeaderEvery()
         self.stage2_prior_frac: float | None = None  # round2 secs / round1 secs per row
         self.slots = 1
         self.max_slots: int | None = None
@@ -231,6 +232,9 @@ class Progress:
             return
         self._last = now
         snap = self.snapshot()
+        hdr = status_header(snap)
+        if self._header(hdr):
+            log.info(hdr)
         log.info(self.line(snap))
         rows_all = sum(st.total_rows for st in self.stages.values())
         done_all = sum(st.done_rows for st in self.stages.values())
@@ -253,40 +257,87 @@ class Progress:
             os.replace(tmp, p)
 
 
-def status_line(snap: dict) -> str:
-    """One log line from a status snapshot (Progress.snapshot, or a status.json read back).
+HEADER_EVERY = 10  # the column header repeats every this many status lines
 
-    Fixed-width fields, so successive lines of a run line up: label, stage k of n, shards and
-    rows done, workers, then time left in the stage and overall with the finish clock. The ETA
-    band, rate and elapsed time stay in status.json (the log's timestamps give elapsed).
-    """
+
+def _columns(snap: dict) -> list[tuple[str, str, str]]:
+    """(header, value, align) per column of a status line. Widths depend only on what is fixed
+    for a run (label, stage names, shard counts, max workers), so successive lines line up."""
     stages = snap["stages"]
     i = next((k for k, s in enumerate(stages) if not s["finished"]), len(stages) - 1)
     cur = stages[i]
+    n = len(stages)
     wname = max(len(s["stage"]) for s in stages)
     wn = len(str(max(s["tasks"] for s in stages)))
     mx = snap.get("max_workers")
     ww = len(str(mx or snap["workers"]))
-    parts = [
-        f"{snap['label']} {i + 1}/{len(stages)} {cur['stage']:<{wname}}",
-        f"{cur['tasks_done']:>{wn}}/{cur['tasks']:<{wn}} shards {float(cur['pct_rows']):5.1f}%",
-        f"{snap['workers']:>{ww}}/{mx} workers" if mx else f"{snap['workers']} workers",
-    ]
+    rps = cur["rows_per_sec_per_worker"]
     eta = cur["eta_seconds"]
     if snap["workers"] == 0 and not cur["finished"]:
-        e = "waiting for workers"
+        stage_left = "waiting for workers"
     elif eta is None or not np.isfinite(eta):
-        e = "calibrating"
+        stage_left = "calibrating"
     else:
-        e = f"stage {fmt_td(eta):>7}"
-    if snap["eta_total_seconds"] is not None:
-        e += f"  all {fmt_td(snap['eta_total_seconds']):>7}"
-        if snap.get("finish_time"):
-            e += f" ({snap['finish_time']})"
-    at_max = cur.get("eta_seconds_at_max_workers")
-    if at_max is not None and mx and snap["workers"] < mx:
-        e += f"  ({fmt_td(at_max)} at {mx})"
-    parts.append(e)
-    if snap.get("note"):
-        parts.append(snap["note"])
-    return " | ".join(parts)
+        stage_left = fmt_td(eta)
+    total = snap["eta_total_seconds"]
+    return [
+        ("run", snap["label"], "<"),
+        ("stage", f"{i + 1:>{len(str(n))}}/{n} {cur['stage']:<{wname}}", "<"),
+        ("shards", f"{cur['tasks_done']:>{wn}}/{cur['tasks']:<{wn}}", ">"),
+        ("rows", f"{float(cur['pct_rows']):.1f}%", ">"),
+        ("workers", f"{snap['workers']:>{ww}}/{mx}" if mx else f"{snap['workers']}", ">"),
+        ("rows/s", f"{rps * max(snap['workers'], 1) / 1e6:.2f}M" if rps else "-", ">"),
+        ("stage left", stage_left, ">"),
+        ("all left", fmt_td(total) if total is not None else "-", ">"),
+        ("done at", snap.get("finish_time") or "-", ">"),
+    ]
+
+
+_WIDTH = {"rows": 6, "rows/s": 8, "stage left": 10, "all left": 8, "done at": 9}
+
+
+def _render(snap: dict, header: bool) -> str:
+    out = []
+    for h, v, al in _columns(snap):
+        w = max(len(h), _WIDTH.get(h, 0), 0 if h == "stage left" else len(v))
+        if not header and h == "stage left" and len(v) > w:  # "waiting for workers": no times
+            out.append(v)
+            break
+        out.append(f"{(h if header else v):{al}{w}}")
+    line = "  ".join(out)
+    if not header:
+        at_max = next((s for s in snap["stages"] if not s["finished"]), snap["stages"][-1]).get(
+            "eta_seconds_at_max_workers")
+        mx = snap.get("max_workers")
+        if at_max is not None and mx and snap["workers"] < mx:
+            line += f"  ({fmt_td(at_max)} at {mx} workers)"
+        if snap.get("note"):
+            line += f"  {snap['note']}"
+    return line.rstrip()
+
+
+def status_line(snap: dict) -> str:
+    """One log line from a status snapshot (Progress.snapshot, or a status.json read back):
+    run, stage k of n, shards done, % rows, workers, throughput, time left in the stage and
+    overall, finish clock. Columns are padded so lines of a run line up under status_header.
+    The ETA band and elapsed time stay in status.json (the log's timestamps give elapsed)."""
+    return _render(snap, header=False)
+
+
+def status_header(snap: dict) -> str:
+    """The column names, aligned with status_line for the same run."""
+    return _render(snap, header=True)
+
+
+class HeaderEvery:
+    """Says when to repeat the column header: at the first line, every HEADER_EVERY lines,
+    and when the columns change width (a new stage with a longer name)."""
+
+    def __init__(self, every: int = HEADER_EVERY):
+        self.every, self.n, self.last = every, 0, None
+
+    def __call__(self, header: str) -> bool:
+        due = self.n % self.every == 0 or header != self.last
+        self.n = 1 if header != self.last else self.n + 1
+        self.last = header
+        return due

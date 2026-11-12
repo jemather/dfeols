@@ -78,7 +78,7 @@ def test_cg_steps_show_in_the_line(tmp_path):
     prog.task_done("cg1", 0, 0.5)
     prog.note, prog.extra_eta = "CG step 1, residual 3.1e-01 (tol 1e-10)", 600.0
     line = prog.line(prog.snapshot())
-    assert line.startswith("fit 2/3 cg1 ") and line.endswith("CG step 1, residual 3.1e-01 (tol 1e-10)")
+    assert line.startswith("fit  2/3 cg1 ") and line.endswith("CG step 1, residual 3.1e-01 (tol 1e-10)")
     assert prog.snapshot()["eta_total_seconds"] >= 600
     assert _cg_steps_left([1.0, 0.5, 0.2], 1e-10) is None  # too few steps
     assert _cg_steps_left([1e-1, 1e-2, 1e-3, 1e-4], 1e-10) == 6  # a decade a step
@@ -86,21 +86,34 @@ def test_cg_steps_show_in_the_line(tmp_path):
 
 
 def test_status_lines_line_up_and_stay_short(tmp_path):
-    """Successive lines of a run keep their columns (padded fields) and fit a terminal:
-    stage k/n, shards, rows, workers, then time left in the stage and overall."""
+    """Successive lines of a run keep their columns under one header (padded fields) and fit
+    a terminal: run, stage k/n, shards, % rows, workers, rows/s, time left, finish clock. The
+    header repeats every HEADER_EVERY lines and when the columns change."""
+    from dfeols.progress import HEADER_EVERY, HeaderEvery, status_header
+
     prog = Progress(tmp_path, label="eve2:all:r4", every=1e9)
     prog.add_stage("singletons1", {i: 1000 for i in range(4355)})
     prog.add_stage("round1", {i: 1000 for i in range(4355)})
     prog.start("singletons1")
     prog.set_slots(40, 40)
-    lines = []
+    lines, headers = [], set()
     for k in (9, 219, 3290):
-        for t in range(k - len(prog.stages["singletons1"].done)):
-            prog.task_done("singletons1", len(prog.stages["singletons1"].done), 1.0)
-        lines.append(prog.line(prog.snapshot()))
-    bars = {tuple(i for i, c in enumerate(ln) if c == "|") for ln in lines}
-    assert len(bars) == 1, lines
-    assert all(len(ln) <= 110 for ln in lines), lines
-    assert lines[0].startswith("eve2:all:r4 1/2 singletons1 |    9/4355 shards   0.2% | 40/40 workers | stage")
+        st = prog.stages["singletons1"]
+        for _ in range(k - len(st.done)):
+            prog.task_done("singletons1", len(st.done), 1.0)
+        snap = prog.snapshot()
+        lines.append(prog.line(snap))
+        headers.add(status_header(snap))
+    assert len(headers) == 1
+    hdr = headers.pop()
+    for col in ("shards", "rows/s", "stage left"):  # each value ends where its header ends
+        end = hdr.index(col) + len(col)
+        assert all(ln[end - 1] != " " and (len(ln) == end or ln[end] == " ") for ln in lines), (hdr, lines)
+    assert all(len(ln) <= 100 for ln in lines + [hdr]), lines
+    assert lines[0].split()[:4] == ["eve2:all:r4", "1/2", "singletons1", "9/4355"]
     prog.set_slots(0, 40)
     assert "waiting for workers" in prog.line(prog.snapshot())
+    every = HeaderEvery()
+    shown = [every(hdr) for _ in range(2 * HEADER_EVERY + 1)]
+    assert shown.count(True) == 3 and shown[0] and shown[HEADER_EVERY]
+    assert every(hdr + " ")  # columns changed: header again

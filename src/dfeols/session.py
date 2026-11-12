@@ -2699,6 +2699,7 @@ class Session:
         self.client: str | None = None
         self.progress = progress  # print estimates and progress lines to stderr while waiting
         self._shown: dict[str, Any] = {}
+        self._headers: dict[str, Any] = {}  # status.json path -> HeaderEvery
         self._manager = manager
         self._thread = thread
 
@@ -2805,7 +2806,7 @@ class Session:
 
     def _show_status(self, path: Path) -> None:
         """Print a stage's status.json (Progress) when it has changed."""
-        from .progress import status_line
+        from .progress import HeaderEvery, status_header, status_line
 
         try:
             snap = _read_json(path)
@@ -2813,6 +2814,10 @@ class Session:
             return
         if snap.get("stages") and self._shown.get(str(path)) != snap.get("updated"):
             self._shown[str(path)] = snap.get("updated")
+            hdr = status_header(snap)
+            every = self._headers.setdefault(str(path), HeaderEvery())
+            if every(hdr):
+                self._say(hdr)
             self._say(status_line(snap))
 
     def _watch_fit(self, rid: str) -> None:
