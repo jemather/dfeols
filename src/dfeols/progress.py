@@ -47,7 +47,9 @@ def fmt_td(s: float | None) -> str:
 def _clock(ts: float) -> str | None:
     """Wall-clock time for a finish estimate, or None if it is not representable."""
     try:
-        return time.strftime("%a %H:%M", time.localtime(ts))
+        t = time.localtime(ts)
+        # today: the clock alone; later: with the weekday
+        return time.strftime("%H:%M" if t[:3] == time.localtime()[:3] else "%a %H:%M", t)
     except (OverflowError, OSError, ValueError):
         return None
 
@@ -252,27 +254,39 @@ class Progress:
 
 
 def status_line(snap: dict) -> str:
-    """One log line from a status snapshot (Progress.snapshot, or a status.json read back)."""
-    cur = next((s for s in snap["stages"] if not s["finished"]), snap["stages"][-1])
-    rps = cur["rows_per_sec_per_worker"]
+    """One log line from a status snapshot (Progress.snapshot, or a status.json read back).
+
+    Fixed-width fields, so successive lines of a run line up: label, stage k of n, shards and
+    rows done, workers, then time left in the stage and overall with the finish clock. The ETA
+    band, rate and elapsed time stay in status.json (the log's timestamps give elapsed).
+    """
+    stages = snap["stages"]
+    i = next((k for k, s in enumerate(stages) if not s["finished"]), len(stages) - 1)
+    cur = stages[i]
+    wname = max(len(s["stage"]) for s in stages)
+    wn = len(str(max(s["tasks"] for s in stages)))
+    mx = snap.get("max_workers")
+    ww = len(str(mx or snap["workers"]))
     parts = [
-        f"[{snap['label']} {cur['stage']}]",
-        f"{cur['tasks_done']}/{cur['tasks']} shards",
-        f"{cur['pct_rows']}% rows",
-        f"{snap['workers']} workers" + (f" (max {snap['max_workers']})" if snap["max_workers"] else ""),
-        f"{rps * max(snap['workers'], 1) / 1e6:.2f}M rows/s" if rps else "calibrating",
-        f"elapsed {fmt_td(snap['elapsed_seconds'])}",
+        f"{snap['label']} {i + 1}/{len(stages)} {cur['stage']:<{wname}}",
+        f"{cur['tasks_done']:>{wn}}/{cur['tasks']:<{wn}} shards {float(cur['pct_rows']):5.1f}%",
+        f"{snap['workers']:>{ww}}/{mx} workers" if mx else f"{snap['workers']} workers",
     ]
-    if cur["eta_seconds"] is not None:
-        e = f"stage ETA {fmt_td(cur['eta_seconds'])}"
-        if cur["eta_band_seconds"]:
-            lo, hi = cur["eta_band_seconds"]
-            e += f" ({fmt_td(lo)}-{fmt_td(hi)})"
-        parts.append(e)
+    eta = cur["eta_seconds"]
+    if snap["workers"] == 0 and not cur["finished"]:
+        e = "waiting for workers"
+    elif eta is None or not np.isfinite(eta):
+        e = "calibrating"
+    else:
+        e = f"stage {fmt_td(eta):>7}"
     if snap["eta_total_seconds"] is not None:
-        parts.append(f"total ETA {fmt_td(snap['eta_total_seconds'])} -> {snap['finish_time']}")
-    if cur.get("eta_seconds_at_max_workers") is not None:
-        parts.append(f"({fmt_td(cur['eta_seconds_at_max_workers'])} if all workers start)")
+        e += f"  all {fmt_td(snap['eta_total_seconds']):>7}"
+        if snap.get("finish_time"):
+            e += f" ({snap['finish_time']})"
+    at_max = cur.get("eta_seconds_at_max_workers")
+    if at_max is not None and mx and snap["workers"] < mx:
+        e += f"  ({fmt_td(at_max)} at {mx})"
+    parts.append(e)
     if snap.get("note"):
         parts.append(snap["note"])
     return " | ".join(parts)
