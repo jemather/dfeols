@@ -51,6 +51,12 @@ break the API).
 
 ### Fixed
 
+- Round 1 with a large crossing FE no longer sends every shard's per-level arrays dense. Each
+  shard returned a present mask and each level's smallest and largest cluster over all of the
+  crossing FE's levels, ~265 MB a shard at 15.5M location-days (D6 r4 on OSCER: ~1.15 TB
+  merged one shard at a time on the coordinator, round 1 ~4 h). Shards now send only their own
+  levels (~18 MB there); results are unchanged, and dense arrays from older shard results
+  still merge.
 - The IV first-stage R² is net of every FE, as the outcomes' within R² is. It was net of the
   FEs nested in the partition only (or of none), so it changed with the partition key.
 - Plan C in level space no longer runs workers out of memory. Shards cap their part of A by

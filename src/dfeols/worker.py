@@ -741,9 +741,7 @@ def _round1(plan: Plan, shard_id: int, files: list[str], write_cache: bool):
     df, n0, local_codes, w = _prepare(plan, shard_id, files, loaded)
     T["read"] = time.perf_counter() - t0
     n = df.height
-    gpresent = [
-        np.bincount(df[c].to_numpy().astype(np.int64), minlength=L) > 0 for _, c, L in plan.global_fes
-    ]
+    gpresent = [np.unique(df[c].to_numpy().astype(np.int64)) for _, c, _ in plan.global_fes]
 
     raw: dict = {}
     if plan.sparse_global:
@@ -877,15 +875,45 @@ def _cluster_stats(plan: Plan, df, local_codes, cl: np.ndarray):
         np.minimum.at(lo, codes.astype(np.int64), cl)
         np.maximum.at(hi, codes.astype(np.int64), cl)
         nested.append(bool((lo == hi).all()))
-    gmm = []
-    for _, c, L in plan.global_fes:
-        codes = df[c].to_numpy().astype(np.int64)
-        lo = np.full(L, np.iinfo(np.int64).max)
-        hi = np.full(L, np.iinfo(np.int64).min)
-        np.minimum.at(lo, codes, cl)
-        np.maximum.at(hi, codes, cl)
-        gmm.append((lo, hi))
+    gmm = [level_minmax(df[c].to_numpy().astype(np.int64), cl) for _, c, _ in plan.global_fes]
     return np.unique(cl), nested, gmm
+
+
+# Global-FE levels present in a shard, and each one's smallest and largest cluster, travel
+# sparse: only the shard's own levels. Dense over all L levels they were ~265 MB a shard at
+# 15.5M location-days (D6 r4, job 35953385: 1.15 TB through the coordinator, round 1 ~4 h).
+
+
+def level_minmax(codes: np.ndarray, cl: np.ndarray) -> tuple:
+    """(levels present, sorted; each one's smallest cluster code; its largest)."""
+    lev, inv = np.unique(codes, return_inverse=True)
+    lo = np.full(len(lev), np.iinfo(np.int64).max)
+    hi = np.full(len(lev), np.iinfo(np.int64).min)
+    np.minimum.at(lo, inv, cl)
+    np.maximum.at(hi, inv, cl)
+    return lev, lo, hi
+
+
+def merge_present(acc: np.ndarray, p: np.ndarray) -> None:
+    """Mark a shard's present levels in the coordinator's dense mask (in place). `p` is the
+    sorted level codes; a dense boolean mask (older shard results) is OR-ed in."""
+    if p.dtype == bool:
+        acc |= p
+    else:
+        acc[p] = True
+
+
+def merge_minmax(lo_acc: np.ndarray, hi_acc: np.ndarray, item) -> None:
+    """Fold a shard's per-level cluster min/max into the coordinator's (in place). `item` is
+    level_minmax's (levels, lo, hi), or a dense (lo, hi) pair over all levels."""
+    if len(item) == 3:
+        lev, lo, hi = item
+        lo_acc[lev] = np.minimum(lo_acc[lev], lo)
+        hi_acc[lev] = np.maximum(hi_acc[lev], hi)
+    else:
+        lo, hi = item
+        np.minimum(lo_acc, lo, out=lo_acc)
+        np.maximum(hi_acc, hi, out=hi_acc)
 
 
 def _iter_store(plan: Plan, shard_id: int, local_codes, Dm, w) -> tuple:

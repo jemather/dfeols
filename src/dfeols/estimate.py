@@ -31,6 +31,8 @@ from .vcov import df_k as _df_k
 from .vcov import vcov_crv1, vcov_hetero, vcov_iid
 from .worker import (
     Plan,
+    merge_minmax,
+    merge_present,
     plan_columns,
     shard_cells,
     shard_matvec,
@@ -1295,7 +1297,7 @@ def fit(
             acc["converged"] &= r["converged"]
             acc["fe_levels"] += np.asarray(r["fe_levels"], np.int64)
             for i, p in enumerate(r["global_present"]):
-                acc["gpresent"][i] |= p
+                merge_present(acc["gpresent"][i], p)
             if plan.cluster:
                 if plan.cluster_local:
                     # nested in the partition key: each cluster lives in one shard,
@@ -1305,9 +1307,8 @@ def fit(
                     acc["cpresent"][r["cluster_present"]] = True
                 if r["n"]:
                     acc["local_nested"] &= np.asarray(r["local_fe_nested_in_cluster"], bool)
-                for i, (lo, hi) in enumerate(r["global_cluster_minmax"]):
-                    acc["glo"][i] = np.minimum(acc["glo"][i], lo)
-                    acc["ghi"][i] = np.maximum(acc["ghi"][i], hi)
+                for i, mm in enumerate(r["global_cluster_minmax"]):
+                    merge_minmax(acc["glo"][i], acc["ghi"][i], mm)
             if plan.cluster2:
                 c2, rc = acc["c2"], r["cluster2"]
                 if plan.cluster2_local:
@@ -1316,9 +1317,8 @@ def fit(
                     c2["cpresent"][rc["present"]] = True
                 if r["n"]:
                     c2["local_nested"] &= np.asarray(rc["local_nested"], bool)
-                for i, (lo, hi) in enumerate(rc["global_minmax"]):
-                    c2["glo"][i] = np.minimum(c2["glo"][i], lo)
-                    c2["ghi"][i] = np.maximum(c2["ghi"][i], hi)
+                for i, mm in enumerate(rc["global_minmax"]):
+                    merge_minmax(c2["glo"][i], c2["ghi"][i], mm)
 
         tasks = [(s["id"], rows[s["id"]], (plan, s["id"], ds.shard_paths(s))) for s in ds.shards]
         prog.start("round1")

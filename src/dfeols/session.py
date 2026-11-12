@@ -63,7 +63,16 @@ from .progress import Progress, fmt_td
 from .results import Result
 from .vcov import df_k as _df_k
 from .vcov import vcov_crv1, vcov_hetero, vcov_iid
-from .worker import Plan, _maxrss_gb, _meat, _prepare, _round1_dense
+from .worker import (
+    Plan,
+    _maxrss_gb,
+    _meat,
+    _prepare,
+    _round1_dense,
+    level_minmax,
+    merge_minmax,
+    merge_present,
+)
 
 log = logging.getLogger("dfeols")
 
@@ -406,9 +415,7 @@ def demean_round1(
         "sumw": float(w.sum()),
         "converged": converged,
         "fe_levels": [int(c.max()) + 1 if len(c) else 0 for c in local_codes],
-        "global_present": [
-            np.bincount(df[c].to_numpy().astype(np.int64), minlength=L) > 0 for _, c, L in plan.global_fes
-        ],
+        "global_present": [np.unique(df[c].to_numpy().astype(np.int64)) for _, c, _ in plan.global_fes],
         "row_key": rowset(df, plan.raw_key) if plan.raw_key else None,  # type: ignore[attr-defined]
         "clusters": {},
         # the collinearity scale: each variable's sums before the FEs, and net of the local FEs
@@ -432,14 +439,7 @@ def demean_round1(
             np.minimum.at(lo, lc.astype(np.int64), codes)
             np.maximum.at(hi, lc.astype(np.int64), codes)
             nested.append(bool((lo == hi).all()))
-        gmm = []
-        for _, col, L in plan.global_fes:
-            g = df[col].to_numpy().astype(np.int64)
-            lo = np.full(L, np.iinfo(np.int64).max)
-            hi = np.full(L, np.iinfo(np.int64).min)
-            np.minimum.at(lo, g, codes)
-            np.maximum.at(hi, g, codes)
-            gmm.append((lo, hi))
+        gmm = [level_minmax(df[col].to_numpy().astype(np.int64), codes) for _, col, _ in plan.global_fes]
         r["clusters"][c["name"]] = {"present": np.unique(codes), "local_nested": nested, "global_minmax": gmm}
     names = list(plan.formula.depvars)
     if plan.global_fes:
@@ -887,7 +887,7 @@ def demean_once(
         acc["converged"] &= r["converged"]
         acc["fe_levels"] += np.asarray(r["fe_levels"], np.int64)
         for i, p in enumerate(r["global_present"]):
-            acc["gpresent"][i] |= p
+            merge_present(acc["gpresent"][i], p)
         if r["row_key"]:
             acc["row_key"].append(r["row_key"])
         if "gram" in r:
@@ -909,9 +909,8 @@ def demean_once(
                 a["present"][c["present"]] = True
             if r["n"]:
                 a["local_nested"] &= np.asarray(c["local_nested"], bool)
-            for i, (lo, hi) in enumerate(c["global_minmax"]):
-                a["glo"][i] = np.minimum(a["glo"][i], lo)
-                a["ghi"][i] = np.maximum(a["ghi"][i], hi)
+            for i, mm in enumerate(c["global_minmax"]):
+                merge_minmax(a["glo"][i], a["ghi"][i], mm)
 
     tasks = [
         (s["id"], rows[s["id"]], (plan, clusters, s["id"], ds.shard_paths(s), str(out), others))
