@@ -9,6 +9,12 @@ break the API).
 
 ### Added
 
+- In-sample prediction including FEs: `fit(..., predict=folder, predict_keep=["row_id"])`
+  writes each estimation row's `xb` (reported regressors), `d` (the sum of its FE terms,
+  local and crossing) and `resid`, one Parquet part per shard, during round 2 (no extra
+  pass over the shards beyond re-reading each shard's rows). Equal to pyfixest's
+  `predict()` and `resid()` with local FEs, dense dummies, the sparse crossing path and
+  plan C, with weights and several outcomes. OLS only; not with `cells=True`.
 - Stacked regressions with per-equation FEs (`dfeols.stack`, `dfeols.Equation`): each
   equation's rows tagged by `k`, its outcome in `y`, regressor roles as per-equation
   columns (`x_k1`, `x_k2`, ... zero off the equation), and every FE interacted with `k`

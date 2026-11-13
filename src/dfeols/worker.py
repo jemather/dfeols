@@ -109,6 +109,10 @@ class Plan:
     # varying slopes (fe[x], fe[[x]]): FE key -> (slope variables, whether the FE keeps its
     # intercept); FEs not in it are plain
     slopes: dict[str, tuple[tuple[str, ...], bool]] = field(default_factory=dict)
+    # fit(predict=...): round 2 writes each row's xb, d (the FEs' sum) and residual here,
+    # with these raw columns carried along (read only for that; they don't touch the sample)
+    predict_dir: str | None = None
+    predict_keep: tuple[str, ...] = ()
 
     @property
     def k_x(self) -> int:
@@ -198,9 +202,10 @@ def _term_columns(t: Term, df: pl.DataFrame, cat_levels: dict[str, list]) -> lis
     return out
 
 
-def _load(plan: Plan, files: list[str], dropped: dict | None = None):
+def _load(plan: Plan, files: list[str], dropped: dict | None = None, extra: tuple[str, ...] = ()):
     """The shard's rows for this spec. `dropped`, if given, gets the rows removed by
-    reason (missing, non_finite, zero_weights), for the record's sample counts."""
+    reason (missing, non_finite, zero_weights), for the record's sample counts. `extra`
+    columns are read too but play no part in which rows are kept."""
     f = plan.formula
     created = dict(plan.created)
     sample = set(plan.filter_vars) if plan.filter_vars is not None else set(f.variables)
@@ -220,11 +225,11 @@ def _load(plan: Plan, files: list[str], dropped: dict | None = None):
 
         for e in created.values():
             raw.update(_expr_columns(e))
-    df = pl.read_parquet(files, columns=sorted(cols | raw))
+    df = pl.read_parquet(files, columns=sorted(cols | raw | set(extra)))
     # listwise deletion on the variables of this spec (a session's: its declared variables)
     num = [c for c in sorted(sample) if df.schema[c].is_float()]
     n = [df.height]
-    df = df.drop_nulls(subset=sorted(cols)) if raw - cols else df.drop_nulls()
+    df = df.drop_nulls(subset=sorted(cols)) if (raw | set(extra)) - cols else df.drop_nulls()
     n.append(df.height)
     if num:
         df = df.filter(pl.all_horizontal([pl.col(c).is_finite() for c in num]))
@@ -715,9 +720,11 @@ def _round1_sparse(plan: Plan, shard_id: int, df, n0: int, local_codes, w, T, t0
     return Y, Yt, Xt, ZtZ, ZtY, (local_codes, Dm), converged, None
 
 
-def _prepare(plan: Plan, shard_id: int, files: list[str], loaded: dict | None = None):
+def _prepare(
+    plan: Plan, shard_id: int, files: list[str], loaded: dict | None = None, extra: tuple[str, ...] = ()
+):
     """The shard's estimation sample: rows, local FE codes (dense) and weights."""
-    df = _load(plan, files, loaded)
+    df = _load(plan, files, loaded, extra)
     n0 = df.height
     if plan.keep_dir:  # singletons over all FEs, found in the passes before round 1
         keep = _read_keep(plan, shard_id, n0)
@@ -1078,6 +1085,45 @@ def _meat(plan: Plan, X: np.ndarray, E: np.ndarray, w: np.ndarray, cl, out: dict
             out[prefix + "cluster_scores"] = Sg
 
 
+def _reported_columns(plan: Plan, df, n: int) -> np.ndarray:
+    """The reported regressors (plan.colnames) on raw rows, before any FE: round 1's first
+    columns of Z."""
+    cols: list[np.ndarray] = []
+    if "Intercept" in plan.colnames:
+        cols.append(np.ones(n))
+    for term in plan.formula.terms:
+        cols.extend(_term_columns(term, df, plan.cat_levels))
+    X = np.column_stack([c if c.ndim == 2 else c[:, None] for c in cols]) if cols else np.zeros((n, 0))
+    if X.shape[1] != len(plan.colnames):
+        raise RuntimeError(f"predict: rebuilt {X.shape[1]} regressor columns, expected {len(plan.colnames)}")
+    return X
+
+
+def _write_prediction(plan: Plan, shard_id: int, files: list[str], lin: dict, E: np.ndarray) -> int:
+    """In-sample prediction for the shard's estimation rows: xb (reported regressors times
+    their coefficients), resid (round 2's residual, net of every FE, local and crossing) and
+    d = y - xb - resid, the sum of the row's FE terms (fixest's predict() is xb + d)."""
+    df, _, _, _ = _prepare(plan, shard_id, files, extra=plan.predict_keep)
+    n = df.height
+    if n != E.shape[0]:
+        raise RuntimeError(f"predict: shard {shard_id} has {n} rows, round 2 had {E.shape[0]}")
+    ys = list(plan.formula.depvars)
+    Y = _outcome_block(plan, df, n)[:, : len(ys)]
+    X = _reported_columns(plan, df, n)
+    xb = X[:, lin["xb_idx"]] @ lin["xb_beta"] if len(lin["xb_idx"]) else np.zeros((n, len(ys)))
+    resid = E[:, : len(ys)]
+    d = Y - xb - resid
+    cols = {c: df[c] for c in plan.predict_keep}
+    for j, y in enumerate(ys):
+        sfx = "" if len(ys) == 1 else f"_{y}"
+        cols.update({f"xb{sfx}": xb[:, j], f"d{sfx}": d[:, j], f"resid{sfx}": resid[:, j]})
+    path = Path(plan.predict_dir) / f"part-{shard_id:05d}.parquet"
+    tmp = path.with_suffix(".parquet.tmp")
+    pl.DataFrame(cols).write_parquet(tmp)
+    os.replace(tmp, path)
+    return n
+
+
 def shard_round2(plan: Plan, shard_id: int, files: list[str], lin: dict) -> dict:
     """Residuals, RSS and meats from linear maps of the shard's columns
     T = [outcome block, Z[:, lin["cols"]]] (outcome block: outcomes, then IV's endogenous
@@ -1130,6 +1176,10 @@ def shard_round2(plan: Plan, shard_id: int, files: list[str], lin: dict) -> dict
         if prefix in dterms:
             E = E - dterms[prefix][0]
             X = X - dterms[prefix][1]
+        if prefix == "" and plan.predict_dir:
+            t_p = time.perf_counter()
+            out["predicted"] = _write_prediction(plan, shard_id, files, g, E)
+            T["predict"] = time.perf_counter() - t_p
         if plan.cluster2 is None:
             _meat(plan, X, E, w, cl, out, prefix)
             continue

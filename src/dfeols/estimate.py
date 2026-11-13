@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import inspect
 import json
@@ -1050,6 +1051,8 @@ def fit(
     purpose: str | list[str] | None = None,
     estimator: str = "2sls",
     fuller: float | None = None,
+    predict: str | os.PathLike | None = None,
+    predict_keep: list[str] | tuple[str, ...] = (),
 ) -> Result:
     """Estimate an HDFE OLS or IV model on a prepared, sharded dataset.
 
@@ -1087,6 +1090,12 @@ def fit(
                FE key and the cluster, and the coordinator solves on the cells, exactly. Pays
                when the data compress (DB1B's market table: 32x). OLS and IV (2SLS, LIML,
                Fuller); vcov CRV1 (one- or two-way) and iid; not HC1 (it needs each row's residual)
+    predict    a folder: round 2 also writes each estimation row's in-sample prediction there,
+               one part-NNNNN.parquet per shard, with columns `predict_keep` (raw columns, e.g.
+               a row id, carried along), xb (reported regressors x coefficients), d (the sum of
+               the row's FE terms, local and crossing: fixest's predict() is xb + d) and resid
+               (y - xb - d); with several outcomes, xb_<y>, d_<y>, resid_<y>. Part files already
+               in the folder are replaced. OLS only
     """
     if not isinstance(ds, Dataset):
         ds = Dataset.open(ds)
@@ -1125,6 +1134,18 @@ def fit(
         crossing_fe=crossing_fe,
         executor=executor,
     )
+    if predict is not None:
+        if cells:
+            raise ValueError("predict= needs each row's residual; not with cells=True")
+        if probe.iv:
+            raise NotImplementedError("predict= is OLS only for now")
+        miss = [c for c in predict_keep if c not in ds.columns]
+        if miss:
+            raise KeyError(f"predict_keep: not in the dataset: {miss}")
+        pdir = Path(predict)
+        pdir.mkdir(parents=True, exist_ok=True)
+        for old in list(pdir.glob("part-*.parquet")) + list(pdir.glob("part-*.parquet.tmp")):
+            old.unlink()
     if cells:
         from . import cells as _cells
 
@@ -1420,7 +1441,12 @@ def fit(
                     elif px + "cluster_scores" in r:
                         parts2[px].append((r[px + "cluster_codes"], r[px + "cluster_scores"]))
 
-        tasks2 = [(s["id"], rows[s["id"]], (plan, s["id"], ds.shard_paths(s), sol.lin)) for s in ds.shards]
+        plan2, lin2 = plan, sol.lin
+        if predict is not None:
+            plan2 = dataclasses.replace(plan, predict_dir=str(pdir), predict_keep=tuple(predict_keep))
+            idx = np.array([plan.colnames.index(n) for n in sol.coefnames], dtype=np.int64)
+            lin2 = dict(sol.lin, xb_idx=idx, xb_beta=np.asarray(sol.coef).reshape(len(idx), -1))
+        tasks2 = [(s["id"], rows[s["id"]], (plan2, s["id"], ds.shard_paths(s), lin2)) for s in ds.shards]
         prog.start("round2")
         executor.run(shard_round2, tasks2, on2, prog, "round2")
         for px, sc in scores.items():
