@@ -9,6 +9,16 @@ break the API).
 
 ### Added
 
+- Run diagnostics (`dfeols.diag`): a Dask fit writes `tasks.jsonl` in its workdir (a line per
+  task: the task's timing, seconds the coordinator spent fetching its result and in
+  `on_result`; a summary per stage with wall time, summed task time, mean tasks running at
+  once and task-time quantiles; CG steps after the second summarised only) and
+  `cluster.jsonl` (every `DFEOLS_DIAG_SECONDS`, default 30: per worker the tasks assigned,
+  threads and memory, the scheduler's task states and the bytes of results held, the
+  coordinator's backlog of finished results). `dfeols.executor` sends the coordinator's
+  `distributed` and `dask_jobqueue` log (the scheduler runs there) to `scheduler.log` next
+  to the worker logs. `DFEOLS_DIAG=0` turns the two JSONL files off.
+
 - HDFE GLMs by IRLS: `dfeols.fit_glm(ds, formula, family="poisson" | "cloglog", cluster=...)`.
   Each iteration is an ordinary weighted `fit` of the working response, so every FE path
   and executor applies; round 2 computes the new linear predictor (xb + every FE) in the
@@ -85,6 +95,15 @@ break the API).
 
 ### Fixed
 
+- Plan C's per-process shard cache (`worker._ITER_CACHE`) is now guarded by a lock. A worker's
+  threads clearing the previous fit's entries together raised `KeyError` (OSCER job 35991256:
+  43 round-1 tasks failed and were retried), and a CG step's check-then-read could lose its
+  entry to another thread's eviction.
+- Plan C's worker-memory estimate counts round 1's arrays over every crossing level
+  (P x (2(k+m)+4) doubles, ~0.6 GB a task at 6.24M levels) and the sparse level matrices, and
+  a round-1 task's memory request reserves the worker's CG cache (scaled by W / (W - cache)),
+  so fewer round-1 tasks share a worker when the cache is large.
+
 - Round 1 with a large crossing FE no longer sends every shard's per-level arrays dense. Each
   shard returned a present mask and each level's smallest and largest cluster over all of the
   crossing FE's levels, ~265 MB a shard at 15.5M location-days (D6 r4 on OSCER: ~1.15 TB
@@ -110,14 +129,6 @@ break the API).
 - Arguments shared by every task that are dicts of large arrays (round 2's linear maps, with
   plan C's FE solution) go to the workers once instead of inside every task: a 758,405-level
   fit sent a 46 MiB task graph.
-- Distributed prep's reduce no longer gathers the scan's level sets and nesting checks in the
-  coordinator's memory. Scan tasks write those frames to `<shard_dir>/_scan/` and return only
-  their paths; the coordinator counts levels, checks hash ids for collisions and nesting, and
-  writes code tables in streaming passes of ~50M frame rows (`REDUCE_ROWS`), each over one
-  bucket of the key's hash, so the counts stay exact. D6 v2's lt365 sample (2.9B rows, 424M
-  type x region x day levels) had the 61 GB coordinator killed twice right after the scan
-  (OSCER 35988182, 36008269): on the same frames, concat + `unique()` peaked at 71 GB (80 GB
-  with the nesting check) and the streaming passes at 5 GB, 18 s instead of 93 s.
 
 ## [0.8.0] - 2026-11-09
 

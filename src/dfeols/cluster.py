@@ -227,7 +227,7 @@ def make_cluster(p: Profile, log_directory: str | None = None):
         kw["log_directory"] = str(ld)
         log.info("cluster: worker logs in %s", ld)
     cls = getattr(dask_jobqueue, _CLASSES[p.scheduler])
-    return cls(
+    cl = cls(
         job_name="dfeols-worker",
         local_directory=w.get("local_directory") or "${TMPDIR:-/tmp}",
         job_script_prologue=list(p.prologue) + _env_lines(p, w["cores"], w["memory"], worker=True),
@@ -241,6 +241,8 @@ def make_cluster(p: Profile, log_directory: str | None = None):
         ],
         **kw,
     )
+    cl.dfeols_log_directory = kw.get("log_directory")  # diag.attach_scheduler_log: next to them
+    return cl
 
 
 def executor(
@@ -286,6 +288,10 @@ def executor(
             wait_count=wait,
         )
     client = Client(cl)
+    if p.scheduler != "local" or log_directory:
+        from .diag import attach_scheduler_log
+
+        attach_scheduler_log(getattr(cl, "dfeols_log_directory", None) or log_directory)
     ex = DaskExecutor(
         client, max_workers=w["max_workers"], tick=tick, worker_memory=_memory_bytes(w["memory"])
     )

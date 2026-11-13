@@ -219,3 +219,49 @@ def test_iter_cache_budget_and_earlier_fits(monkeypatch):
     for sid in range(4, 8):
         wk._iter_store(new, sid, codes, Dm, w)
     assert len(wk._ITER_CACHE) == 3
+
+
+def test_iter_cache_threads(monkeypatch):
+    # a worker's threads share the cache: job 35991256 lost 43 round-1 tasks to KeyError when
+    # threads starting a new fit cleared the previous fit's entries together. Many threads
+    # store and evict (budget of 3 entries) while a new fit's first stores clear the old one.
+    import sys
+    import threading
+
+    from dfeols import worker as wk
+
+    monkeypatch.delenv("DFEOLS_ITER_CACHE_GB", raising=False)
+    monkeypatch.setattr(wk, "_ITER_CACHE", type(wk._ITER_CACHE)())
+    monkeypatch.setattr(sys, "getswitchinterval", sys.getswitchinterval)
+    sys.setswitchinterval(1e-6)  # switch threads as often as possible
+    n, P = 200, 20
+    Dm = sp.csr_matrix((np.ones(n), (np.arange(n), np.arange(n) % P)), shape=(n, P))
+    codes, w = [np.zeros(n, np.int32)], np.ones(n)
+    one = wk._iter_store(wk.Plan.__new__(wk.Plan), 0, codes, Dm, w)[-1]  # no token: not cached
+    errors = []
+    for rnd in range(30):
+        old = wk.Plan.__new__(wk.Plan)
+        old.iter_token, old.iter_cache_bytes = f"old{rnd}", 1000 * one
+        for sid in range(200):
+            wk._iter_store(old, sid, codes, Dm, w)
+        new = wk.Plan.__new__(wk.Plan)
+        new.iter_token, new.iter_cache_bytes = f"new{rnd}", 3 * one
+        go = threading.Barrier(8)
+
+        def work(t, go=go, new=new):
+            try:
+                go.wait()
+                for sid in range(t, 64, 8):
+                    wk._iter_store(new, sid, codes, Dm, w)
+                    with wk._ITER_LOCK:
+                        wk._ITER_CACHE.get((new.iter_token, sid))
+            except Exception as e:
+                errors.append(e)
+
+        ts = [threading.Thread(target=work, args=(t,)) for t in range(8)]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        assert not errors, errors[:3]
+        assert all(k[0] == new.iter_token for k in wk._ITER_CACHE) and len(wk._ITER_CACHE) <= 3

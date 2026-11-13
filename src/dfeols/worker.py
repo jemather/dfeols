@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from collections import OrderedDict
 
@@ -56,8 +57,22 @@ SPARSE_GRAM_LEVELS = 2000
 # drops every earlier fit's: the module outlives fits, and D5 (job 35888031) ran pair x year
 # after fare on workers still holding fare's 8 GB of state, 15-17 GB idle of 22 GiB, until
 # round-1 tasks pushed them past the nanny's 95% limit.
+# A worker runs several tasks at once in threads that share the module, so every access to
+# _ITER_CACHE holds _ITER_LOCK: job 35991256 (D11 R1 L2) lost 43 round-1 tasks to KeyError when
+# threads cleared the previous fit's entries together (`del` of a key another thread had deleted).
 _ITER_CACHE: OrderedDict = OrderedDict()
+_ITER_LOCK = threading.Lock()
 ITER_CACHE_DEFAULT_GB = 8.0
+
+
+def iter_cache_drop(token: str, sid: int | None = None) -> None:
+    """Forget this process's cached shard state for fit `token` (one shard, or all of them)."""
+    with _ITER_LOCK:
+        if sid is not None:
+            _ITER_CACHE.pop((token, sid), None)
+        else:
+            for k in [k for k in _ITER_CACHE if k[0] == token]:
+                del _ITER_CACHE[k]
 
 
 def _iter_cache_bytes(plan) -> float:
@@ -962,13 +977,14 @@ def _iter_store(plan: Plan, shard_id: int, local_codes, Dm, w) -> tuple:
     )
     entry = (local_codes, Dm, w, idx, nbytes)
     if plan.iter_token:
-        for k in [k for k in _ITER_CACHE if k[0] != plan.iter_token]:  # earlier fits' state
-            del _ITER_CACHE[k]
-        _ITER_CACHE[(plan.iter_token, shard_id)] = entry
-        used = sum(v[-1] for v in _ITER_CACHE.values())
         budget = _iter_cache_bytes(plan)
-        while _ITER_CACHE and used > budget:
-            used -= _ITER_CACHE.popitem(last=False)[1][-1]
+        with _ITER_LOCK:
+            for k in [k for k in _ITER_CACHE if k[0] != plan.iter_token]:  # earlier fits' state
+                del _ITER_CACHE[k]
+            _ITER_CACHE[(plan.iter_token, shard_id)] = entry
+            used = sum(v[-1] for v in _ITER_CACHE.values())
+            while _ITER_CACHE and used > budget:
+                used -= _ITER_CACHE.popitem(last=False)[1][-1]
     return entry
 
 
@@ -977,11 +993,12 @@ def shard_matvec(plan: Plan, shard_id: int, files: list[str], p: np.ndarray) -> 
     returned on the levels the shard has (idx)."""
     t0 = time.perf_counter()
     key = (plan.iter_token, shard_id)
-    hit = key in _ITER_CACHE
-    if hit:
-        _ITER_CACHE.move_to_end(key)
-        entry = _ITER_CACHE[key]
-    else:  # a worker that has not seen this shard (new, or the cache was full)
+    with _ITER_LOCK:  # check and read at once: another thread may evict it in between
+        entry = _ITER_CACHE.get(key)
+        if entry is not None:
+            _ITER_CACHE.move_to_end(key)
+    hit = entry is not None
+    if not hit:  # a worker that has not seen this shard (new, or the cache was full)
         df, _, local_codes, w = _prepare(plan, shard_id, files)
         entry = _iter_store(plan, shard_id, local_codes, _global_matrix(df, plan, df.height)[0], w)
     local_codes, Dm, w, idx, _ = entry

@@ -177,3 +177,58 @@ def test_shared_argument_survives_losing_its_worker():
         prog.start("s")
         ex.run(_sum_shared, tasks, lambda t, r: got.setdefault(t, r["x"]), prog, "s")
     assert got == {i: 300_000.0 + i for i in range(4)}
+
+
+def test_diagnostics_written(tmp_path, monkeypatch):
+    """A Dask fit writes tasks.jsonl (a line per task, a summary per stage) and cluster.jsonl
+    (scheduler snapshots) in its workdir; the scheduler log goes next to the worker logs.
+    CG stages after the second are summarised only. DFEOLS_DIAG=0 writes neither."""
+    import json
+    import logging
+
+    import polars as pl
+
+    import dfeols
+    from dfeols import diag
+    from simdata import sim_panel
+
+    distributed = pytest.importorskip("distributed")
+    monkeypatch.setenv("DFEOLS_DIAG_SECONDS", "0")
+    d = sim_panel().with_columns(cw=(pl.col("id_f") % 100) * 100 + pl.col("week"))
+    ds = dfeols.prep(
+        d, shard_dir=tmp_path / "s", partition="id_a", fixed_effects=["spell", "cw"], target_rows=3000
+    )
+    f = "eng ~ feat + posts | spell + cw"
+    kw = dict(crossing_fe="iterate", log_every=1e9, level_space_gb=0, iter_tol=1e-12)
+    with (
+        distributed.LocalCluster(n_workers=2, threads_per_worker=2, dashboard_address=None) as lc,
+        distributed.Client(lc) as c,
+    ):
+        sched = diag.attach_scheduler_log(tmp_path / "logs")
+        res = dfeols.fit(
+            ds, f, executor=DaskExecutor(c, max_workers=2, tick=0.1), workdir=str(tmp_path / "b"), **kw
+        )
+        monkeypatch.setenv("DFEOLS_DIAG", "0")
+        dfeols.fit(
+            ds, f, executor=DaskExecutor(c, max_workers=2, tick=0.1), workdir=str(tmp_path / "c"), **kw
+        )
+    for name in ("distributed", "dask_jobqueue"):  # leave other tests' logging alone
+        lg = logging.getLogger(name)
+        for h in [h for h in lg.handlers if getattr(h, "baseFilename", "") == str(sched.resolve())]:
+            lg.removeHandler(h)
+            h.close()
+    assert sched.exists()
+    lines = [json.loads(x) for x in (tmp_path / "b" / "tasks.jsonl").read_text().splitlines()]
+    summ = {r["stage"]: r["summary"] for r in lines if "summary" in r}
+    tasks = [r for r in lines if "summary" not in r]
+    steps = res.options["crossing_cg"]["steps"]
+    assert steps > diag.DETAIL_CG_STEPS
+    assert {"round1", "round2", "cg1", f"cg{steps}"} <= set(summ)
+    assert summ["round1"]["tasks"] == len(ds.shards) == sum(r["stage"] == "round1" for r in tasks)
+    assert not any(r["stage"] == f"cg{diag.DETAIL_CG_STEPS + 1}" for r in tasks)
+    assert all(r["fetch_s"] >= 0 and r["on_result_s"] >= 0 and "total" in r for r in tasks)
+    assert summ["round1"]["mean_running"] > 0
+    snaps = [json.loads(x) for x in (tmp_path / "b" / "cluster.jsonl").read_text().splitlines()]
+    assert snaps and all("states" in s and len(s["workers"]) == 2 for s in snaps)
+    assert {w["threads"] for s in snaps for w in s["workers"]} == {2}
+    assert not (tmp_path / "c" / "tasks.jsonl").exists() and not (tmp_path / "c" / "cluster.jsonl").exists()

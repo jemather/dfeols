@@ -299,9 +299,41 @@ def estimate_worker_gb(plan: Plan, rows: int, n_cols: int, cells: bool = False) 
     if cells:
         return cells_worker_gb(rows, n_cols, m + plan.k_x, len(plan.local_fes) + len(plan.global_fes) + 1)
     if plan.crossing_iterate:
-        return worker_gb(rows, n_cols, m, plan.k_x, 0) + rows * (m + plan.k_x) * 8 * 2 / 1e9
+        gb = worker_gb(rows, n_cols, m, plan.k_x, 0) + rows * (m + plan.k_x) * 8 * 2 / 1e9
+        return gb + iterate_level_gb(plan, rows)
     levels = sum(L for *_, L in plan.global_fes) if plan.sparse_global else 0
     return worker_gb(rows, n_cols, m, plan.k_x, plan.n_dummy, levels)
+
+
+def iterate_level_gb(plan: Plan, rows: int) -> float:
+    """Plan C's round 1 (worker._round1_sparse with crossing_iterate) also builds arrays over
+    every crossing level, whatever the shard holds: D'W [X Y] and its stacked copy, D'W 1 and
+    the Jacobi diagonal (P x (2(k+m) + 4) doubles), plus the sparse level matrix D, its
+    transpose and the local-FE product C (~48 bytes a row per crossing FE). D11 R1 L2 (6.24M
+    levels, job 35991256): ~0.6 GB a task on top of the rest, which the estimate missed."""
+    P = sum(L for *_, L in plan.global_fes)
+    m = len(plan.formula.depvars) + len(plan.endog_names)
+    return (P * (2 * (plan.k_x + m) + 4) * 8 + rows * len(plan.global_fes) * 48) / 1e9
+
+
+def task_slot_gb(plan: Plan, need_gb: float, executor) -> float:
+    """Memory a task asks of its worker (DaskExecutor's MEMORY resource). Plan C's workers
+    also keep shard state between CG steps (worker._ITER_CACHE, up to plan.iter_cache_bytes),
+    which no task's estimate holds, so round 1's tasks (the ones building arrays over every
+    crossing level) share what is left: scale the estimate by W / (W - cache). Job 35991256
+    ran 4 L2 round-1 tasks a worker next to a 6 GB cache (15.4 GB peak) and lost 14 workers at
+    once; the cause isn't confirmed, so this is a precaution. CG steps keep the plain estimate."""
+    if not plan.crossing_iterate or not plan.iter_cache_bytes:
+        return need_gb
+    from .crossing import worker_bytes
+
+    W = worker_bytes(executor)
+    if not W:
+        return need_gb
+    from .worker import _iter_cache_bytes
+
+    cache = min(_iter_cache_bytes(plan), 0.5 * W)
+    return need_gb * W / (W - cache)
 
 
 def worker_gb(rows: int, n_cols: int, m: int, k_x: int, n_dummy: int, sparse_levels: int = 0) -> float:
@@ -1349,6 +1381,7 @@ def fit(
 
         tasks = [(s["id"], rows[s["id"]], (plan, s["id"], ds.shard_paths(s))) for s in ds.shards]
         prog.start("round1")
+        prog.task_gb = task_slot_gb(plan, need_gb, executor)  # round 1 builds the level arrays
         reduce = None
         if plan.crossing_iterate and plan.level_nnz:
             import functools

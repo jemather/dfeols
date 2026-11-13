@@ -291,6 +291,13 @@ class DaskExecutor:
             fargs[f] = args
         order = list(futs)  # submission order = priority order
         pending = set(futs)
+        from .diag import RunLog
+
+        diag = RunLog(self.client, progress, stage, n)
+
+        def backlog():  # results finished on the workers that the coordinator has not taken
+            return sum(1 for f in list(pending) if f.status == "finished")
+
         key_to_tid = {f.key: futs[f] for f in futs}
         last_task = None
         while pending or (pool and not pool.finished()):
@@ -329,9 +336,13 @@ class DaskExecutor:
                 if f.status == "error":
                     exc = f.exception()
                     raise RuntimeError(f"shard {tid} failed in {stage}: {exc!r}") from exc
+                t_fetch = time.perf_counter()
                 res = f.result()
+                t_on = time.perf_counter()
                 on_result(tid, res)
+                t_end = time.perf_counter()
                 progress.task_done(stage, tid, res.get("timing", {}).get("total", 0.0), res.get("timing"))
+                diag.task(tid, res.get("timing"), t_on - t_fetch, t_end - t_on)
                 pending.discard(f)
                 f.release()
                 if not pending:
@@ -340,6 +351,9 @@ class DaskExecutor:
             progress.set_slots(s, mx)
             progress.running[stage] = {key_to_tid[k] for k in self._running_keys() if k in key_to_tid}
             progress.tick()
+            diag.tick(backlog)
+        summ = diag.close()
+        log.debug("%s %s: %s", stage, progress.label, summ)
         if pool:
             root = pool.root()
             reduce.done(root.result() if root is not None else None)

@@ -515,9 +515,9 @@ def demean_round2(
             U = demean(U, local, w, plan.fe_tol, plan.fe_maxiter, plan.fe_method)[0]
         V = Yt - U
     if plan is not None and plan.iter_token:
-        from .worker import _ITER_CACHE
+        from .worker import iter_cache_drop
 
-        _ITER_CACHE.pop((plan.iter_token, sid), None)
+        iter_cache_drop(plan.iter_token, sid)
     _write_part(out_dir, sid, names, V, None if bare else w, cls)
     p.unlink()
     r = {
@@ -975,10 +975,9 @@ def demean_once(
             crossing["A_saved"] = str(CROSSING_A)
         elif create is not None and saved_A is not None and saved_A.exists():
             crossing["A_from"] = str(CROSSING_A)
-        from .worker import _ITER_CACHE
+        from .worker import iter_cache_drop
 
-        for k in [k for k in _ITER_CACHE if k[0] == plan.iter_token]:  # this process's (serial)
-            _ITER_CACHE.pop(k, None)
+        iter_cache_drop(plan.iter_token)  # this process's (serial)
     elif plan.global_fes:
         zref = reference_ss(acc["z_s1"], acc["z_s2"], acc["sumw"]) if plan.local_fes else None
         keep = collinear_keep(acc["ZtZ"], 1e-9, ref_diag=zref)

@@ -60,3 +60,30 @@ def test_tasks_share_a_worker_by_memory(task_gb, together):
         assert ex.slots()[0] == 1  # workers, not threads
     at_once = max(sum(a <= s < b for a, b in spans) for s, _ in spans)  # running at each start
     assert at_once == (3 if together else 1)
+
+
+def test_plan_c_task_slot_reserves_the_cache(monkeypatch):
+    """Plan C tasks count their arrays over all crossing levels, and share a worker with the CG
+    cache (job 35991256: 4 L2 tasks a worker beside a 6 GB cache, 14 workers lost at once)."""
+    from types import SimpleNamespace
+
+    from dfeols.estimate import iterate_level_gb, task_slot_gb
+
+    monkeypatch.delenv("DFEOLS_ITER_CACHE_GB", raising=False)
+    W = 24_000_000_000
+    ex = SimpleNamespace(worker_memory=W)
+    f = SimpleNamespace(depvars=["y"])
+    plan = SimpleNamespace(
+        crossing_iterate=True,
+        iter_cache_bytes=W // 4,
+        global_fes=[("gene^cell_type", "c", 6_240_000)],
+        formula=f,
+        endog_names=[],
+        k_x=3,
+    )
+    small = SimpleNamespace(**{**vars(plan), "global_fes": [("gene", "g", 61_000)]})
+    assert iterate_level_gb(plan, 5_000_000) > 0.6 > iterate_level_gb(small, 5_000_000)
+    assert task_slot_gb(plan, 4.0, ex) == pytest.approx(4.0 * 4 / 3)  # a quarter of W is cache
+    assert task_slot_gb(SimpleNamespace(**{**vars(plan), "crossing_iterate": False}), 4.0, ex) == 4.0
+    monkeypatch.setenv("DFEOLS_ITER_CACHE_GB", "100")  # the cache never takes more than half
+    assert task_slot_gb(plan, 4.0, ex) == pytest.approx(8.0)
