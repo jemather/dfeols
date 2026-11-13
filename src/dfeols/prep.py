@@ -31,7 +31,7 @@ from .rowhash import column_bits, hexdigest, rowset
 log = logging.getLogger("dfeols")
 
 META = "dfeols_meta.json"
-WORK_DIRS = ("shards", "_staging", "_buckets", "_codes")
+WORK_DIRS = ("shards", "_staging", "_buckets", "_codes", "_scan")
 
 
 def remove_dir(path: Path) -> None:

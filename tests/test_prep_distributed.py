@@ -146,9 +146,13 @@ def test_coordinator_helps_with_no_workers(tmp_path):
 
 
 @pytest.mark.parametrize("name,d,fits", CASES, ids=[c[0] for c in CASES])
-def test_hash_ids_and_range_shards_match(tmp_path, name, d, fits):
+def test_hash_ids_and_range_shards_match(tmp_path, monkeypatch, name, d, fits):
     """Forcing the 1e10-scale paths on small data (hash ids for nested FEs and
-    clusters, hash-range shard assignment) gives the same fits as dense codes."""
+    clusters, hash-range shard assignment, a reduce in many streaming passes)
+    gives the same fits as dense codes."""
+    import dfeols.prep_dist as pd_
+
+    monkeypatch.setattr(pd_, "REDUCE_ROWS", 1000)
     raw, truth = _gen(tmp_path, d, name)
     src = str(raw / "*.parquet")
     ex = dfeols.SerialExecutor()
@@ -165,6 +169,7 @@ def test_hash_ids_and_range_shards_match(tmp_path, name, d, fits):
             **kw,
         )
         assert b.meta["shard_assignment"] == "range"
+        assert not (tmp_path / f"hash_{part}" / "_scan").exists()
         assert any(m.get("id") == "hash" for m in list(b.fes.values()) + list(b.clusters.values()))
         assert a.n_rows == b.n_rows and sum(s["rows"] for s in b.shards) == b.n_rows
         rows = [s["rows"] for s in b.shards]
@@ -372,32 +377,45 @@ def test_task_results_delivered_twice(tmp_path, opts):
     )
 
 
-def test_scan_frames_are_reduced_as_they_arrive():
-    """The coordinator merges per-file scan frames incrementally (regression:
-    at 1e10 rows it held 5,000 copies of the group x time level set and the
-    nesting-check tables, well over 100 GB, and was killed)."""
-    from dfeols.prep_dist import _Compactor
+@pytest.mark.parametrize("reduce_rows", [10**9, 500], ids=["one-pass", "many-passes"])
+def test_scan_frames_reduce_in_streaming_passes(tmp_path, monkeypatch, reduce_rows):
+    """The scan tasks' level and nesting frames are reduced from Parquet in
+    streaming passes over hash buckets (regression: D6 v2 lt365, 424M levels;
+    concat + unique() in memory peaked at 71 GB and the 61 GB coordinator was
+    killed twice, OSCER 35988182 and 36008269). Exact for any number of passes,
+    with keys repeated across task frames."""
+    import dfeols.prep_dist as pd_
 
+    monkeypatch.setattr(pd_, "REDUCE_ROWS", reduce_rows)
     rng = np.random.default_rng(0)
-    levels = _Compactor(lambda df: df.unique(), min_rows=500)
-    checks = _Compactor(lambda df: df.group_by("g").agg(pl.col("lo").min(), pl.col("hi").max()), min_rows=500)
-    peak = 0
-    for _ in range(2000):  # 2,000 files, each repeating most of 400 distinct keys
-        g = rng.choice(400, 300, replace=False)
-        levels.add(pl.DataFrame({"g": g}))
-        checks.add(pl.DataFrame({"g": g, "lo": rng.integers(0, 9, 300), "hi": rng.integers(9, 99, 300)}))
-        held = sum(x.height for x in levels.pending) + (
-            levels.merged.height if levels.merged is not None else 0
-        )
-        peak = max(peak, held)
-    assert levels.result()["g"].sort().to_list() == list(range(400))
-    assert checks.result().height == 400
-    assert peak < 2_000  # vs 600,000 rows held without merging
-
-    disjoint = _Compactor(lambda df: df.unique(), min_rows=100)
-    for f in range(300):  # nothing overlaps (unit-level frames): still exact
-        disjoint.add(pl.DataFrame({"u": np.arange(f * 50, f * 50 + 50)}))
-    assert disjoint.result().height == 15_000
+    lv, cn, cx, rows = [], [], [], 0
+    for t in range(20):  # 20 tasks, each holding most of 400 x 3 keys
+        df = pl.DataFrame({"g": rng.choice(400, 300, replace=False), "s": rng.integers(0, 3, 300)}).unique()
+        rows += df.height
+        lv.append(str(tmp_path / f"L{t}.parquet"))
+        df.write_parquet(lv[-1])
+        # nesting frames per inner key g: outer g // 4 (nested), and one task that
+        # disagrees with the others on g == 7 (not nested)
+        c = df.select("g").unique().with_columns((pl.col("g") // 4).alias("lo"))
+        c = c.with_columns(pl.col("lo").alias("hi"))
+        cn.append(str(tmp_path / f"Cn{t}.parquet"))
+        c.write_parquet(cn[-1])
+        if t == 13:
+            c = c.with_columns(pl.when(pl.col("g") == 7).then(99).otherwise(pl.col("lo")).alias("lo"))
+            c = c.with_columns(pl.col("lo").alias("hi"))
+        cx.append(str(tmp_path / f"Cx{t}.parquet"))
+        c.write_parquet(cx[-1])
+    assert pd_._n_passes(rows) == (1 if reduce_rows > rows else -(-rows // reduce_rows))
+    truth = pl.concat([pl.read_parquet(f) for f in lv]).unique().sort("g", "s")
+    n, n_id = pd_._count_levels(lv, ["g", "s"], rows)
+    assert n == n_id == truth.height
+    n_codes = pd_._write_codes(lv, ["g", "s"], "c", tmp_path / "codes.parquet")
+    codes = pl.read_parquet(tmp_path / "codes.parquet")
+    assert n_codes == truth.height and codes.columns == ["c", "g", "s"]
+    assert codes["c"].dtype == pl.UInt32 and codes["c"].to_list() == list(range(n_codes))
+    assert codes.select("g", "s").equals(truth)
+    assert pd_._nested(cn, ["g"], rows) is True
+    assert pd_._nested(cx, ["g"], rows) is False
 
 
 @pytest.mark.parametrize("opts", [{}, {"max_files": 0}], ids=["direct", "two-level"])
