@@ -229,6 +229,18 @@ Each FE is absorbed as `k^fe`. Where one equation has fewer FEs than another, it
 slot is filled with a level its own FEs already span, so the fit doesn't change. Such
 fillers still count in K, as fixest would count them; see `dfeols/stack.py`.
 
+## Poisson and cloglog
+
+```python
+r = dfeols.fit_glm(ds, "unf ~ lfeat:i(tbin) + lposts | id_f + id_a + week",
+                   family="cloglog", cluster="id_a")     # or family="poisson"
+r.options["glm"]   # iterations, deviance, rows dropped as separated
+```
+
+Fitted by IRLS, each step a weighted dfeols fit, so it scales and shards like `fit`; the
+working response lives in per-shard files between steps. Separated FE groups are dropped
+first. Equal to pyfixest's `fepois` and R fixest's `feglm`; see `dfeols/glm.py`.
+
 ## Discrete-time hazard models
 
 `dfeols.lpm_dthazard(ds, "exit ~ x1 + i(age) | fe", unit="id", time="t")`

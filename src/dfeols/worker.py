@@ -26,6 +26,7 @@ reported regressors, before the dummies.
 
 from __future__ import annotations
 
+import json
 import os
 import time
 from collections import OrderedDict
@@ -113,6 +114,12 @@ class Plan:
     # with these raw columns carried along (read only for that; they don't touch the sample)
     predict_dir: str | None = None
     predict_keep: tuple[str, ...] = ()
+    # GLM by IRLS (dfeols.glm): per-shard Parquet files of extra columns aligned to the
+    # shard's raw rows (the working response and weights), joined before any row is
+    # dropped; and, in round 2, the family and where to write the next iteration's columns
+    sidecar_dir: str | None = None
+    sidecar_cols: tuple[str, ...] = ()
+    glm: dict | None = None
 
     @property
     def k_x(self) -> int:
@@ -202,7 +209,17 @@ def _term_columns(t: Term, df: pl.DataFrame, cat_levels: dict[str, list]) -> lis
     return out
 
 
-def _load(plan: Plan, files: list[str], dropped: dict | None = None, extra: tuple[str, ...] = ()):
+def sidecar_path(folder, shard_id: int) -> Path:
+    return Path(folder) / f"part-{shard_id:05d}.parquet"
+
+
+def _load(
+    plan: Plan,
+    files: list[str],
+    dropped: dict | None = None,
+    extra: tuple[str, ...] = (),
+    shard_id: int | None = None,
+):
     """The shard's rows for this spec. `dropped`, if given, gets the rows removed by
     reason (missing, non_finite, zero_weights), for the record's sample counts. `extra`
     columns are read too but play no part in which rows are kept."""
@@ -225,7 +242,17 @@ def _load(plan: Plan, files: list[str], dropped: dict | None = None, extra: tupl
 
         for e in created.values():
             raw.update(_expr_columns(e))
-    df = pl.read_parquet(files, columns=sorted(cols | raw | set(extra)))
+    side = set(plan.sidecar_cols)
+    df = pl.read_parquet(files, columns=sorted((cols | raw | set(extra)) - side))
+    if plan.sidecar_dir:
+        if shard_id is None:
+            raise RuntimeError("a fit with sidecar columns needs the shard id to read them")
+        sc = pl.read_parquet(sidecar_path(plan.sidecar_dir, shard_id), columns=list(plan.sidecar_cols))
+        if sc.height != df.height:
+            raise RuntimeError(f"shard {shard_id}: sidecar has {sc.height} rows, the shard {df.height}")
+        df = df.hstack(sc)
+    if plan.glm:  # the raw row position, so round 2 can write the next sidecar aligned
+        df = df.with_row_index("__row")
     # listwise deletion on the variables of this spec (a session's: its declared variables)
     num = [c for c in sorted(sample) if df.schema[c].is_float()]
     n = [df.height]
@@ -309,7 +336,7 @@ def shard_singletons(plan: Plan, shard_id: int, files: list[str], gcount, first:
     15.5M location x day levels: 124 MB per shard, 540 GB to the coordinator over 4,355
     shards; singletons1 ran at a third of r1's speed)."""
     t0 = time.perf_counter()
-    df = _load(plan, files)  # the same rows round 1 sees (listwise deletion included)
+    df = _load(plan, files, shard_id=shard_id)  # the same rows round 1 sees (listwise deletion included)
     n0 = df.height
     keep = np.ones(n0, bool) if first else np.load(_keep_path(plan, shard_id))
     # only FEs with an intercept have singletons (fixest: a slope-only FE drops none)
@@ -724,7 +751,7 @@ def _prepare(
     plan: Plan, shard_id: int, files: list[str], loaded: dict | None = None, extra: tuple[str, ...] = ()
 ):
     """The shard's estimation sample: rows, local FE codes (dense) and weights."""
-    df = _load(plan, files, loaded, extra)
+    df = _load(plan, files, loaded, extra, shard_id)
     n0 = df.height
     if plan.keep_dir:  # singletons over all FEs, found in the passes before round 1
         keep = _read_keep(plan, shard_id, n0)
@@ -1103,7 +1130,7 @@ def _write_prediction(plan: Plan, shard_id: int, files: list[str], lin: dict, E:
     """In-sample prediction for the shard's estimation rows: xb (reported regressors times
     their coefficients), resid (round 2's residual, net of every FE, local and crossing) and
     d = y - xb - resid, the sum of the row's FE terms (fixest's predict() is xb + d)."""
-    df, _, _, _ = _prepare(plan, shard_id, files, extra=plan.predict_keep)
+    df, n0, _, _ = _prepare(plan, shard_id, files, extra=plan.predict_keep)
     n = df.height
     if n != E.shape[0]:
         raise RuntimeError(f"predict: shard {shard_id} has {n} rows, round 2 had {E.shape[0]}")
@@ -1113,6 +1140,8 @@ def _write_prediction(plan: Plan, shard_id: int, files: list[str], lin: dict, E:
     xb = X[:, lin["xb_idx"]] @ lin["xb_beta"] if len(lin["xb_idx"]) else np.zeros((n, len(ys)))
     resid = E[:, : len(ys)]
     d = Y - xb - resid
+    if plan.glm:
+        return _write_glm_step(plan, shard_id, df, n0, (xb + d)[:, 0])
     cols = {c: df[c] for c in plan.predict_keep}
     for j, y in enumerate(ys):
         sfx = "" if len(ys) == 1 else f"_{y}"
@@ -1122,6 +1151,39 @@ def _write_prediction(plan: Plan, shard_id: int, files: list[str], lin: dict, E:
     pl.DataFrame(cols).write_parquet(tmp)
     os.replace(tmp, path)
     return n
+
+
+def _write_glm_step(plan: Plan, shard_id: int, df, n0: int, eta: np.ndarray) -> int:
+    """IRLS: from the fitted linear predictor (xb + d, every FE included) on the estimation
+    rows, write the next working response z and weights w for all raw rows (null off the
+    sample), and this shard's deviance at the new mean (glm-NNNNN.json)."""
+    from . import glm as _glm
+
+    g = plan.glm
+    fam = _glm.FAMILIES[g["family"]]
+    y = df[g["y"]].to_numpy().astype(np.float64)
+    eta = np.clip(eta, *fam.eta_bounds)
+    mu = fam.linkinv(eta)
+    z, w = fam.working(y, eta, mu)
+    dev = float(fam.deviance(y, mu).sum())
+    rows = df["__row"].to_numpy()
+    import pyarrow.parquet as pq
+
+    n0 = pq.ParquetFile(sidecar_path(plan.sidecar_dir, shard_id)).metadata.num_rows  # raw rows
+    zf = np.full(n0, np.nan)
+    wf = np.full(n0, np.nan)
+    zf[rows], wf[rows] = z, w
+    zc, wc = plan.sidecar_cols
+    out = pl.DataFrame({zc: zf, wc: wf}).with_columns(pl.all().fill_nan(None))
+    path = sidecar_path(g["out"], shard_id)
+    tmp = path.with_suffix(".parquet.tmp")
+    out.write_parquet(tmp)
+    os.replace(tmp, path)
+    stats = {"deviance": dev, "n": len(y), "sum_y": float(y.sum())}
+    stats["max_abs_eta"] = float(np.abs(eta).max(initial=0.0))
+    jp = Path(g["out"]) / f"glm-{shard_id:05d}.json"
+    jp.write_text(json.dumps(stats))
+    return len(y)
 
 
 def shard_round2(plan: Plan, shard_id: int, files: list[str], lin: dict) -> dict:

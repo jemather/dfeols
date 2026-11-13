@@ -9,6 +9,16 @@ break the API).
 
 ### Added
 
+- HDFE GLMs by IRLS: `dfeols.fit_glm(ds, formula, family="poisson" | "cloglog", cluster=...)`.
+  Each iteration is an ordinary weighted `fit` of the working response, so every FE path
+  and executor applies; round 2 computes the new linear predictor (xb + every FE) in the
+  shard and writes the next working response and weights to per-shard sidecar files, so
+  only deviances reach the coordinator. FE groups whose outcome never varies (Poisson: all
+  zero; binary: all 0 or all 1) are dropped first, repeated until stable. Poisson equals
+  pyfixest's `fepois` (N, coefficients, CRV1, HC1 and iid SEs) with local FEs, the sparse
+  crossing path and plan C; cloglog equals R fixest's `feglm(binomial("cloglog"))`.
+  Convergence on relative deviance change (`tol`, default 1e-8 as fixest; tighten it for
+  agreement beyond about 1e-5). Not yet: prior weights, varying slopes, `cells=True`.
 - In-sample prediction including FEs: `fit(..., predict=folder, predict_keep=["row_id"])`
   writes each estimation row's `xb` (reported regressors), `d` (the sum of its FE terms,
   local and crossing) and `resid`, one Parquet part per shard, during round 2 (no extra

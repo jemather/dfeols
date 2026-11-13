@@ -8,6 +8,7 @@ from .cluster import executor
 from .dthazard import lpm_dthazard
 from .estimate import build_plan, fit
 from .executors import DaskExecutor, SerialExecutor
+from .glm import fit_glm
 from .lock import LockedError
 from .planner import plan
 from .prep import Dataset, prep
@@ -36,6 +37,7 @@ __all__ = [
     "Equation",
     "Stacked",
     "sample_groups",
+    "fit_glm",
 ]
 __version__ = "0.8.0"
 

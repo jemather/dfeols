@@ -156,7 +156,9 @@ def build_plan(
     fe_method: str = "auto",
     crossing_fe: str = "auto",
     executor=None,
+    extra_columns: tuple[str, ...] = (),
 ) -> Plan:
+    """`extra_columns`: columns supplied per shard at load time (GLM sidecars), not in ds."""
     f = parse(formula)
     local, glob, slopes = [], [], {}
     for t in f.fe_terms:
@@ -221,7 +223,7 @@ def build_plan(
     if missing_cats:
         raise KeyError(f"Variables not in the prepared data: {sorted(missing_cats)}")
     cat_levels = category_levels(ds, cats, executor)
-    missing = (f.variables | ({weights} if weights else set())) - set(ds.columns)
+    missing = (f.variables | ({weights} if weights else set())) - set(ds.columns) - set(extra_columns)
     if missing:
         raise KeyError(f"Variables not in the prepared data: {sorted(missing)}")
 
@@ -1053,6 +1055,7 @@ def fit(
     fuller: float | None = None,
     predict: str | os.PathLike | None = None,
     predict_keep: list[str] | tuple[str, ...] = (),
+    _glm: dict | None = None,
 ) -> Result:
     """Estimate an HDFE OLS or IV model on a prepared, sharded dataset.
 
@@ -1133,7 +1136,10 @@ def fit(
         fe_method=fe_method,
         crossing_fe=crossing_fe,
         executor=executor,
+        extra_columns=tuple(_glm["cols"]) if _glm else (),
     )
+    if _glm:  # one IRLS step of dfeols.glm: z and w come from sidecar files per shard
+        plan = dataclasses.replace(plan, sidecar_dir=str(_glm["read"]), sidecar_cols=tuple(_glm["cols"]))
     if predict is not None:
         if cells:
             raise ValueError("predict= needs each row's residual; not with cells=True")
@@ -1443,7 +1449,12 @@ def fit(
 
         plan2, lin2 = plan, sol.lin
         if predict is not None:
-            plan2 = dataclasses.replace(plan, predict_dir=str(pdir), predict_keep=tuple(predict_keep))
+            plan2 = dataclasses.replace(
+                plan,
+                predict_dir=str(pdir),
+                predict_keep=tuple(predict_keep),
+                glm={"family": _glm["family"], "y": _glm["y"], "out": str(_glm["write"])} if _glm else None,
+            )
             idx = np.array([plan.colnames.index(n) for n in sol.coefnames], dtype=np.int64)
             lin2 = dict(sol.lin, xb_idx=idx, xb_beta=np.asarray(sol.coef).reshape(len(idx), -1))
         tasks2 = [(s["id"], rows[s["id"]], (plan2, s["id"], ds.shard_paths(s), lin2)) for s in ds.shards]
