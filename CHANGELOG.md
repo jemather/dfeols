@@ -9,6 +9,18 @@ break the API).
 
 ### Added
 
+- Stacked regressions with per-equation FEs (`dfeols.stack`, `dfeols.Equation`): each
+  equation's rows tagged by `k`, its outcome in `y`, regressor roles as per-equation
+  columns (`x_k1`, `x_k2`, ... zero off the equation), and every FE interacted with `k`
+  in slots lined up across equations (local FEs with local, crossing with crossing;
+  missing slots filled with a level the equation's other FEs span). One fit gives every
+  equation's coefficients and one joint clustered VCE for cross-equation tests.
+  `Stacked.formula("x:i(tbin) + p")` expands roles per equation; `same_rows=True` gives
+  every equation the same observations; `Stacked.coef_index` finds an equation's terms.
+  Coefficients equal each equation fitted alone, and the stacked fit equals pyfixest on
+  the stacked rows. `dfeols.sample_groups(by, frac, seed)`: a filter keeping a fixed
+  share of groups with all their rows, from a hash stable across machines and Polars
+  versions (nested fractions nest).
 - `dfeols convert-dta SRC OUT` (`dfeols.convert.convert_dta`): streams a Stata `.dta` file
   into 1 GB Parquet parts with bounded memory. One Arrow schema comes from the header, so
   integer columns stay int8/16/32 even in chunks with missing values. Stata missing becomes

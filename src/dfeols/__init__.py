@@ -15,6 +15,7 @@ from .record import write_collection
 from .results import Result
 from .session import Session
 from .site import profile
+from .stack import Equation, Stacked, sample_groups, stack
 
 __all__ = [
     "prep",
@@ -31,6 +32,10 @@ __all__ = [
     "write_collection",
     "Session",
     "lpm_dthazard",
+    "stack",
+    "Equation",
+    "Stacked",
+    "sample_groups",
 ]
 __version__ = "0.8.0"
 
