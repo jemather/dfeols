@@ -45,6 +45,15 @@ If it fails:
 Prep encodes the FE and cluster variables, checks nesting and writes Parquet shards.
 Every model on that dataset reuses the shards.
 
+**Stata data:** convert a `.dta` file to Parquet parts first. It streams with bounded
+memory (about 160 MB/s on one core), keeps each column's Stata type across parts, turns
+every Stata missing code into null, and writes labels, formats and value labels to
+`_dta_meta.json`:
+
+```bash
+dfeols convert-dta panel.dta /scratch/me/panel_pq/ --part-gb 1   # --columns a,b,c for a subset
+```
+
 ```python
 import dfeols
 prof = dfeols.profile()

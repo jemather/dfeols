@@ -9,6 +9,12 @@ break the API).
 
 ### Added
 
+- `dfeols convert-dta SRC OUT` (`dfeols.convert.convert_dta`): streams a Stata `.dta` file
+  into 1 GB Parquet parts with bounded memory. One Arrow schema comes from the header, so
+  integer columns stay int8/16/32 even in chunks with missing values. Stata missing becomes
+  null, value labels are kept as codes, dates as Stata codes, and labels, formats, value
+  labels and null counts go to `_dta_meta.json` (written last, rows checked against the
+  header).
 - Varying slopes in `fit`, in fixest's syntax: `unit[t]` (unit FE plus a slope on t per
   unit), `unit[[t]]` (slopes only), `unit[t, z]`, `a^b[x]`. Slopes on an FE nested in the
   partition key are projected out in the shard, exactly with one local FE and by

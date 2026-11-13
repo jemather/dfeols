@@ -415,6 +415,9 @@ def main(argv=None):
     from . import store as _store
 
     _store.add_parser(sub)
+    from . import convert as _convert
+
+    _convert.add_parser(sub)
     args, rest = ap.parse_known_args(argv)
     if args.cmd == "bench":
         return bench_cmd(args, rest)
@@ -435,6 +438,7 @@ def main(argv=None):
 
 
 def _dispatch(args) -> None:
+    from . import convert as _convert
     from . import session as _session
     from . import store as _store
 
@@ -449,6 +453,7 @@ def _dispatch(args) -> None:
         "check": lambda: check_cmd(args),
         "session": lambda: _session.main(args),
         "demeaned": lambda: _store.main(args),
+        "convert-dta": lambda: _convert.main(args),
     }[args.cmd]()
 
 
