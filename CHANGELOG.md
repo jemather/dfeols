@@ -129,6 +129,14 @@ break the API).
 - Arguments shared by every task that are dicts of large arrays (round 2's linear maps, with
   plan C's FE solution) go to the workers once instead of inside every task: a 758,405-level
   fit sent a 46 MiB task graph.
+- Distributed prep's reduce no longer gathers the scan's level sets and nesting checks in the
+  coordinator's memory. Scan tasks write those frames to `<shard_dir>/_scan/` and return only
+  their paths; the coordinator counts levels, checks hash ids for collisions and nesting, and
+  writes code tables in streaming passes of ~50M frame rows (`REDUCE_ROWS`), each over one
+  bucket of the key's hash, so the counts stay exact. D6 v2's lt365 sample (2.9B rows, 424M
+  type x region x day levels) had the 61 GB coordinator killed twice right after the scan
+  (OSCER 35988182, 36008269): on the same frames, concat + `unique()` peaked at 71 GB (80 GB
+  with the nesting check) and the streaming passes at 5 GB, 18 s instead of 93 s.
 
 ## [0.8.0] - 2026-11-09
 

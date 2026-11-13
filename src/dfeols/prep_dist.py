@@ -5,8 +5,10 @@ the workers, so the coordinator never holds or streams the full data.
 
   scan    (per input file)    row counts, distinct levels of every FE/cluster
                               spec, partition-group sizes, nesting pairs
-  reduce  (coordinator)       global integer codes (sorted levels), LPT shard
-                              assignment, nesting flags -> small Parquet tables
+  reduce  (coordinator)       global integer codes (sorted levels) or hash ids,
+                              shard assignment, nesting flags -> small Parquet
+                              tables; streaming passes over the scan's frames,
+                              which the tasks leave in <shard_dir>/_scan
   encode  (per file batch)    join the code tables, bucket rows by shard
   merge   (per shard)         concatenate a shard's pieces into one file
 
@@ -61,55 +63,88 @@ def _nrows(f: str) -> int:
     return pq.read_metadata(f).num_rows
 
 
-class _Compactor:
-    """Accumulates per-file scan frames and reduces them as they arrive.
+REDUCE_ROWS = 50_000_000  # scan-frame rows per streaming pass of the reduce
 
-    Each file returns, e.g., every group x time level it contains; at 1e10
-    rows that is 5,000 overlapping copies of a 500k-row table (tens of GB
-    held until the scan ended, which got the coordinator killed). Merging
-    whenever the pending rows reach the size of what is already merged (and
-    at least `min_rows`) keeps memory near the number of distinct keys, at
-    O(n log n) total work. Frames whose keys don't overlap across files
-    (unit-level ones) don't shrink when merged, so merging stops for them
-    after a merge of several files' frames that saves less than 10%."""
 
-    def __init__(self, reduce, min_rows: int = 1_000_000):
-        self.reduce, self.min_rows = reduce, min_rows
-        self.merged: pl.DataFrame | None = None
-        self.pending: list[pl.DataFrame] = []
-        self.pending_rows = 0
-        self.worthwhile = True
+def _n_passes(rows: int) -> int:
+    return max(1, -(-int(rows) // REDUCE_ROWS))
 
-    def add(self, df: pl.DataFrame) -> None:
-        self.pending.append(df)
-        self.pending_rows += df.height
-        merged = self.merged.height if self.merged is not None else 0
-        if self.worthwhile and self.pending_rows >= max(self.min_rows, merged):
-            self._compact()
 
-    def _compact(self) -> None:
-        parts = ([self.merged] if self.merged is not None else []) + self.pending
-        before = sum(p.height for p in parts)
-        self.merged = self.reduce(pl.concat(parts)) if parts else None
-        self.pending, self.pending_rows = [], 0
-        # judge only merges across several files (one file's rows are unique anyway)
-        if len(parts) >= 8 and self.merged is not None and self.merged.height > 0.9 * before:
-            self.worthwhile = False
+def _bucket(lf: pl.LazyFrame, h: pl.Expr, j: int, k: int) -> pl.LazyFrame:
+    return lf if k == 1 else lf.filter(h % k == j)
 
-    def result(self) -> pl.DataFrame:
-        if self.pending or self.merged is None:
-            self._compact()
-        return self.merged
+
+def _count_levels(paths: list[str], comps: list[str], rows: int) -> tuple[int, int]:
+    """Distinct levels of `comps` in the scan tasks' level frames, and distinct
+    hash ids among them (equal iff the ids have no collision).
+
+    Streaming passes over buckets of the id hash: a level and every level its id
+    collides with share a bucket, so per-bucket counts add up exactly, and each
+    pass holds one bucket's hash table. lt365 of D6 v2 (424M type x region x day
+    levels): in memory, concat + unique() peaked at 71 GB and got the 61 GB
+    coordinator killed (OSCER 35988182, 36008269); 9 passes of ~50M rows, ~7 GB."""
+    h = pl.struct(comps).hash(seed=SEED_FE)
+    lf = pl.scan_parquet(paths).select(comps).with_columns(h.alias("__id"))
+    k, n, n_id = _n_passes(rows), 0, 0
+    for j in range(k):
+        b = _bucket(lf, pl.col("__id"), j, k)
+        a, c = pl.collect_all(
+            [b.select(comps).unique().select(pl.len()), b.select("__id").unique().select(pl.len())],
+            engine="streaming",
+        )
+        n, n_id = n + int(a.item()), n_id + int(c.item())
+    return n, n_id
+
+
+def _nested(paths: list[str], inner: list[str], rows: int) -> bool:
+    """Nesting check over the scan tasks' frames (per inner level, min and max of
+    a hash of the outer key): nested iff min == max for every inner level.
+    Streaming passes over buckets of the inner key, as _count_levels."""
+    lf = pl.scan_parquet(paths)
+    k = _n_passes(rows)
+    for j in range(k):
+        ok = (
+            _bucket(lf, pl.struct(inner).hash(seed=SEED_FE), j, k)
+            .group_by(inner)
+            .agg((pl.col("lo").min() == pl.col("hi").max()).alias("ok"))
+            .select(pl.col("ok").all())
+            .collect(engine="streaming")
+            .item()
+        )
+        if ok is False:
+            return False
+    return True
+
+
+def _write_codes(paths: list[str], comps: list[str], col: str, out: Path) -> int:
+    """Dense codes: the sorted distinct levels numbered from 0, streamed to
+    `out`; returns the number of levels."""
+    (
+        pl.scan_parquet(paths)
+        .select(comps)
+        .unique()
+        .sort(comps)
+        .with_row_index(col)
+        .with_columns(pl.col(col).cast(pl.UInt32))
+        .sink_parquet(out)
+    )
+    return _nrows(str(out))
 
 
 # ------------------------------------------------------------------ tasks
-def _scan_task(files, cols, key_cols, specs, partition, checks):
+def _scan_task(files, cols, key_cols, specs, partition, checks, out_dir):
     """Scan a batch of input files. Level sets and nesting checks are reduced
     over the whole batch here, on the worker: per file, each would repeat the
     same tables (at 1e10 rows, 5,000 copies of 500k group x time rows shipped
     to and merged on the coordinator made the scan coordinator-bound). Row
-    counts and partition-group counts stay per file (`__path`)."""
+    counts and partition-group counts stay per file (`__path`).
+
+    The level and nesting frames go to Parquet files in `out_dir` (L<spec>/,
+    C<check>/, one file per task attempt); the result names them with their row
+    counts. The coordinator reduces them in streaming passes and never holds
+    them (D6 v2: 424M type x region x day levels, ~16 GB of frames)."""
     t = time.perf_counter()
+    token = _attempt_token()
     lf = (
         pl.scan_parquet(files, include_file_paths="__path")
         .select([*cols, "__path"])
@@ -132,11 +167,25 @@ def _scan_task(files, cols, key_cols, specs, partition, checks):
     out = dict(zip(keys, frames))
     per_file = out["P"].group_by("__path").agg(pl.col("_n").sum())
     n_by_file = dict(zip(per_file["__path"].to_list(), per_file["_n"].to_list()))
+    written = {}
+    for j, name in enumerate(specs):
+        written[f"L:{name}"] = _write_frame(out.pop(f"L:{name}"), out_dir, f"L{j}", token)
+    for i in range(len(checks)):
+        written[f"C:{i}"] = _write_frame(out.pop(f"C:{i}"), out_dir, f"C{i}", token)
     return {
         "n_by_file": {f: int(n_by_file.get(f, 0)) for f in files},
-        "frames": out,
+        "frames": out,  # P (partition-group rows per file) only
+        "written": written,  # key -> (path, rows)
         "timing": {"total": time.perf_counter() - t},
     }
+
+
+def _write_frame(df: pl.DataFrame, out_dir, sub: str, token: str) -> tuple[str, int]:
+    d = Path(out_dir) / sub
+    d.mkdir(parents=True, exist_ok=True)
+    f = d / f"{token}.parquet"
+    df.write_parquet(f)
+    return str(f), df.height
 
 
 def _range_bins(group_rows: np.ndarray, n_rows: int, n_bins: int) -> np.ndarray:
@@ -539,15 +588,8 @@ def prep_distributed(
     prog.add_stage("scan", {b: max(sum(rows_in[i] for i in idx), 1) for b, idx in enumerate(scan_batches)})
 
     # ---------------- scan ----------------
-    def _minmax(inner):
-        return lambda df: df.group_by(inner).agg(pl.col("lo").min(), pl.col("hi").max())
-
-    acc = {
-        "n": 0,
-        "levels": {k: _Compactor(lambda df: df.unique()) for k in specs},
-        "P": [],
-        "C": {i: _Compactor(_minmax(checks[i][0])) for i in range(len(checks))},
-    }
+    scan_dir = (root / "_scan").absolute()  # the tasks' level and nesting frames
+    acc = {"n": 0, "P": [], "paths": {}, "rows": {}}
 
     scanned: set = set()
     scan_n: dict[int, int] = {}  # rows per input file after dropping null keys
@@ -559,15 +601,14 @@ def prep_distributed(
         for f, n_f in r["n_by_file"].items():
             scan_n[file_idx[f]] = n_f
             acc["n"] += n_f
-        for k in specs:
-            acc["levels"][k].add(r["frames"][f"L:{k}"])
+        for k, (path, rows) in r["written"].items():
+            acc["paths"].setdefault(k, []).append(path)
+            acc["rows"][k] = acc["rows"].get(k, 0) + rows
         acc["P"].append(
             r["frames"]["P"]
             .with_columns(pl.col("__path").replace_strict(file_idx, return_dtype=pl.UInt32).alias("__file"))
             .drop("__path")
         )
-        for i in range(len(checks)):
-            acc["C"][i].add(r["frames"][f"C:{i}"])
 
     log.info(
         "prep: scanning %d files (%s rows) on workers, %d tasks",
@@ -577,7 +618,11 @@ def prep_distributed(
     )
     prog.start("scan")
     scan_tasks = [
-        (b, sum(rows_in[i] for i in idx), ([files[i] for i in idx], cols, key_cols, specs, partition, checks))
+        (
+            b,
+            sum(rows_in[i] for i in idx),
+            ([files[i] for i in idx], cols, key_cols, specs, partition, checks, str(scan_dir)),
+        )
         for b, idx in enumerate(scan_batches)
     ]
     # the scan is read-only, so the coordinator helps while no workers are up yet
@@ -586,21 +631,21 @@ def prep_distributed(
     n_rows = acc["n"]
 
     # ---------------- reduce ----------------
+    # streaming passes over the frames the scan tasks wrote (only the accepted
+    # attempts' files); the coordinator never holds a full level set
+    t_reduce = time.time()
     codes_dir = root / "_codes"
     codes_dir.mkdir(exist_ok=True)
     fe_meta: dict[str, dict] = {}
-    levels = {}
     for name, comps in specs.items():
-        levels[name] = acc["levels"].pop(name).result()
         fe_meta[name] = {
             "column": fe_column(name),
             "components": comps,
-            "n_levels": levels[name].height,
+            "n_levels": None,
             "nested_in_partition": True,
         }
     for (name, outer), i in zip(check_keys, range(len(checks))):
-        mm = acc["C"].pop(i).result()
-        ok = bool((mm["lo"] == mm["hi"]).all()) if mm.height else True
+        ok = _nested(acc["paths"][f"C:{i}"], checks[i][0], acc["rows"][f"C:{i}"])
         if outer == "__partition__":
             fe_meta[name]["nested_in_partition"] = ok
         else:
@@ -612,29 +657,31 @@ def prep_distributed(
     hashed = []
     for name, comps in specs.items():
         col = fe_column(name)
-        lv = levels.pop(name)
-        if fe_meta[name]["nested_in_partition"] and lv.height > hash_levels:
-            n_hash = lv.select(pl.struct(comps).hash(seed=SEED_FE).n_unique()).item()
-            if n_hash == lv.height:
-                hashed.append(name)
-                fe_meta[name]["id"] = "hash"
-                continue
-            log.warning(
-                "prep: hash collision among %s levels of %s; using dense codes", f"{lv.height:,}", name
-            )
-        (
-            lv.sort(comps)
-            .with_row_index(col)
-            .with_columns(pl.col(col).cast(pl.UInt32))
-            .write_parquet(codes_dir / f"{col}.parquet")
+        paths, rows = acc["paths"][f"L:{name}"], acc["rows"][f"L:{name}"]
+        # rows (the frames' total) bounds the level count from above
+        if fe_meta[name]["nested_in_partition"] and rows > hash_levels:
+            n, n_id = _count_levels(paths, comps, rows)
+            if n > hash_levels:
+                if n_id == n:
+                    hashed.append(name)
+                    fe_meta[name].update(n_levels=n, id="hash")
+                    continue
+                log.warning("prep: hash collision among %s levels of %s; using dense codes", f"{n:,}", name)
+        fe_meta[name].update(
+            n_levels=_write_codes(paths, comps, col, codes_dir / f"{col}.parquet"), id="code"
         )
-        fe_meta[name]["id"] = "code"
     if hashed:
         log.info(
             "prep: hash ids for %s (more than %s levels, nested in the partition)",
             ", ".join(hashed),
             f"{int(hash_levels):,}",
         )
+    remove_dir(scan_dir)
+    log.info(
+        "prep: levels and nesting from %s scan-frame rows in %.0fs",
+        f"{sum(acc['rows'].values()):,}",
+        time.time() - t_reduce,
+    )
 
     acc["P_files"] = acc.pop("P")
     counts = pl.concat(acc["P_files"]).group_by(partition).agg(pl.col("_n").cast(pl.Int64).sum())
