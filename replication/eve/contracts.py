@@ -40,7 +40,8 @@ Tables (``<out>/<table>/part-NN.parquet``, buckets of ``contract_id``; ``snapsho
 ``snapshots``        one row per snapshot file: ``snapshot_id`` (0.. in time order, over the whole
                      inventory, so a subset build uses the same ids), ``snap_time`` (from the file
                      name), ``scrape_start``/``scrape_end``/``datasource`` (datasource, or server
-                     before 2023-05-24) and ``meta`` (meta.json as read), torrent, rel, sha256,
+                     before 2023-05-24; times are ISO strings, or epoch-second numbers from
+                     2022-10-29 to 2023-05-23) and ``meta`` (meta.json as parsed), torrent, rel, sha256,
                      bytes, per-table row counts, ``headers`` (JSON: each CSV's columns as
                      written), ``absent`` (CSVs the tar lacks, e.g. contract_non_dynamic_items
                      before 2024) and ``regions`` (list of region_id, http_last_modified,
@@ -111,7 +112,7 @@ import sys
 import tarfile
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 os.environ.setdefault("POLARS_MAX_THREADS", "2")
@@ -304,6 +305,22 @@ def region_stamps(c: pl.DataFrame) -> pl.DataFrame:
     return top.join(n, on="region_id").sort("region_id")
 
 
+UTC_US = pl.Datetime("us", "UTC")
+
+
+def meta_time(v) -> datetime | None:
+    """A meta.json scrape time: an ISO string (``TS``), or, from 2022-10-29 ~23:00 to 2023-05-23
+    ~23:00, Unix epoch seconds written as a JSON number (``1667086203.000000000``). Strict:
+    anything else raises."""
+    if v is None:
+        return None
+    if isinstance(v, str):
+        return datetime.strptime(v, TS).replace(tzinfo=timezone.utc)
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return datetime.fromtimestamp(round(v * 1_000_000) / 1_000_000, timezone.utc)
+    raise ValueError(f"meta.json time {v!r}")
+
+
 def collapse_day(day: str, snaps: list[dict], dest: str, commit: str) -> dict:
     t0 = time.time()
     stacks: dict[str, list[pl.DataFrame]] = {t: [] for t in RAW_TABLES}
@@ -335,7 +352,8 @@ def collapse_day(day: str, snaps: list[dict], dest: str, commit: str) -> dict:
             stacks[t].append(fr[t])
         m = meta["meta"]
         srows.append({"snapshot_id": sid, "snap_time": sn["snap_time"],
-                      "scrape_start": m.get("scrape_start"), "scrape_end": m.get("scrape_end"),
+                      "scrape_start": meta_time(m.get("scrape_start")),
+                      "scrape_end": meta_time(m.get("scrape_end")),
                       "datasource": m.get("datasource", m.get("server")),
                       "meta": json.dumps(m, sort_keys=True),
                       "torrent": sn["torrent"], "rel": sn["rel"], "sha256": sn["sha256"],
@@ -393,11 +411,9 @@ def collapse_day(day: str, snaps: list[dict], dest: str, commit: str) -> dict:
         r, flags[t] = _ranges(df, ["contract_id", "item_id", "kind", "dogma_id"], ["value", "is_default"])
         longs.append(r)
     pl.concat(longs).write_parquet(tmp / "item_attributes.parquet")
-    pl.DataFrame(srows, schema_overrides={"scrape_start": S, "scrape_end": S, "datasource": S,
-                                          "meta": S, "absent": S}).with_columns(
-        *[pl.col(x).str.strptime(pl.Datetime("us"), TS, strict=True).dt.replace_time_zone("UTC")
-          for x in ("scrape_start", "scrape_end")],
-    ).write_parquet(tmp / "snapshots.parquet")
+    pl.DataFrame(srows, schema_overrides={"scrape_start": UTC_US, "scrape_end": UTC_US,
+                                          "datasource": S, "meta": S, "absent": S}
+                 ).write_parquet(tmp / "snapshots.parquet")
     info.update({"conflicts": conflicts, "flags": flags, "orphans": orph,
                  "contracts": con["contract_id"].n_unique(), "seconds": round(time.time() - t0, 1)})
     (tmp / "_day.json").write_text(json.dumps(info, indent=1))
