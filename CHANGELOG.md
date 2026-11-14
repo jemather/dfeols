@@ -17,7 +17,10 @@ break the API).
   threads and memory, the scheduler's task states and the bytes of results held, the
   coordinator's backlog of finished results). `dfeols.executor` sends the coordinator's
   `distributed` and `dask_jobqueue` log (the scheduler runs there) to `scheduler.log` next
-  to the worker logs. `DFEOLS_DIAG=0` turns the two JSONL files off.
+  to the worker logs. `scheduler_profile.jsonl` (per stage, and for CG steps 1, 2 and every
+  10th): the scheduler event loop's busy seconds and its top functions, from Dask's own
+  profile of that thread (the client shares it). Stage summaries count plan C cache hits
+  and the seconds tasks spent reading shards. `DFEOLS_DIAG=0` turns the JSONL files off.
 
 - HDFE GLMs by IRLS: `dfeols.fit_glm(ds, formula, family="poisson" | "cloglog", cluster=...)`.
   Each iteration is an ordinary weighted `fit` of the working response, so every FE path
