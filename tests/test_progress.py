@@ -117,3 +117,27 @@ def test_status_lines_line_up_and_stay_short(tmp_path):
     shown = [every(hdr) for _ in range(2 * HEADER_EVERY + 1)]
     assert shown.count(True) == 3 and shown[0] and shown[HEADER_EVERY]
     assert every(hdr + " ")  # columns changed: header again
+
+
+def test_rows_per_sec_is_what_the_stage_achieves():
+    # D6 r4 35953385 round 1: tasks of ~1 s each said 5.2M rows/s while results queued on the
+    # coordinator and 0.25M rows/s came in; the line and the ETA now follow the arrivals
+    import time
+
+    from dfeols.progress import Progress, status_line
+
+    p = Progress(None, label="t", every=1e9)
+    p.add_stage("round1", {i: 1000 for i in range(100)})
+    p.start("round1")
+    now = time.time()
+    st = p.stages["round1"]
+    st.started = now - 100
+    for i in range(20):
+        p.task_done("round1", i, 0.01)
+        st.done_at[i] = now - 100 + 5 * i
+    p.set_slots(4)
+    snap = p.snapshot()
+    s = snap["stages"][0]
+    assert 150 < s["rows_per_sec"] < 250
+    assert s["eta_seconds"] >= 80_000 / 250
+    assert "0.00M" in status_line(snap)  # ~200 rows/s, not 4 x 100k

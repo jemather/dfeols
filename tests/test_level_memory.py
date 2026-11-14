@@ -153,7 +153,7 @@ def test_shared_dict_of_arrays_sent_once_as_a_task():
     ex = DaskExecutor(_Client())
     tasks = [(i, 1, ("plan", i, [f"f{i}"], lin, small)) for i in range(5)]
     shared = ex._scatter_shared(tasks, "r1")
-    assert list(shared) == [id(lin)] and len(ex.client.sent) == 1
+    assert list(shared) == [id(lin)] and len(ex.client.sent) == 1 and shared[id(lin)][1] == {}
     fn, args, key = ex.client.sent[0]
     assert fn(*args) is lin and key == "dfeols-shared-r1-0" and fn is _unbox
 

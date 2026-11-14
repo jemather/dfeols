@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import dataclasses
+import functools
 import hashlib
 import inspect
 import json
@@ -657,6 +658,11 @@ def _tss(plan: Plan, acc: dict, m: int, collin_tol: float, cols=None) -> np.ndar
     return yy - np.einsum("ij,ij->j", DY[d], g)
 
 
+# Plan C with a pass per step: CG's state is written at most this often (a rerun resumes from
+# it; crossing.Checkpoint)
+CG_CHECKPOINT_EVERY_S = 300.0
+
+
 def _cg_steps_left(hist: list[float], tol: float, window: int = 30) -> int | None:
     """Steps until the residual reaches tol at its average rate of fall over the last
     `window` steps (CG residuals stall and drop, so this is rough); None before 3 steps
@@ -731,6 +737,15 @@ def _crossing_cg(
     )
 
     step = {"it": 0, "t": time.time()}
+    affinity = {"affinity": plan.iter_token} if "affinity" in inspect.signature(executor.run).parameters else {}
+    # a step's task holds only its shard's own levels (worker.shard_matvec), not round 1's
+    # arrays over all of them; it shares the worker with the cache like round 1's
+    gb_round = prog.task_gb
+    if gb_round is not None and not level:
+        rmax = max(rows.values(), default=1)
+        gb_step = task_slot_gb(plan, max(gb_round - iterate_level_gb(plan, rmax), 0.5), executor)
+    else:
+        gb_step = gb_round
 
     def matvec_pass(p):
         Ap = np.zeros((P, c))
@@ -746,12 +761,20 @@ def _crossing_cg(
         tasks = [(s["id"], rows[s["id"]], (plan, s["id"], ds.shard_paths(s), p)) for s in ds.shards]
         prog.add_stage(name, rows, before="round2")
         prog.start(name)
+        prog.task_gb = gb_step
         if "reduce" in inspect.signature(executor.run).parameters:
             # the shards' sums in a tree on the workers: one block reaches the coordinator
-            red = Reduce(get=cx.step_part, strip=cx.step_strip, combine=cx.step_combine, done=done)
-            executor.run(shard_matvec, tasks, lambda tid, res: None, prog, name, reduce=red)
+            red = Reduce(
+                get=cx.step_part,
+                strip=cx.step_strip,
+                combine=functools.partial(cx.step_combine, P=P),
+                done=done,
+                combine_gb=cx.step_combine_gb(P, c),
+            )
+            executor.run(shard_matvec, tasks, lambda tid, res: None, prog, name, reduce=red, **affinity)
         else:
-            executor.run(shard_matvec, tasks, on, prog, name)
+            executor.run(shard_matvec, tasks, on, prog, name, **affinity)
+        prog.task_gb = gb_round
         prog.finish(name, log=False)
         return Ap
 
@@ -774,7 +797,7 @@ def _crossing_cg(
     # same solve (same right-hand side, tolerance, preconditioner) resumes from it
     ck = state = None
     if not level and getattr(plan, "cg_checkpoint", None):
-        ck = cx.Checkpoint(plan.cg_checkpoint, R, tol, method)
+        ck = cx.Checkpoint(plan.cg_checkpoint, R, tol, method, every_s=CG_CHECKPOINT_EVERY_S)
         state = ck.load()
         if state is not None:
             log.info("fit %s: crossing-FE CG resumes at step %d (%s)", label, int(state["it"]), ck.path)
@@ -789,8 +812,8 @@ def _crossing_cg(
         state=state,
         on_state=ck.save if ck else None,
     )
-    if ck is not None and rel <= tol:
-        ck.remove()
+    if ck is not None:
+        ck.remove() if rel <= tol else ck.flush()
     prog.note, prog.extra_eta = "", None
     if rel > tol:
         raise RuntimeError(
@@ -1217,6 +1240,17 @@ def fit(
     k_rep = len(plan.colnames)
     k_tot = plan.k_x + (0 if plan.crossing_iterate else plan.n_dummy)
     log.info("fit %s: %s", label, _build_text())
+    if plan.crossing_iterate:  # known now, not only after round 1 (hours at D6 r4's size)
+        P_cx = sum(L for *_, L in plan.global_fes)
+        log.info(
+            "fit %s: crossing FEs (%s levels) by CG: %s; shard state cache %.1f GB a worker",
+            label,
+            f"{P_cx:,}",
+            f"level space up to {plan.level_nnz:,} nonzeros of A, else a pass over the shards per step"
+            if plan.level_nnz
+            else "level space off (level_space_gb=0), a pass over the shards per step",
+            plan.iter_cache_bytes / 1e9,
+        )
     log.info(
         "fit %s: %s | %d regressors + %d FE dummies, %d local FEs, %d shards, %s rows",
         label,
@@ -1348,8 +1382,9 @@ def fit(
             acc["sumw"] += r["sumw"]
             if "crossing" in r:
                 cr = r["crossing"]
-                acc["DR"][cr["idx"]] += cr["DR"]
-                acc["ddiag"][cr["idx"]] += cr["ddiag"]
+                if "DR" in cr:  # else summed on the workers (reduce below)
+                    acc["DR"][cr["idx"]] += cr["DR"]
+                    acc["ddiag"][cr["idx"]] += cr["ddiag"]
                 if "gram" in acc and "part" in cr:  # else summed on the workers (reduce below)
                     acc["gram"].add(cr["part"], tid)
             acc["row_n"][tid] = r["n"]
@@ -1384,10 +1419,7 @@ def fit(
         prog.task_gb = task_slot_gb(plan, need_gb, executor)  # round 1 builds the level arrays
         reduce = None
         if plan.crossing_iterate and plan.level_nnz:
-            import functools
-
             from .crossing import combine_parts, part_of, without_part, worker_bytes
-            from .executors import Reduce
 
             prog.task_gb = None  # each shard's part of A is not in the estimate: a whole worker
             gram = acc["gram"]
@@ -1395,14 +1427,39 @@ def fit(
                 get=part_of,
                 strip=without_part,
                 combine=functools.partial(
-                    combine_parts, offs=gram.offs, max_nnz=plan.level_nnz, worker_bytes=worker_bytes(executor)
+                    combine_parts,
+                    offs=gram.offs,
+                    max_nnz=plan.level_nnz,
+                    worker_bytes=worker_bytes(executor),
+                    token=plan.iter_token,
                 ),
                 done=lambda part: gram.add(part, None),  # None: a shard could not form its part
             )
-        if reduce and "reduce" in inspect.signature(executor.run).parameters:
-            executor.run(shard_round1, tasks, on1, prog, "round1", reduce=reduce)
+        elif plan.crossing_iterate:
+            # no level space: the per-level sums still go in a tree on the workers, so the
+            # coordinator takes one block, not a shard's at a time (D11 L3 job 36016180: 27 min
+            # fetching ~98 MB results one by one after the workers had finished)
+            from .crossing import level_sums_of, step_combine, step_combine_gb, without_level_sums
+
+            def level_sums_done(total):
+                if total is not None:
+                    acc["DR"][total[0]] += total[1][:, :-1]
+                    acc["ddiag"][total[0]] += total[1][:, -1]
+
+            reduce = Reduce(
+                get=level_sums_of,
+                strip=without_level_sums,
+                combine=functools.partial(step_combine, P=len(acc["ddiag"])),
+                done=level_sums_done,
+                combine_gb=step_combine_gb(len(acc["ddiag"]), acc["DR"].shape[1] + 1),
+            )
+        params = inspect.signature(executor.run).parameters
+        # plan C: round 1 leaves each shard's state in its worker's cache, where the CG steps go
+        aff = {"affinity": plan.iter_token} if plan.crossing_iterate and "affinity" in params else {}
+        if reduce and "reduce" in params:
+            executor.run(shard_round1, tasks, on1, prog, "round1", reduce=reduce, **aff)
         else:  # an executor without reduce: each shard's part reaches on1
-            executor.run(shard_round1, tasks, on1, prog, "round1")
+            executor.run(shard_round1, tasks, on1, prog, "round1", **aff)
         prog.task_gb = need_gb
         prog.finish("round1")
         if not acc["converged"]:

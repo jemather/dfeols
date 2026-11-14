@@ -22,6 +22,7 @@ interface (map over shards, reduce on the coordinator, broadcast back).
 from __future__ import annotations
 
 import logging
+import os
 import time
 import uuid
 from collections.abc import Callable
@@ -42,6 +43,11 @@ class Reduce:
     combine: Callable
     done: Callable
     fan_in: int = 4
+    # memory a combine asks of its worker (GB; DaskExecutor's MEMORY resource), None: a whole
+    # worker. A combine is the top task in its worker's queue, so while it waits for its
+    # memory the worker starts nothing else: with whole-worker combines D6 r4's CG passes ran
+    # one task per worker (36011018: ~970 combines a pass, 4-thread workers)
+    combine_gb: float | None = None
 
 
 class _Tree:
@@ -123,8 +129,27 @@ def _nbytes(a) -> int:
 
 def _unbox(box):
     """A shared argument's task: returns the one object it was submitted with (see
-    DaskExecutor._share)."""
+    DaskExecutor._scatter_shared)."""
     return box[0]
+
+
+def _same(x):
+    """A copy of a shared argument on one worker (DaskExecutor._spread): the object itself,
+    which the worker fetched from the copy above it in the tree."""
+    return x
+
+
+def _on_worker(fn, *args):
+    """Run fn and note the worker that ran it (DaskExecutor.run with affinity)."""
+    res = fn(*args)
+    if isinstance(res, dict):
+        try:
+            from distributed import get_worker
+
+            res["_worker"] = get_worker().address
+        except Exception:  # not on a worker (local_help runs fn itself)
+            pass
+    return res
 
 
 def _order(tasks):
@@ -150,6 +175,7 @@ class SerialExecutor:
         stage: str,
         local_help: bool = False,
         reduce: Reduce | None = None,
+        affinity: str | None = None,  # one process: every task's state is here
     ):
         progress.set_slots(1, 1)
         tree = _Tree(reduce, lambda f, *a: f(*a)) if reduce else None
@@ -179,6 +205,10 @@ class DaskExecutor:
     """
 
     MARGIN = 1.25  # on the worker-memory estimate
+    # seconds to fetch one finished result before giving up: a worker that cannot read a
+    # result it spilled (job 35937527: ENOSPC on 3 workers' local disk) leaves Dask's gather
+    # retrying forever ("Couldn't gather keys"), and the coordinator sat 53 min until cancelled
+    GATHER_TIMEOUT_S = float(os.environ.get("DFEOLS_GATHER_TIMEOUT_S", "900"))
 
     def __init__(
         self,
@@ -194,6 +224,9 @@ class DaskExecutor:
         self.tick_s = tick
         self.retries = retries
         self.scatter_min_bytes = 1 << 20  # arrays this large shared by every task are scattered
+        self.spread_min_bytes = 32 << 20  # ... and this large copied to every worker in a tree
+        self.spread_fan_out = 4
+        self._affinity: dict[str, dict] = {}  # affinity key -> {task id: worker address}
 
     def slots(self):
         try:
@@ -210,10 +243,58 @@ class DaskExecutor:
         except Exception:
             return set()
 
-    def _scatter_shared(self, tasks, run_id: str = "") -> dict:
+    def _fetch(self, f, what: str):
+        """f.result(), or a clear error when the result cannot be fetched in GATHER_TIMEOUT_S."""
+        try:
+            return f.result(timeout=self.GATHER_TIMEOUT_S)
+        except TimeoutError:
+            try:
+                where = sorted(self.client.who_has([f]).get(f.key, ()))
+            except Exception:
+                where = []
+            raise RuntimeError(
+                f"{what}: finished, but its result could not be fetched from "
+                f"{', '.join(where) or 'its worker'} in {self.GATHER_TIMEOUT_S:.0f} s (the "
+                "worker may have run out of local disk for spilled data, or died; see its log "
+                "and the scheduler log); DFEOLS_GATHER_TIMEOUT_S sets the limit"
+            ) from None
+
+    def _workers(self) -> list[str]:
+        try:
+            info = self.client.scheduler_info(n_workers=-1)
+        except TypeError:
+            info = self.client.scheduler_info()
+        return sorted(info.get("workers", {}))
+
+    def _spread(self, root, key: str, priority: int) -> dict:
+        """Copies of a shared argument (the future `root`) on every worker, in a tree: each
+        copy is fetched from the one above it, fan_out at a time, so no worker sends more than
+        fan_out copies. Tasks whose worker is known (affinity) take that worker's copy. D6 r4
+        (36011018, 12.1M levels x 7: 0.68 GB) waited ~2.5 min at each CG step while 36 workers
+        fetched the block from the one that held it. {worker address: future}."""
+        workers = self._workers()
+        if len(workers) < 2:
+            return {}
+        k = self.spread_fan_out
+        out: dict = {}
+        for i, w in enumerate(workers):
+            parent = root if i < k else out[workers[i // k - 1]]
+            out[w] = self.client.submit(
+                _same,
+                parent,
+                key=f"{key}-on-{i}",
+                workers=[w],
+                allow_other_workers=True,
+                pure=False,
+                retries=self.retries,
+                priority=priority,
+            )
+        return out
+
+    def _scatter_shared(self, tasks, run_id: str = "", spread: bool = False) -> dict:
         """Large arguments passed to every task go to the workers once, not once per task:
         arrays (plan C's CG block) and dicts of them (round 2's linear maps, with plan C's FE
-        solution: D6, 758k levels, a 46 MiB graph). {id(argument): future}.
+        solution: D6, 758k levels, a 46 MiB graph).
 
         Each is a task returning it (_unbox), not client.scatter: scatter(broadcast=True)
         calls Scheduler.replicate, which loops until every worker holds a copy while the
@@ -223,7 +304,10 @@ class DaskExecutor:
         recipe: when its last holder left, Dask logged that it "can't be recovered" and the
         tasks waiting on it never started. A task's argument stays in the scheduler's graph,
         so Dask recomputes it on a lost worker, and workers fetch it from each other as they
-        need it."""
+        need it.
+
+        With `spread` (the tasks' workers are known), an argument of spread_min_bytes or more
+        is also copied to every worker (_spread). {id(argument): (future, {worker: copy})}."""
         if not tasks:
             return {}
         ids = None
@@ -241,7 +325,9 @@ class DaskExecutor:
             for j, (i, a) in enumerate(shared.items()):
                 # in a list, so Dask passes a dict as one object rather than walking its keys
                 key = f"dfeols-shared-{run_id or uuid.uuid4().hex[:8]}-{j}"
-                out[i] = self.client.submit(_unbox, [a], key=key, pure=False, retries=self.retries)
+                root = self.client.submit(_unbox, [a], key=key, pure=False, retries=self.retries)
+                big = spread and _nbytes(a) >= self.spread_min_bytes
+                out[i] = (root, self._spread(root, key, len(tasks) + 3) if big else {})
         return out
 
     def run(
@@ -253,13 +339,19 @@ class DaskExecutor:
         stage: str,
         local_help: bool = False,
         reduce: Reduce | None = None,
+        affinity: str | None = None,
     ):
         """local_help: while no workers are connected, the coordinator runs
         queued tasks itself (lowest priority first). Only for tasks without
         side effects, since a task a worker had just picked up may then run
         twice (its worker result is discarded). reduce: see Reduce; a lost part
-        is recomputed by Dask from its task."""
-        from distributed import wait
+        is recomputed by Dask from its task. affinity: a name for state the
+        tasks leave in their worker's memory (plan C's shard cache): each task
+        goes to the worker that last ran the same task id under that name, if it
+        is still there (else anywhere), so CG steps find their shard in the
+        cache (D6 r4 job 36011018: tasks went to any worker, 2.5% hits, and
+        reading the shard again was 4-5 s of each ~5 s task)."""
+        import queue
 
         if reduce and local_help:
             raise ValueError("reduce and local_help together are not supported")
@@ -267,26 +359,46 @@ class DaskExecutor:
         futs, fargs = {}, {}
         n = len(ordered)
         run_id = uuid.uuid4().hex[:8]  # task keys must never repeat across runs (e.g. two preps)
-        shared = self._scatter_shared(ordered, run_id)
-        pool = self._pool(reduce, stage, run_id, n + 2) if reduce else None
+        where = self._affinity.setdefault(affinity, {}) if affinity else {}
+        shared = self._scatter_shared(ordered, run_id, spread=bool(where))
+        # finished futures arrive here from their done callbacks (run off the event loop), once
+        # each: distributed.wait(FIRST_COMPLETED) over every pending future, called again after
+        # each completion, leaves a waiter task per future on the loop it shares with the
+        # scheduler, so the loop's work grows as calls x pending (the stalls of 36011018 and
+        # 36016180, 5 s a median mid-step, measured by the D11 chat)
+        doneq: queue.Queue = queue.Queue()
+        pool = self._pool(reduce, stage, run_id, n + 2, doneq.put) if reduce else None
         part_futs: set = set()
         kw = {}
         if self.worker_memory:
             gb = getattr(progress, "task_gb", None)
             need = self.worker_memory if gb is None else min(gb * 1e9 * self.MARGIN, self.worker_memory)
             kw["resources"] = {"MEMORY": int(need)}
+        alive = set(self._workers()) if where else set()
+        run_fn = (lambda *a: (_on_worker, fn, *a)) if affinity else (lambda *a: (fn, *a))
+
+        def arg(a, w):
+            if id(a) not in shared:
+                return a
+            root, copies = shared[id(a)]
+            return copies.get(w, root)
+
         for i, (tid, _rows, args) in enumerate(ordered):
             key = f"dfeols-{stage}-{progress.label}-{run_id}-{tid}"
-            sargs = [shared.get(id(a), a) for a in args]
+            w = where.get(tid)
+            place = {"workers": [w], "allow_other_workers": True} if w in alive else {}
+            sargs = [arg(a, w if w in alive else None) for a in args]
             f = self.client.submit(
-                fn, *sargs, key=key, priority=n - i, retries=self.retries, pure=False, **kw
+                *run_fn(*sargs), key=key, priority=n - i, retries=self.retries, pure=False, **kw, **place
             )
             if reduce:  # on_result sees the result without its part; the part goes in the tree
                 hi = {"priority": n + 1, "pure": False}  # ahead of the shards still queued
                 part = self.client.submit(reduce.get, f, key=f"{key}-part", **hi)
                 pool.add(part)
                 part_futs.add(part)
+                part.add_done_callback(doneq.put)
                 f = self.client.submit(reduce.strip, f, key=f"{key}-rest", **hi)
+            f.add_done_callback(doneq.put)
             futs[f] = tid
             fargs[f] = args
         order = list(futs)  # submission order = priority order
@@ -300,6 +412,7 @@ class DaskExecutor:
 
         key_to_tid = {f.key: futs[f] for f in futs}
         last_task = None
+        t_status = float("-inf")
         while pending or (pool and not pool.finished()):
             if local_help and self.slots()[0] == 0:
                 running = self._running_keys()
@@ -319,11 +432,15 @@ class DaskExecutor:
                     progress.task_done(stage, tid, res.get("timing", {}).get("total", 0.0), res.get("timing"))
                     progress.tick()
                     continue
-            watch = pending | pool.running if pool else pending
+            got = []
             try:
-                done, _ = wait(watch, timeout=self.tick_s, return_when="FIRST_COMPLETED")
-            except Exception:  # timeout
-                done = set()
+                got.append(doneq.get(timeout=self.tick_s))
+                while True:
+                    got.append(doneq.get_nowait())
+            except queue.Empty:
+                pass
+            # a future cancelled by local_help, or already handled, is not waited on any more
+            done = [f for f in got if f in pending or (pool is not None and f in pool.running)]
             for f in done:
                 if f not in futs:  # a part or a combine: into the pool
                     if f.status == "error":
@@ -337,7 +454,10 @@ class DaskExecutor:
                     exc = f.exception()
                     raise RuntimeError(f"shard {tid} failed in {stage}: {exc!r}") from exc
                 t_fetch = time.perf_counter()
-                res = f.result()
+                res = self._fetch(f, f"shard {tid} in {stage}")
+                if affinity and isinstance(res, dict) and "_worker" in res:
+                    res = dict(res)
+                    where[tid] = res.pop("_worker")
                 t_on = time.perf_counter()
                 on_result(tid, res)
                 t_end = time.perf_counter()
@@ -347,16 +467,18 @@ class DaskExecutor:
                 f.release()
                 if not pending:
                     last_task = time.perf_counter()
-            s, mx = self.slots()
-            progress.set_slots(s, mx)
-            progress.running[stage] = {key_to_tid[k] for k in self._running_keys() if k in key_to_tid}
+            if time.monotonic() - t_status >= self.tick_s:  # scheduler queries: once a tick
+                t_status = time.monotonic()
+                s, mx = self.slots()
+                progress.set_slots(s, mx)
+                progress.running[stage] = {key_to_tid[k] for k in self._running_keys() if k in key_to_tid}
             progress.tick()
             diag.tick(backlog)
         summ = diag.close()
         log.debug("%s %s: %s", stage, progress.label, summ)
         if pool:
             root = pool.root()
-            reduce.done(root.result() if root is not None else None)
+            reduce.done(self._fetch(root, f"the sum of {stage}'s parts") if root is not None else None)
             log.info(
                 "%s %s: parts summed on the workers in %d combines (%.0f s after the last task)",
                 stage,
@@ -365,17 +487,22 @@ class DaskExecutor:
                 time.perf_counter() - (last_task or time.perf_counter()),
             )
 
-    def _pool(self, reduce: Reduce, stage: str, run_id: str, priority: int) -> _Pool:
+    def _pool(self, reduce: Reduce, stage: str, run_id: str, priority: int, on_done=None) -> _Pool:
         """Combine tasks, each summing fan_in parts as soon as they exist, ahead of the shards
         still queued (parts do not pile up on the workers). A combine holds fan_in parts at
-        once: it asks for a whole worker."""
-        kw = {"resources": {"MEMORY": int(self.worker_memory)}} if self.worker_memory else {}
+        once: it asks for reduce.combine_gb, else a whole worker."""
+        kw = {}
+        if self.worker_memory:
+            gb = reduce.combine_gb
+            need = self.worker_memory if gb is None else min(gb * 1e9, self.worker_memory)
+            kw["resources"] = {"MEMORY": int(need)}
         seq = iter(range(1 << 30))
 
         def submit(fn, *items):
             key = f"dfeols-{stage}-combine-{run_id}-{next(seq)}"
-            return self.client.submit(
-                fn, *items, key=key, pure=False, retries=self.retries, priority=priority, **kw
-            )
+            f = self.client.submit(fn, *items, key=key, pure=False, retries=self.retries, priority=priority, **kw)
+            if on_done is not None:
+                f.add_done_callback(on_done)
+            return f
 
         return _Pool(reduce, submit)

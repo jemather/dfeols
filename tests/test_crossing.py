@@ -170,6 +170,51 @@ def test_step_combine_sums_levels_like_the_coordinator():
     np.testing.assert_allclose(tree, dense, rtol=1e-13)
     assert cx.step_strip(parts[0]) == {"timing": {"total": 0.1}}
     assert cx.step_combine(None) is None
+    # with P: a union over a quarter of the levels or more is summed densely, same result
+    for P_ in (P, 10**6):
+        lv2, S2 = cx.step_combine(
+            cx.step_combine(*(cx.step_part(p) for p in parts[:3]), P=P_),
+            cx.step_combine(*(cx.step_part(p) for p in parts[3:]), P=P_),
+            P=P_,
+        )
+        np.testing.assert_array_equal(lv2, lv)
+        np.testing.assert_allclose(S2, S, rtol=1e-13)
+    assert cx.step_combine_gb(12_100_000, 7) < 5.5  # D6 lt365 r4: well under a 24 GB worker
+
+
+def test_shard_matvec_on_its_own_levels(monkeypatch):
+    # the cached dummies on the shard's own levels give the step of the full n x P product
+    from dfeols import worker as wk
+
+    monkeypatch.setattr(wk, "_ITER_CACHE", type(wk._ITER_CACHE)())
+    rng = np.random.default_rng(5)
+    n, P, c = 500, 3000, 4
+    cols = np.concatenate([rng.integers(0, 1000, n), 2000 + rng.integers(0, 600, n)])
+    Dm = sp.csr_matrix((np.ones(2 * n), (np.tile(np.arange(n), 2), cols)), shape=(n, P))
+    local = [wk.densify(rng.integers(0, 40, n))[0]]
+    w = rng.random(n) + 0.5
+    plan = wk.Plan.__new__(wk.Plan)
+    plan.iter_token, plan.iter_cache_bytes = "t", 10**9
+    plan.fe_tol, plan.fe_maxiter, plan.fe_method = 1e-12, 1000, "map"
+    wk._iter_store(plan, 0, local, Dm, w)
+    p = rng.standard_normal((P, c))
+    res = wk.shard_matvec(plan, 0, [], p)
+    U = wk.demean(Dm @ p, local, w, 1e-12, 1000, "map")[0]
+    full = Dm.T @ (U * w[:, None])
+    np.testing.assert_array_equal(res["idx"], np.unique(cols))
+    np.testing.assert_allclose(res["S"], full[res["idx"]], rtol=1e-12, atol=1e-12)
+    assert res["timing"]["cache_hit"] and abs(full).sum(1)[np.setdiff1d(np.arange(P), cols)].max() == 0
+
+
+def test_checkpoint_every_s_and_flush(tmp_path):
+    R = np.ones((5, 2))
+    ck = cx.Checkpoint(tmp_path / "cg.npz", R, 1e-8, "jacobi", every_s=3600)
+    st = lambda it: {"X": R * it, "r": R, "p": R, "rz": np.ones(2), "it": it}  # noqa: E731
+    ck.save(st(1))
+    ck.save(st(2))  # within every_s: kept, not written
+    assert int(ck.load()["it"]) == 1
+    ck.flush()
+    assert int(ck.load()["it"]) == 2
 
 
 def test_pcg_resumes_from_a_checkpoint(tmp_path):
@@ -203,7 +248,7 @@ def test_iter_cache_budget_and_earlier_fits(monkeypatch):
     codes, w = [np.zeros(n, np.int32)], np.ones(n)
     arrays = (codes[0], Dm.data, Dm.indices, Dm.indptr, w, np.arange(P, dtype=Dm.indices.dtype))
     one = sum(a.nbytes for a in arrays)
-    assert cx.iter_cache_budget(24_000_000_000) == 6_000_000_000
+    assert cx.iter_cache_budget(24_000_000_000) == 9_600_000_000
 
     old = wk.Plan.__new__(wk.Plan)
     old.iter_token, old.iter_cache_bytes = "fare", 10 * one
@@ -214,7 +259,7 @@ def test_iter_cache_budget_and_earlier_fits(monkeypatch):
     new.iter_token, new.iter_cache_bytes = "pairyear", int(2.5 * one)
     for sid in range(4):
         wk._iter_store(new, sid, codes, Dm, w)
-    assert list(wk._ITER_CACHE) == [("pairyear", 2), ("pairyear", 3)]  # fare's gone, LRU kept 2
+    assert list(wk._ITER_CACHE) == [("pairyear", 0), ("pairyear", 1)]  # fare's gone; full: kept
     monkeypatch.setenv("DFEOLS_ITER_CACHE_GB", str(3.5 * one / 1e9))
     for sid in range(4, 8):
         wk._iter_store(new, sid, codes, Dm, w)
@@ -265,3 +310,19 @@ def test_iter_cache_threads(monkeypatch):
             t.join()
         assert not errors, errors[:3]
         assert all(k[0] == new.iter_token for k in wk._ITER_CACHE) and len(wk._ITER_CACHE) <= 3
+
+
+def test_combine_past_the_budget_tells_the_shards_still_to_run():
+    # D6 r4 35948257: every shard built its part of A though the sum was long past the budget
+    P = 30
+    offs = np.array([0, P])
+    rng = np.random.default_rng(0)
+    parts = []
+    for _ in range(3):
+        r, c = rng.integers(0, P, 200), rng.integers(0, P, 200)
+        parts.append({"full": True, "blocks": True, "nnz": 200, "r": r, "c": c, "v": np.ones(200)})
+    assert not cx.over_flag("fitA", "full") and not cx.over_flag(None, "full", set_it=True)
+    out = cx.combine_parts(*parts, offs=offs, max_nnz=50, token="fitA")
+    assert not out["full"] and not out["blocks"]
+    assert cx.over_flag("fitA", "full") and cx.over_flag("fitA", "blocks")
+    assert not cx.over_flag("fitB", "blocks")  # per fit

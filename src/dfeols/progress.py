@@ -54,6 +54,11 @@ def _clock(ts: float) -> str | None:
         return None
 
 
+THROUGHPUT_WINDOW_S = 600.0
+THROUGHPUT_MIN_TASKS = 10
+THROUGHPUT_MIN_S = 60.0
+
+
 @dataclass
 class StageProgress:
     name: str
@@ -61,6 +66,21 @@ class StageProgress:
     done: dict[int, float] = field(default_factory=dict)  # task id -> seconds
     started: float | None = None
     finished: float | None = None
+    done_at: dict[int, float] = field(default_factory=dict)  # task id -> when its result came in
+
+    def throughput(self, now: float, window: float = THROUGHPUT_WINDOW_S) -> float | None:
+        """Rows a second whose results reached the coordinator over the last `window` seconds
+        (the whole stage before that): what the stage actually achieves, which the tasks' own
+        seconds overstate when results wait on the coordinator or the workers run fewer tasks
+        than they could (D6 r4 35953385 round 1: 5.2M rows/s shown, 0.25M achieved)."""
+        if self.started is None or len(self.done_at) < THROUGHPUT_MIN_TASKS:
+            return None
+        span = now - self.started
+        if span < THROUGHPUT_MIN_S:
+            return None
+        lo = now - min(window, span)
+        rows = sum(self.rows[k] for k, t in self.done_at.items() if t >= lo)
+        return rows / (now - lo)
 
     @property
     def total_rows(self) -> int:
@@ -129,6 +149,7 @@ class Progress:
 
     def task_done(self, stage: str, tid: int, seconds: float, timing: dict | None = None):
         self.stages[stage].done[tid] = seconds
+        self.stages[stage].done_at[tid] = time.time()
         self.running[stage].discard(tid)
         # the prior only describes a fit's round 2 relative to its round 1; prep
         # stages (scan, encode, split, merge) have unrelated costs and wait for
@@ -177,10 +198,13 @@ class Progress:
             projected = False
             if rate is None and name == "round2" and r1 is not None and self.stage2_prior_frac:
                 rate, projected = r1 * self.stage2_prior_frac, True
+            thr = None if st.finished else st.throughput(now)
             if st.finished:
                 eta = 0.0
             else:
                 eta, _ = self._stage_eta(st, rate, self.slots)
+                if thr and eta is not None and np.isfinite(eta):  # the slower of the two
+                    eta = max(eta, (st.total_rows - st.done_rows) / thr)
             band = None
             b = st.rate_band()
             if b is not None and not st.finished and eta is not None and rate:
@@ -201,6 +225,7 @@ class Progress:
                     "rows": st.total_rows,
                     "pct_rows": round(100 * st.done_rows / max(st.total_rows, 1), 1),
                     "rows_per_sec_per_worker": (1 / rate) if rate else None,
+                    "rows_per_sec": thr,  # achieved (StageProgress.throughput), None early on
                     "rate_projected": projected,
                     "eta_seconds": eta,
                     "eta_band_seconds": band,
@@ -286,11 +311,19 @@ def _columns(snap: dict) -> list[tuple[str, str, str]]:
         ("shards", f"{cur['tasks_done']:>{wn}}/{cur['tasks']:<{wn}}", ">"),
         ("rows", f"{float(cur['pct_rows']):.1f}%", ">"),
         ("workers", f"{snap['workers']:>{ww}}/{mx}" if mx else f"{snap['workers']}", ">"),
-        ("rows/s", f"{rps * max(snap['workers'], 1) / 1e6:.2f}M" if rps else "-", ">"),
+        ("rows/s", _rows_per_sec(cur, snap["workers"]), ">"),
         ("stage left", stage_left, ">"),
         ("all left", fmt_td(total) if total is not None else "-", ">"),
         ("done at", snap.get("finish_time") or "-", ">"),
     ]
+
+
+def _rows_per_sec(cur: dict, workers: int) -> str:
+    """Achieved rows a second once known, else the tasks' own rate times the workers."""
+    thr, rps = cur.get("rows_per_sec"), cur["rows_per_sec_per_worker"]
+    if thr is not None:
+        return f"{thr / 1e6:.2f}M"
+    return f"{rps * max(workers, 1) / 1e6:.2f}M" if rps else "-"
 
 
 _WIDTH = {"rows": 6, "rows/s": 8, "stage left": 10, "all left": 8, "done at": 9}

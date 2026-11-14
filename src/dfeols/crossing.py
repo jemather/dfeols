@@ -38,8 +38,9 @@ LEVEL_SPACE_SHARE = 0.25
 # the process itself, Dask's buffers and the nanny's 95% limit)
 WORKER_SHARE = 0.6
 # A worker's memory plan C keeps shard state in between CG steps (worker._ITER_CACHE); it
-# sits beside every task's own peak, so it takes less than a combine
-ITER_CACHE_SHARE = 0.25
+# sits beside every task's own peak, so it takes less than a combine. 0.4 since CG steps hold
+# only their shard's own levels (D11 L3: ~8 GB of shard state a 24 GB worker, peak RSS 8.2 GB)
+ITER_CACHE_SHARE = 0.4
 # Bytes per nonzero of a combine's inputs while it sums them, on top of the inputs themselves
 # (one at a time: the sum so far and its next copy; measured 21-24 on 4 x 5M random parts)
 MERGE_BYTES = 24
@@ -128,7 +129,60 @@ def without_part(res: dict) -> dict:
     return {**res, "crossing": cr}
 
 
-def combine_parts(*parts, offs: np.ndarray, max_nnz: int, worker_bytes: int | None = None) -> dict:
+def level_sums_of(res: dict):
+    """A plan C round-1 result's per-level sums, D'W [X Y] and D'W 1 side by side, as
+    step_combine's (levels, sums) (executors.Reduce.get without level space)."""
+    cr = res.get("crossing")
+    if not cr:
+        return None
+    return np.asarray(cr["idx"]), np.hstack([cr["DR"], np.asarray(cr["ddiag"])[:, None]])
+
+
+def without_level_sums(res: dict) -> dict:
+    """A round-1 result without its per-level sums (executors.Reduce.strip)."""
+    if "crossing" not in res:
+        return res
+    cr = {k: v for k, v in res["crossing"].items() if k not in ("idx", "DR", "ddiag")}
+    return {**res, "crossing": cr}
+
+
+# Round 1's verdict on A, shared by its combines and the shards still to run (over_flag):
+# once a combine finds the summed parts past the budget, the shards after it build only
+# their diagonal blocks (or nothing), instead of every shard building a part the sum throws
+# away (D6 r4 35948257: the parts came to ~4.5e10 nonzeros for a 4e8 budget, round 1 at 10%
+# after 34 min). On Dask a named distributed.Event per verdict, else this process's set.
+_OVER: set = set()
+
+
+def _event(name: str):
+    try:
+        from distributed import Event, get_worker
+
+        get_worker()
+        return Event(name)
+    except Exception:
+        return None
+
+
+def over_flag(token: str | None, what: str, set_it: bool = False) -> bool:
+    """Round 1's verdict `what` ("full": A is past the budget, "blocks": its diagonal blocks
+    too) for fit `token`: set it, or read it."""
+    if not token:
+        return False
+    name = f"dfeols-over-{what}-{token}"
+    ev = _event(name)
+    try:
+        if set_it:
+            ev.set() if ev is not None else _OVER.add(name)
+            return True
+        return ev.is_set() if ev is not None else name in _OVER
+    except Exception:  # advice only: a missed verdict costs time, not the result
+        return False
+
+
+def combine_parts(
+    *parts, offs: np.ndarray, max_nnz: int, worker_bytes: int | None = None, token: str | None = None
+) -> dict:
     """Sum shards' parts of A (worker.shard_round1's `part`, or earlier sums) on a worker, by
     LevelGram's rules: past `max_nnz` keep only the diagonal blocks, past it again nothing.
     Round 1 sums the parts in a tree on the workers (DaskExecutor's `reduce`), so the
@@ -186,10 +240,12 @@ def combine_parts(*parts, offs: np.ndarray, max_nnz: int, worker_bytes: int | No
     if out["full"] and S.nnz > max_nnz:
         out["full"] = False
         out["reason"] = f"the shards' parts summed have more than {max_nnz:,} nonzeros"
+        over_flag(token, "full", set_it=True)
         S = _blocks_only(S, fe_of)
     if S.nnz > max_nnz:
         out.update(blocks=False, nnz=0, block_nnz=int(S.nnz))
         out["reason"] = f"the diagonal blocks summed have more than {max_nnz:,} nonzeros"
+        over_flag(token, "blocks", set_it=True)
         return out
     it = np.int32 if P < 2**31 else np.int64
     out.update(
@@ -613,10 +669,15 @@ class Checkpoint:
 
     RTOL = 1e-10
 
-    def __init__(self, path, R: np.ndarray, tol: float, method: str):
+    def __init__(self, path, R: np.ndarray, tol: float, method: str, every_s: float = 0.0):
+        """every_s: write at most this often (the latest state is kept for flush): D6 r4's
+        state is 4 blocks of 12.1M x 7 doubles, 2.7 GB a step on the coordinator."""
         self.path = Path(path)
         self.R = R
         self.digest = f"{R.shape}|{tol!r}|{method}"
+        self.every_s = every_s
+        self._last = None  # (state, written)
+        self._t = float("-inf")
 
     def load(self) -> dict | None:
         try:
@@ -632,6 +693,20 @@ class Checkpoint:
             return None
 
     def save(self, state: dict) -> None:
+        now = time.monotonic()
+        if now - self._t < self.every_s:
+            self._last = (state, False)
+            return
+        self._write(state)
+        self._t, self._last = now, (state, True)
+
+    def flush(self) -> None:
+        """Write the latest state if save() skipped it (a solve stopped short of tol)."""
+        if self._last is not None and not self._last[1]:
+            self._write(self._last[0])
+            self._last = (self._last[0], True)
+
+    def _write(self, state: dict) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_name(self.path.name + ".tmp.npz")
         np.savez(tmp, digest=self.digest, R=self.R, **state)
@@ -654,13 +729,36 @@ def step_strip(res: dict) -> dict:
     return {k: v for k, v in res.items() if k not in ("idx", "S")}
 
 
-def step_combine(*parts):
-    """Sum shards' (levels, sums) on a worker: the union of the levels, sums added."""
+def step_combine(*parts, P: int | None = None):
+    """Sum shards' (levels, sums) on a worker: the union of the levels, sums added. Each
+    part's levels are sorted and distinct (np.unique in worker._iter_store, and here), so each
+    adds into its rows of the union by position, without np.add.at (D6 r4: up to 4 x 12.1M
+    levels x 7 near the root, where np.unique and np.add.at took most of the 30-100 s between
+    a CG step's last shard and its sum). With `P` (all levels) a union that covers a large
+    share of them is summed in a dense P-row block instead of sorting."""
     parts = [p for p in parts if p is not None]
     if not parts:
         return None
-    idx = np.concatenate([p[0] for p in parts])
-    uniq, inv = np.unique(idx, return_inverse=True)
-    out = np.zeros((len(uniq), parts[0][1].shape[1]))
-    np.add.at(out, inv, np.concatenate([p[1] for p in parts]))
+    if len(parts) == 1:
+        return parts[0]
+    c = parts[0][1].shape[1]
+    total = sum(len(p[0]) for p in parts)
+    if P is not None and total >= P // 4:
+        out = np.zeros((P, c))
+        seen = np.zeros(P, bool)
+        for idx, S in parts:
+            out[idx] += S
+            seen[idx] = True
+        uniq = np.flatnonzero(seen)
+        return uniq, out[uniq]
+    uniq = np.unique(np.concatenate([p[0] for p in parts]))
+    out = np.zeros((len(uniq), c))
+    for idx, S in parts:
+        out[np.searchsorted(uniq, idx)] += S
     return uniq, out
+
+
+def step_combine_gb(P: int, c: int, fan_in: int = FAN_IN) -> float:
+    """Most memory a step_combine needs: fan_in parts and the sum over at most P levels, the
+    dense block and its gathered copy (8 bytes a value, 8 an index)."""
+    return ((fan_in + 2) * P * (8 * c + 8) + P) / 1e9 + 0.2

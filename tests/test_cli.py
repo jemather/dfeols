@@ -55,6 +55,8 @@ def test_submit_options_after_script(monkeypatch, tmp_path, argv, profile, name,
     seen = {}
     real = dfeols.site.profile
     monkeypatch.setenv("DFEOLS_CONFIG", str(tmp_path / "none.toml"))
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "run.py").write_text("")
 
     def fake_profile(n=None, **k):
         seen["p"] = n
@@ -71,6 +73,22 @@ def test_submit_options_after_script(monkeypatch, tmp_path, argv, profile, name,
     main(argv)
     assert seen["p"] == profile and seen["job_name"] == name
     assert seen["cmd"].endswith(cmd_end)
+
+
+def test_submit_checks_the_script_and_sets_coordinator_memory(monkeypatch, tmp_path):
+    import dfeols.cli as cli
+    import dfeols.cluster
+
+    monkeypatch.setenv("DFEOLS_CONFIG", str(tmp_path / "none.toml"))
+    monkeypatch.chdir(tmp_path)
+    with pytest.raises(SystemExit, match="no script at"):
+        main(["submit", "missing.py", "--", "x"])
+    (tmp_path / "run.py").write_text("")
+    seen = {}
+    monkeypatch.setattr(dfeols.cluster, "coordinator_script", lambda p, cmd, **k: seen.setdefault("p", p))
+    monkeypatch.setattr(cli, "_submit_and_report", lambda *a: None)
+    main(["submit", "run.py", "--coordinator-memory", "120G", "--", "x"])
+    assert seen["p"].coordinator["memory"] == "120G"
 
 
 def test_env_lines_pin_polars_spill_to_scratch(tmp_path):

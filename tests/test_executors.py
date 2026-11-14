@@ -161,7 +161,8 @@ def test_shared_argument_survives_losing_its_worker():
         ex = DaskExecutor(c, max_workers=2, tick=0.1)
         tasks = [(i, 1, (i, big)) for i in range(4)]
         shared = ex._scatter_shared(tasks, "t")
-        (fut,) = shared.values()
+        ((fut, copies),) = shared.values()
+        assert copies == {}  # the tasks' workers are not known: no copies on every worker
         distributed.wait(fut)
         holder = next(iter(c.who_has(fut)[fut.key]))
         import os
@@ -232,3 +233,45 @@ def test_diagnostics_written(tmp_path, monkeypatch):
     assert snaps and all("states" in s and len(s["workers"]) == 2 for s in snaps)
     assert {w["threads"] for s in snaps for w in s["workers"]} == {2}
     assert not (tmp_path / "c" / "tasks.jsonl").exists() and not (tmp_path / "c" / "cluster.jsonl").exists()
+
+
+def _where(i, big=None):
+    from distributed import get_worker
+
+    return {"w": get_worker().address, "s": None if big is None else float(big.sum()), "timing": {"total": 0.0}}
+
+
+def test_affinity_sends_tasks_back_to_their_worker():
+    """Tasks run under an affinity name go to the worker that last ran the same task id (plan C:
+    round 1 leaves each shard's state there, and the CG steps find it; job 36011018 hit the
+    cache on 2.5% of tasks). A large shared argument then reaches every worker as a copy in a
+    tree (_spread) and the tasks take their worker's copy."""
+    import numpy as np
+
+    distributed = pytest.importorskip("distributed")
+    n = 24
+    big = np.ones(5_000_000)  # 40 MB: over spread_min_bytes
+    with (
+        distributed.LocalCluster(n_workers=4, threads_per_worker=2, dashboard_address=None) as lc,
+        distributed.Client(lc) as c,
+    ):
+        ex = DaskExecutor(c, max_workers=4, tick=0.05)
+        runs = []
+        for k in range(3):
+            got = {}
+            prog = Progress(None, label="t", every=1e9)
+            prog.add_stage(f"s{k}", {i: 1 for i in range(n)})
+            prog.start(f"s{k}")
+            args = (lambda i: (i,)) if k == 0 else (lambda i: (i, big))
+            ex.run(_where, [(i, 1, args(i)) for i in range(n)], lambda t, r, g=got: g.setdefault(t, r),
+                   prog, f"s{k}", affinity="fit1")
+            runs.append(got)
+        assert all("_worker" not in r for r in runs[1].values())  # the note is the executor's
+        assert {t: r["w"] for t, r in runs[1].items()} == {t: r["w"] for t, r in runs[0].items()}
+        assert {t: r["w"] for t, r in runs[2].items()} == {t: r["w"] for t, r in runs[0].items()}
+        assert all(r["s"] == 5_000_000.0 for r in runs[2].values())
+        assert ex._affinity["fit1"] == {t: r["w"] for t, r in runs[0].items()}
+        root = c.submit(lambda: big, pure=False)
+        copies = ex._spread(root, "k", 10)
+        assert sorted(copies) == sorted(c.scheduler_info()["workers"])
+        assert all(f.result().sum() == 5_000_000.0 for f in copies.values())

@@ -51,7 +51,7 @@ from .rowhash import rowset
 # Sparse path: above this many crossing-FE levels a shard returns its Gram matrix sparse
 SPARSE_GRAM_LEVELS = 2000
 
-# Plan C: shard state kept between conjugate-gradient steps, least recently used first out.
+# Plan C: shard state kept between conjugate-gradient steps, up to a budget (no eviction).
 # Its budget is the plan's (crossing.iter_cache_budget: a share of a worker's memory), or
 # DFEOLS_ITER_CACHE_GB if set, else ITER_CACHE_DEFAULT_GB. A fit's first entry on a worker
 # drops every earlier fit's: the module outlives fits, and D5 (job 35888031) ran pair x year
@@ -672,8 +672,18 @@ def _round1_sparse(plan: Plan, shard_id: int, df, n0: int, local_codes, w, T, t0
             lim = min(plan.level_nnz, plan.part_nnz) if plan.part_nnz else plan.level_nnz
             # count the part before building it: building it whole and checking after took
             # 110 GB on two days of D5 (A nearly dense over 60,720 zone pairs)
-            size = _part_size(local_codes, gcodes, P, lim) if n and local_codes else None
-            if size is not None and not size["blocks"]:
+            from .crossing import over_flag
+
+            over_full = over_flag(plan.iter_token, "full")  # round 1's sum so far (crossing)
+            if over_flag(plan.iter_token, "blocks"):  # A and its blocks past the budget: no part
+                size = None
+                part = {"full": False, "blocks": False, "nnz": 0, "block_nnz": 0}
+                part["reason"] = "the shards' diagonal blocks summed have more nonzeros than the budget"
+            else:
+                size = _part_size(local_codes, gcodes, P, lim) if n and local_codes else None
+            if part is not None:
+                pass
+            elif size is not None and not size["blocks"]:
                 part = {"full": False, "blocks": False, "nnz": size["nnz"], "block_nnz": size["block_nnz"]}
                 part["reason"] = (
                     f"shard {shard_id}'s part of A has more than {lim:,} nonzeros, its diagonal "
@@ -681,7 +691,7 @@ def _round1_sparse(plan: Plan, shard_id: int, df, n0: int, local_codes, w, T, t0
                     + (f" (a worker sums {FAN_IN} parts within its memory)" if lim < plan.level_nnz else "")
                 )
             else:
-                blocks_only = size is not None and not size["full"]
+                blocks_only = over_full or (size is not None and not size["full"])
                 try:
                     if blocks_only:  # one crossing FE at a time: never all of the part at once
                         DD = sum(
@@ -699,7 +709,7 @@ def _round1_sparse(plan: Plan, shard_id: int, df, n0: int, local_codes, w, T, t0
                     d = DD.diagonal()
                     r, c, v = DD.row, DD.col, DD.data
                     full = not blocks_only and len(v) <= lim
-                    part = {"full": full, "blocks": True, "nnz": size["nnz"] if blocks_only else int(len(v))}
+                    part = {"full": full, "blocks": True, "nnz": size["nnz"] if blocks_only and size else int(len(v))}
                     if not full:
                         fe_of = np.repeat(np.arange(len(plan.global_fes)), [L for *_, L in plan.global_fes])
                         keep = fe_of[r] == fe_of[c]
@@ -965,26 +975,43 @@ def merge_minmax(lo_acc: np.ndarray, hi_acc: np.ndarray, item) -> None:
         np.maximum(hi_acc, hi, out=hi_acc)
 
 
+def _local_columns(Dm, idx: np.ndarray):
+    """Dm (n x P) on the levels the shard has: n x len(idx), column j = level idx[j]."""
+    import scipy.sparse as sp
+
+    cols = np.searchsorted(idx, Dm.indices).astype(np.int32 if len(idx) < 2**31 else np.int64)
+    return sp.csr_matrix((Dm.data, cols, Dm.indptr), shape=(Dm.shape[0], len(idx)))
+
+
 def _iter_store(plan: Plan, shard_id: int, local_codes, Dm, w) -> tuple:
+    """Keep a shard's plan C state for its CG steps: the dummies on the shard's own levels
+    (Dl, n x len(idx)), so a step's products are over those levels and not all P (D6 r4,
+    12.1M location-days: each step built a dense P x 7 block, 0.68 GB, per task)."""
     idx = np.unique(Dm.indices)  # levels present in the shard
+    Dl = _local_columns(Dm, idx)
     nbytes = (
         sum(c.nbytes for c in local_codes)
-        + Dm.data.nbytes
-        + Dm.indices.nbytes
-        + Dm.indptr.nbytes
+        + Dl.data.nbytes
+        + Dl.indices.nbytes
+        + Dl.indptr.nbytes
         + w.nbytes
         + idx.nbytes
     )
-    entry = (local_codes, Dm, w, idx, nbytes)
+    entry = (local_codes, Dl, w, idx, nbytes)
     if plan.iter_token:
         budget = _iter_cache_bytes(plan)
         with _ITER_LOCK:
             for k in [k for k in _ITER_CACHE if k[0] != plan.iter_token]:  # earlier fits' state
                 del _ITER_CACHE[k]
-            _ITER_CACHE[(plan.iter_token, shard_id)] = entry
+            key = (plan.iter_token, shard_id)
+            _ITER_CACHE.pop(key, None)
             used = sum(v[-1] for v in _ITER_CACHE.values())
-            while _ITER_CACHE and used > budget:
-                used -= _ITER_CACHE.popitem(last=False)[1][-1]
+            # full: keep what is there rather than evict (LRU). Every CG step visits a worker's
+            # shards in the same order, so with more shards than fit LRU evicts the one needed
+            # next and nothing hits (D11 L3 job 36016180: 2 hits in 1,443); kept, a share
+            # budget/need of them hits on every step
+            if used + nbytes <= budget:
+                _ITER_CACHE[key] = entry
     return entry
 
 
@@ -995,22 +1022,20 @@ def shard_matvec(plan: Plan, shard_id: int, files: list[str], p: np.ndarray) -> 
     key = (plan.iter_token, shard_id)
     with _ITER_LOCK:  # check and read at once: another thread may evict it in between
         entry = _ITER_CACHE.get(key)
-        if entry is not None:
-            _ITER_CACHE.move_to_end(key)
     hit = entry is not None
     if not hit:  # a worker that has not seen this shard (new, or the cache was full)
         df, _, local_codes, w = _prepare(plan, shard_id, files)
         entry = _iter_store(plan, shard_id, local_codes, _global_matrix(df, plan, df.height)[0], w)
-    local_codes, Dm, w, idx, _ = entry
+    local_codes, Dl, w, idx, _ = entry
     t_read = time.perf_counter() - t0
-    U = Dm @ p
+    U = Dl @ p[idx]
     if local_codes and len(w):
         U = demean(U, local_codes, w, plan.fe_tol, plan.fe_maxiter, plan.fe_method)[0]
-    S = Dm.T @ (U * w[:, None])
+    S = Dl.T @ (U * w[:, None])
     return {
         "shard": shard_id,
         "idx": idx,
-        "S": S[idx],
+        "S": S,
         "timing": {
             "read": t_read,
             "total": time.perf_counter() - t0,

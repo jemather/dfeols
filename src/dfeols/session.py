@@ -645,7 +645,9 @@ def _level_reduce(gram, plan: Plan, executor=None):
     return Reduce(
         get=part_of,
         strip=without_part,
-        combine=functools.partial(combine_parts, offs=gram.offs, max_nnz=plan.level_nnz, worker_bytes=wb),
+        combine=functools.partial(
+            combine_parts, offs=gram.offs, max_nnz=plan.level_nnz, worker_bytes=wb, token=plan.iter_token
+        ),
         done=lambda part: gram.add(part, None),
     )
 

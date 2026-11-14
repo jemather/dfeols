@@ -296,6 +296,8 @@ def executor(
         client, max_workers=w["max_workers"], tick=tick, worker_memory=_memory_bytes(w["memory"])
     )
     ex.cluster = cl
+    if p.scheduler != "local":
+        _close_on_exit(cl)
     ex.profile = p
     log.info(
         "cluster: profile %r (%s), up to %d workers x %s cores, %s, walltime %s",
@@ -307,6 +309,42 @@ def executor(
         w["walltime"],
     )
     return ex
+
+
+def _close_on_exit(cl) -> None:
+    """Cancel the cluster's worker jobs, queued ones too, when the coordinator ends, including
+    by SIGTERM (scancel, or the batch system at walltime). Python's default SIGTERM ends the
+    process without cleanup, so the worker jobs still queued started after the coordinator had
+    gone and sat until their death timeout."""
+    import atexit
+    import signal
+    import sys
+    import threading
+
+    done = {"closed": False}
+
+    def close():
+        if done["closed"]:
+            return
+        done["closed"] = True
+        try:
+            cl.close(timeout=20)
+        except Exception as e:  # pragma: no cover (best effort at exit)
+            log.warning("cluster: closing the worker jobs at exit failed: %r", e)
+
+    atexit.register(close)
+    if threading.current_thread() is not threading.main_thread():
+        return
+    prev = signal.getsignal(signal.SIGTERM)
+    if prev not in (signal.SIG_DFL, None):
+        return  # the caller's own handler: leave it
+
+    def on_term(signum, frame):
+        log.warning("cluster: SIGTERM, cancelling the worker jobs")
+        close()
+        sys.exit(128 + signum)
+
+    signal.signal(signal.SIGTERM, on_term)
 
 
 # ---------------------------------------------------- coordinator scripts

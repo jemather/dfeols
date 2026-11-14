@@ -15,7 +15,7 @@
                                        draft a profile's node classes from sinfo/scontrol
   dfeols config show [--profile P]     print the resolved profile
   dfeols jobscript "CMD" [--profile P] print a coordinator job script for CMD
-  dfeols submit SCRIPT.py [--profile P] [--name N] [-- ARGS]
+  dfeols submit SCRIPT.py [--profile P] [--name N] [--coordinator-memory M] [-- ARGS]
   dfeols submit -m MODULE  [--profile P] [--name N] [-- ARGS]
                                        submit as a coordinator job
   dfeols bench [--profile P] [BENCH OPTIONS]
@@ -205,8 +205,10 @@ def _submit_options(args):
     op.add_argument("--profile", default=args.profile)
     op.add_argument("--name", default=args.name)
     op.add_argument("-m", "--module", default=args.module)
+    op.add_argument("--coordinator-memory", default=getattr(args, "coordinator_memory", None))
     known, extra = op.parse_known_args(own)
     args.profile, args.name, args.module = known.profile, known.name, known.module
+    args.coordinator_memory = known.coordinator_memory
     return extra + rest
 
 
@@ -217,7 +219,14 @@ def submit_cmd(args):
     from .site import profile
 
     rest = _submit_options(args)
+    if not args.module and args.script and not Path(args.script).is_file():
+        # the job would start, fail at once, and leave only a "can't open file" in its output
+        sys.exit(f"dfeols submit: no script at {Path(args.script).resolve()} (from {Path.cwd()})")
     p = profile(args.profile)
+    if args.coordinator_memory:  # e.g. 120G for a fit whose coordinator holds large level arrays
+        import dataclasses
+
+        p = dataclasses.replace(p, coordinator={**p.coordinator, "memory": args.coordinator_memory})
     jobs = p.scratch_dir("jobs")
     jobs.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S")
@@ -373,6 +382,7 @@ def main(argv=None):
     s_.add_argument("args", nargs=argparse.REMAINDER)
     s_.add_argument("--profile")
     s_.add_argument("--name", default="dfeols")
+    s_.add_argument("--coordinator-memory", default=None, help="the coordinator job's memory, e.g. 120G")
     bn = sub.add_parser("bench", help="submit a benchmark as a coordinator job (other options go to it)")
     bn.add_argument("--profile")
     bn.add_argument("--name", default="dfeols-bench")

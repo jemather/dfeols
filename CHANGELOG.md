@@ -78,6 +78,28 @@ break the API).
 
 ### Changed
 
+- Plan C CG steps with a pass per step (D6 r4 on 2.7-4.2B rows: ~10 min a pass; D11 L3):
+  each task goes back to the worker that cached its shard in round 1 (`DaskExecutor.run(...,
+  affinity=)`; job 36011018 hit the cache on 2.5% of tasks and reread every shard); a cached
+  shard keeps its dummies on its own levels, so a step's product is over those, not a dense
+  P x c block per task; the CG block reaches every worker as copies in a tree rather than
+  each worker fetching it from one (~2.5 min a step at 0.68 GB x 36 workers); step tasks ask
+  for their own memory, not round 1's level arrays; the step sums are merged by position
+  (no `np.add.at`, dense above a quarter of the levels) and a combine asks for its estimate
+  instead of a whole worker (whole-worker combines at the head of a worker's queue held it
+  to one task at a time); the CG checkpoint is written at most every 5 min. The shard cache
+  keeps what it holds when full instead of evicting (LRU on a loop that does not fit hit
+  nothing, D11 L3: 2 of 1,443) and takes 40% of a worker (was 25%).
+- Plan C without level space: round 1's per-level sums are summed in a tree on the workers
+  (D11 L3 36016180: 27 min fetching ~98 MB results one at a time). With level space, once a
+  combine finds the summed parts of A past the budget, the shards still to run build only
+  their diagonal blocks, or nothing (D6 r4 35948257 built ~4.5e10 nonzeros for a 4e8 budget).
+- The progress line's rows/s and stage ETA follow the rows whose results have arrived (over
+  the last 10 min), not the tasks' own seconds (D6 r4 35953385 round 1: 5.2M rows/s shown,
+  0.25M achieved, ETA 7 min for 4 h).
+- A plan C fit logs its CG mode (level space budget or off) before round 1, not only after.
+- `dfeols submit` refuses a script path that does not exist, and takes `--coordinator-memory`.
+
 - Worker logs go in `<scratch>/logs/<coordinator job id>/` (outside a batch job,
   `logs/local-<time>-<pid>/`), not all in `<scratch>/logs/`. Each file is still named by the
   worker's own job id, so a run's worker logs could not be told apart from every other run's.
@@ -97,6 +119,16 @@ break the API).
   README and DESCRIPTION name broom, which modelsummary needs for the records.
 
 ### Fixed
+
+- The DaskExecutor's result loop: `distributed.wait(FIRST_COMPLETED)` over every pending
+  future, called after each completion, left a waiter per future on the event loop the
+  scheduler shares, so the loop stalled more as a stage went on (D6 36011018, D11 36016180:
+  877 stalls, median 5 s; found by the D11 chat). Done callbacks now feed a queue, once per
+  future; the scheduler is queried once a tick.
+- A result that cannot be fetched (a worker out of local disk for spilled data: job 35937527,
+  53 min blocked in Dask's gather retries) fails the fit after `DFEOLS_GATHER_TIMEOUT_S`
+  (900 s) with the worker named.
+- A coordinator ended by SIGTERM (scancel, walltime) cancels its worker jobs, queued ones too.
 
 - Plan C's per-process shard cache (`worker._ITER_CACHE`) is now guarded by a lock. A worker's
   threads clearing the previous fit's entries together raised `KeyError` (OSCER job 35991256:
