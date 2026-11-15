@@ -16,21 +16,19 @@ column order varies between files, so they are read by name and cast strictly (S
 anything that does not parse fails the snapshot). The April 2019 ``.json.gz`` snapshots and
 ``backfills/`` (other formats, third-party collections) are not read.
 
-What the probes found (2021-06-17..20, 2023-07-11..13, 2025-03-01, 2026-02-14), and so how the
-tables are cut:
+What the probes and the first full run (2026-11-14) found, and so how the tables are cut:
 
 * Contract terms almost never change: ``date_issued`` moves on one or two contracts a day in
   2021 (a midnight placeholder replaced by the real time, or back). ``date_expired`` moves
   forward every snapshot on auctions. ``universe_id`` (eve, wormhole or null) is in the files
   from 2021-06-19 ~16:00 to 2023-05-23 only. ``http_last_modified`` is one value per snapshot
   and region (the region's page fetch), with a few exceptions in June 2021.
-* A contract's items are all present or all absent in a snapshot; they can appear one or two
-  snapshots after the contract does, never earlier, and stay until it leaves. The same holds
-  for its mutated (dynamic) items and their dogma rows, and bids stay once placed. So every
-  child row carries the first and last snapshot it is in.
-* Bids' ``http_last_modified`` is one value per contract and snapshot (the bids page fetch).
-  Items' and mutated items' stamps are fixed per row, except 2021-06-17..07-05, when the
-  archive refetched every contract's items about hourly and each fetch has a new stamp.
+* The archive refetches contracts' items now and then (about hourly in 2021-06-17..07-05,
+  in bulk about weekly later), and a refetch can bring changed rows: mutated items' dogma
+  values change or rows vanish after game patches (e.g. attribute 633 on 2022-01-12), and a
+  few items and bids change. So child rows are runs, like contract spells, not fixed rows.
+* Fetch stamps (``http_last_modified``) of a contract's items, of its mutated items and of its
+  bids are each one value per contract and snapshot (a page fetch), with rare exceptions.
 * No snapshots on 19 days (2021-06-24..07-01, 07-03, 2022-01-12..13, 2023-01-27..31,
   2024-11-22..23, 2025-05-19), and 98 gaps over 90 minutes between snapshots: a contract seen
   on both sides of a gap is in adjacent snapshot ids, so its spell runs through the gap.
@@ -55,43 +53,48 @@ Tables (``<out>/<table>/part-NN.parquet``, buckets of ``contract_id``; ``snapsho
 ``contract_changes`` spells: ``contract_id``, ``from_snapshot``, ``to_snapshot`` (inclusive),
                      ``terms_version``, ``date_expired``, ``universe_id``,
                      ``http_last_modified`` (only where it differs from the region's stamp in
-                     ``snapshots.regions``, else null), ``bids_http_last_modified`` (null when no
-                     bids rows). A new spell starts when any of these changes or the contract
-                     is missing from a snapshot (region fetch failures look like that), so the
-                     contract is in snapshot s exactly when a spell covers s.
-``items``            contract_items rows (key contract_id, record_id) with ``first_snapshot``,
-                     ``last_snapshot``; for mutated items also ``created_by``,
-                     ``mutator_type_id``, ``source_type_id``, ``dynamic_http_last_modified``,
-                     ``dynamic_first_snapshot``, ``dynamic_last_snapshot`` (from
-                     contract_dynamic_items, matched on contract_id and item_id); for items
-                     listed in contract_non_dynamic_items (2024 on), ``non_dynamic_first_snapshot``
-                     and ``non_dynamic_last_snapshot``. ``http_last_modified`` is the first seen.
-``item_attributes``  the mutated items' dogma rows, long: ``contract_id``, ``item_id``, ``kind``
+                     ``snapshots.regions``, else null), and the contract's fetch stamps in those
+                     snapshots: ``items_http_last_modified``, ``dynamic_http_last_modified``
+                     (mutated items), ``bids_http_last_modified`` (each the earliest if rows
+                     differ; null when no such rows). A new spell starts when any of these
+                     changes or the contract is missing from a snapshot (region fetch failures
+                     look like that), so the contract is in snapshot s exactly when a spell
+                     covers s.
+
+Child tables are runs: one row per key and stretch of consecutive snapshots with the same
+values (``from_snapshot``, ``to_snapshot``, inclusive); a new run when a value changes or the
+row is missing from a snapshot. A child row is in snapshot s exactly when a run covers s. Their
+``http_last_modified`` columns are overrides: null where the row's stamp equals its contract's
+(or, for dogma rows, its mutated item's) stamp in that snapshot, else the row's own.
+
+``items``            contract_items runs (key contract_id, record_id): the contract_items columns;
+                     ``dynamic`` (the item is in contract_dynamic_items in these snapshots, matched
+                     on contract_id and item_id) with ``created_by``, ``mutator_type_id``,
+                     ``source_type_id``, ``dynamic_http_last_modified`` (override); and
+                     ``non_dynamic``, ``non_dynamic_type_id`` (contract_non_dynamic_items, 2024 on).
+``item_attributes``  the mutated items' dogma runs, long: ``contract_id``, ``item_id``, ``kind``
                      (``attribute`` or ``effect``), ``dogma_id`` (attribute_id or effect_id),
-                     ``value`` (attributes), ``is_default`` (effects), ``first_snapshot``,
-                     ``last_snapshot``. Their http_last_modified equals the item's
-                     ``dynamic_http_last_modified`` (counted in pass 1; the check confirms).
-``bids``             ``bid_id``, ``contract_id``, ``amount``, ``date_bid``, ``first_snapshot``,
-                     ``last_snapshot``.
+                     ``value`` (attributes), ``is_default`` (effects), ``http_last_modified``.
+``bids``             runs of ``bid_id``: ``contract_id``, ``amount``, ``date_bid``,
+                     ``http_last_modified``.
 
 Rebuild rule (``check``): a contract is in snapshot s when a spell covers s, with that spell's
-terms version; a child row is in s when s is in its [first, last] range and its contract is
-in s. http_last_modified comes from the spell or ``snapshots.regions`` (contracts),
-``contract_changes`` (bids) or ``items`` (items, dynamic rows and dogma rows). ``check``
-rebuilds every table of the chosen snapshots and compares them with the raw tars, value for
-value after the same strict parse, and splits differing rows into content (some column other
-than http_last_modified differs) and stamp-only. Stamp-only rows are expected in the 2021
-refetch weeks (items keep their first stamp). Typed values are compared, so the CSV's spelling
+terms version, and a child row when a run covers s; stamps are the override, else the spell's
+(``snapshots.regions`` for contracts). ``check`` rebuilds every table of the chosen snapshots
+and compares them with the raw tars, value for value after the same strict parse, and splits
+differing rows into content (some column other than http_last_modified differs) and
+stamp-only; both fail it. Typed values are compared, so the CSV's spelling
 of a number (``45000000`` vs ``4.5e7``) is not kept, nor, outside text columns, quoted-empty
 (``""``) vs empty: both are null (some files quote empty numbers and booleans). In text
 columns (``title``, ``type``, ``universe_id``) ``""`` and null stay distinct.
 
 Pass 1, per day (``<out>/pass1/<YYYY>/<day>/*.parquet`` + ``_day.json``; resumable): the day's
 snapshots, hash-checked, parsed, exact duplicate rows dropped (counted); rows collapsed to the
-tables above within the day; anything that should be constant but varies is counted
-(``conflicts``; the first sighting is kept). Pass 2 merges the days in buckets of contract_id
-(ranges by min/max, spells joined across day boundaries when the ids are adjacent and the values
-equal; terms versions numbered by first sighting) and writes the tables and ``_summary.json``.
+runs and spells within the day; oddities are counted (``conflicts``: duplicate keys, more than
+one stamp per contract, orphans, unmatched mutated rows). Pass 2 merges the days in buckets of
+contract_id (runs and spells joined across day boundaries when the ids are adjacent and the
+values equal; terms versions numbered by first sighting) and writes the tables and
+``_summary.json``. A day written by an older pass-1 format is redone.
 Nothing in the archive is run.
 """
 
@@ -159,12 +162,21 @@ KEYS = {"contracts": ["contract_id"], "contract_items": ["contract_id", "record_
         "contract_non_dynamic_items": ["contract_id", "item_id"]}
 CONTRACT_TERMS = [c for c in SCHEMAS["contracts"]
                   if c not in ("date_expired", "universe_id", "http_last_modified")]
-SPELL_VALS = ["terms_hash", "date_expired", "universe_id", "http_last_modified",
-              "bids_http_last_modified"]
-ITEM_COLS = [c for c in SCHEMAS["contract_items"] if c not in KEYS["contract_items"]]
-DYN_COLS = ["created_by", "mutator_type_id", "source_type_id", "http_last_modified"]
 STAMP = "http_last_modified"
+# per contract and snapshot: the fetch stamps of its items, mutated items and bids pages
+CSTAMPS = ["items_http_last_modified", "dynamic_http_last_modified", "bids_http_last_modified"]
+SPELL_VALS = ["terms_hash", "date_expired", "universe_id", STAMP] + CSTAMPS
+ITEM_COLS = [c for c in SCHEMAS["contract_items"] if c not in KEYS["contract_items"]]
+DYN_COLS = ["created_by", "mutator_type_id", "source_type_id"]
+# items runs: contract_items columns (stamp = override), then the matched mutated and
+# non-dynamic rows (``dynamic`` / ``non_dynamic`` say whether they are in the snapshot)
+ITEM_VALS = (ITEM_COLS + ["dynamic"] + DYN_COLS + ["dynamic_" + STAMP]
+             + ["non_dynamic", "non_dynamic_type_id"])
+ITEM_KEY = ["contract_id", "record_id"]
+ATT_KEY, ATT_VALS = ["contract_id", "item_id", "kind", "dogma_id"], ["value", "is_default", STAMP]
+BID_KEY, BID_VALS = ["bid_id"], ["contract_id", "amount", "date_bid", STAMP]
 TABLES = ["contracts", "contract_changes", "items", "item_attributes", "bids"]
+FORMAT = 2  # pass-1 layout; days written by another format are redone
 
 
 def commit_id() -> str:
@@ -278,22 +290,53 @@ def _ranges(df: pl.DataFrame, key: list[str], cols: list[str]) -> tuple[pl.DataF
     return g.drop("_v", "_st"), flags
 
 
-def _spell_ids(o: pl.DataFrame, key: str, start: str, end: str, vals: list[str]) -> pl.DataFrame:
-    """Sorted rows -> a spell number: a new spell when start != previous end + 1 within the key
-    or a value differs (nulls equal)."""
-    same = (pl.col(key) == pl.col(key).shift()) & (pl.col(start) == pl.col(end).shift() + 1)
+def _run_flags(r: pl.DataFrame, key: list[str]) -> dict:
+    """Run counts: keys, runs, keys with more than one run, rows with a stamp override."""
+    return {"keys": r.select(key).n_unique(), "runs": r.height,
+            "multi_run_keys": r.select(key).unique().height - r.select(key).filter(
+                ~pl.struct(key).is_duplicated()).height,
+            "stamp_overrides": int(sum(r[c].is_not_null().sum() for c in r.columns
+                                       if c.endswith(STAMP)))}
+
+
+def _spell_ids(o: pl.DataFrame, key: list[str], start: str, end: str, vals: list[str]) -> pl.DataFrame:
+    """Rows sorted by key and start -> a run number: a new run when the key changes, start !=
+    previous end + 1, or a value differs (nulls equal)."""
+    same = pl.col(start) == pl.col(end).shift() + 1
+    for k in key:
+        same = same & (pl.col(k) == pl.col(k).shift())
     for v in vals:
         same = same & pl.col(v).eq_missing(pl.col(v).shift())
     return o.with_columns(_spell=(~same.fill_null(False)).cum_sum())
 
 
-def spells(obs: pl.DataFrame, vals: list[str]) -> pl.DataFrame:
-    """Rows (contract_id, s, *vals) -> spells (contract_id, from_snapshot, to_snapshot, *vals)."""
-    o = _spell_ids(obs.sort("contract_id", "s"), "contract_id", "s", "s", vals)
+def runs(obs: pl.DataFrame, key: list[str], vals: list[str]) -> pl.DataFrame:
+    """Rows (*key, s, *vals) -> runs (*key, from_snapshot, to_snapshot, *vals): one per stretch
+    of consecutive snapshot ids with the same values. The row is in snapshot s exactly when a
+    run covers s, with that run's values."""
+    o = _spell_ids(obs.sort(*key, "s"), key, "s", "s", vals)
     return (o.group_by("_spell", maintain_order=True)
-            .agg(pl.col("contract_id").first(), pl.col("s").min().alias("from_snapshot"),
+            .agg(*[pl.col(k).first() for k in key], pl.col("s").min().alias("from_snapshot"),
                  pl.col("s").max().alias("to_snapshot"), *[pl.col(v).first() for v in vals])
             .drop("_spell"))
+
+
+def _merge_runs(lf: pl.LazyFrame, key: list[str], vals: list[str]) -> pl.DataFrame:
+    """Pass-1 runs of all days -> runs over the window (adjacent ids and equal values join)."""
+    o = _spell_ids(lf.sort(*key, "from_snapshot").collect(), key, "from_snapshot", "to_snapshot", vals)
+    return (o.group_by("_spell", maintain_order=True)
+            .agg(*[pl.col(k).first() for k in key], pl.col("from_snapshot").min(),
+                 pl.col("to_snapshot").max(), *[pl.col(v).first() for v in vals])
+            .drop("_spell"))
+
+
+def _override(df: pl.DataFrame, ref: pl.DataFrame, on: list[str], refcol: str,
+              out: str = STAMP) -> pl.DataFrame:
+    """Replace ``http_last_modified`` by ``out``: the row's own stamp only where it differs from
+    ``refcol`` in ``ref`` (matched on ``on`` + s; null there), else null."""
+    d = df.join(ref.select(*on, "s", pl.col(refcol).alias("_ref")), on=[*on, "s"], how="left")
+    return d.with_columns(pl.when(pl.col(STAMP).eq_missing(pl.col("_ref"))).then(None)
+                          .otherwise(pl.col(STAMP)).alias(out)).drop("_ref", *([STAMP] if out != STAMP else []))
 
 
 def region_stamps(c: pl.DataFrame) -> pl.DataFrame:
@@ -371,50 +414,68 @@ def collapse_day(day: str, snaps: list[dict], dest: str, commit: str) -> dict:
                   "rows_in": {t: st[t].height for t in RAW_TABLES}}
     flags: dict = {}
 
-    # contracts: terms versions (by hash) and spells
+    # contracts: terms versions (by hash) and spells. A spell also carries the contract's items,
+    # mutated-items and bids fetch stamps in that snapshot (one value each; rows that differ keep
+    # their own as an override)
     c = st["contracts"].with_columns(terms_hash=pl.struct(CONTRACT_TERMS).hash(seed=0))
     con, f = _ranges(c, ["contract_id", "terms_hash"], [x for x in CONTRACT_TERMS if x != "contract_id"])
     add("contracts.terms_changed", con["contract_id"].is_duplicated().sum())
     con.write_parquet(tmp / "contracts.parquet")
-    bstamp = (st["contract_bids"].group_by("contract_id", "s")
-              .agg(pl.col(STAMP).n_unique().alias("k"), pl.col(STAMP).min().alias("bids_http_last_modified")))
-    add("bids.stamp", bstamp.filter(pl.col("k") > 1).height)
     present = c.select("contract_id", "s")
-    orph = {"contract_bids": bstamp.join(present, on=["contract_id", "s"], how="anti").height}
-    obs = c.select("contract_id", "s", "terms_hash", "date_expired", "universe_id", STAMP).join(
-        bstamp.drop("k"), on=["contract_id", "s"], how="left")
-    spells(obs, SPELL_VALS).write_parquet(tmp / "spells.parquet")
+    obs = c.select("contract_id", "s", "terms_hash", "date_expired", "universe_id", STAMP)
+    cst = {}
+    for t, col in zip(["contract_items", "contract_dynamic_items", "contract_bids"], CSTAMPS):
+        g = (st[t].group_by("contract_id", "s")
+             .agg(pl.col(STAMP).n_unique().alias("k"), pl.col(STAMP).min().alias(col)))
+        add(f"{t}.stamps_in_contract", g.filter(pl.col("k") > 1).height)
+        # orphans: rows whose contract is not in that snapshot (their stamps stay on the rows)
+        orph = int(st[t].join(present, on=["contract_id", "s"], how="anti").height)
+        add(f"orphan.{t}", orph)
+        cst[t] = g.drop("k").join(present, on=["contract_id", "s"])
+        obs = obs.join(cst[t], on=["contract_id", "s"], how="left")
+    runs(obs, ["contract_id"], SPELL_VALS).write_parquet(tmp / "spells.parquet")
 
-    # children: ranges per key; orphans (rows whose contract is not in that snapshot) counted
-    for t, cols in [("contract_items", ITEM_COLS), ("contract_dynamic_items", DYN_COLS),
-                    ("contract_non_dynamic_items", ["type_id"]),
-                    ("contract_bids", ["contract_id", "amount", "date_bid"])]:
-        df = st[t]
-        if t != "contract_bids":
-            orph[t] = df.select("contract_id", "s").unique().join(
-                present, on=["contract_id", "s"], how="anti").height
-        r, flags[t] = _ranges(df, KEYS[t], cols)
-        r.write_parquet(tmp / f"{t}.parquet")
-    # dogma rows: long; stamp checked against the dynamic item's stamp in the same snapshot
-    dyn = st["contract_dynamic_items"].select("contract_id", "item_id", "s", pl.col(STAMP).alias("_d"))
+    # items: contract_items rows, the matched mutated row and non-dynamic row in the same snapshot
+    it = _override(st["contract_items"], cst["contract_items"], ["contract_id"], "items_" + STAMP)
+    dy = _override(st["contract_dynamic_items"], cst["contract_dynamic_items"], ["contract_id"],
+                   "dynamic_" + STAMP, out="dynamic_" + STAMP).with_columns(dynamic=pl.lit(True))
+    nd = st["contract_non_dynamic_items"].select(
+        "contract_id", "item_id", "s", pl.col("type_id").alias("non_dynamic_type_id"),
+        non_dynamic=pl.lit(True))
+    ids = it.filter(pl.col("item_id").is_not_null()).select("contract_id", "item_id", "s")
+    add("contract_items.item_id_dup", ids.is_duplicated().sum())
+    for t, x in (("contract_dynamic_items", dy), ("contract_non_dynamic_items", nd)):
+        add(f"{t}.unmatched", x.join(ids, on=["contract_id", "item_id", "s"], how="anti").height)
+    it = (it.join(dy, on=["contract_id", "item_id", "s"], how="left")
+          .join(nd, on=["contract_id", "item_id", "s"], how="left")
+          .with_columns(pl.col("dynamic", "non_dynamic").fill_null(False)))
+    ir = runs(it, ITEM_KEY, ITEM_VALS)
+    ir.write_parquet(tmp / "items.parquet")
+    flags["items"] = _run_flags(ir, ITEM_KEY)
+
+    # dogma rows, long; stamp an override of the mutated item's stamp in the same snapshot
     longs = []
+    dstamp = st["contract_dynamic_items"].select("contract_id", "item_id", "s", STAMP)
     for t, kind, idc in [("contract_dynamic_items_dogma_attributes", "attribute", "attribute_id"),
                          ("contract_dynamic_items_dogma_effects", "effect", "effect_id")]:
-        df = st[t].join(dyn, on=["contract_id", "item_id", "s"], how="left")
-        orph[t] = df.filter(pl.col("_d").is_null()).height
-        add(f"{t}.stamp_vs_item", df.filter(pl.col("_d").is_not_null() & (pl.col("_d") != pl.col(STAMP))).height)
-        df = df.select("contract_id", "item_id", pl.lit(kind).alias("kind"),
-                       pl.col(idc).alias("dogma_id"),
-                       (pl.col("value") if kind == "attribute" else pl.lit(None, F64)).alias("value"),
-                       (pl.col("is_default") if kind == "effect" else pl.lit(None, B)).alias("is_default"),
-                       "s")
-        r, flags[t] = _ranges(df, ["contract_id", "item_id", "kind", "dogma_id"], ["value", "is_default"])
-        longs.append(r)
-    pl.concat(longs).write_parquet(tmp / "item_attributes.parquet")
+        df = _override(st[t], dstamp, ["contract_id", "item_id"], STAMP)
+        add(f"{t}.stamp_vs_item", df.filter(pl.col(STAMP).is_not_null()).height)
+        longs.append(df.select(
+            "contract_id", "item_id", pl.lit(kind).alias("kind"), pl.col(idc).alias("dogma_id"),
+            (pl.col("value") if kind == "attribute" else pl.lit(None, F64)).alias("value"),
+            (pl.col("is_default") if kind == "effect" else pl.lit(None, B)).alias("is_default"),
+            STAMP, "s"))
+    ar = runs(pl.concat(longs), ATT_KEY, ATT_VALS)
+    ar.write_parquet(tmp / "item_attributes.parquet")
+    flags["item_attributes"] = _run_flags(ar, ATT_KEY)
+    br = runs(_override(st["contract_bids"], cst["contract_bids"], ["contract_id"], "bids_" + STAMP),
+              BID_KEY, BID_VALS)
+    br.write_parquet(tmp / "bids.parquet")
+    flags["bids"] = _run_flags(br, BID_KEY)
     pl.DataFrame(srows, schema_overrides={"scrape_start": UTC_US, "scrape_end": UTC_US,
                                           "datasource": S, "meta": S, "absent": S}
                  ).write_parquet(tmp / "snapshots.parquet")
-    info.update({"conflicts": conflicts, "flags": flags, "orphans": orph,
+    info.update({"conflicts": conflicts, "flags": flags, "format": FORMAT,
                  "contracts": con["contract_id"].n_unique(), "seconds": round(time.time() - t0, 1)})
     (tmp / "_day.json").write_text(json.dumps(info, indent=1))
     shutil.rmtree(out, ignore_errors=True)
@@ -423,9 +484,8 @@ def collapse_day(day: str, snaps: list[dict], dest: str, commit: str) -> dict:
 
 
 def _day_flags(s: dict) -> dict:
+    """What should be zero but is not (run counts in ``flags`` are information)."""
     out = {k: v for k, v in s["conflicts"].items() if v}
-    out.update({f"{t}.{k}": v for t, f in s["flags"].items() for k, v in f.items() if v})
-    out.update({f"orphan.{t}": v for t, v in s["orphans"].items() if v})
     out.update({f"dup.{t}": v for t, v in s["dup_rows"].items() if v})
     return out
 
@@ -438,7 +498,8 @@ def pass1(inv: pl.DataFrame, days: list[str], p1: Path, workers: int, force: boo
         ids = [s["snapshot_id"] for s in by_day[d]]
         if not force and (dest / "_day.json").exists():
             try:
-                if json.loads((dest / "_day.json").read_text())["snapshots"] == ids:
+                j = json.loads((dest / "_day.json").read_text())
+                if j["snapshots"] == ids and j.get("format") == FORMAT:
                     continue
             except (OSError, ValueError, KeyError):
                 pass
@@ -483,15 +544,6 @@ def _merge_ranges(lf: pl.LazyFrame, key: list[str], cols: list[str]) -> pl.DataF
     return g.drop("_v", "_st"), flags
 
 
-def _merge_spells(lf: pl.LazyFrame) -> pl.DataFrame:
-    o = _spell_ids(lf.sort("contract_id", "from_snapshot").collect(), "contract_id",
-                   "from_snapshot", "to_snapshot", SPELL_VALS)
-    return (o.group_by("_spell", maintain_order=True)
-            .agg(pl.col("contract_id").first(), pl.col("from_snapshot").min(),
-                 pl.col("to_snapshot").max(), *[pl.col(v).first() for v in SPELL_VALS])
-            .drop("_spell"))
-
-
 def _add(acc: dict, name: str, f: dict) -> None:
     for k, v in f.items():
         acc[f"{name}.{k}"] = acc.get(f"{name}.{k}", 0) + v
@@ -525,12 +577,12 @@ def pass2(p1: Path, out: Path, days: list[str], nb: int, commit: str) -> dict:
         con = con.sort("contract_id", "first_snapshot").with_columns(
             terms_version=pl.int_range(pl.len()).over("contract_id").cast(pl.Int16),
             n_terms=pl.len().over("contract_id").cast(pl.Int16))
-        sp = _merge_spells(scan("spells").filter(inb)).join(
+        sp = _merge_runs(scan("spells").filter(inb), ["contract_id"], SPELL_VALS).join(
             con.select("contract_id", "terms_hash", "terms_version"), on=["contract_id", "terms_hash"],
             how="left")
         _add(fl, "contract_changes", {"no_terms": sp.filter(pl.col("terms_version").is_null()).height})
         sp = sp.select("contract_id", "from_snapshot", "to_snapshot", "terms_version", "date_expired",
-                       "universe_id", STAMP, "bids_http_last_modified").sort("contract_id", "from_snapshot")
+                       "universe_id", STAMP, *CSTAMPS).sort("contract_id", "from_snapshot")
         nch = sp.group_by("contract_id").agg(pl.len().cast(I32).alias("n_changes"))
         con = (con.join(nch, on="contract_id", how="left").rename({"n": "n_snapshots"})
                .select(["contract_id", "terms_version"] + terms +
@@ -538,37 +590,17 @@ def pass2(p1: Path, out: Path, days: list[str], nb: int, commit: str) -> dict:
                .sort("contract_id", "terms_version"))
         con.write_parquet(out / "contracts" / part)
         sp.write_parquet(out / "contract_changes" / part)
-        # items, with the dynamic and non-dynamic rows matched on (contract_id, item_id)
-        ik = KEYS["contract_items"]
-        items, f = _merge_ranges(scan("contract_items").filter(inb), ik, ITEM_COLS)
-        _add(fl, "items", f)
-        dyn, f = _merge_ranges(scan("contract_dynamic_items").filter(inb), ["contract_id", "item_id"], DYN_COLS)
-        _add(fl, "dynamic", f)
-        nd, f = _merge_ranges(scan("contract_non_dynamic_items").filter(inb), ["contract_id", "item_id"], ["type_id"])
-        _add(fl, "non_dynamic", f)
-        withid = items.filter(pl.col("item_id").is_not_null())
-        _add(fl, "items", {"item_id_dup": int(withid.select("contract_id", "item_id").is_duplicated().sum())})
-        dyn = dyn.rename({STAMP: "dynamic_http_last_modified", "first_snapshot": "dynamic_first_snapshot",
-                          "last_snapshot": "dynamic_last_snapshot"}).drop("n")
-        nd = nd.rename({"type_id": "_nd_type", "first_snapshot": "non_dynamic_first_snapshot",
-                        "last_snapshot": "non_dynamic_last_snapshot"}).drop("n")
-        for name, x in (("dynamic", dyn), ("non_dynamic", nd)):
-            _add(fl, name, {"unmatched": x.join(withid, on=["contract_id", "item_id"], how="anti").height})
-        items = (items.join(dyn, on=["contract_id", "item_id"], how="left")
-                 .join(nd, on=["contract_id", "item_id"], how="left"))
-        _add(fl, "non_dynamic", {"type_differs": items.filter(
-            pl.col("_nd_type").is_not_null() & (pl.col("_nd_type") != pl.col("type_id"))).height})
-        items = items.drop("_nd_type", "n").sort("contract_id", "record_id")
+        items = _merge_runs(scan("items").filter(inb), ITEM_KEY, ITEM_VALS).select(
+            *ITEM_KEY, "from_snapshot", "to_snapshot", *ITEM_VALS)
+        att = _merge_runs(scan("item_attributes").filter(inb), ATT_KEY, ATT_VALS).select(
+            *ATT_KEY, "from_snapshot", "to_snapshot", *ATT_VALS)
+        bids = _merge_runs(scan("bids").filter(inb), BID_KEY, BID_VALS).select(
+            *BID_KEY, "from_snapshot", "to_snapshot", *BID_VALS).sort("contract_id", "bid_id")
+        for name, df, key in (("items", items, ITEM_KEY), ("item_attributes", att, ATT_KEY),
+                              ("bids", bids, BID_KEY)):
+            _add(fl, name, _run_flags(df, key))
         items.write_parquet(out / "items" / part)
-        att, f = _merge_ranges(scan("item_attributes").filter(inb),
-                               ["contract_id", "item_id", "kind", "dogma_id"], ["value", "is_default"])
-        _add(fl, "item_attributes", f)
-        att = att.drop("n").sort("contract_id", "item_id", "kind", "dogma_id")
         att.write_parquet(out / "item_attributes" / part)
-        bids, f = _merge_ranges(scan("contract_bids").filter(inb), ["bid_id"], ["contract_id", "amount", "date_bid"])
-        _add(fl, "bids", f)
-        bids = bids.drop("n").sort("contract_id", "bid_id").select(
-            "bid_id", "contract_id", "amount", "date_bid", "first_snapshot", "last_snapshot")
         bids.write_parquet(out / "bids" / part)
         for t, df in (("contracts", con), ("contract_changes", sp), ("items", items),
                       ("item_attributes", att), ("bids", bids)):
@@ -593,46 +625,37 @@ def pass2(p1: Path, out: Path, days: list[str], nb: int, commit: str) -> dict:
 def rebuild(out: Path, sids: list[int]) -> dict[int, dict[str, pl.DataFrame]]:
     """Rebuild the raw tables of the given snapshots from the consolidated tables."""
     lo, hi = min(sids), max(sids)
+    ov = (pl.col("from_snapshot") <= hi) & (pl.col("to_snapshot") >= lo)
 
     def scan(t):
-        return pl.scan_parquet(str(out / t / "*.parquet"))
+        return pl.scan_parquet(str(out / t / "*.parquet")).filter(ov).collect()
 
     snaps = pl.read_parquet(out / "snapshots.parquet").filter(pl.col("snapshot_id").is_in(sids))
-    ch = scan("contract_changes").filter((pl.col("from_snapshot") <= hi) & (pl.col("to_snapshot") >= lo)).collect()
-    ids = ch["contract_id"].unique().implode()
-    con = scan("contracts").filter(pl.col("contract_id").is_in(ids)).collect()
-
-    def ov(f, l):
-        return (pl.col(f) <= hi) & (pl.col(l) >= lo) & pl.col("contract_id").is_in(ids)
-
-    items = scan("items").filter(ov("first_snapshot", "last_snapshot")
-                                 | ov("dynamic_first_snapshot", "dynamic_last_snapshot")
-                                 | ov("non_dynamic_first_snapshot", "non_dynamic_last_snapshot")).collect()
-    att = scan("item_attributes").filter(ov("first_snapshot", "last_snapshot")).collect()
-    bids = scan("bids").filter(ov("first_snapshot", "last_snapshot")).collect()
+    ch, items, att, bids = (scan(t) for t in ("contract_changes", "items", "item_attributes", "bids"))
+    con = pl.scan_parquet(str(out / "contracts" / "*.parquet")).filter(
+        pl.col("contract_id").is_in(ch["contract_id"].unique().implode())).collect()
     res = {}
     for row in snaps.iter_rows(named=True):
         s = row["snapshot_id"]
-
-        def inr(f, l):
-            return (pl.col(f) <= s) & (pl.col(l) >= s)
-
-        here = ch.filter(inr("from_snapshot", "to_snapshot"))
+        inr = (pl.col("from_snapshot") <= s) & (pl.col("to_snapshot") >= s)
+        here = ch.filter(inr)
         reg = pl.DataFrame(row["regions"], schema={"region_id": I32, STAMP: UTC, "contracts": I32})
         c = (here.select("contract_id", "terms_version", "date_expired", "universe_id",
                          pl.col(STAMP).alias("_o"))
              .join(con, on=["contract_id", "terms_version"], how="left")
              .join(reg.select("region_id", STAMP), on="region_id", how="left")
              .with_columns(pl.coalesce("_o", STAMP).alias(STAMP)))
-        cin = here.select("contract_id")
-        it = items.filter(inr("first_snapshot", "last_snapshot")).join(cin, on="contract_id")
-        dy = (items.filter(inr("dynamic_first_snapshot", "dynamic_last_snapshot")).join(cin, on="contract_id")
-              .drop(STAMP).rename({"dynamic_http_last_modified": STAMP}))
-        nd = items.filter(inr("non_dynamic_first_snapshot", "non_dynamic_last_snapshot")).join(cin, on="contract_id")
-        a = att.filter(inr("first_snapshot", "last_snapshot")).join(
-            dy.select("contract_id", "item_id", STAMP), on=["contract_id", "item_id"])
-        bd = bids.filter(inr("first_snapshot", "last_snapshot")).join(
-            here.select("contract_id", pl.col("bids_http_last_modified").alias(STAMP)), on="contract_id")
+        cs = here.select("contract_id", *[pl.col(x).alias("_c" + x) for x in CSTAMPS])
+        it = (items.filter(inr).join(cs, on="contract_id", how="left")
+              .with_columns(pl.coalesce(STAMP, "_citems_" + STAMP).alias(STAMP),
+                            pl.coalesce("dynamic_" + STAMP, "_cdynamic_" + STAMP).alias("_dst")))
+        dy = it.filter("dynamic").drop(STAMP).rename({"_dst": STAMP})
+        nd = it.filter("non_dynamic").with_columns(pl.col("non_dynamic_type_id").alias("type_id"))
+        a = (att.filter(inr).join(dy.select("contract_id", "item_id", pl.col(STAMP).alias("_d")),
+                                  on=["contract_id", "item_id"], how="left")
+             .with_columns(pl.coalesce(STAMP, "_d").alias(STAMP)))
+        bd = (bids.filter(inr).join(cs, on="contract_id", how="left")
+              .with_columns(pl.coalesce(STAMP, "_cbids_" + STAMP).alias(STAMP)))
         frames = {
             "contracts": c, "contract_items": it, "contract_bids": bd, "contract_dynamic_items": dy,
             "contract_dynamic_items_dogma_attributes": a.filter(pl.col("kind") == "attribute")
@@ -729,8 +752,8 @@ def main(argv=None) -> int:
     ap.add_argument("--buckets", type=int, default=32, help="contract_id buckets in pass 2")
     ap.add_argument("--every", type=int, default=1, help="check: every k-th snapshot id")
     ap.add_argument("--json", default=None, help="check: write the result here")
-    ap.add_argument("--stamp-ok-until", default="2021-07-05",
-                    help="check: stamp-only differences on or before this day pass (the refetch weeks)")
+    ap.add_argument("--stamp-ok-until", default="",
+                    help="check: stamp-only differences on or before this day pass (default: none)")
     a = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
     out, commit = Path(a.out), commit_id()
