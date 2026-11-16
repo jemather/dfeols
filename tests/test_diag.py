@@ -59,8 +59,13 @@ def test_runlog_writes_scheduler_profile_and_cache_counts(tmp_path, monkeypatch)
     ):
         rl = diag.RunLog(c, prog, "cg10", 3)
         t = time.time()
-        while time.time() - t < 2.5:  # keep the scheduler busy over a few one-second cycles
+        # keep the scheduler busy until its profile has samples (a loaded machine can need more
+        # than a few one-second cycles), then let the last cycle close
+        while time.time() - t < 2.5 or (
+            time.time() - t < 30 and not c.profile(scheduler=True, start=t).get("count")
+        ):
             c.gather(c.map(_inc, range(300), pure=False))
+        time.sleep(1.2)
         for i, hit in enumerate((True, False, True)):
             rl.task(i, {"total": 1.0, "read": 0.0 if hit else 0.5, "cache_hit": hit}, 0.01, 0.0)
         summ = rl.close()
