@@ -743,13 +743,22 @@ def _crossing_cg(
     if "affinity_prune" in run_params:  # a task that moved leaves a stale copy behind
         affinity["affinity_prune"] = iter_cache_keep
     # a step's task holds only its shard's own levels (worker.shard_matvec), not round 1's
-    # arrays over all of them; it shares the worker with the cache like round 1's
+    # arrays over all of them; it shares the worker with the cache like round 1's. Each task
+    # asks for its own shard's rows, the cache counted once: D6 r4 (36113346) asked 14.7 GB
+    # of a 24 GB worker for every task (the largest shard's 6.6M rows, and the cache scaling
+    # applied to round 1's already scaled estimate), so a worker ran one step task at a time
+    # and a CG step averaged 4-5 tasks running on 34 workers
     gb_round = prog.task_gb
+    gb_step = gb_round
+    gb_step_of = None
     if gb_round is not None and not level:
-        rmax = max(rows.values(), default=1)
-        gb_step = task_slot_gb(plan, max(gb_round - iterate_level_gb(plan, rmax), 0.5), executor)
-    else:
-        gb_step = gb_round
+        n_cols = len(ds.columns)
+
+        def gb_step_of(r, n_cols=n_cols):
+            need = estimate_worker_gb(plan, r, n_cols) - iterate_level_gb(plan, r)
+            return task_slot_gb(plan, max(need, 0.5), executor)
+
+        gb_step = gb_step_of(max(rows.values(), default=1))
 
     def matvec_pass(p):
         Ap = np.zeros((P, c))
@@ -765,7 +774,7 @@ def _crossing_cg(
         tasks = [(s["id"], rows[s["id"]], (plan, s["id"], ds.shard_paths(s), p)) for s in ds.shards]
         prog.add_stage(name, rows, before="round2")
         prog.start(name)
-        prog.task_gb = gb_step
+        prog.task_gb, prog.task_gb_of = gb_step, gb_step_of
         if "reduce" in inspect.signature(executor.run).parameters:
             # the shards' sums in a tree on the workers: one block reaches the coordinator
             red = Reduce(
@@ -778,7 +787,7 @@ def _crossing_cg(
             executor.run(shard_matvec, tasks, lambda tid, res: None, prog, name, reduce=red, **affinity)
         else:
             executor.run(shard_matvec, tasks, on, prog, name, **affinity)
-        prog.task_gb = gb_round
+        prog.task_gb, prog.task_gb_of = gb_round, None
         prog.finish(name, log=False)
         return Ap
 

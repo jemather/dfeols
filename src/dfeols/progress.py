@@ -132,6 +132,8 @@ class Progress:
         # GB each task asks of its worker (DaskExecutor runs as many at once as fit its memory);
         # None: a whole worker, one task at a time (prep, and stages without an estimate)
         self.task_gb: float | None = None
+        # GB a task of `rows` rows asks (DaskExecutor's MEMORY), when tasks differ: else task_gb
+        self.task_gb_of = None
         self.extra_eta: float | None = None  # seconds of work no stage holds yet (CG steps to come)
 
     # --- bookkeeping -----------------------------------------------------

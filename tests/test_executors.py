@@ -418,3 +418,37 @@ def test_iter_cache_keep_drops_other_owners_shards():
         c.run(wk.iter_cache_keep, "f", {0: a, 1: b}, workers=[a])
         assert sorted(wk._ITER_CACHE) == [("f", 0), ("f", 2), ("g", 0)]
         wk._ITER_CACHE.clear()
+
+
+def _rows_task(i):
+    return {"timing": {"total": 0.0}}
+
+
+def test_task_memory_follows_each_tasks_rows():
+    """progress.task_gb_of: each task asks the MEMORY its own rows need (plan C's CG steps:
+    D6 r4 job 36113346 asked the largest shard's 14.7 GB of a 24 GB worker for every task,
+    so workers ran one step task at a time)."""
+    distributed = pytest.importorskip("distributed")
+    mem = 10e9
+    with (
+        distributed.LocalCluster(n_workers=1, threads_per_worker=2, resources={"MEMORY": mem},
+                                 dashboard_address=None) as lc,
+        distributed.Client(lc) as c,
+    ):
+        ex = DaskExecutor(c, max_workers=1, tick=0.05, worker_memory=mem)
+        seen = {}
+
+        def record(dask_scheduler=None):
+            return {k: dict(ts.resource_restrictions or {}) for k, ts in dask_scheduler.tasks.items()}
+
+        prog = Progress(None, label="t", every=1e9)
+        prog.add_stage("s", {i: 1 for i in range(3)})
+        prog.start("s")
+        prog.task_gb, prog.task_gb_of = 8.0, lambda r: r / 1e6  # 1 GB a million rows
+
+        def on(tid, res):
+            seen.update(c.run_on_scheduler(record))
+
+        ex.run(_rows_task, [(0, 1_000_000, (0,)), (1, 2_000_000, (1,)), (2, 4_000_000, (2,))], on, prog, "s")
+        asked = {int(k.rsplit("-", 1)[1]): r["MEMORY"] for k, r in seen.items() if k.startswith("dfeols-s-")}
+        assert asked == {0: 1.25e9, 1: 2.5e9, 2: 5e9}

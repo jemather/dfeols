@@ -112,6 +112,18 @@ break the API).
   (4x). Each worker's pace is learnt from its tasks' times and kept across steps, so a slow
   node sheds its queue. Workers that join mid-step get tasks at once; a gone worker's queue
   goes back to the shared one.
+- Plan C CG steps asked far more worker memory than they use: every step task asked for the
+  largest shard's estimate, with the cache share applied twice (round 1's estimate was
+  already scaled for it), so D6 r4 (job 36113346) asked 14.7 GB of a 24 GB worker per task
+  and ran one step task per worker: 4-5 tasks running on 34 workers, 400-900 s a step for
+  ~2,000 task-seconds. Each step task now asks for its own shard's rows
+  (`Progress.task_gb_of`, which `DaskExecutor` uses per task), the cache counted once:
+  ~3.7 GB for a 1M-row D6 shard.
+- `np.unique` without `return_*` in NumPy 2.5 hashes, 30-50x slower than a sort on many
+  distinct integers (1M level codes: 0.69 s against 0.02 s). Shard level sets, present
+  levels and cluster codes and the CG step combines use `crossing.sorted_unique`: a D6 step
+  combine of 4 x 300k levels 0.77 -> 0.16 s (~970 combines a step). Combines switch to the
+  dense P-row sum when the parts hold half the levels (was a quarter), where it is faster.
 - Plan C without level space: round 1's per-level sums are summed in a tree on the workers
   (D11 L3 36016180: 27 min fetching ~98 MB results one at a time). With level space, once a
   combine finds the summed parts of A past the budget, the shards still to run build only

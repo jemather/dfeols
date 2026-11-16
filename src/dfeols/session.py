@@ -54,6 +54,7 @@ from typing import Any
 import numpy as np
 import polars as pl
 
+from .crossing import sorted_unique
 from .executors import SerialExecutor
 from .formula import Formula, fe_components, parse
 from .linalg import absorbed, collinear_keep, reference_ss, solve_spd
@@ -417,7 +418,7 @@ def demean_round1(
         "sumw": float(w.sum()),
         "converged": converged,
         "fe_levels": [int(c.max()) + 1 if len(c) else 0 for c in local_codes],
-        "global_present": [np.unique(df[c].to_numpy().astype(np.int64)) for _, c, _ in plan.global_fes],
+        "global_present": [sorted_unique(df[c].to_numpy().astype(np.int64)) for _, c, _ in plan.global_fes],
         "row_key": rowset(df, plan.raw_key) if plan.raw_key else None,  # type: ignore[attr-defined]
         "clusters": {},
         # the collinearity scale: each variable's sums before the FEs, and net of the local FEs
@@ -442,7 +443,7 @@ def demean_round1(
             np.maximum.at(hi, lc.astype(np.int64), codes)
             nested.append(bool((lo == hi).all()))
         gmm = [level_minmax(df[col].to_numpy().astype(np.int64), codes) for _, col, _ in plan.global_fes]
-        r["clusters"][c["name"]] = {"present": np.unique(codes), "local_nested": nested, "global_minmax": gmm}
+        r["clusters"][c["name"]] = {"present": sorted_unique(codes), "local_nested": nested, "global_minmax": gmm}
     names = list(plan.formula.depvars)
     if plan.global_fes:
         stage: dict[str, np.ndarray] = {"Y": Yt, "w": w, **{_cl_col(k): v for k, v in cls.items()}}

@@ -545,10 +545,18 @@ class DaskExecutor:
             pool.expect(n)
         part_futs: set = set()
         kw = {}
+        gb_of = getattr(progress, "task_gb_of", None) if self.worker_memory else None
         if self.worker_memory:
             gb = getattr(progress, "task_gb", None)
             need = self.worker_memory if gb is None else min(gb * 1e9 * self.MARGIN, self.worker_memory)
             kw["resources"] = {"MEMORY": int(need)}
+        trows = {tid: r for tid, r, _a in ordered}
+
+        def task_kw(tid):  # a task's own memory, when the estimate depends on its rows
+            if gb_of is None:
+                return kw
+            gb = gb_of(max(int(trows[tid] or 0), 1))
+            return {**kw, "resources": {"MEMORY": int(min(gb * 1e9 * self.MARGIN, self.worker_memory))}}
         run_fn = (lambda *a: (_on_worker, fn, *a)) if affinity else (lambda *a: (fn, *a))
 
         def arg(a, w):
@@ -570,7 +578,7 @@ class DaskExecutor:
             sargs = [arg(a, w) for a in args]
             f = self.client.submit(
                 *run_fn(*sargs), key=key, priority=n - pos[tid], retries=self.retries, pure=False,
-                **kw, **place,
+                **task_kw(tid), **place,
             )
             if reduce:  # on_result sees the result without its part; the part goes in the tree
                 hi = {"priority": n + 1, "pure": False}  # ahead of the shards still queued

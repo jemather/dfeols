@@ -170,8 +170,8 @@ def test_step_combine_sums_levels_like_the_coordinator():
     np.testing.assert_allclose(tree, dense, rtol=1e-13)
     assert cx.step_strip(parts[0]) == {"timing": {"total": 0.1}}
     assert cx.step_combine(None) is None
-    # with P: a union over a quarter of the levels or more is summed densely, same result
-    for P_ in (P, 10**6):
+    # with P: parts over half the levels or more are summed densely, same result
+    for P_ in (P, 2 * P, 10**6):
         lv2, S2 = cx.step_combine(
             cx.step_combine(*(cx.step_part(p) for p in parts[:3]), P=P_),
             cx.step_combine(*(cx.step_part(p) for p in parts[3:]), P=P_),

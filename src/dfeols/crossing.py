@@ -719,6 +719,21 @@ class Checkpoint:
 # ---------------------------------------------------------------- CG steps' tree reduction
 
 
+def sorted_unique(a) -> np.ndarray:
+    """np.unique(a) for integer codes, by sorting. NumPy 2.5's np.unique without return_*
+    hashes, and on many distinct values that is 30-50x slower than a sort: 1M level codes
+    0.69 s against 0.02 s, D6 r4's largest shard (6.6M) 4.2 s; with return_inverse it sorts
+    and stays fast. Called on every shard in every round and CG step."""
+    a = np.asarray(a).ravel()
+    if a.size == 0:
+        return a.copy()
+    s = np.sort(a)
+    keep = np.empty(s.size, bool)
+    keep[0] = True
+    np.not_equal(s[1:], s[:-1], out=keep[1:])
+    return s[keep]
+
+
 def step_part(res: dict) -> tuple[np.ndarray, np.ndarray]:
     """A CG step's shard result as (levels, sums): what the tree adds up."""
     return np.asarray(res["idx"]), res["S"]
@@ -731,11 +746,14 @@ def step_strip(res: dict) -> dict:
 
 def step_combine(*parts, P: int | None = None):
     """Sum shards' (levels, sums) on a worker: the union of the levels, sums added. Each
-    part's levels are sorted and distinct (np.unique in worker._iter_store, and here), so each
+    part's levels are sorted and distinct (sorted_unique in worker._iter_store, and here), so each
     adds into its rows of the union by position, without np.add.at (D6 r4: up to 4 x 12.1M
     levels x 7 near the root, where np.unique and np.add.at took most of the 30-100 s between
     a CG step's last shard and its sum). With `P` (all levels) a union that covers a large
-    share of them is summed in a dense P-row block instead of sorting."""
+    share of them (parts' levels adding to half of P or more; below that the sort is as fast,
+    1-4 x 1.5M levels: 0.7 s against 0.9 s) is summed in a dense P-row block instead of
+    sorting. The union is sorted_unique, not np.unique (0.73 of a 0.85 s combine of 4 x 300k
+    levels at D6's P)."""
     parts = [p for p in parts if p is not None]
     if not parts:
         return None
@@ -743,7 +761,7 @@ def step_combine(*parts, P: int | None = None):
         return parts[0]
     c = parts[0][1].shape[1]
     total = sum(len(p[0]) for p in parts)
-    if P is not None and total >= P // 4:
+    if P is not None and total >= P // 2:
         out = np.zeros((P, c))
         seen = np.zeros(P, bool)
         for idx, S in parts:
@@ -751,7 +769,7 @@ def step_combine(*parts, P: int | None = None):
             seen[idx] = True
         uniq = np.flatnonzero(seen)
         return uniq, out[uniq]
-    uniq = np.unique(np.concatenate([p[0] for p in parts]))
+    uniq = sorted_unique(np.concatenate([p[0] for p in parts]))
     out = np.zeros((len(uniq), c))
     for idx, S in parts:
         out[np.searchsorted(uniq, idx)] += S

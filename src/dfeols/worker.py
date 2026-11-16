@@ -43,7 +43,7 @@ from types import SimpleNamespace
 import numpy as np
 import polars as pl
 
-from .crossing import FAN_IN
+from .crossing import FAN_IN, sorted_unique
 from .demean import demean, densify, drop_singletons
 from .formula import Formula, Term
 from .rowhash import rowset
@@ -582,7 +582,7 @@ def _projected_dummy_gram(local_codes, w, Dm, max_block: int = 20_000):
     for c in range(ncomp):
         bl = order[starts[c] : starts[c + 1]]
         Fc = F[bl]
-        lv = np.unique(Fc.indices)
+        lv = sorted_unique(Fc.indices)
         if not len(lv):
             continue
         Fd = Fc[:, lv].toarray()
@@ -822,7 +822,7 @@ def _round1(plan: Plan, shard_id: int, files: list[str], write_cache: bool):
     df, n0, local_codes, w = _prepare(plan, shard_id, files, loaded)
     T["read"] = time.perf_counter() - t0
     n = df.height
-    gpresent = [np.unique(df[c].to_numpy().astype(np.int64)) for _, c, _ in plan.global_fes]
+    gpresent = [sorted_unique(df[c].to_numpy().astype(np.int64)) for _, c, _ in plan.global_fes]
 
     raw: dict = {}
     if plan.sparse_global:
@@ -958,7 +958,7 @@ def _cluster_stats(plan: Plan, df, local_codes, cl: np.ndarray):
         np.maximum.at(hi, codes.astype(np.int64), cl)
         nested.append(bool((lo == hi).all()))
     gmm = [level_minmax(df[c].to_numpy().astype(np.int64), cl) for _, c, _ in plan.global_fes]
-    return np.unique(cl), nested, gmm
+    return sorted_unique(cl), nested, gmm
 
 
 # Global-FE levels present in a shard, and each one's smallest and largest cluster, travel
@@ -1011,7 +1011,7 @@ def _iter_store(plan: Plan, shard_id: int, local_codes, Dm, w) -> tuple:
     (Dl, n x len(idx)), so a step's products are over those levels and not all P (D6 r4,
     12.1M location-days: each step built a dense P x 7 block, 0.68 GB, per task).
     Returns (entry, kept): kept is False when the cache was full (or there is no token)."""
-    idx = np.unique(Dm.indices)  # levels present in the shard
+    idx = sorted_unique(Dm.indices)  # levels present in the shard
     Dl = _local_columns(Dm, idx)
     nbytes = (
         sum(c.nbytes for c in local_codes)
