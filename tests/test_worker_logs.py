@@ -40,3 +40,36 @@ def test_explicit_log_directory_kept(monkeypatch, tmp_path):
     finally:
         cl.close()
     assert not (tmp_path / "logs").exists()
+
+
+def test_ib_interface_workers_listen_on_their_own_ib_address(monkeypatch, tmp_path):
+    """interface = "ib": each worker job finds its node's IPoIB address at start and listens
+    there (OSCER: dfeols' traffic went over eno1 Ethernet, ibp4s0 unused); a node without one
+    falls back to its primary address and says so."""
+    import subprocess
+
+    monkeypatch.setenv("DFEOLS_CONFIG", str(tmp_path / "none.toml"))
+    p = replace(dfeols.profile("local", scratch=str(tmp_path)), scheduler="slurm", interface="ib")
+    cl = make_cluster(p)
+    try:
+        script = cl.job_script()
+    finally:
+        cl.close()
+    assert "--host $DFEOLS_WORKER_HOST" in script, script
+    from dfeols.cluster import IB_HOST_LINES
+
+    body = "\n".join(IB_HOST_LINES) + '\necho "HOST=$DFEOLS_WORKER_HOST"\n'
+    assert all(line in script for line in IB_HOST_LINES)
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    (fake / "ip").write_text(
+        "#!/bin/sh\necho 'lo UNKNOWN 127.0.0.1/8'\necho 'ibp4s0 UP 10.251.87.90/22'\n"
+        "echo 'eno1 UP 10.251.83.90/22'\n"
+    )
+    (fake / "ip").chmod(0o755)
+    env = {"PATH": f"{fake}:/usr/bin:/bin"}
+    out = subprocess.run(["bash", "-c", body], capture_output=True, text=True, env=env)
+    assert out.returncode == 0 and "HOST=10.251.87.90" in out.stdout, out
+    (fake / "ip").write_text("#!/bin/sh\necho 'eno1 UP 10.251.83.90/22'\n")
+    out = subprocess.run(["bash", "-c", body], capture_output=True, text=True, env=env)
+    assert out.returncode == 0 and "HOST=" in out.stdout and "no InfiniBand address" in out.stderr, out

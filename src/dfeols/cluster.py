@@ -16,6 +16,11 @@ Site-specific workarounds live here, not in user code:
     sites) -> cleared before submitting worker jobs.
   * All: the coordinator listens on a private (cluster-internal) interface,
     since a campus/public address is often unreachable from compute nodes.
+  * interface = "ib": the coordinator and every worker use their own node's InfiniBand
+    (IPoIB) address. OSCER's nodes default to Ethernet (eno1) and dfeols' traffic went over
+    it: D6 r4's CG steps copied a 0.76 GB block to every worker and summed parts of that
+    size, and waited 50-110 s a step before any task ran. IB names differ by node type
+    (ibp4s0, ib0), so each job finds its own at start.
 """
 
 from __future__ import annotations
@@ -96,6 +101,30 @@ def private_interface() -> str | None:
                 continue
             best.append((0 if a.address.startswith("10.") else 1, name, a.address))
     return sorted(best)[0][1] if best else None
+
+
+def ib_interface() -> str | None:
+    """The first InfiniBand (IPoIB) interface that is up and has an IPv4 address: a name
+    starting with "ib" (ib0, ibp4s0, ...)."""
+    import psutil
+
+    stats = psutil.net_if_stats()
+    for name in sorted(psutil.net_if_addrs()):
+        st = stats.get(name)
+        if name.startswith("ib") and (st is None or st.isup) and _interface_ips(name):
+            return name
+    return None
+
+
+# worker job prologue for interface = "ib": the node's own IPoIB address, else its primary
+# address (said in the worker's log); the worker listens there (--host)
+IB_HOST_LINES = [
+    "DFEOLS_WORKER_HOST=$(ip -br -4 addr 2>/dev/null | awk '$1 ~ /^ib/ && $2 == \"UP\" "
+    "{ sub(\"/.*\", \"\", $3); print $3; exit }')",
+    'if [ -z "$DFEOLS_WORKER_HOST" ]; then DFEOLS_WORKER_HOST=$(hostname -I | awk \'{print $1}\'); '
+    'echo "dfeols: no InfiniBand address on $(hostname); worker listens on $DFEOLS_WORKER_HOST" >&2; fi',
+    "export DFEOLS_WORKER_HOST",
+]
 
 
 def _interface_ips(name: str) -> list[str]:
@@ -214,8 +243,16 @@ def make_cluster(p: Profile, log_directory: str | None = None):
 
     fix_scheduler_env(p.scheduler)
     kw = _job_kwargs(p, w["cores"], w["memory"], w["walltime"], worker=True)
+    ib = p.interface == "ib"
     if p.interface:
-        name = private_interface() if p.interface == "auto" else p.interface
+        if ib:
+            name = ib_interface()
+            if name is None:
+                name = private_interface()
+                log.warning("cluster: interface = \"ib\" but this node has no InfiniBand address; "
+                            "the coordinator listens on %s, and workers on IB may not reach it", name)
+        else:
+            name = private_interface() if p.interface == "auto" else p.interface
         if name:
             log.info("cluster: coordinator listens on %s (%s)", name, ", ".join(_interface_ips(name)))
             kw["scheduler_options"] = {"interface": name}
@@ -230,8 +267,11 @@ def make_cluster(p: Profile, log_directory: str | None = None):
     cl = cls(
         job_name="dfeols-worker",
         local_directory=w.get("local_directory") or "${TMPDIR:-/tmp}",
-        job_script_prologue=list(p.prologue) + _env_lines(p, w["cores"], w["memory"], worker=True),
-        worker_extra_args=[
+        job_script_prologue=list(p.prologue)
+        + _env_lines(p, w["cores"], w["memory"], worker=True)
+        + (IB_HOST_LINES if ib else []),
+        worker_extra_args=(["--host", "$DFEOLS_WORKER_HOST"] if ib else [])
+        + [
             "--lifetime",
             f"{life}s",
             "--lifetime-stagger",

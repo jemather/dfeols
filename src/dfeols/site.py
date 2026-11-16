@@ -14,7 +14,8 @@ system (or one way of using it). `dfeols config init` writes a template.
     account = ""                   # optional
     scratch = "/scratch/$USER/dfeols"
     prologue = ["module load Python/3.12", "source $HOME/envs/dfeols/bin/activate"]
-    interface = "auto"             # coordinator network interface ("auto" = private/internal)
+    interface = "auto"             # coordinator network interface ("auto" = private/internal;
+                                   # "ib" = every job's InfiniBand address, coordinator and workers)
     extra_directives = []          # e.g. ["--qos=long"] (Slurm) or ["-l place=scatter"] (PBS)
     record_level = 5               # estimation records' disclosure level, 1-5 (default 4);
                                    # 5 keeps the scheduler, timing, hosts and every package
@@ -108,7 +109,9 @@ prologue = [
   "module load python",
   "source $HOME/envs/dfeols/bin/activate",
 ]
-interface = "auto"             # coordinator NIC; "auto" picks a private (internal) address
+interface = "auto"             # coordinator NIC; "auto" picks a private (internal) address;
+                               # "ib": coordinator and workers each use their node's InfiniBand
+                               # (IPoIB) address, for clusters whose default NIC is slow Ethernet
 extra_directives = []          # raw scheduler directives, e.g. ["--qos=long"]
 # disclosure level of estimation records, 1-5 (default 4: no scheduler, timing, hosts or
 # package list); 5 keeps them, for diagnosing runs on this system
