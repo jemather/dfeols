@@ -103,6 +103,15 @@ break the API).
   are fetched by 16 threads (`DFEOLS_FETCH_THREADS`) instead of one at a time: one fetch
   from a busy worker held up the rest (cg5: 148 s, with 1,078 results waiting), and
   fetching took 300-700 s of each 500-900 s pass.
+- Plan C CG steps (with the placement above, D11 L3 job 36113341, cg836): a placement fixed
+  at the start of a step still left six workers with 18-29 tasks queued at 100 s of a
+  ~190 s step while the other 17 ran nothing. Step tasks are now handed out as workers free
+  up: each worker holds at most 2x its threads submitted (`DFEOLS_QUEUE_DEPTH`), takes its
+  own cached shards first, then unowned ones, then the tail of the worker that would finish
+  last, when that worker would finish it later than this one reading the shard again
+  (4x). Each worker's pace is learnt from its tasks' times and kept across steps, so a slow
+  node sheds its queue. Workers that join mid-step get tasks at once; a gone worker's queue
+  goes back to the shared one.
 - Plan C without level space: round 1's per-level sums are summed in a tree on the workers
   (D11 L3 36016180: 27 min fetching ~98 MB results one at a time). With level space, once a
   combine finds the summed parts of A past the budget, the shards still to run build only

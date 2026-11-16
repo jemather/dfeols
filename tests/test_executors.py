@@ -2,7 +2,7 @@
 
 import pytest
 
-from dfeols.executors import DaskExecutor, Reduce, SerialExecutor, _order, _place
+from dfeols.executors import MISS_COST, DaskExecutor, Reduce, SerialExecutor, _Feeder
 from dfeols.progress import Progress
 
 
@@ -267,36 +267,105 @@ def test_affinity_sends_tasks_back_to_their_worker():
                    prog, f"s{k}", affinity="fit1")
             runs.append(got)
         assert all("_worker" not in r for r in runs[1].values())  # the note is the executor's
-        first = {t: r["w"] for t, r in runs[0].items()}
-        # back to their worker, but only up to an even split (_place): round 0 left to Dask
-        want = _place(_order([(i, 1, ()) for i in range(n)]), first, ex._threads())
-        assert {t: r["w"] for t, r in runs[1].items()} == want
-        again = _place(_order([(i, 1, ()) for i in range(n)]), want, ex._threads())
-        assert {t: r["w"] for t, r in runs[2].items()} == again
+        # each task goes back to its worker unless another would finish it sooner (_Feeder):
+        # with equal workers, nearly all
+        for prev, cur in ((runs[0], runs[1]), (runs[1], runs[2])):
+            back = sum(cur[t]["w"] == prev[t]["w"] for t in cur)
+            assert back >= 0.75 * n, (back, n)
         assert all(r["s"] == 5_000_000.0 for r in runs[2].values())
-        assert ex._affinity["fit1"] == again
+        assert ex._affinity["fit1"] == {t: r["w"] for t, r in runs[2].items()}
         root = c.submit(lambda: big, pure=False)
         copies = ex._spread(root, "k", 10)
         assert sorted(copies) == sorted(c.scheduler_info()["workers"])
         assert all(f.result().sum() == 5_000_000.0 for f in copies.values())
 
 
-def test_place_keeps_owners_up_to_an_even_split():
-    """_place: tasks stay with their owner while it would finish them no later than another
-    worker reading the shard again (MISS_COST); tasks with no live owner spread evenly (D11 L3
-    job 36097608: one worker had 51-68 tasks queued while most sat idle)."""
-    tasks = [(i, 10, ()) for i in range(40)]
+def _simulate(feeder, speed=None, hit=1.0, miss=MISS_COST, joins=None):
+    """Run a _Feeder against simulated workers: each thread runs a task in rows x (hit if it
+    ran on the task's owner, else miss) / speed seconds. {tid: worker}, makespan."""
+    import heapq
+
+    speed = speed or {}
+    joins = dict(joins or {})  # time -> {worker: threads}
+    free = {w: t for w, t in feeder.threads.items()}
+    queued = {w: [] for w in feeder.threads}
+    events, ran, now, seq = [], {}, 0.0, 0
+
+    def start(w):
+        nonlocal seq
+        while free[w] and queued[w]:
+            t = queued[w].pop(0)
+            cost = feeder.rows[t] * (hit if feeder.where.get(t) == w else miss) / speed.get(w, 1.0)
+            free[w] -= 1
+            seq += 1
+            heapq.heappush(events, (now + cost, seq, t, w))
+
+    def submit():
+        for t, w in feeder.fill():
+            assert t not in ran
+            ran[t] = w
+            queued[w].append(t)
+        for w in queued:
+            start(w)
+
+    submit()
+    while events or len(feeder):
+        if joins and (not events or min(joins) <= events[0][0]):
+            now = min(joins)
+            new = joins.pop(now)
+            feeder.workers({**feeder.threads, **new})
+            for w, k in new.items():
+                free[w], queued[w] = k, []
+            submit()
+            continue
+        now, _s, t, w = heapq.heappop(events)
+        free[w] += 1
+        feeder.done(w, t)
+        feeder.observe(t, feeder.rows[t] * (hit if feeder.where.get(t) == w else miss) / speed.get(w, 1.0))
+        submit()
+    return ran, now
+
+
+def test_feeder_keeps_owners_until_another_worker_would_be_sooner():
+    """_Feeder: a task runs on its owner unless that owner's queue is longer than reading the
+    shard again elsewhere (MISS_COST); unowned tasks go to whoever is free. D11 L3 job
+    36113341 (cg836): with a fixed placement six workers held 18-29 tasks at 100 s while 17
+    ran nothing."""
     threads = {"a": 4, "b": 4, "c": 4, "d": 4}
-    where = {i: "a" for i in range(40)}  # everything cached on a
-    got = _place(tasks, where, threads)
-    count = {w: sum(v == w for v in got.values()) for w in threads}
-    # a: 10 a task, others 40: a takes ~23 (10 x 23 = 40 x 17 / 3), the rest share 17
-    assert 21 <= count["a"] <= 24 and all(5 <= count[w] <= 7 for w in "bcd")
+    tasks = [(i, 10, ()) for i in range(40)]  # a hit 10 s, a miss 40 s
     even = {i: "abcd"[i % 4] for i in range(40)}
-    assert _place(tasks, even, threads) == even  # balanced already: nothing moves
-    gone = {i: "zz" for i in range(40)}  # owner not connected: spread evenly
-    assert {sum(v == w for v in _place(tasks, gone, threads).values()) for w in threads} == {10}
-    assert _place(tasks, where, {}) == {}
+    ran, span = _simulate(_Feeder(tasks, even, threads))
+    assert ran == even and span == 30.0  # balanced already: nothing moves
+    # everything cached on a: a keeps 28 (70 s), the others take one 40 s miss a thread
+    ran, span = _simulate(_Feeder(tasks, {i: "a" for i in range(40)}, threads))
+    assert sorted(ran) == list(range(40)) and sum(w == "a" for w in ran.values()) == 28
+    assert span == 70.0  # a alone: 100 s
+    # no owner: spread over everyone, 10 misses each, 3 rounds
+    ran, span = _simulate(_Feeder(tasks, {}, threads))
+    assert span == 120.0
+    # a slow owner sheds its tail once its pace is known; the pace carries to the next run
+    tasks = [(i, 10, ()) for i in range(160)]
+    even = {i: "abcd"[i % 4] for i in range(160)}
+    rates: dict = {}
+    ran, span = _simulate(_Feeder(tasks, even, threads, rates=rates), speed={"b": 0.25})
+    assert span <= 200.0 and sum(w == "b" for w in ran.values()) < 25  # placed up front: 400 s
+    assert rates["b"] == pytest.approx(0.25) and rates["a"] == pytest.approx(1.0)
+    ran, span = _simulate(_Feeder(tasks, even, threads, rates=rates), speed={"b": 0.25})
+    assert span <= 200.0
+
+
+def test_feeder_follows_workers_that_leave_and_join():
+    """A gone worker's queue goes back to the shared one, a new worker takes tasks at once."""
+    tasks = [(i, 10, ()) for i in range(24)]
+    f = _Feeder(tasks, {i: "abc"[i % 3] for i in range(24)}, {"a": 1, "b": 1, "c": 1}, depth=1)
+    first = dict(f.fill())
+    assert first == {0: "a", 1: "b", 2: "c"}
+    f.workers({"a": 1, "b": 1})  # c left: its 7 queued tasks are anyone's
+    assert len(f.rest) == 7 and "c" not in f.own
+    f.workers({"a": 1, "b": 1, "z": 2})
+    assert sorted(w for _t, w in f.fill()) == ["z", "z"]
+    ran, _span = _simulate(_Feeder(tasks, {}, {"a": 1}), joins={25.0: {"b": 1}})
+    assert sorted(ran) == list(range(24)) and 8 <= sum(w == "b" for w in ran.values()) <= 12
 
 
 def _kept(i, keep):

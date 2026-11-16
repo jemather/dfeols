@@ -25,6 +25,7 @@ import logging
 import os
 import time
 import uuid
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -92,10 +93,16 @@ class _Pool:
         self.running: set = set()  # part and combine futures not finished yet
         self.parts_left = 0
         self.combines = 0
+        self._counted = True  # add() counts the parts, unless expect() gave the total
+
+    def expect(self, n: int) -> None:
+        """All n parts counted before they are submitted: with tasks submitted as workers
+        free up (_Feeder), the parts so far could all arrive mid-run and look like the last."""
+        self.parts_left, self._counted = n, False
 
     def add(self, part) -> None:
         self.running.add(part)
-        self.parts_left += 1
+        self.parts_left += self._counted
 
     def arrived(self, f, is_part: bool) -> None:
         self.running.discard(f)
@@ -162,35 +169,141 @@ def _order(tasks):
     return [small] + s
 
 
-# _place: a task whose shard is not cached where it goes reads it again (D6 r4: 4-5 s
+# _Feeder: a task whose shard is not cached where it goes reads it again (D6 r4: 4-5 s
 # against ~0.7 s from the cache), so it counts this many times its rows
 MISS_COST = 4.0
 
 
-def _place(tasks, where: dict, nthreads: dict) -> dict:
-    """{task id: worker} for a run with affinity: largest first, each task to the worker where
-    it would finish first, counting its rows once on the worker that holds its shard (where)
-    and MISS_COST times elsewhere, per thread. So tasks stay with their shard while that
-    worker is no busier than the others would be reading it again. Dask keeps a loose
-    restriction (workers=[w], allow_other_workers=True) on w while w exists, however busy,
-    and work stealing will not move a task whose input is that worker's copy of the CG
-    block, so the balance has to be made here: in D11 L3 (job 36097608) one worker had 51-68
-    tasks queued while 27-29 of ~34 sat idle. tasks: (tid, rows, args) in run order."""
-    if not nthreads:
-        return {}
-    load = dict.fromkeys(nthreads, 0.0)
-    out: dict = {}
-    for tid, r, _a in sorted(tasks, key=lambda t: -int(t[1] or 0)):
-        r = max(int(r or 0), 1)
-        own = where.get(tid)
+class _Feeder:
+    """Hands out a run's tasks (with affinity) to workers as they free up, instead of placing
+    them all at the start. Dask keeps a loose restriction (workers=[w],
+    allow_other_workers=True) on w while w exists, however busy, and work stealing will not
+    move a task whose input is that worker's copy of the CG block, so a placement made up
+    front stays: with any fixed one, D11 L3 (job 36113341, cg836) had six workers with 18-29
+    tasks queued at 100 s of a ~190 s step while the other 17 ran nothing.
 
-        def finish(w, r=r, own=own):
-            return (load[w] + r * (1.0 if w == own else MISS_COST)) / nthreads[w], w != own
+    Each worker has its own queue (the tasks whose shard it holds, `where`, in run order) and
+    holds at most `depth` x its threads tasks submitted. A worker with room takes from its
+    own queue, else from the shared one (no live owner), else the last task of the worker
+    whose queue would take longest, when that worker would finish it later than this one,
+    reading the shard again (MISS_COST), would. Work is counted in rows, a hit 1 and a miss
+    MISS_COST a row, per thread, at each worker's own pace (`rates`: work a second a thread,
+    learnt from the tasks' times, observe(); kept by the executor across runs, since a slow
+    node stays slow: the tail of cg836 was on five hosts). tasks: (tid, rows, args) in run
+    order."""
 
-        w = min(nthreads, key=finish)
-        out[tid] = w
-        load[w] += r * (1.0 if w == own else MISS_COST)
-    return out
+    def __init__(self, tasks, where: dict, threads: dict, depth: float = 2.0, rates: dict | None = None):
+        self.rows = {tid: max(int(r or 0), 1) for tid, r, _a in tasks}
+        self.pos = {tid: i for i, (tid, _r, _a) in enumerate(tasks)}
+        self.where = where
+        self.depth = depth
+        self.threads: dict = {}
+        self.inflight: dict = {}
+        self.work: dict = {}  # worker -> work in flight (rows x hit or miss cost)
+        self.cost: dict = {}  # task in flight -> its work there
+        self.ran: dict = {}  # task finished, its time not seen yet -> (worker, work)
+        self.rates = {} if rates is None else rates
+        self.own: dict = {}
+        self.qrows: dict = {}
+        self.rest: deque = deque()
+        for tid, _r, _a in tasks:
+            self.rest.append(tid)
+        self.workers(threads)
+
+    def __len__(self):
+        return len(self.rest) + sum(len(q) for q in self.own.values())
+
+    def workers(self, threads: dict) -> None:
+        """Follow the connected workers: a new one starts empty; a gone one's queue goes
+        back to the shared queue (in run order), and its tasks in flight are Dask's."""
+        back, changed = [], False
+        for w in [w for w in self.own if w not in threads]:
+            back += self.own.pop(w)
+            del self.qrows[w], self.threads[w], self.inflight[w], self.work[w]
+            changed = True
+        for w, t in threads.items():
+            if w not in self.own:
+                self.own[w], self.qrows[w], self.inflight[w], self.work[w] = deque(), 0, 0, 0.0
+                changed = True
+            self.threads[w] = max(int(t or 1), 1)
+        if changed:
+            keep = []
+            for t in list(self.rest) + back:
+                w = self.where.get(t)
+                if w in self.own:
+                    self.own[w].append(t)
+                    self.qrows[w] += self.rows[t]
+                else:
+                    keep.append(t)
+            self.rest = deque(sorted(keep, key=self.pos.__getitem__))
+            for w, q in self.own.items():
+                self.own[w] = deque(sorted(q, key=self.pos.__getitem__))
+
+    def _take(self, w):
+        if self.own[w]:
+            t = self.own[w].popleft()
+            self.qrows[w] -= self.rows[t]
+            return t
+        if self.rest:
+            return self.rest.popleft()
+        busy = [v for v in self.own if v != w and self.own[v]]
+        if not busy:
+            return None
+        def left(v):  # seconds until v is through its work, queue and in flight
+            return (self.work[v] + self.qrows[v]) / self.threads[v] / self.rate(v)
+
+        v = max(busy, key=left)
+        t = self.own[v][-1]
+        if left(v) <= (self.work[w] / self.threads[w] + MISS_COST * self.rows[t]) / self.rate(w):
+            return None  # its owner finishes it sooner than w would, reading the shard
+        self.own[v].pop()
+        self.qrows[v] -= self.rows[t]
+        return t
+
+    def fill(self) -> list:
+        """[(tid, worker)] to submit now: every worker topped up to depth x threads, a task
+        at a time in turn, so no worker takes the whole shared queue."""
+        out = []
+        room = {w: int(self.depth * self.threads[w]) - self.inflight[w] for w in self.own}
+        while True:
+            moved = False
+            for w in sorted(room, key=lambda w: -room[w]):
+                if room[w] <= 0:
+                    continue
+                t = self._take(w)
+                if t is None:
+                    room[w] = 0
+                    continue
+                out.append((t, w))
+                room[w] -= 1
+                self.inflight[w] += 1
+                self.cost[t] = self.rows[t] * (1.0 if self.where.get(t) == w else MISS_COST)
+                self.work[w] += self.cost[t]
+                moved = True
+            if not moved:
+                return out
+
+    def rate(self, w) -> float:
+        """w's work a second a thread; a worker not timed yet counts as the median one."""
+        if w in self.rates:
+            return self.rates[w]
+        known = sorted(self.rates.values())
+        return known[len(known) // 2] if known else 1.0
+
+    def done(self, w, tid) -> None:
+        c = self.cost.pop(tid, 0.0)
+        self.ran[tid] = (w, c)
+        if w in self.inflight:
+            self.inflight[w] -= 1
+            self.work[w] = max(self.work[w] - c, 0.0)
+
+    def observe(self, tid, seconds) -> None:
+        """A finished task's own time (its result's timing): w's pace, a moving average."""
+        w, c = self.ran.pop(tid, (None, 0.0))
+        if w is None or not c or not seconds or seconds <= 0:
+            return
+        r = c / seconds
+        self.rates[w] = r if w not in self.rates else 0.7 * self.rates[w] + 0.3 * r
 
 
 class SerialExecutor:
@@ -258,11 +371,16 @@ class DaskExecutor:
         self.spread_min_bytes = 32 << 20  # ... and this large copied to every worker in a tree
         self.spread_fan_out = 4
         self._affinity: dict[str, dict] = {}  # affinity key -> {task id: worker address}
+        self._rates: dict = {}  # worker address -> its pace (_Feeder), across runs
         # finished results fetched at once, each its own round trip to the worker that holds
         # it: one at a time, a fetch from a busy worker held up the rest (D6 r4 job 36097628,
         # cg5: one fetch blocked 148 s while 1,078 results waited; fetching was 300-700 s
         # of each 500-900 s pass)
         self.fetch_threads = int(os.environ.get("DFEOLS_FETCH_THREADS", "16"))
+        # tasks with affinity held submitted per worker thread (_Feeder): enough that a worker
+        # never waits on the coordinator for its next task, few enough that the rest stay
+        # free to go to whichever worker frees up first
+        self.queue_depth = float(os.environ.get("DFEOLS_QUEUE_DEPTH", "2"))
 
     def slots(self):
         try:
@@ -396,8 +514,10 @@ class DaskExecutor:
         reading the shard again was 4-5 s of each ~5 s task). A result's "cached" (False: the
         worker did not keep the state, its cache was full) keeps the map from following a
         task to a worker without it. affinity_prune(affinity, {task id: worker}) runs on
-        every worker after a run in which a task moved to another worker (_place, or Dask
-        stealing), so the old worker drops its stale copy (worker.iter_cache_keep)."""
+        every worker after a run in which a task moved to another worker (_Feeder, or Dask
+        stealing), so the old worker drops its stale copy (worker.iter_cache_keep). With
+        affinity and connected workers, tasks are submitted as workers free up (_Feeder),
+        at most queue_depth x a worker's threads at a time."""
         import queue
         from concurrent.futures import ThreadPoolExecutor
 
@@ -408,12 +528,12 @@ class DaskExecutor:
         n = len(ordered)
         run_id = uuid.uuid4().hex[:8]  # task keys must never repeat across runs (e.g. two preps)
         where = self._affinity.setdefault(affinity, {}) if affinity else {}
-        # every task placed (and given its worker's copy of the shared block) once the map
-        # has entries: a task left to Dask took the single root copy, so each miss fetched
-        # the block from one worker again (36097628: ~2.5 min at the start of each pass)
-        threads = self._threads() if where else {}
-        placed = _place(ordered, where, threads) if threads else {}
-        shared = self._scatter_shared(ordered, run_id, spread=bool(placed), workers=sorted(threads))
+        # every task given to a worker by the coordinator (and its worker's copy of the shared
+        # block): a task left to Dask took the single root copy, so each miss fetched the
+        # block from one worker again (36097628: ~2.5 min at the start of each pass)
+        threads = self._threads() if affinity else {}
+        feeder = _Feeder(ordered, where, threads, self.queue_depth, self._rates) if threads else None
+        shared = self._scatter_shared(ordered, run_id, spread=feeder is not None, workers=sorted(threads))
         # finished futures arrive here from their done callbacks (run off the event loop), once
         # each: distributed.wait(FIRST_COMPLETED) over every pending future, called again after
         # each completion, leaves a waiter task per future on the loop it shares with the
@@ -421,6 +541,8 @@ class DaskExecutor:
         # 36016180, 5 s a median mid-step, measured by the D11 chat)
         doneq: queue.Queue = queue.Queue()
         pool = self._pool(reduce, stage, run_id, n + 2, doneq.put) if reduce else None
+        if pool is not None:
+            pool.expect(n)
         part_futs: set = set()
         kw = {}
         if self.worker_memory:
@@ -435,13 +557,20 @@ class DaskExecutor:
             root, copies = shared[id(a)]
             return copies.get(w, root)
 
-        for i, (tid, _rows, args) in enumerate(ordered):
+        targs = {tid: args for tid, _rows, args in ordered}
+        pos = {tid: i for i, (tid, _r, _a) in enumerate(ordered)}
+        fworker: dict = {}  # future -> the worker the feeder gave it to
+        key_to_tid: dict = {}
+        pending: set = set()
+
+        def submit(tid, w=None):
+            args = targs[tid]
             key = f"dfeols-{stage}-{progress.label}-{run_id}-{tid}"
-            w = placed.get(tid)
             place = {"workers": [w], "allow_other_workers": True} if w else {}
             sargs = [arg(a, w) for a in args]
             f = self.client.submit(
-                *run_fn(*sargs), key=key, priority=n - i, retries=self.retries, pure=False, **kw, **place
+                *run_fn(*sargs), key=key, priority=n - pos[tid], retries=self.retries, pure=False,
+                **kw, **place,
             )
             if reduce:  # on_result sees the result without its part; the part goes in the tree
                 hi = {"priority": n + 1, "pure": False}  # ahead of the shards still queued
@@ -453,8 +582,18 @@ class DaskExecutor:
             f.add_done_callback(doneq.put)
             futs[f] = tid
             fargs[f] = args
-        order = list(futs)  # submission order = priority order
-        pending = set(futs)
+            key_to_tid[f.key] = tid
+            pending.add(f)
+            if w:
+                fworker[f] = w
+
+        if feeder is None:
+            for tid, _rows, _args in ordered:
+                submit(tid)
+        else:
+            for tid, w in feeder.fill():
+                submit(tid, w)
+        order = list(futs)  # submission order = priority order (local_help: no feeder)
         from .diag import RunLog
 
         diag = RunLog(self.client, progress, stage, n)
@@ -462,7 +601,6 @@ class DaskExecutor:
         def backlog():  # results finished on the workers that the coordinator has not taken
             return sum(1 for f in list(pending) if f.status == "finished")
 
-        key_to_tid = {f.key: futs[f] for f in futs}
         fetcher = ThreadPoolExecutor(max(1, self.fetch_threads), thread_name_prefix="dfeols-fetch")
 
         def fetch_one(f, tid):  # in a fetch thread; the result comes back through doneq
@@ -476,8 +614,8 @@ class DaskExecutor:
         last_task = None
         t_status = float("-inf")
         try:
-            while pending or (pool and not pool.finished()):
-                if local_help and self.slots()[0] == 0:
+            while pending or (feeder is not None and len(feeder)) or (pool and not pool.finished()):
+                if local_help and feeder is None and self.slots()[0] == 0:
                     running = self._running_keys()
                     cand = [
                         f
@@ -522,7 +660,12 @@ class DaskExecutor:
                     if f.status == "error":
                         exc = f.exception()
                         raise RuntimeError(f"shard {tid} failed in {stage}: {exc!r}") from exc
+                    if f in fworker:  # its worker has room again
+                        feeder.done(fworker.pop(f), tid)
                     fetcher.submit(fetch_one, f, tid)
+                if feeder is not None and done:
+                    for tid, w in feeder.fill():
+                        submit(tid, w)
                 for f, tid, res, fetch_s, err in fetched:
                     if err is not None:
                         raise err
@@ -536,6 +679,8 @@ class DaskExecutor:
                             where[tid] = w
                         elif where.get(tid) == w:  # its worker no longer has it
                             where.pop(tid, None)
+                    if feeder is not None:
+                        feeder.observe(tid, (res.get("timing") or {}).get("total"))
                     t_on = time.perf_counter()
                     on_result(tid, res)
                     t_end = time.perf_counter()
@@ -548,7 +693,14 @@ class DaskExecutor:
                         last_task = time.perf_counter()
                 if time.monotonic() - t_status >= self.tick_s:  # scheduler queries: once a tick
                     t_status = time.monotonic()
-                    s, mx = self.slots()
+                    if feeder is not None:  # workers that joined or left
+                        live = self._threads()
+                        feeder.workers(live)
+                        for tid, w in feeder.fill():
+                            submit(tid, w)
+                        s, mx = len(live), self.max_workers
+                    else:
+                        s, mx = self.slots()
                     progress.set_slots(s, mx)
                     progress.running[stage] = {key_to_tid[k] for k in self._running_keys() if k in key_to_tid}
                 progress.tick()
