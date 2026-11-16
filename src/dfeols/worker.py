@@ -75,6 +75,28 @@ def iter_cache_drop(token: str, sid: int | None = None) -> None:
                 del _ITER_CACHE[k]
 
 
+def iter_cache_keep(token: str, owners: dict, dask_worker=None) -> int:
+    """Drop this worker's cached state for fit `token` on shards whose affinity owner
+    (owners: shard id -> worker address, DaskExecutor's map) is another worker: a task that
+    ran away from its owner cached its shard there too, and the stale copy took budget that
+    the shards still to be cached needed (D11 L3 job 36097608: hits fell from 554 of 1,443 to
+    44-65 within 30 steps). Run by Client.run, which passes dask_worker. Returns the number
+    dropped."""
+    if dask_worker is None:
+        try:
+            from distributed import get_worker
+
+            dask_worker = get_worker()
+        except Exception:
+            return 0
+    me = dask_worker.address
+    with _ITER_LOCK:
+        gone = [k for k in _ITER_CACHE if k[0] == token and owners.get(k[1], me) != me]
+        for k in gone:
+            del _ITER_CACHE[k]
+    return len(gone)
+
+
 def _iter_cache_bytes(plan) -> float:
     env = os.environ.get("DFEOLS_ITER_CACHE_GB")
     if env:
@@ -833,7 +855,8 @@ def _round1(plan: Plan, shard_id: int, files: list[str], write_cache: bool):
     }
     if aux is not None:
         out["crossing"] = aux
-        _iter_store(plan, shard_id, extra[0], extra[1], w)
+        # whether this worker kept the state: DaskExecutor.run's affinity map follows it
+        out["cached"] = _iter_store(plan, shard_id, extra[0], extra[1], w)[1]
     return _round1_finish(plan, shard_id, df, local_codes, w, Yt, Zt, out, T, t, t0, write_cache, extra)
 
 
@@ -986,7 +1009,8 @@ def _local_columns(Dm, idx: np.ndarray):
 def _iter_store(plan: Plan, shard_id: int, local_codes, Dm, w) -> tuple:
     """Keep a shard's plan C state for its CG steps: the dummies on the shard's own levels
     (Dl, n x len(idx)), so a step's products are over those levels and not all P (D6 r4,
-    12.1M location-days: each step built a dense P x 7 block, 0.68 GB, per task)."""
+    12.1M location-days: each step built a dense P x 7 block, 0.68 GB, per task).
+    Returns (entry, kept): kept is False when the cache was full (or there is no token)."""
     idx = np.unique(Dm.indices)  # levels present in the shard
     Dl = _local_columns(Dm, idx)
     nbytes = (
@@ -1012,7 +1036,8 @@ def _iter_store(plan: Plan, shard_id: int, local_codes, Dm, w) -> tuple:
             # budget/need of them hits on every step
             if used + nbytes <= budget:
                 _ITER_CACHE[key] = entry
-    return entry
+                return entry, True
+    return entry, False
 
 
 def shard_matvec(plan: Plan, shard_id: int, files: list[str], p: np.ndarray) -> dict:
@@ -1022,10 +1047,10 @@ def shard_matvec(plan: Plan, shard_id: int, files: list[str], p: np.ndarray) -> 
     key = (plan.iter_token, shard_id)
     with _ITER_LOCK:  # check and read at once: another thread may evict it in between
         entry = _ITER_CACHE.get(key)
-    hit = entry is not None
+    hit = kept = entry is not None
     if not hit:  # a worker that has not seen this shard (new, or the cache was full)
         df, _, local_codes, w = _prepare(plan, shard_id, files)
-        entry = _iter_store(plan, shard_id, local_codes, _global_matrix(df, plan, df.height)[0], w)
+        entry, kept = _iter_store(plan, shard_id, local_codes, _global_matrix(df, plan, df.height)[0], w)
     local_codes, Dl, w, idx, _ = entry
     t_read = time.perf_counter() - t0
     U = Dl @ p[idx]
@@ -1036,6 +1061,7 @@ def shard_matvec(plan: Plan, shard_id: int, files: list[str], p: np.ndarray) -> 
         "shard": shard_id,
         "idx": idx,
         "S": S,
+        "cached": kept,  # this worker holds the shard's state for the next step
         "timing": {
             "read": t_read,
             "total": time.perf_counter() - t0,

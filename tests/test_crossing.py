@@ -254,7 +254,7 @@ def test_iter_cache_budget_and_earlier_fits(monkeypatch):
     old.iter_token, old.iter_cache_bytes = "fare", 10 * one
     for sid in range(3):
         wk._iter_store(old, sid, codes, Dm, w)
-    assert wk._iter_store(old, 9, codes, Dm, w)[-1] == one
+    assert wk._iter_store(old, 9, codes, Dm, w)[0][-1] == one
     new = wk.Plan.__new__(wk.Plan)
     new.iter_token, new.iter_cache_bytes = "pairyear", int(2.5 * one)
     for sid in range(4):
@@ -282,7 +282,7 @@ def test_iter_cache_threads(monkeypatch):
     n, P = 200, 20
     Dm = sp.csr_matrix((np.ones(n), (np.arange(n), np.arange(n) % P)), shape=(n, P))
     codes, w = [np.zeros(n, np.int32)], np.ones(n)
-    one = wk._iter_store(wk.Plan.__new__(wk.Plan), 0, codes, Dm, w)[-1]  # no token: not cached
+    one = wk._iter_store(wk.Plan.__new__(wk.Plan), 0, codes, Dm, w)[0][-1]  # no token: not cached
     errors = []
     for rnd in range(30):
         old = wk.Plan.__new__(wk.Plan)

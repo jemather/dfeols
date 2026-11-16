@@ -90,6 +90,19 @@ break the API).
   to one task at a time); the CG checkpoint is written at most every 5 min. The shard cache
   keeps what it holds when full instead of evicting (LRU on a loop that does not fit hit
   nothing, D11 L3: 2 of 1,443) and takes 40% of a worker (was 25%).
+- Plan C CG steps on OSCER after the above (D6 lt365 r4 job 36097628, D11 L3 36097608): task
+  time fell 3-5x but passes did not get faster. Now every step task is placed by the
+  coordinator, largest first, on the worker where it would finish first (its shard cached
+  there counts once, elsewhere 4x), so a worker holding many shards no longer queues 51-68
+  tasks while most sit idle: a loose restriction stays on its worker however busy, and
+  stealing will not move a task whose input is that worker's copy of the block. Each task
+  takes its own worker's copy, never the single root copy (each miss fetched the block from
+  one worker again). The affinity map follows a task only to a worker that kept its state
+  (results say `cached`), and after a step where tasks moved, workers drop the stale copies
+  (`worker.iter_cache_keep`); hits had fallen from 2,241 of 2,902 to 485. Finished results
+  are fetched by 16 threads (`DFEOLS_FETCH_THREADS`) instead of one at a time: one fetch
+  from a busy worker held up the rest (cg5: 148 s, with 1,078 results waiting), and
+  fetching took 300-700 s of each 500-900 s pass.
 - Plan C without level space: round 1's per-level sums are summed in a tree on the workers
   (D11 L3 36016180: 27 min fetching ~98 MB results one at a time). With level space, once a
   combine finds the summed parts of A past the budget, the shards still to run build only

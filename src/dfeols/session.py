@@ -403,13 +403,15 @@ def demean_round1(
         from .worker import _iter_store, _round1_sparse
 
         Y, Yt, _, _, _, extra, converged, aux = _round1_sparse(plan, sid, df, n0, local_codes, w, T, t0)
-        _iter_store(plan, sid, extra[0], extra[1], w)  # for CG steps with a pass each
+        cached = _iter_store(plan, sid, extra[0], extra[1], w)[1]  # for CG steps with a pass each
         Zt = ZtZ = ZtY = None
     else:
+        cached = None
         Y, Yt, Zt, ZtZ, ZtY, converged, _ = _round1_dense(plan, df, n, local_codes, w, T, raw)
     r: dict[str, Any] = {
         "shard": sid,
         "rows_in": n0,
+        **({"cached": cached} if cached is not None else {}),
         "load": loaded,
         "n": n,
         "sumw": float(w.sum()),

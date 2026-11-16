@@ -2,7 +2,7 @@
 
 import pytest
 
-from dfeols.executors import DaskExecutor, Reduce, SerialExecutor
+from dfeols.executors import DaskExecutor, Reduce, SerialExecutor, _order, _place
 from dfeols.progress import Progress
 
 
@@ -267,11 +267,85 @@ def test_affinity_sends_tasks_back_to_their_worker():
                    prog, f"s{k}", affinity="fit1")
             runs.append(got)
         assert all("_worker" not in r for r in runs[1].values())  # the note is the executor's
-        assert {t: r["w"] for t, r in runs[1].items()} == {t: r["w"] for t, r in runs[0].items()}
-        assert {t: r["w"] for t, r in runs[2].items()} == {t: r["w"] for t, r in runs[0].items()}
+        first = {t: r["w"] for t, r in runs[0].items()}
+        # back to their worker, but only up to an even split (_place): round 0 left to Dask
+        want = _place(_order([(i, 1, ()) for i in range(n)]), first, ex._threads())
+        assert {t: r["w"] for t, r in runs[1].items()} == want
+        again = _place(_order([(i, 1, ()) for i in range(n)]), want, ex._threads())
+        assert {t: r["w"] for t, r in runs[2].items()} == again
         assert all(r["s"] == 5_000_000.0 for r in runs[2].values())
-        assert ex._affinity["fit1"] == {t: r["w"] for t, r in runs[0].items()}
+        assert ex._affinity["fit1"] == again
         root = c.submit(lambda: big, pure=False)
         copies = ex._spread(root, "k", 10)
         assert sorted(copies) == sorted(c.scheduler_info()["workers"])
         assert all(f.result().sum() == 5_000_000.0 for f in copies.values())
+
+
+def test_place_keeps_owners_up_to_an_even_split():
+    """_place: tasks stay with their owner while it would finish them no later than another
+    worker reading the shard again (MISS_COST); tasks with no live owner spread evenly (D11 L3
+    job 36097608: one worker had 51-68 tasks queued while most sat idle)."""
+    tasks = [(i, 10, ()) for i in range(40)]
+    threads = {"a": 4, "b": 4, "c": 4, "d": 4}
+    where = {i: "a" for i in range(40)}  # everything cached on a
+    got = _place(tasks, where, threads)
+    count = {w: sum(v == w for v in got.values()) for w in threads}
+    # a: 10 a task, others 40: a takes ~23 (10 x 23 = 40 x 17 / 3), the rest share 17
+    assert 21 <= count["a"] <= 24 and all(5 <= count[w] <= 7 for w in "bcd")
+    even = {i: "abcd"[i % 4] for i in range(40)}
+    assert _place(tasks, even, threads) == even  # balanced already: nothing moves
+    gone = {i: "zz" for i in range(40)}  # owner not connected: spread evenly
+    assert {sum(v == w for v in _place(tasks, gone, threads).values()) for w in threads} == {10}
+    assert _place(tasks, where, {}) == {}
+
+
+def _kept(i, keep):
+    from distributed import get_worker
+
+    return {"w": get_worker().address, "cached": keep(i), "timing": {"total": 0.0}}
+
+
+def _keep_even(i):
+    return i % 2 == 0
+
+
+def test_affinity_follows_only_kept_state():
+    """A task whose worker did not keep its state ("cached": False, the cache was full) is not
+    pinned there: D6 r4 job 36097628's hits fell from 2241 of 2902 to 485 as the map followed
+    tasks to workers without their shard."""
+    distributed = pytest.importorskip("distributed")
+    n = 12
+    with (
+        distributed.LocalCluster(n_workers=3, threads_per_worker=1, dashboard_address=None) as lc,
+        distributed.Client(lc) as c,
+    ):
+        ex = DaskExecutor(c, max_workers=3, tick=0.05)
+        prog = Progress(None, label="t", every=1e9)
+        prog.add_stage("s", {i: 1 for i in range(n)})
+        prog.start("s")
+        got = {}
+        ex.run(_kept, [(i, 1, (i, _keep_even)) for i in range(n)], lambda t, r: got.setdefault(t, r),
+               prog, "s", affinity="fit")
+        assert all("cached" not in r for r in got.values())
+        assert ex._affinity["fit"] == {t: r["w"] for t, r in got.items() if t % 2 == 0}
+
+
+def test_iter_cache_keep_drops_other_owners_shards():
+    """worker.iter_cache_keep: on each worker, the fit's entries whose shard is owned by another
+    worker go (a task that moved left its state behind); others' fits and unowned shards stay."""
+    import dfeols.worker as wk
+
+    distributed = pytest.importorskip("distributed")
+    with (
+        distributed.LocalCluster(n_workers=2, threads_per_worker=1, processes=False,
+                                 dashboard_address=None) as lc,
+        distributed.Client(lc) as c,
+    ):
+        a, b = sorted(c.scheduler_info()["workers"])
+        with wk._ITER_LOCK:
+            wk._ITER_CACHE.clear()
+            for k in [("f", 0), ("f", 1), ("f", 2), ("g", 0)]:
+                wk._ITER_CACHE[k] = (None, 1)
+        c.run(wk.iter_cache_keep, "f", {0: a, 1: b}, workers=[a])
+        assert sorted(wk._ITER_CACHE) == [("f", 0), ("f", 2), ("g", 0)]
+        wk._ITER_CACHE.clear()

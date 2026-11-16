@@ -33,6 +33,7 @@ from .vcov import df_k as _df_k
 from .vcov import vcov_crv1, vcov_hetero, vcov_iid
 from .worker import (
     Plan,
+    iter_cache_keep,
     merge_minmax,
     merge_present,
     plan_columns,
@@ -737,7 +738,10 @@ def _crossing_cg(
     )
 
     step = {"it": 0, "t": time.time()}
-    affinity = {"affinity": plan.iter_token} if "affinity" in inspect.signature(executor.run).parameters else {}
+    run_params = inspect.signature(executor.run).parameters
+    affinity = {"affinity": plan.iter_token} if "affinity" in run_params else {}
+    if "affinity_prune" in run_params:  # a task that moved leaves a stale copy behind
+        affinity["affinity_prune"] = iter_cache_keep
     # a step's task holds only its shard's own levels (worker.shard_matvec), not round 1's
     # arrays over all of them; it shares the worker with the cache like round 1's
     gb_round = prog.task_gb

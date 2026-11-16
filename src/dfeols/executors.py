@@ -162,6 +162,37 @@ def _order(tasks):
     return [small] + s
 
 
+# _place: a task whose shard is not cached where it goes reads it again (D6 r4: 4-5 s
+# against ~0.7 s from the cache), so it counts this many times its rows
+MISS_COST = 4.0
+
+
+def _place(tasks, where: dict, nthreads: dict) -> dict:
+    """{task id: worker} for a run with affinity: largest first, each task to the worker where
+    it would finish first, counting its rows once on the worker that holds its shard (where)
+    and MISS_COST times elsewhere, per thread. So tasks stay with their shard while that
+    worker is no busier than the others would be reading it again. Dask keeps a loose
+    restriction (workers=[w], allow_other_workers=True) on w while w exists, however busy,
+    and work stealing will not move a task whose input is that worker's copy of the CG
+    block, so the balance has to be made here: in D11 L3 (job 36097608) one worker had 51-68
+    tasks queued while 27-29 of ~34 sat idle. tasks: (tid, rows, args) in run order."""
+    if not nthreads:
+        return {}
+    load = dict.fromkeys(nthreads, 0.0)
+    out: dict = {}
+    for tid, r, _a in sorted(tasks, key=lambda t: -int(t[1] or 0)):
+        r = max(int(r or 0), 1)
+        own = where.get(tid)
+
+        def finish(w, r=r, own=own):
+            return (load[w] + r * (1.0 if w == own else MISS_COST)) / nthreads[w], w != own
+
+        w = min(nthreads, key=finish)
+        out[tid] = w
+        load[w] += r * (1.0 if w == own else MISS_COST)
+    return out
+
+
 class SerialExecutor:
     def slots(self):
         return 1, 1
@@ -227,6 +258,11 @@ class DaskExecutor:
         self.spread_min_bytes = 32 << 20  # ... and this large copied to every worker in a tree
         self.spread_fan_out = 4
         self._affinity: dict[str, dict] = {}  # affinity key -> {task id: worker address}
+        # finished results fetched at once, each its own round trip to the worker that holds
+        # it: one at a time, a fetch from a busy worker held up the rest (D6 r4 job 36097628,
+        # cg5: one fetch blocked 148 s while 1,078 results waited; fetching was 300-700 s
+        # of each 500-900 s pass)
+        self.fetch_threads = int(os.environ.get("DFEOLS_FETCH_THREADS", "16"))
 
     def slots(self):
         try:
@@ -260,19 +296,23 @@ class DaskExecutor:
             ) from None
 
     def _workers(self) -> list[str]:
+        return sorted(self._threads())
+
+    def _threads(self) -> dict:
+        """{worker address: threads} of the connected workers."""
         try:
             info = self.client.scheduler_info(n_workers=-1)
         except TypeError:
             info = self.client.scheduler_info()
-        return sorted(info.get("workers", {}))
+        return {a: int(w.get("nthreads") or 1) for a, w in info.get("workers", {}).items()}
 
-    def _spread(self, root, key: str, priority: int) -> dict:
+    def _spread(self, root, key: str, priority: int, workers: list | None = None) -> dict:
         """Copies of a shared argument (the future `root`) on every worker, in a tree: each
         copy is fetched from the one above it, fan_out at a time, so no worker sends more than
         fan_out copies. Tasks whose worker is known (affinity) take that worker's copy. D6 r4
         (36011018, 12.1M levels x 7: 0.68 GB) waited ~2.5 min at each CG step while 36 workers
         fetched the block from the one that held it. {worker address: future}."""
-        workers = self._workers()
+        workers = self._workers() if workers is None else list(workers)
         if len(workers) < 2:
             return {}
         k = self.spread_fan_out
@@ -291,7 +331,9 @@ class DaskExecutor:
             )
         return out
 
-    def _scatter_shared(self, tasks, run_id: str = "", spread: bool = False) -> dict:
+    def _scatter_shared(
+        self, tasks, run_id: str = "", spread: bool = False, workers: list | None = None
+    ) -> dict:
         """Large arguments passed to every task go to the workers once, not once per task:
         arrays (plan C's CG block) and dicts of them (round 2's linear maps, with plan C's FE
         solution: D6, 758k levels, a 46 MiB graph).
@@ -327,7 +369,7 @@ class DaskExecutor:
                 key = f"dfeols-shared-{run_id or uuid.uuid4().hex[:8]}-{j}"
                 root = self.client.submit(_unbox, [a], key=key, pure=False, retries=self.retries)
                 big = spread and _nbytes(a) >= self.spread_min_bytes
-                out[i] = (root, self._spread(root, key, len(tasks) + 3) if big else {})
+                out[i] = (root, self._spread(root, key, len(tasks) + 3, workers) if big else {})
         return out
 
     def run(
@@ -340,6 +382,7 @@ class DaskExecutor:
         local_help: bool = False,
         reduce: Reduce | None = None,
         affinity: str | None = None,
+        affinity_prune: Callable | None = None,
     ):
         """local_help: while no workers are connected, the coordinator runs
         queued tasks itself (lowest priority first). Only for tasks without
@@ -350,8 +393,13 @@ class DaskExecutor:
         goes to the worker that last ran the same task id under that name, if it
         is still there (else anywhere), so CG steps find their shard in the
         cache (D6 r4 job 36011018: tasks went to any worker, 2.5% hits, and
-        reading the shard again was 4-5 s of each ~5 s task)."""
+        reading the shard again was 4-5 s of each ~5 s task). A result's "cached" (False: the
+        worker did not keep the state, its cache was full) keeps the map from following a
+        task to a worker without it. affinity_prune(affinity, {task id: worker}) runs on
+        every worker after a run in which a task moved to another worker (_place, or Dask
+        stealing), so the old worker drops its stale copy (worker.iter_cache_keep)."""
         import queue
+        from concurrent.futures import ThreadPoolExecutor
 
         if reduce and local_help:
             raise ValueError("reduce and local_help together are not supported")
@@ -360,7 +408,12 @@ class DaskExecutor:
         n = len(ordered)
         run_id = uuid.uuid4().hex[:8]  # task keys must never repeat across runs (e.g. two preps)
         where = self._affinity.setdefault(affinity, {}) if affinity else {}
-        shared = self._scatter_shared(ordered, run_id, spread=bool(where))
+        # every task placed (and given its worker's copy of the shared block) once the map
+        # has entries: a task left to Dask took the single root copy, so each miss fetched
+        # the block from one worker again (36097628: ~2.5 min at the start of each pass)
+        threads = self._threads() if where else {}
+        placed = _place(ordered, where, threads) if threads else {}
+        shared = self._scatter_shared(ordered, run_id, spread=bool(placed), workers=sorted(threads))
         # finished futures arrive here from their done callbacks (run off the event loop), once
         # each: distributed.wait(FIRST_COMPLETED) over every pending future, called again after
         # each completion, leaves a waiter task per future on the loop it shares with the
@@ -374,7 +427,6 @@ class DaskExecutor:
             gb = getattr(progress, "task_gb", None)
             need = self.worker_memory if gb is None else min(gb * 1e9 * self.MARGIN, self.worker_memory)
             kw["resources"] = {"MEMORY": int(need)}
-        alive = set(self._workers()) if where else set()
         run_fn = (lambda *a: (_on_worker, fn, *a)) if affinity else (lambda *a: (fn, *a))
 
         def arg(a, w):
@@ -385,9 +437,9 @@ class DaskExecutor:
 
         for i, (tid, _rows, args) in enumerate(ordered):
             key = f"dfeols-{stage}-{progress.label}-{run_id}-{tid}"
-            w = where.get(tid)
-            place = {"workers": [w], "allow_other_workers": True} if w in alive else {}
-            sargs = [arg(a, w if w in alive else None) for a in args]
+            w = placed.get(tid)
+            place = {"workers": [w], "allow_other_workers": True} if w else {}
+            sargs = [arg(a, w) for a in args]
             f = self.client.submit(
                 *run_fn(*sargs), key=key, priority=n - i, retries=self.retries, pure=False, **kw, **place
             )
@@ -411,69 +463,103 @@ class DaskExecutor:
             return sum(1 for f in list(pending) if f.status == "finished")
 
         key_to_tid = {f.key: futs[f] for f in futs}
+        fetcher = ThreadPoolExecutor(max(1, self.fetch_threads), thread_name_prefix="dfeols-fetch")
+
+        def fetch_one(f, tid):  # in a fetch thread; the result comes back through doneq
+            t = time.perf_counter()
+            try:
+                doneq.put((f, tid, self._fetch(f, f"shard {tid} in {stage}"), time.perf_counter() - t, None))
+            except BaseException as e:  # raised on the coordinator's thread
+                doneq.put((f, tid, None, 0.0, e))
+
+        moved = False  # a task's state now on another worker than before: prune after
         last_task = None
         t_status = float("-inf")
-        while pending or (pool and not pool.finished()):
-            if local_help and self.slots()[0] == 0:
-                running = self._running_keys()
-                cand = [
+        try:
+            while pending or (pool and not pool.finished()):
+                if local_help and self.slots()[0] == 0:
+                    running = self._running_keys()
+                    cand = [
+                        f
+                        for f in reversed(order)
+                        if f in pending and f.key not in running and f.status == "pending"
+                    ]
+                    if cand:
+                        f = cand[0]
+                        f.cancel()
+                        pending.discard(f)
+                        tid = futs[f]
+                        progress.running[stage].add(tid)
+                        res = fn(*fargs[f])
+                        on_result(tid, res)
+                        timing = res.get("timing", {})
+                        progress.task_done(stage, tid, timing.get("total", 0.0), res.get("timing"))
+                        progress.tick()
+                        continue
+                got = []
+                try:
+                    got.append(doneq.get(timeout=self.tick_s))
+                    while True:
+                        got.append(doneq.get_nowait())
+                except queue.Empty:
+                    pass
+                fetched = [g for g in got if isinstance(g, tuple)]
+                # a future cancelled by local_help, or already handled, is not waited on any more
+                done = [
                     f
-                    for f in reversed(order)
-                    if f in pending and f.key not in running and f.status == "pending"
+                    for f in got
+                    if not isinstance(f, tuple) and (f in pending or (pool is not None and f in pool.running))
                 ]
-                if cand:
-                    f = cand[0]
-                    f.cancel()
-                    pending.discard(f)
+                for f in done:
+                    if f not in futs:  # a part or a combine: into the pool
+                        if f.status == "error":
+                            exc = f.exception()
+                            raise RuntimeError(f"combining the parts failed in {stage}: {exc!r}") from exc
+                        pool.arrived(f, f in part_futs)
+                        part_futs.discard(f)
+                        continue
                     tid = futs[f]
-                    progress.running[stage].add(tid)
-                    res = fn(*fargs[f])
-                    on_result(tid, res)
-                    progress.task_done(stage, tid, res.get("timing", {}).get("total", 0.0), res.get("timing"))
-                    progress.tick()
-                    continue
-            got = []
-            try:
-                got.append(doneq.get(timeout=self.tick_s))
-                while True:
-                    got.append(doneq.get_nowait())
-            except queue.Empty:
-                pass
-            # a future cancelled by local_help, or already handled, is not waited on any more
-            done = [f for f in got if f in pending or (pool is not None and f in pool.running)]
-            for f in done:
-                if f not in futs:  # a part or a combine: into the pool
                     if f.status == "error":
                         exc = f.exception()
-                        raise RuntimeError(f"combining the parts failed in {stage}: {exc!r}") from exc
-                    pool.arrived(f, f in part_futs)
-                    part_futs.discard(f)
-                    continue
-                tid = futs[f]
-                if f.status == "error":
-                    exc = f.exception()
-                    raise RuntimeError(f"shard {tid} failed in {stage}: {exc!r}") from exc
-                t_fetch = time.perf_counter()
-                res = self._fetch(f, f"shard {tid} in {stage}")
-                if affinity and isinstance(res, dict) and "_worker" in res:
-                    res = dict(res)
-                    where[tid] = res.pop("_worker")
-                t_on = time.perf_counter()
-                on_result(tid, res)
-                t_end = time.perf_counter()
-                progress.task_done(stage, tid, res.get("timing", {}).get("total", 0.0), res.get("timing"))
-                diag.task(tid, res.get("timing"), t_on - t_fetch, t_end - t_on)
-                pending.discard(f)
-                f.release()
-                if not pending:
-                    last_task = time.perf_counter()
-            if time.monotonic() - t_status >= self.tick_s:  # scheduler queries: once a tick
-                t_status = time.monotonic()
-                s, mx = self.slots()
-                progress.set_slots(s, mx)
-                progress.running[stage] = {key_to_tid[k] for k in self._running_keys() if k in key_to_tid}
-            progress.tick()
-            diag.tick(backlog)
+                        raise RuntimeError(f"shard {tid} failed in {stage}: {exc!r}") from exc
+                    fetcher.submit(fetch_one, f, tid)
+                for f, tid, res, fetch_s, err in fetched:
+                    if err is not None:
+                        raise err
+                    if f not in pending:
+                        continue
+                    if affinity and isinstance(res, dict) and "_worker" in res:
+                        res = dict(res)
+                        w = res.pop("_worker")
+                        if res.pop("cached", True):
+                            moved = moved or where.get(tid) not in (None, w)
+                            where[tid] = w
+                        elif where.get(tid) == w:  # its worker no longer has it
+                            where.pop(tid, None)
+                    t_on = time.perf_counter()
+                    on_result(tid, res)
+                    t_end = time.perf_counter()
+                    timing = res.get("timing", {})
+                    progress.task_done(stage, tid, timing.get("total", 0.0), res.get("timing"))
+                    diag.task(tid, res.get("timing"), fetch_s, t_end - t_on)
+                    pending.discard(f)
+                    f.release()
+                    if not pending:
+                        last_task = time.perf_counter()
+                if time.monotonic() - t_status >= self.tick_s:  # scheduler queries: once a tick
+                    t_status = time.monotonic()
+                    s, mx = self.slots()
+                    progress.set_slots(s, mx)
+                    progress.running[stage] = {key_to_tid[k] for k in self._running_keys() if k in key_to_tid}
+                progress.tick()
+                diag.tick(backlog)
+        finally:
+            fetcher.shutdown(wait=False, cancel_futures=True)
+        if affinity_prune is not None and moved:
+            try:
+                self.client.run(affinity_prune, affinity, dict(where))
+            except Exception as e:  # the cache's housekeeping only
+                log.debug("%s: affinity prune failed: %r", stage, e)
         summ = diag.close()
         log.debug("%s %s: %s", stage, progress.label, summ)
         if pool:
