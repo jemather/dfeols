@@ -805,6 +805,9 @@ def _crossing_cg(
         state = ck.load()
         if state is not None:
             log.info("fit %s: crossing-FE CG resumes at step %d (%s)", label, int(state["it"]), ck.path)
+            # the rate of fall is the resumed steps' own: the 1.0 at the start of hist is
+            # step 0's, so after a resume at step 808 it read as 808 steps' fall in a few
+            hist.clear()
     X, it, rel = cx.pcg(
         (lambda p: A @ p) if level else matvec_pass,
         R,

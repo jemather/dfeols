@@ -133,6 +133,10 @@ break the API).
 
 ### Fixed
 
+- A resumed plan C CG solve (`cg_checkpoint.npz`) estimated the steps left from a fall
+  measured against step 0's residual of 1, so for its first 30 steps it said "about 10 more
+  steps" when hundreds were left (D11 L3 resumed at step 808). The estimate now uses only the
+  resumed steps.
 - The DaskExecutor's result loop: `distributed.wait(FIRST_COMPLETED)` over every pending
   future, called after each completion, left a waiter per future on the event loop the
   scheduler shares, so the loop stalled more as a stage went on (D6 36011018, D11 36016180:
