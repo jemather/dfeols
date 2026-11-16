@@ -11,11 +11,14 @@ break the API).
 
 - Profile `interface = "ib"`: the coordinator and every worker use their own node's
   InfiniBand (IPoIB) address, found at job start (names differ by node type: `ib0`,
-  `ibp4s0`); a node without one falls back to its primary address and says so in its log.
-  On OSCER dfeols' traffic went over `eno1` Ethernet while each node also has IPoIB: D6 r4's
-  CG steps copy a 0.76 GB block to every worker and sum parts of that size, and waited
-  50-110 s a step before any task ran. Pair it with a scheduler constraint that keeps jobs
-  on IB nodes (OSCER: `extra_directives = ["--constraint=fdr"]`).
+  `ibp4s0`); a worker node without one falls back to its primary address and says so in its
+  log. A coordinator without one keeps every worker on its default address, with a warning:
+  on OSCER a coordinator on a node without IB could not gather results from workers on IB
+  addresses and the fit stalled. On OSCER dfeols' traffic went over `eno1` Ethernet while
+  each node also has IPoIB: D6 r4's CG steps copy a 0.76 GB block to every worker and sum
+  parts of that size, and waited 50-110 s a step before any task ran. Pair it with a
+  scheduler constraint that keeps jobs on IB nodes (OSCER: `extra_directives =
+  ["--constraint=hdr"]`).
 - Run diagnostics (`dfeols.diag`): a Dask fit writes `tasks.jsonl` in its workdir (a line per
   task: the task's timing, seconds the coordinator spent fetching its result and in
   `on_result`; a summary per stage with wall time, summed task time, mean tasks running at

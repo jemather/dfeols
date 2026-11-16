@@ -48,15 +48,26 @@ def test_ib_interface_workers_listen_on_their_own_ib_address(monkeypatch, tmp_pa
     falls back to its primary address and says so."""
     import subprocess
 
+    from dfeols import cluster as cmod
+    from dfeols.cluster import IB_HOST_LINES
+
     monkeypatch.setenv("DFEOLS_CONFIG", str(tmp_path / "none.toml"))
     p = replace(dfeols.profile("local", scratch=str(tmp_path)), scheduler="slurm", interface="ib")
-    cl = make_cluster(p)
-    try:
-        script = cl.job_script()
-    finally:
-        cl.close()
+
+    def script_with(ib_name):
+        monkeypatch.setattr(cmod, "ib_interface", lambda: ib_name)
+        cl = make_cluster(p)
+        try:
+            return cl.job_script()
+        finally:
+            cl.close()
+
+    # A coordinator without IB (OSCER c943) could not gather from workers on IB addresses:
+    # the workers then stay on their default addresses.
+    script = script_with(None)
+    assert "--host" not in script and IB_HOST_LINES[0] not in script, script
+    script = script_with("lo")
     assert "--host $DFEOLS_WORKER_HOST" in script, script
-    from dfeols.cluster import IB_HOST_LINES
 
     body = "\n".join(IB_HOST_LINES) + '\necho "HOST=$DFEOLS_WORKER_HOST"\n'
     assert all(line in script for line in IB_HOST_LINES)

@@ -248,9 +248,13 @@ def make_cluster(p: Profile, log_directory: str | None = None):
         if ib:
             name = ib_interface()
             if name is None:
+                # Workers on IB addresses are unreachable from a coordinator without IB (seen on
+                # OSCER: the scheduler could not gather results), so all stay on Ethernet.
                 name = private_interface()
+                ib = False
                 log.warning("cluster: interface = \"ib\" but this node has no InfiniBand address; "
-                            "the coordinator listens on %s, and workers on IB may not reach it", name)
+                            "the coordinator listens on %s and workers stay on their default "
+                            "addresses (Ethernet)", name)
         else:
             name = private_interface() if p.interface == "auto" else p.interface
         if name:
