@@ -481,6 +481,7 @@ def _call(result) -> str:
         "cluster",
         "vcov",
         "weights",
+        "subset",
         "drop_singletons",
         "fe_tol",
         "fe_maxiter",

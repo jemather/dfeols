@@ -157,6 +157,9 @@ class Plan:
     sidecar_dir: str | None = None
     sidecar_cols: tuple[str, ...] = ()
     glm: dict | None = None
+    # fit(subset=...): a row condition on raw columns (expr.condition), applied before
+    # listwise deletion; its columns are read only for it
+    subset: str | None = None
 
     @property
     def k_x(self) -> int:
@@ -258,8 +261,10 @@ def _load(
     shard_id: int | None = None,
 ):
     """The shard's rows for this spec. `dropped`, if given, gets the rows removed by
-    reason (missing, non_finite, zero_weights), for the record's sample counts. `extra`
-    columns are read too but play no part in which rows are kept."""
+    reason (subset, missing, non_finite, zero_weights), for the record's sample counts.
+    `extra` columns are read too but play no part in which rows are kept. With
+    plan.subset, rows where it does not hold go first (counted as "subset"), so the other
+    counts are of rows in the subset."""
     f = plan.formula
     created = dict(plan.created)
     sample = set(plan.filter_vars) if plan.filter_vars is not None else set(f.variables)
@@ -279,8 +284,13 @@ def _load(
 
         for e in created.values():
             raw.update(_expr_columns(e))
+    sub = set()
+    if plan.subset:
+        from .expr import columns as _expr_columns
+
+        sub = set(_expr_columns(plan.subset))
     side = set(plan.sidecar_cols)
-    df = pl.read_parquet(files, columns=sorted((cols | raw | set(extra)) - side))
+    df = pl.read_parquet(files, columns=sorted((cols | raw | sub | set(extra)) - side))
     if plan.sidecar_dir:
         if shard_id is None:
             raise RuntimeError("a fit with sidecar columns needs the shard id to read them")
@@ -292,8 +302,13 @@ def _load(
         df = df.with_row_index("__row")
     # listwise deletion on the variables of this spec (a session's: its declared variables)
     num = [c for c in sorted(sample) if df.schema[c].is_float()]
+    n_read = df.height
+    if plan.subset:  # after __row, so a GLM sidecar stays aligned to the raw rows
+        from .expr import condition as _condition
+
+        df = df.filter(_condition(plan.subset))
     n = [df.height]
-    df = df.drop_nulls(subset=sorted(cols)) if (raw | set(extra)) - cols else df.drop_nulls()
+    df = df.drop_nulls(subset=sorted(cols)) if (raw | sub | set(extra)) - cols else df.drop_nulls()
     n.append(df.height)
     if num:
         df = df.filter(pl.all_horizontal([pl.col(c).is_finite() for c in num]))
@@ -303,8 +318,10 @@ def _load(
     n.append(df.height)
     if dropped is not None:
         dropped.update(
-            {"rows": n[0], "missing": n[0] - n[1], "non_finite": n[1] - n[2], "zero_weights": n[2] - n[3]}
+            {"rows": n_read, "missing": n[0] - n[1], "non_finite": n[1] - n[2], "zero_weights": n[2] - n[3]}
         )
+        if plan.subset:
+            dropped["subset"] = n_read - n[0]
     if created:
         from .expr import compile as _expr
 

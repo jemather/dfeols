@@ -221,6 +221,26 @@ def compile(text: str) -> pl.Expr:
     return pl.when(bad).then(None).otherwise(e)
 
 
+def condition(text: str) -> pl.Expr:
+    """A row condition (fit(subset=...)): the Boolean Polars expression, which must be a
+    comparison or and/or/not of comparisons, e.g. `vanished == 1 & duration < 365`. False
+    wherever a column it reads is null or not finite (as fixest's subset drops NA), so
+    filtering on it keeps exactly the rows where it holds."""
+    tree = parse(text)
+    texts = string_columns(tree)
+    e, kind = _compile(tree, text)
+    if kind != "bool":
+        raise ExpressionError(f"{text!r}: a row condition must be a comparison, e.g. x > 0 or g == 1")
+    cols = columns(text)
+    if not cols:
+        raise ExpressionError(f"{text!r}: a row condition must read at least one column")
+    ok = [
+        pl.col(c).is_not_null() if c in texts else pl.col(c).cast(pl.Float64).is_finite().fill_null(False)
+        for c in cols
+    ]
+    return pl.all_horizontal(ok) & e.fill_null(False)
+
+
 def _num(e, kind):
     return e.cast(pl.Float64) if kind == "bool" else e
 

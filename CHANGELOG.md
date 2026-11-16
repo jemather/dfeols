@@ -9,6 +9,18 @@ break the API).
 
 ### Added
 
+- `fit(subset=...)` (and `fit_glm`): a row condition on the dataset's columns, e.g.
+  `"vanished == 1"` or `"duration < 365 & is_buy == 0"` (comparisons joined by `&`, `|`, `!`,
+  in `dfeols.expr` syntax; `expr.condition`). Rows where it does not hold, or where a column
+  it reads is null or not finite, are left out in each shard before listwise deletion and
+  singletons, so one prep serves every sample (D6 v2's `duration < 365` sample was a 96 GB
+  filtered copy with its own 61-minute prep). Every path takes it (local, dense, sparse and
+  iterated crossing FEs, two-way clusters, cells, IV, predict, GLM's separation scan); each
+  equals a prep of the filtered rows (tests/test_subset.py). The record keeps the condition
+  as written as the sample's restriction, counts the rows outside it as `dropped.subset`, and
+  replays it in `call`; its canonical form is part of the spec id. i() levels come from the
+  subset's rows (cached per condition in `_levels/`), so a subset that removes the reference
+  level makes the next one the reference, as a prep of those rows and fixest do.
 - Profile `interface = "ib"`: the coordinator and every worker use their own node's
   InfiniBand (IPoIB) address, found at job start (names differ by node type: `ib0`,
   `ibp4s0`); a worker node without one falls back to its primary address and says so in its

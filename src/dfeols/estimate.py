@@ -52,9 +52,13 @@ def _norm(name: str) -> str:
     return "^".join(fe_components(name))
 
 
-def _levels_task(paths: list[str], cols: list[str]) -> dict:
+def _levels_task(paths: list[str], cols: list[str], subset: str | None = None) -> dict:
     t = time.perf_counter()
     lf = pl.scan_parquet(paths)
+    if subset:  # fit(subset=): the levels present in the subset's rows, as fixest's i()
+        from .expr import condition
+
+        lf = lf.filter(condition(subset))
     frames = pl.collect_all([lf.select(c).drop_nulls().unique() for c in cols], engine="streaming")
     return {
         "levels": {c: fr[c].to_list() for c, fr in zip(cols, frames)},
@@ -62,20 +66,29 @@ def _levels_task(paths: list[str], cols: list[str]) -> dict:
     }
 
 
-def category_levels(ds: Dataset, cols: list[str], executor=None) -> dict[str, list]:
+def category_levels(ds: Dataset, cols: list[str], executor=None, subset: str | None = None) -> dict[str, list]:
     """Sorted levels of each i() variable, read on the executor's workers and
-    cached in <shard_dir>/_levels/ (the dataset never changes after prep).
+    cached in <shard_dir>/_levels/ (the dataset never changes after prep). With a
+    fit(subset=) condition, the levels in the rows where it holds (cached per condition), so
+    i()'s reference level is the subset's first, as with a prep of those rows.
 
     Reading one column of every shard on the coordinator took 55 minutes at
     1e10 rows on Lustre, before any worker started; as tasks over batches of
     shards it is a short map/reduce, and later fits on the same data reuse it."""
     out, todo = {}, []
     cache = ds.root / "_levels"
+    if subset:
+        from .expr import canonical
+
+        subset_key = canonical(subset)
+        sfx = "." + hashlib.sha1(subset_key.encode()).hexdigest()[:12]
+    else:
+        subset_key, sfx = None, ""
     for c in cols:
-        f = cache / f"{c}.json"
+        f = cache / f"{c}{sfx}.json"
         try:
             d = json.loads(f.read_text())
-            if d.get("n_rows") == ds.n_rows:
+            if d.get("n_rows") == ds.n_rows and d.get("subset") == subset_key:
                 out[c] = d["levels"]
                 continue
         except (FileNotFoundError, ValueError, KeyError):
@@ -89,7 +102,7 @@ def category_levels(ds: Dataset, cols: list[str], executor=None) -> dict[str, li
     for i, s in enumerate(ds.shards):
         groups[i % n_tasks].append(s)
     tasks = [
-        (i, max(sum(s["rows"] for s in g), 1), ([p for s in g for p in ds.shard_paths(s)], todo))
+        (i, max(sum(s["rows"] for s in g), 1), ([p for s in g for p in ds.shard_paths(s)], todo, subset))
         for i, g in enumerate(groups)
         if g
     ]
@@ -113,9 +126,9 @@ def category_levels(ds: Dataset, cols: list[str], executor=None) -> dict[str, li
     for c in todo:
         out[c] = sorted(found[c])
         try:
-            tmp = cache / f".{c}.json.tmp"
-            tmp.write_text(json.dumps({"levels": out[c], "n_rows": ds.n_rows}))
-            os.replace(tmp, cache / f"{c}.json")
+            tmp = cache / f".{c}{sfx}.json.tmp"
+            tmp.write_text(json.dumps({"levels": out[c], "n_rows": ds.n_rows, "subset": subset_key}))
+            os.replace(tmp, cache / f"{c}{sfx}.json")
         except (TypeError, ValueError, OSError):  # unusual level types: just don't cache
             pass
     log.info("fit: levels of %s from %d tasks (%.0fs)", ", ".join(todo), len(tasks), time.time() - t0)
@@ -159,8 +172,10 @@ def build_plan(
     crossing_fe: str = "auto",
     executor=None,
     extra_columns: tuple[str, ...] = (),
+    subset: str | None = None,
 ) -> Plan:
-    """`extra_columns`: columns supplied per shard at load time (GLM sidecars), not in ds."""
+    """`extra_columns`: columns supplied per shard at load time (GLM sidecars), not in ds.
+    `subset`: fit(subset=)'s row condition (i() levels are the subset's)."""
     f = parse(formula)
     local, glob, slopes = [], [], {}
     for t in f.fe_terms:
@@ -224,7 +239,7 @@ def build_plan(
     missing_cats = set(cats) - set(ds.columns)
     if missing_cats:
         raise KeyError(f"Variables not in the prepared data: {sorted(missing_cats)}")
-    cat_levels = category_levels(ds, cats, executor)
+    cat_levels = category_levels(ds, cats, executor, subset=subset)
     missing = (f.variables | ({weights} if weights else set())) - set(ds.columns) - set(extra_columns)
     if missing:
         raise KeyError(f"Variables not in the prepared data: {sorted(missing)}")
@@ -893,7 +908,7 @@ def _fit_cells(
         parts.append(r)
         acc["rows_in"] += r["rows_in"]
         for key, v in r.get("load", {}).items():
-            acc["load"][key] += v
+            acc["load"][key] = acc["load"].get(key, 0) + v
         if r.get("row_key"):
             acc["row_key"].append(r["row_key"])
 
@@ -1019,6 +1034,7 @@ def check_sample(n: int, rows_in: int, load: dict) -> None:
     parts = [
         f"{load.get(k, 0):,} {what}"
         for k, what in (
+            ("subset", "outside subset="),
             ("missing", "with a missing value"),
             ("non_finite", "non-finite"),
             ("zero_weights", "with a zero weight"),
@@ -1100,6 +1116,7 @@ def fit(
     cluster: str | None = None,
     vcov=None,
     weights: str | None = None,
+    subset: str | None = None,
     executor=None,
     workdir: str | None = None,
     cache: bool | str = "auto",
@@ -1134,6 +1151,12 @@ def fit(
                ["a", "b"]) for two-way clustering (Cameron, Gelbach and Miller: V_a + V_b - V_ab,
                each scaled with G the smaller count, as fixest and pyfixest); not with cells=True
     vcov       "iid", "hetero", "CRV1" or a list of them (all computed in one pass)
+    subset     a row condition on the dataset's columns, e.g. "vanished == 1" or
+               "duration < 365 & is_buy == 0" (comparisons joined by &, |, !; expression syntax
+               as dfeols.expr). Rows where it does not hold, or where a column it reads is null
+               or not finite, are left out before listwise deletion and singletons, so one prep
+               serves every sample. Recorded as the record's sample restriction, part of the
+               spec id (workdir)
     executor   SerialExecutor() (default) or DaskExecutor(client)
     workdir    where status.json and the demeaned cache go; defaults to
                <shard_dir>/runs/<spec id>. Put it on shared scratch.
@@ -1189,8 +1212,18 @@ def fit(
     iv_opts = {"estimator": estimator, "fuller": fuller} if probe.iv else {}
     if not probe.iv and (estimator != "2sls" or fuller is not None):
         raise ValueError("estimator= and fuller= apply to IV formulas (y ~ x | fe | d ~ z)")
+    if subset is not None:
+        from . import expr as _expr
+
+        _expr.condition(subset)  # raises ExpressionError unless a row condition
+        # kept as written (the record's restriction); the spec id uses its canonical form
+        subset = subset.strip()
+        miss = [c for c in _expr.columns(subset) if c not in ds.columns]
+        if miss:
+            raise KeyError(f"subset: not in the dataset: {miss}")
     spec_id = probe.fingerprint(
-        cluster=cluster_key(cluster), weights=weights, singletons=drop_singletons, **iv_opts
+        cluster=cluster_key(cluster), weights=weights, singletons=drop_singletons, **iv_opts,
+        **({"subset": _expr.canonical(subset)} if subset is not None else {}),
     )
     wd = Path(workdir) if workdir else ds.root / "runs" / spec_id
     wd.mkdir(parents=True, exist_ok=True)
@@ -1208,9 +1241,12 @@ def fit(
         crossing_fe=crossing_fe,
         executor=executor,
         extra_columns=tuple(_glm["cols"]) if _glm else (),
+        subset=subset,
     )
     if _glm:  # one IRLS step of dfeols.glm: z and w come from sidecar files per shard
         plan = dataclasses.replace(plan, sidecar_dir=str(_glm["read"]), sidecar_cols=tuple(_glm["cols"]))
+    if subset is not None:
+        plan = dataclasses.replace(plan, subset=subset)
     if predict is not None:
         if cells:
             raise ValueError("predict= needs each row's residual; not with cells=True")
@@ -1392,7 +1428,7 @@ def fit(
             acc["n"] += r["n"]
             acc["rows_in"] += r["rows_in"]
             for key, v in r.get("load", {}).items():
-                acc["load"][key] += v
+                acc["load"][key] = acc["load"].get(key, 0) + v
             if r.get("row_key"):
                 acc["row_key"].append(r["row_key"])
             acc["sumw"] += r["sumw"]
@@ -1696,6 +1732,7 @@ def fit(
         "collin_tol": collin_tol,
         "cache": cache,
         **iv_opts,
+        **({"subset": plan.subset} if plan.subset else {}),
     }
     if cells:
         options.update(
@@ -1723,8 +1760,12 @@ def fit(
     )
     run["sample"] = {
         "rows_input": acc["load"]["rows"],
-        "dropped": {k: acc["load"][k] for k in ("missing", "non_finite", "zero_weights")},
+        "dropped": {
+            k: acc["load"][k] for k in ("subset", "missing", "non_finite", "zero_weights") if k in acc["load"]
+        },
     }
+    if plan.subset:
+        run["restriction"] = f"rows where {plan.subset} (fit subset=; null or non-finite inputs excluded)"
     src_rows = (ds.meta.get("source") or {}).get("rows")
     if src_rows is not None and src_rows >= ds.n_rows:
         # prep drops rows with a missing partition, FE or cluster key

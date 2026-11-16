@@ -115,10 +115,18 @@ def shard_glm_init(sid: int, files: list[str], spec: dict) -> dict:
     t0 = time.perf_counter()
     fam = FAMILIES[spec["family"]]
     cols = sorted(set([spec["y"], *spec["vars"], *spec["fes"]]))
-    df = pl.read_parquet(files, columns=cols)
+    sub = spec.get("subset")
+    if sub:  # fit(subset=): the rows outside it are not in the sample (worker._load drops them too)
+        from .expr import columns as _expr_columns, condition as _condition
+
+        df = pl.read_parquet(files, columns=sorted(set(cols) | set(_expr_columns(sub))))
+    else:
+        df = pl.read_parquet(files, columns=cols)
     ok = pl.all_horizontal(
         [pl.col(c).is_not_null() & (pl.col(c).is_finite() if df.schema[c].is_float() else True) for c in cols]
     )
+    if sub:
+        ok = ok & _condition(sub)
     valid = df.select(ok).to_series().to_numpy()
     y = df[spec["y"]].cast(pl.Float64).fill_null(0.0).to_numpy()
     bad = valid & (
@@ -220,7 +228,15 @@ def fit_glm(
     xvars = sorted((set(f.variables) - {y} - {t.base for t in f.fe_terms}) | set(clus_cols))
     xvars = [v for v in xvars if v in ds.columns]
 
-    tag = hashlib.sha1(f"{formula}|{family}|{cluster}".encode()).hexdigest()[:12]
+    subset = fit_kw.get("subset")
+    if subset is not None:
+        from . import expr as _expr
+
+        _expr.condition(subset)
+    tag = hashlib.sha1(
+        f"{formula}|{family}|{cluster}".encode()
+        + (f"|{_expr.canonical(subset)}".encode() if subset is not None else b"")
+    ).hexdigest()[:12]
     wd = Path(workdir) if workdir else ds.root / "runs" / f"glm-{tag}"
     sides = [wd / "side0", wd / "side1"]
     for d in sides:
@@ -231,7 +247,7 @@ def fit_glm(
     # separation: drop FE groups whose outcome never varies, until none changes
     dead: dict[str, np.ndarray] = {c: np.zeros(0, np.int64) for c in fes}
     passes, n0 = 0, None
-    spec = {"family": family, "y": y, "vars": xvars, "fes": fes, "dead": dead, "mode": "scan"}
+    spec = {"family": family, "y": y, "vars": xvars, "fes": fes, "dead": dead, "mode": "scan", "subset": subset}
     while True:
         passes += 1
         res = _run(executor, shard_glm_init, ds, lambda sid: spec, wd, "glm_scan")
