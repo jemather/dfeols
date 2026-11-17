@@ -1,4 +1,4 @@
-# dfeols
+# <img src="https://raw.githubusercontent.com/jemather/dfeols/main/docs/dfeols.svg" alt="" width="36" height="36"> dfeols
 
 [![CI](https://github.com/jemather/dfeols/actions/workflows/ci.yml/badge.svg)](https://github.com/jemather/dfeols/actions/workflows/ci.yml)
 [![License: GPL v3+](https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg)](https://github.com/jemather/dfeols/blob/main/LICENSE)
