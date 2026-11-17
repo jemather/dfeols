@@ -1,8 +1,7 @@
-# The docs site's build (mkdocs.yml; .github/workflows/docs.yml). Pinned to the versions
-# it was last built and checked with. mkdocstrings reads the API from src/ without
+# The docs site's build with Zensical (it reads mkdocs.yml; .github/workflows/docs.yml).
+# Pinned to the versions it was last built and checked with. mkdocstrings reads the API from src/ without
 # importing dfeols, so dfeols's own dependencies are not needed.
-mkdocs==1.6.1
-mkdocs-material==9.8.1
+zensical==0.1.2
 mkdocstrings==1.0.8
 mkdocstrings-python==2.0.11
 pymdown-extensions==13.1

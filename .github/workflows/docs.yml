@@ -1,7 +1,7 @@
 name: Docs
 
-# Build the docs site (mkdocs build --strict: broken links and anchors fail the build) on
-# every push and pull request; deploy it to GitHub Pages from main.
+# Build the docs site with Zensical (zensical build --strict: broken links and anchors fail
+# the build) on every push and pull request; deploy it to GitHub Pages from main.
 # One-time setup: Settings -> Pages -> Build and deployment -> Source: "GitHub Actions".
 
 on:
@@ -26,9 +26,7 @@ jobs:
         with:
           python-version: "3.13"
       - run: pip install -r docs/requirements.txt
-      - run: mkdocs build --strict
-        env:
-          NO_MKDOCS_2_WARNING: "1"
+      - run: zensical build --strict
       - uses: actions/upload-pages-artifact@v3
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         with:

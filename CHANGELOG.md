@@ -9,10 +9,11 @@ break the API).
 
 ### Added
 
-- Documentation site at https://jemather.github.io/dfeols/ (MkDocs Material, deployed to
-  GitHub Pages by `.github/workflows/docs.yml`): getting started, a user guide, an API
-  reference generated from the docstrings, benchmarks, validation and the design notes.
-  `pip install -e ".[docs]"` and `mkdocs serve` build it locally.
+- Documentation site at https://jemather.github.io/dfeols/ (built with Zensical from
+  `mkdocs.yml`, deployed to GitHub Pages by `.github/workflows/docs.yml`): getting started, a
+  user guide, an API reference generated from the docstrings, benchmarks, validation and the
+  design notes. `pip install -e ".[docs]"` and `zensical serve` build it locally. It was first
+  built with MkDocs Material, which is now in maintenance mode.
 
 ### Changed
 
