@@ -1070,29 +1070,60 @@ def write_collection(
     purpose: str | list[str] | None = None,
     **kwargs: Any,
 ) -> dict:
-    """Write several fits as one `estrec-collection/0.1` file (estimation spec section 11)
-    at `path` (`<name>.estrec-collection.json`); returns the collection as written.
+    """Write several fits as one `estrec-collection/0.1` file (estimation spec section 11).
 
-    fits       dfeols Results and/or estimation records (dicts, e.g. from
-               `estrec.read`): a list, a mapping label -> fit, or one fit. A fit
-               with several responses gives one member per response (`<label>.<response>`)
-    kind       "batch" (default: a set of runs), "paper", "session", "replication", "other"
-    labels     the members' labels, one per member (default: the mapping's keys, else each
-               fit's label)
-    locators   where each member appears in `publication`: a label string, a locator dict
-               or a list of them, one entry per member (None where there is none)
-    publication  the collection's `publication` (the paper; members carry the locators)
-    redact     leave identifying details out of the members and the collection
-    members    "auto" (embed unless above 16 MB), "embed" or "jsonl" (a members file)
-    level      disclosure level of the collection and its members (estimation spec 4.9, 11.7):
-               fits are written at it (default 4, see `record_level`), records above it are
-               lowered (new records with meta.parent). With only records and no `level`,
-               no level is declared and the records stay as they are
-    purpose    purpose profiles for the fits' records, e.g. "dcas/0.1"
+    Large structures of a member (a vcov above 10,000 elements) go to side files next to
+    the collection, as `Result.write_estimation` does for a record. Records passed in are
+    kept as they are (one without `meta.id` is prepared first).
 
-    Large structures of a member (a vcov above 10,000 elements) go to side files next to the
-    collection, as `write_estimation` does for a record. Records passed in are kept as they
-    are (one without `meta.id` is prepared first). Other keywords go to `to_estimation`."""
+    Parameters
+    ----------
+    fits : Result, dict, list or mapping
+        dfeols Results and/or estimation records (dicts, e.g. from `estrec.read`): a list,
+        a mapping label -> fit, or one fit. A fit with several responses gives one member
+        per response (`<label>.<response>`).
+    path : str or path
+        Where to write, conventionally `<name>.estrec-collection.json`.
+    kind : {"batch", "paper", "session", "replication", "other"}, default "batch"
+        What the collection is; `"batch"` is a set of runs.
+    labels : list of str, optional
+        The members' labels, one per member. Default the mapping's keys, else each fit's
+        label.
+    locators : list, optional
+        Where each member appears in `publication`: a label string, a locator dict or a list
+        of them, one entry per member (None where there is none).
+    publication : dict, optional
+        The collection's `publication` (the paper); members carry the locators.
+    session : dict, optional
+        The `session` block of a session collection.
+    events : list of dict, optional
+        The collection's event log (for sessions: models fitted, variables added).
+    provenance : dict, optional
+        The collection's `provenance` block.
+    redact : bool, default False
+        Leave identifying details out of the members and the collection.
+    members : {"auto", "embed", "jsonl"}, default "auto"
+        Embed the members in the file, or write them to a JSON Lines members file;
+        `"auto"` embeds unless they come to more than 16 MB.
+    sha256 : bool, default True
+        Record each member's digest in the collection.
+    title, tags, notes : optional
+        The collection's `meta` title, tags and notes.
+    level : int, optional
+        Disclosure level of the collection and its members (estimation spec 4.9, 11.7). Fits
+        are written at it (default 4, see `fit`'s `record_level`); records above it are
+        lowered (new records with `meta.parent`). With only records and no `level`, no level
+        is declared and the records stay as they are.
+    purpose : str or list of str, optional
+        Purpose profiles for the fits' records, e.g. `"dcas/0.1"`.
+    **kwargs
+        Passed to `Result.to_estimation` for each fit.
+
+    Returns
+    -------
+    dict
+        The collection as written.
+    """
     from . import __version__
 
     path = Path(path)

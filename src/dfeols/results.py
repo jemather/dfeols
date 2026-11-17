@@ -17,6 +17,46 @@ def _t_p(t, df):
 
 @dataclass
 class Result:
+    """The result of `fit` (also `Session.fit`, `fit_glm`): estimates for each outcome.
+
+    Printing a Result shows `summary()`. Results are saved with `save` and read back with
+    `Result.load`; `write_estimation` writes them as estimation records.
+
+    Attributes
+    ----------
+    formula : str
+        The formula as given.
+    label : str
+        The fit's name (default its spec id).
+    coefnames : list of str
+        Names of the reported coefficients, in order.
+    outcomes : dict
+        Per outcome: `"coef"` (array), `"vcov"` ({type: (matrix, t degrees of freedom)}),
+        `"rss"`, `"tss"`, and `"r2_within"` (with FEs) or `"r2"`; IV fits add `"kappa"`
+        and `"overid"`.
+    N : int
+        Observations used.
+    N_dropped : int
+        Observations dropped (missing values, singletons, `subset`).
+    G : int or None
+        Number of clusters (the smaller count with two-way clustering).
+    cluster : str or None
+        The cluster variable.
+    fe : list of str
+        The absorbed FEs; `fe_levels` gives each one's number of levels.
+    collinear : list of str
+        Regressors dropped as collinear.
+    vcov_default : str
+        The vcov type used when none is asked for.
+    seconds : float
+        Wall time of the fit.
+    workdir : str
+        The fit's working folder.
+    options, timing, run, iv : dict
+        The resolved `fit` arguments; timings by stage; sample counts and provenance; and,
+        for IV fits, the estimator, instruments and first-stage statistics.
+    """
+
     formula: str
     label: str
     coefnames: list[str]
@@ -38,12 +78,35 @@ class Result:
     iv: dict = field(default_factory=dict)  # IV: estimator, endogenous, instruments, first_stage
 
     def coef(self, y: str | None = None) -> np.ndarray:
+        """Coefficients for outcome `y` (default the first), in `coefnames` order."""
         return self.outcomes[y or next(iter(self.outcomes))]["coef"]
 
     def vcov(self, y: str | None = None, type: str | None = None) -> np.ndarray:
+        """Variance matrix for outcome `y` (default the first).
+
+        `type` is one of the vcov types the fit computed (`"iid"`, `"hetero"`, `"CRV1"`);
+        default `vcov_default`.
+        """
         return self.outcomes[y or next(iter(self.outcomes))]["vcov"][type or self.vcov_default][0]
 
     def tidy(self, y: str | None = None, type: str | None = None, alpha: float = 0.05):
+        """Coefficient table as a pandas DataFrame, like fixest's `coeftable`.
+
+        Parameters
+        ----------
+        y : str, optional
+            Outcome; default the first.
+        type : str, optional
+            Vcov type; default `vcov_default`.
+        alpha : float, default 0.05
+            For the confidence interval columns.
+
+        Returns
+        -------
+        pandas.DataFrame
+            Estimate, standard error, t value, p-value and confidence interval, indexed by
+            coefficient.
+        """
         import pandas as pd
         from scipy import stats
 
@@ -67,6 +130,7 @@ class Result:
         )
 
     def summary(self, type: str | None = None) -> str:
+        """Printable summary: formula, FEs, sample, and the coefficient table per outcome."""
         lines = []
         ncl = (getattr(self, "run", None) or {}).get("n_clusters")
         if ncl and len(ncl) > 1:  # two-way: each count (G, the smaller, sets the adjustment)
@@ -94,23 +158,34 @@ class Result:
 
     # ---- estimation records ---------------------------------------------------
     def to_estimation(self, y: str | None = None, **kwargs) -> dict:
-        """Response `y` as an `estimation` record (dict); see dfeols.record.to_estimation.
-        `y` may be left out when the fit has one response."""
+        """Outcome `y` as an `estimation` record (a dict); see `dfeols.record.to_estimation`.
+
+        `y` may be left out when the fit has one outcome. Keyword arguments (`redact`,
+        `publication`, `level`, ...) are `to_estimation`'s.
+        """
         from .record import to_estimation
 
         return to_estimation(self, y, **kwargs)
 
     def write_estimation(self, path, **kwargs) -> dict:
-        """Write one record per response: at `path` (`<name>.estrec.json`) for one
-        response, else `<name>.<response>.estrec.json`. `redact=True` removes
-        identifying fields, `publication={...}` adds a publication block. Returns the
-        records as written, by response."""
+        """Write one estimation record per outcome.
+
+        With one outcome the record goes to `path` (`<name>.estrec.json`); with several, to
+        `<name>.<outcome>.estrec.json`. `redact=True` leaves out identifying fields and
+        `publication={...}` adds a publication block.
+
+        Returns
+        -------
+        dict
+            The records as written, by outcome.
+        """
         from .record import write_estimations
 
         return write_estimations(self, path, **kwargs)
 
     # ---- persistence --------------------------------------------------------
     def to_dict(self) -> dict:
+        """The result as plain JSON-serialisable types (arrays as lists)."""
         outs = {}
         for y, o in self.outcomes.items():
             outs[y] = {
@@ -122,10 +197,12 @@ class Result:
         return d
 
     def save(self, path) -> None:
+        """Save the result as JSON; read it back with `Result.load`."""
         Path(path).write_text(json.dumps(self.to_dict(), indent=1, default=float))
 
     @classmethod
     def load(cls, path) -> Result:
+        """Read a result written by `save`."""
         d = json.loads(Path(path).read_text())
         for o in d["outcomes"].values():
             o["coef"] = np.array(o["coef"])

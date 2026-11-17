@@ -221,7 +221,28 @@ def load_config(path: str | os.PathLike | None = None) -> dict:
 
 
 def profile(name: str | None = None, path=None, **overrides) -> Profile:
-    """Load a site profile. Missing config -> the built-in 'local' profile."""
+    """Load a site profile: how to reach the cluster's scheduler and what workers to ask for.
+
+    Parameters
+    ----------
+    name : str, optional
+        Profile name in the config. Default `$DFEOLS_PROFILE`, else the config's `default`,
+        else the built-in `"local"` profile (also used when there is no config).
+    path : str or path, optional
+        Config file. Default `$DFEOLS_CONFIG`, else `~/.config/dfeols/config.toml`
+        (`dfeols config init` writes one).
+    **overrides
+        Profile keys to change for this call, e.g. `max_workers=40`.
+
+    Returns
+    -------
+    Profile
+
+    Raises
+    ------
+    KeyError
+        If `name` is not in the config.
+    """
     cfg = load_config(path)
     profiles = cfg.get("profiles", {})
     name = name or os.environ.get("DFEOLS_PROFILE") or cfg.get("default")

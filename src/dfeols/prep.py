@@ -235,30 +235,49 @@ def prep(
     checksum: bool = True,
     **dist_options,
 ) -> Dataset:
-    """Encode FEs and clusters and write sharded Parquet.
+    """Encode FEs and clusters and write the data as sharded Parquet.
 
-    source         Parquet path or glob, CSV path, or a Polars/pandas frame.
-    shard_dir      Output directory. Put it on the shared scratch/temp filesystem.
-    partition      Key whose groups never split across shards (e.g. "id_a").
-                   FEs and clusters nested in this key are handled locally.
-                   "auto": `dfeols plan` picks it for `formula` (the smallest
-                   crossing system among balanced keys that fit); the report is
-                   logged and kept in dfeols_meta.json under "partition_plan".
-    formula        with partition="auto": the specification the shards are for
-                   (its FEs must be among fixed_effects; the cluster is the only
-                   entry of clusters, if there is one)
-    fixed_effects  FE specs to encode, e.g. ["spell", "week", "id_a^week"].
-                   Any FE used later in fit() must be listed here.
-    clusters       Cluster variables to encode, e.g. ["id_a"].
-    keep           Data columns to keep (default: all).
-    target_rows    Approximate rows per shard. Peak worker memory is about
-                   rows x (outcomes + regressors + dummies) x 8 bytes x 3.
-    checksum       record the source's sha256 (files) or content hash (frames) in
-                   dfeols_meta.json; estimation records carry it
-    executor       run prep as map/reduce rounds on this executor's workers
-                   (Parquet input). Use it for data too large to stream on the
-                   coordinator; output is identical in structure. Extra keyword
-                   options (rows_per_task, max_pieces) tune the distributed path.
+    Parameters
+    ----------
+    source : str, path or frame
+        Parquet path or glob, CSV path, or a Polars or pandas frame.
+    shard_dir : str or path
+        Output directory. Put it on the shared scratch or temp filesystem.
+    partition : str or list of str
+        Key whose groups never split across shards (e.g. `"id_a"`). FEs and clusters
+        nested in this key are handled locally. `"auto"`: `dfeols plan` picks it for
+        `formula` (the smallest crossing system among balanced keys that fit); the report
+        is logged and kept in `dfeols_meta.json` under `"partition_plan"`.
+    formula : str, optional
+        With `partition="auto"`: the specification the shards are for. Its FEs must be among
+        `fixed_effects`; its cluster, if any, is the only entry of `clusters`.
+    fixed_effects : list of str
+        FE specs to encode, e.g. `["spell", "week", "id_a^week"]`. Any FE used later in
+        `fit` must be listed here.
+    clusters : list of str
+        Cluster variables to encode, e.g. `["id_a"]`.
+    keep : list of str, optional
+        Data columns to keep. Default all.
+    target_rows : int, default 1_000_000
+        Approximate rows per shard. Peak worker memory is about
+        rows x (outcomes + regressors + dummies) x 8 bytes x 3.
+    overwrite : bool, default False
+        Replace a prepared dataset already in `shard_dir` (otherwise `FileExistsError`).
+    keep_staging : bool, default False
+        Keep the intermediate `_staging` folder after the shards are written, for debugging.
+    executor : DaskExecutor, optional
+        Run prep as map/reduce rounds on this executor's workers (Parquet input). Use it for
+        data too large to stream on the coordinator; the output has the same structure.
+    checksum : bool, default True
+        Record the source's sha256 (files) or content hash (frames) in `dfeols_meta.json`;
+        estimation records carry it.
+    **dist_options
+        Tuning for the distributed path (`executor`): `rows_per_task`, `max_pieces`.
+
+    Returns
+    -------
+    Dataset
+        The prepared dataset, ready for `fit`.
     """
     from .lock import DirLock
 

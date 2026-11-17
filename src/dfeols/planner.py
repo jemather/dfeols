@@ -242,21 +242,43 @@ def plan(
 ) -> dict:
     """Probe the FE structure of a specification and recommend a partition key and path.
 
-    source      Parquet path or glob, CSV path, or a Polars/pandas frame (raw or prepped)
-    formula     dfeols formula; or `fe` (FE specs) and `vars` (outcome first, then regressors)
-    cluster     cluster variable (or interaction a^b)
-    partition   candidate partition keys (a^b for a compound key); default: every FE,
-                interaction component and the cluster
-    target_rows prep's shard target
-    level_space_gb  fit's budget for A on plan C (default: a quarter of the profile's
-                coordinator memory, else of this machine's)
-    profile     site profile (name or Profile) to check worker and coordinator memory against
-    workers     workers the fit will run on, for shard balance and the wall-time estimate
-                (default: the profile's max_workers, else DEFAULT_WORKERS)
-    specs       how many specifications will share these FEs, sample and weights (more
-                than one: demean-first, a session)
+    Parameters
+    ----------
+    source : str, path or frame
+        Parquet path or glob, CSV path, or a Polars or pandas frame, raw or prepared.
+    formula : str, optional
+        dfeols formula. Instead, give `fe` and `vars`.
+    fe : list of str, optional
+        FE specs, when there is no `formula`.
+    vars : list of str, optional
+        Outcome first, then regressors, when there is no `formula`.
+    cluster : str, optional
+        Cluster variable, or an interaction `a^b`.
+    weights : str, optional
+        Weight column; rows with weights <= 0 are left out, as in `fit`.
+    partition : str or list of str, optional
+        Candidate partition keys (`a^b` for a compound key). Default every FE, interaction
+        component and the cluster.
+    target_rows : int, default 1_000_000
+        `prep`'s shard target.
+    max_dummy_levels : int, default 2000
+        `fit`'s limit for dense crossing-FE dummies.
+    level_space_gb : float, optional
+        `fit`'s budget for A on plan C. Default a quarter of the profile's coordinator
+        memory, else of this machine's.
+    profile : str or Profile, optional
+        Site profile to check worker and coordinator memory against.
+    workers : int, optional
+        Workers the fit will run on, for shard balance and the wall-time estimate. Default the
+        profile's `max_workers`, else 20.
+    specs : int, default 1
+        How many specifications will share these FEs, sample and weights. More than one
+        suggests demeaning first, in a session.
 
-    Returns a JSON-serialisable dict; `format_report` prints it.
+    Returns
+    -------
+    dict
+        A JSON-serialisable report; `dfeols.planner.format_report` prints it.
     """
     from .prep import _scan
 

@@ -299,12 +299,29 @@ def executor(
 ):
     """Return a DaskExecutor whose workers come from the profile's scheduler.
 
-    Worker settings (cores, memory, walltime, max_workers, min_workers,
-    retire_minutes) and profile keys (queue, account, ...) can be overridden
-    as keyword arguments. Workers join as the scheduler starts them.
-    hold=True asks for max_workers and keeps them while idle (sessions)
-    instead of adapting between min_workers and max_workers.
-    The client and cluster are available as ex.client and ex.cluster.
+    Workers join as the scheduler starts them. The Dask client and cluster are available as
+    `ex.client` and `ex.cluster`.
+
+    Parameters
+    ----------
+    profile : str or Profile, optional
+        Site profile (see `dfeols.profile`). Default `$DFEOLS_PROFILE`, else the config's
+        default, else `"local"`.
+    tick : float, default 10.0
+        Seconds between the coordinator's scheduler queries while tasks run.
+    log_directory : str, optional
+        Folder for the worker jobs' logs. Default `<scratch>/logs/...` when the profile has
+        a scratch directory.
+    hold : bool, default False
+        Ask for `max_workers` and keep them while idle (sessions), instead of adapting
+        between `min_workers` and `max_workers`.
+    **overrides
+        Worker settings (`cores`, `memory`, `walltime`, `max_workers`, `min_workers`,
+        `retire_minutes`) and profile keys (`queue`, `account`, ...) for this executor only.
+
+    Returns
+    -------
+    DaskExecutor
     """
     from distributed import Client
 

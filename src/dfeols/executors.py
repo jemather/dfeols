@@ -332,6 +332,12 @@ class _Feeder:
 
 
 class SerialExecutor:
+    """Run every shard task in this process, one after another.
+
+    The default executor for `fit` and `prep`: no cluster needed, so it suits small data,
+    tests and checking a specification before a full run.
+    """
+
     def slots(self):
         return 1, 1
 
@@ -363,14 +369,29 @@ class SerialExecutor:
 
 
 class DaskExecutor:
-    """Run tasks on a dask.distributed Client.
+    """Run shard tasks on a `dask.distributed` Client.
 
-    With `worker_memory` (bytes; dfeols.cluster's workers declare it as the Dask resource
-    MEMORY, with a thread per core), each task asks for `progress.task_gb` of it, so a
-    worker runs as many shards at once as fit its memory: the tasks are mostly
-    single-threaded numpy and scipy (DB1B 2005Q2-Q3: 4 threads made a task 0-15% faster).
-    Without an estimate, or with a plain Client (no worker_memory), one task per worker
-    (nthreads=1 per job), which keeps memory predictable.
+    Usually made by `dfeols.executor(profile)`, which starts the workers through the
+    cluster's scheduler. Build one directly to use a Client you already have.
+
+    With `worker_memory` (dfeols.cluster's workers declare it as the Dask resource MEMORY,
+    with a thread per core), each task asks for its estimated memory, so a worker runs as
+    many shards at once as fit: the tasks are mostly single-threaded numpy and scipy (DB1B
+    2005Q2-Q3: 4 threads made a task 0-15% faster). Without it, or with a plain Client, one
+    task runs per worker, which keeps memory predictable.
+
+    Parameters
+    ----------
+    client : distributed.Client
+        A connected Dask client.
+    max_workers : int, optional
+        Most workers the fit expects, shown in progress reports ("12 of 40 workers").
+    tick : float, default 5.0
+        Seconds between scheduler queries while tasks run.
+    retries : int, default 3
+        Times Dask reruns a task that fails, for example because its worker died.
+    worker_memory : int, optional
+        Bytes of memory each worker declares as the Dask resource MEMORY.
     """
 
     MARGIN = 1.25  # on the worker-memory estimate

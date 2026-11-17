@@ -1147,52 +1147,118 @@ def fit(
 ) -> Result:
     """Estimate an HDFE OLS or IV model on a prepared, sharded dataset.
 
-    cluster    cluster variable (encoded in prep); default vcov is then CRV1. Two ("a+b" or
-               ["a", "b"]) for two-way clustering (Cameron, Gelbach and Miller: V_a + V_b - V_ab,
-               each scaled with G the smaller count, as fixest and pyfixest); not with cells=True
-    vcov       "iid", "hetero", "CRV1" or a list of them (all computed in one pass)
-    subset     a row condition on the dataset's columns, e.g. "vanished == 1" or
-               "duration < 365 & is_buy == 0" (comparisons joined by &, |, !; expression syntax
-               as dfeols.expr). Rows where it does not hold, or where a column it reads is null
-               or not finite, are left out before listwise deletion and singletons, so one prep
-               serves every sample. Recorded as the record's sample restriction, part of the
-               spec id (workdir)
-    executor   SerialExecutor() (default) or DaskExecutor(client)
-    workdir    where status.json and the demeaned cache go; defaults to
-               <shard_dir>/runs/<spec id>. Put it on shared scratch.
-    record     write `estimation` records, one per response: True puts them at
-               <workdir>/result.estrec.json (result.<y>.estrec.json with
-               several responses), a path puts them there, False skips them
-    publication  `publication` block for the record (citation, locator, links)
-    redact     leave identifying details (user, host, paths, job ids) out of the record
-    record_level  disclosure level of the record, 1-5 (estimation spec 4.9): default the
-               executor profile's `record_level`, else $DFEOLS_RECORD_LEVEL, else 4 (or what
-               `purpose` needs). 5 keeps the scheduler, timing, hosts and every package
-    purpose    purpose profiles the record is for, e.g. "dcas/0.1"
-    estimator  IV formulas (`y ~ x | fe | d ~ z`): "2sls" (default) or "liml"
-    fuller     Fuller's modified LIML with constant a (estimator="liml"); a=1 is common
-    crossing_fe  how FEs that cross the partition are absorbed: "dense" dummy columns,
-               "sparse" per-level sums with a dense solve on the coordinator, "iterate"
-               conjugate gradient across shards (plan C; iter_tol, iter_maxiter), or
-               "auto" (the default) to pick from the FE structure
-    iter_tol   plan C: CG stops when every column's residual is below this, relative to its
-               right-hand side (default 1e-8)
-    level_space_gb  plan C: coordinator memory for A = D~'W D~, built in round 1 so CG runs
-               with no further passes (default: a quarter of the profile's coordinator memory,
-               or of this machine's; 0 turns it off). Above it each CG step is a pass over the
-               shards, and dfeols warns (crossing.SlowConvergenceWarning)
-    crossing_precond  plan C: "auto" (from A's block structure), "jacobi", "bjacobi" or "sgs"
-               (AP-sweep, level space only)
-    cells      fit from per-cell sums (dfeols.cells): one pass groups each shard's rows by every
-               FE key and the cluster, and the coordinator solves on the cells, exactly. Pays
-               when the data compress (DB1B's market table: 32x). OLS and IV (2SLS, LIML,
-               Fuller); vcov CRV1 (one- or two-way) and iid; not HC1 (it needs each row's residual)
-    predict    a folder: round 2 also writes each estimation row's in-sample prediction there,
-               one part-NNNNN.parquet per shard, with columns `predict_keep` (raw columns, e.g.
-               a row id, carried along), xb (reported regressors x coefficients), d (the sum of
-               the row's FE terms, local and crossing: fixest's predict() is xb + d) and resid
-               (y - xb - d); with several outcomes, xb_<y>, d_<y>, resid_<y>. Part files already
-               in the folder are replaced. OLS only
+    Parameters
+    ----------
+    ds : Dataset or str
+        The prepared dataset, or its shard directory (opened with `Dataset.open`).
+    formula : str
+        `y ~ x1 + x2 | fe1 + fe2` for OLS, `y ~ x | fe | d ~ z1 + z2` for IV. Several
+        outcomes (`y1 + y2 ~ ...`) are fitted on a common sample. Every FE must have been
+        encoded by `prep`.
+    cluster : str or list of str, optional
+        Cluster variable (encoded in prep); the default vcov is then CRV1. Two (`"a+b"` or
+        `["a", "b"]`) for two-way clustering (Cameron, Gelbach and Miller: V_a + V_b - V_ab,
+        each scaled with G the smaller count, as fixest and pyfixest). Not with `cells=True`.
+    vcov : str or list of str, optional
+        `"iid"`, `"hetero"`, `"CRV1"` or a list of them, all computed in one pass. Default
+        `"CRV1"` with a cluster, else `"iid"`.
+    weights : str, optional
+        Column of analytic weights.
+    subset : str, optional
+        A row condition on the dataset's columns, e.g. `"vanished == 1"` or
+        `"duration < 365 & is_buy == 0"` (comparisons joined by `&`, `|`, `!`; expression
+        syntax as `dfeols.expr`). Rows where it does not hold, or where a column it reads is
+        null or not finite, are left out before listwise deletion and singletons, so one prep
+        serves every sample. Recorded as the record's sample restriction, and part of the
+        spec id (and so of `workdir`).
+    executor : SerialExecutor or DaskExecutor, optional
+        Where the shard tasks run. Default `SerialExecutor()`; `dfeols.executor(profile)`
+        gives a `DaskExecutor` on the cluster's scheduler.
+    workdir : str, optional
+        Where `status.json` and the demeaned cache go. Default `<shard_dir>/runs/<spec id>`.
+        Put it on shared scratch.
+    cache : bool or "auto", default "auto"
+        Keep each shard's demeaned arrays on disk between the two passes. `"auto"` caches
+        only when demeaning is iterative (three or more FEs nested in the partition, or two
+        with `fe_method="iterate"`); otherwise recomputing is cheaper than writing and
+        re-reading the arrays.
+    keep_cache : bool, default False
+        Leave the demeaned cache in `workdir` after the fit (it is deleted by default).
+    max_dummy_levels : int, default 2000
+        Largest crossing FE (one that crosses the partition) absorbed as dense dummy columns.
+        Larger crossing FEs take the sparse or iterative path (`crossing_fe`).
+    drop_singletons : bool, default True
+        Drop observations alone in a FE group, as fixest and pyfixest do.
+    fe_tol : float, default 1e-10
+        Convergence tolerance of the iterative within-shard demeaning (alternating
+        projections): it stops when a sweep moves no entry by more than this.
+    fe_method : {"auto", "exact", "iterate"}, default "auto"
+        Within-shard demeaning. One FE is always one exact pass. With two, `"auto"` and
+        `"exact"` solve exactly (Schur complement), falling back to alternating projections
+        for a component too large or singular; `"iterate"` always uses alternating
+        projections, as do three or more FEs.
+    crossing_fe : {"auto", "dense", "sparse", "iterate"}, default "auto"
+        How FEs that cross the partition are absorbed: `"dense"` dummy columns, `"sparse"`
+        per-level sums with a dense solve on the coordinator, `"iterate"` conjugate gradient
+        across shards (plan C; `iter_tol`, `iter_maxiter`), or `"auto"` to pick from the FE
+        structure.
+    collin_tol : float, default 1e-9
+        A regressor whose sum of squares net of the FEs is at most this share of its centered
+        sum of squares is absorbed by the FEs, and dropped as collinear.
+    iter_tol : float, default 1e-8
+        Plan C: CG stops when every column's residual is below this, relative to its
+        right-hand side.
+    iter_maxiter : int, default 5000
+        Plan C: most CG steps.
+    level_space_gb : float, optional
+        Plan C: coordinator memory for A = D~'W D~, built in round 1 so CG runs with no
+        further passes. Default a quarter of the profile's coordinator memory, or of this
+        machine's; 0 turns it off. Above it each CG step is a pass over the shards, and dfeols
+        warns (`crossing.SlowConvergenceWarning`).
+    crossing_precond : {"auto", "jacobi", "bjacobi", "sgs"}, default "auto"
+        Plan C preconditioner: `"auto"` picks from A's block structure; `"sgs"` is an
+        alternating-projections sweep, level space only.
+    cells : bool, default False
+        Fit from per-cell sums (`dfeols.cells`): one pass groups each shard's rows by every
+        FE key and the cluster, and the coordinator solves on the cells, exactly. Pays when
+        the data compress (DB1B's market table: 32x). OLS and IV (2SLS, LIML, Fuller); vcov
+        CRV1 (one- or two-way) and iid, not HC1 (it needs each row's residual).
+    label : str, optional
+        Name of the fit in the log, `status.json` and the record. Default the spec id.
+    log_every : float, default 30.0
+        Seconds between progress lines in the log.
+    record : bool or path, default True
+        Write `estimation` records, one per response. True puts them at
+        `<workdir>/result.estrec.json` (`result.<y>.estrec.json` with several responses), a
+        path puts them there, False skips them.
+    publication : dict, optional
+        `publication` block for the record (citation, locator, links).
+    redact : bool, default False
+        Leave identifying details (user, host, paths, job ids) out of the record.
+    record_level : int, optional
+        Disclosure level of the record, 1-5 (estimation spec 4.9). Default the executor
+        profile's `record_level`, else `$DFEOLS_RECORD_LEVEL`, else 4 (or what `purpose`
+        needs). 5 keeps the scheduler, timing, hosts and every package.
+    purpose : str or list of str, optional
+        Purpose profiles the record is for, e.g. `"dcas/0.1"`.
+    estimator : {"2sls", "liml"}, default "2sls"
+        Estimator for IV formulas (`y ~ x | fe | d ~ z`).
+    fuller : float, optional
+        Fuller's modified LIML with constant a (`estimator="liml"`); a = 1 is common.
+    predict : path, optional
+        A folder: round 2 also writes each estimation row's in-sample prediction there, one
+        `part-NNNNN.parquet` per shard, with the columns `predict_keep`, `xb` (reported
+        regressors x coefficients), `d` (the sum of the row's FE terms, local and crossing:
+        fixest's `predict()` is xb + d) and `resid` (y - xb - d); with several outcomes,
+        `xb_<y>`, `d_<y>`, `resid_<y>`. Part files already in the folder are replaced. OLS
+        only.
+    predict_keep : list of str, optional
+        Raw columns carried into the `predict` files unchanged, e.g. a row id.
+
+    Returns
+    -------
+    Result
+        Coefficients, variance matrices and fit statistics for each outcome.
     """
     if not isinstance(ds, Dataset):
         ds = Dataset.open(ds)
