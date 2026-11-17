@@ -329,19 +329,27 @@ def main(argv=None):
             info["parts"][str(r["chunk"])] = r
             print(f"pass2 chunk {r['chunk']}: {r['rows']:,} rows ({time.time() - t0:.0f} s)", flush=True)
     files = [a.out / "data" / f"part-{k:04d}.parquet" for k in sorted(chunks)]
-    chk = (
-        pl.scan_parquet(files)
-        .select(
-            pl.len().alias("rows"),
-            *[c(k).null_count().alias(f"null_{k}") for k in SCHEMA.names],
-            c("sample").n_unique().alias("samples"),
-            c("series").n_unique().alias("series"),
-            (c("count") > 0).sum().alias("nonzero"),
-            c("count").max().alias("count_max"),
+    # check one part at a time: n_unique over all ~7B rows exceeds Polars' spill budget.
+    # A sample never spans parts (parts are sample ranges); series can, so union their sets.
+    chk: dict = {}
+    series_seen: set[int] = set()
+    for f in files:
+        r = (
+            pl.scan_parquet(f)
+            .select(
+                pl.len().alias("rows"),
+                *[c(k).null_count().alias(f"null_{k}") for k in SCHEMA.names],
+                c("sample").n_unique().alias("samples"),
+                (c("count") > 0).sum().alias("nonzero"),
+                c("count").max().alias("count_max"),
+            )
+            .collect()
+            .row(0, named=True)
         )
-        .collect(engine="streaming")
-        .row(0, named=True)
-    )
+        for k2, v in r.items():
+            chk[k2] = max(chk.get(k2, 0), v or 0) if k2 == "count_max" else chk.get(k2, 0) + (v or 0)
+        series_seen |= set(pl.scan_parquet(f).select(c("series").unique()).collect()["series"].to_list())
+    chk["series"] = len(series_seen)
     info["check"] = chk
     if (
         chk["rows"] != expect
