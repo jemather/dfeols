@@ -9,6 +9,13 @@ break the API).
 
 ### Added
 
+- Late tasks copied: in the iterated crossing-FE stages (round 1 and each CG step), once no
+  task is left to hand out, a task out for over `DFEOLS_COPY_AFTER_S` (default 30 s) and 4x
+  its expected time (`DFEOLS_COPY_FACTOR`) is copied to the fastest idle worker; the first of
+  the two to finish counts and the other is cancelled, so each part is summed once. In D11 L3
+  (36130493) 65 of 310 CG steps each waited on one task of 60-430 s (median 3-4 s) on two
+  nodes shared with other jobs: 3.2 of 8.1 h. The log says how many were copied and how many
+  copies won. `DFEOLS_COPY_AFTER_S=0` turns it off.
 - `fit(subset=...)` (and `fit_glm`): a row condition on the dataset's columns, e.g.
   `"vanished == 1"` or `"duration < 365 & is_buy == 0"` (comparisons joined by `&`, `|`, `!`,
   in `dfeols.expr` syntax; `expr.condition`). Rows where it does not hold, or where a column

@@ -305,6 +305,31 @@ class _Feeder:
         r = c / seconds
         self.rates[w] = r if w not in self.rates else 0.7 * self.rates[w] + 0.3 * r
 
+    def stragglers(self, out: dict, per_row: float, busy: dict, min_s: float, factor: float) -> list:
+        """[(tid, worker)]: tasks to copy to another worker, once nothing is left to hand out.
+        out: {tid: (its worker, seconds since it was handed out)} of the tasks not finished
+        and not copied yet; per_row: seconds a row of this run's finished tasks; busy:
+        {worker: copies running there}. A task is late past max(min_s, factor x its expected
+        time); the latest go first, each to the fastest other worker with a thread free.
+        Tasks already running are Dask's, and the feeder's stealing moves only queued ones:
+        in D11 L3 (36130493) 65 of 310 CG steps each waited on one task of 60-430 s
+        (median 3-4 s) on a node shared with other jobs, 3.2 of 8.1 h."""
+        free = {w: self.threads[w] - self.inflight[w] - busy.get(w, 0) for w in self.own}
+        late = []
+        for t, (w, age) in out.items():
+            due = max(min_s, factor * self.rows.get(t, 1) * per_row)
+            if age > due:
+                late.append((age - due, t, w))
+        res = []
+        for _over, t, w in sorted(late, key=lambda x: -x[0]):
+            cands = [v for v in free if v != w and free[v] > 0]
+            if not cands:
+                break
+            v = max(cands, key=self.rate)
+            free[v] -= 1
+            res.append((t, v))
+        return res
+
 
 class SerialExecutor:
     def slots(self):
@@ -381,6 +406,11 @@ class DaskExecutor:
         # never waits on the coordinator for its next task, few enough that the rest stay
         # free to go to whichever worker frees up first
         self.queue_depth = float(os.environ.get("DFEOLS_QUEUE_DEPTH", "2"))
+        # a task handed out (_Feeder) and not back after this many seconds, and factor x its
+        # expected time, gets a copy on an idle worker once no task is left to hand out; the
+        # first of the two to finish counts (_Feeder.stragglers). 0 turns copies off
+        self.copy_after_s = float(os.environ.get("DFEOLS_COPY_AFTER_S", "30"))
+        self.copy_factor = float(os.environ.get("DFEOLS_COPY_FACTOR", "4"))
 
     def slots(self):
         try:
@@ -570,30 +600,79 @@ class DaskExecutor:
         fworker: dict = {}  # future -> the worker the feeder gave it to
         key_to_tid: dict = {}
         pending: set = set()
+        # copies of late tasks (_Feeder.stragglers): each attempt is (task, part) by its result
+        # future; the first attempt of a task to bring back its part or result wins, and the
+        # other is cancelled and forgotten, so every part is summed once
+        attempt: dict = {}  # result future -> (task future, part future or None)
+        part_of: dict = {}  # part future -> its attempt's result future
+        first: dict = {}  # tid -> its first attempt's result future
+        copied: dict = {}  # tid -> its copy's result future
+        copy_w: dict = {}  # a copy's result future -> its worker
+        busy: dict = {}  # worker -> copies running there
+        handed: dict = {}  # tid -> when it was handed out
+        won: set = set()
+        per_row: list = []  # seconds a row of the finished tasks
+        n_won = 0
 
-        def submit(tid, w=None):
+        def submit(tid, w=None, copy=False):
             args = targs[tid]
-            key = f"dfeols-{stage}-{progress.label}-{run_id}-{tid}"
+            key = f"dfeols-{stage}-{progress.label}-{run_id}-{tid}" + ("-copy" if copy else "")
             place = {"workers": [w], "allow_other_workers": True} if w else {}
             sargs = [arg(a, w) for a in args]
-            f = self.client.submit(
+            m = f = self.client.submit(
                 *run_fn(*sargs), key=key, priority=n - pos[tid], retries=self.retries, pure=False,
                 **task_kw(tid), **place,
             )
+            part = None
             if reduce:  # on_result sees the result without its part; the part goes in the tree
                 hi = {"priority": n + 1, "pure": False}  # ahead of the shards still queued
-                part = self.client.submit(reduce.get, f, key=f"{key}-part", **hi)
+                part = self.client.submit(reduce.get, m, key=f"{key}-part", **hi)
                 pool.add(part)
                 part_futs.add(part)
                 part.add_done_callback(doneq.put)
-                f = self.client.submit(reduce.strip, f, key=f"{key}-rest", **hi)
+                f = self.client.submit(reduce.strip, m, key=f"{key}-rest", **hi)
+                part_of[part] = f
             f.add_done_callback(doneq.put)
+            attempt[f] = (m, part)
             futs[f] = tid
             fargs[f] = args
             key_to_tid[f.key] = tid
             pending.add(f)
-            if w:
-                fworker[f] = w
+            if copy:
+                copied[tid], copy_w[f] = f, w
+                busy[w] = busy.get(w, 0) + 1
+            else:
+                first[tid] = f
+                handed[tid] = time.monotonic()
+                if w:
+                    fworker[f] = w
+
+        def drop(f):  # an attempt that lost, or a copy that failed: cancelled and forgotten
+            tid = futs[f]
+            m, part = attempt[f]
+            pending.discard(f)
+            if part is not None:
+                pool.running.discard(part)
+                part_futs.discard(part)
+            if f in fworker:  # its worker's slot is free; its pace: as slow as it was
+                feeder.done(fworker.pop(f), tid)
+                feeder.observe(tid, time.monotonic() - handed[tid])
+            if f in copy_w:
+                busy[copy_w.pop(f)] -= 1
+            for x in (f, part, m):
+                if x is not None:
+                    x.cancel()
+
+        def settle(f):  # f's attempt brought back something first: the other one goes
+            nonlocal n_won
+            tid = futs[f]
+            if tid not in copied or tid in won:
+                return
+            won.add(tid)
+            n_won += f in copy_w
+            for g in (first[tid], copied[tid]):
+                if g is not f and g in pending:
+                    drop(g)
 
         if feeder is None:
             for tid, _rows, _args in ordered:
@@ -657,19 +736,34 @@ class DaskExecutor:
                     if not isinstance(f, tuple) and (f in pending or (pool is not None and f in pool.running))
                 ]
                 for f in done:
+                    if not (f in pending or (pool is not None and f in pool.running)):
+                        continue  # its attempt lost to a copy earlier in this batch
                     if f not in futs:  # a part or a combine: into the pool
+                        own = part_of.get(f)
                         if f.status == "error":
+                            if own in copy_w and futs[own] not in won:  # a failed copy
+                                drop(own)
+                                continue
                             exc = f.exception()
                             raise RuntimeError(f"combining the parts failed in {stage}: {exc!r}") from exc
+                        if own is not None:
+                            settle(own)
                         pool.arrived(f, f in part_futs)
                         part_futs.discard(f)
                         continue
                     tid = futs[f]
                     if f.status == "error":
+                        if f in copy_w and tid not in won:  # the first attempt may still finish
+                            log.debug("%s: copy of shard %s failed: %r", stage, tid, f.exception())
+                            drop(f)
+                            continue
                         exc = f.exception()
                         raise RuntimeError(f"shard {tid} failed in {stage}: {exc!r}") from exc
+                    settle(f)
                     if f in fworker:  # its worker has room again
                         feeder.done(fworker.pop(f), tid)
+                    if f in copy_w:
+                        busy[copy_w.pop(f)] -= 1
                     fetcher.submit(fetch_one, f, tid)
                 if feeder is not None and done:
                     for tid, w in feeder.fill():
@@ -688,7 +782,10 @@ class DaskExecutor:
                         elif where.get(tid) == w:  # its worker no longer has it
                             where.pop(tid, None)
                     if feeder is not None:
-                        feeder.observe(tid, (res.get("timing") or {}).get("total"))
+                        secs = (res.get("timing") or {}).get("total")
+                        feeder.observe(tid, secs)
+                        if secs:
+                            per_row.append(secs / feeder.rows.get(tid, 1))
                     t_on = time.perf_counter()
                     on_result(tid, res)
                     t_end = time.perf_counter()
@@ -706,6 +803,17 @@ class DaskExecutor:
                         feeder.workers(live)
                         for tid, w in feeder.fill():
                             submit(tid, w)
+                        if self.copy_after_s > 0 and not len(feeder) and len(per_row) >= 3:
+                            now = time.monotonic()
+                            out = {
+                                futs[f]: (w, now - handed[futs[f]])
+                                for f, w in fworker.items()
+                                if futs[f] not in copied
+                            }
+                            rate = sorted(per_row)[len(per_row) // 2]
+                            late = feeder.stragglers(out, rate, busy, self.copy_after_s, self.copy_factor)
+                            for tid, w in late:
+                                submit(tid, w, copy=True)
                         s, mx = len(live), self.max_workers
                     else:
                         s, mx = self.slots()
@@ -722,6 +830,11 @@ class DaskExecutor:
                 log.debug("%s: affinity prune failed: %r", stage, e)
         summ = diag.close()
         log.debug("%s %s: %s", stage, progress.label, summ)
+        if copied:
+            log.info(
+                "%s %s: %d late tasks copied to another worker; the copy finished first for %d",
+                stage, progress.label, len(copied), n_won,
+            )
         if pool:
             root = pool.root()
             reduce.done(self._fetch(root, f"the sum of {stage}'s parts") if root is not None else None)

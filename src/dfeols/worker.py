@@ -30,6 +30,7 @@ import json
 import os
 import threading
 import time
+import uuid
 from collections import OrderedDict
 
 try:
@@ -423,7 +424,8 @@ def shard_singletons(plan: Plan, shard_id: int, files: list[str], gcount, first:
                 changed = True
     p = _keep_path(plan, shard_id)
     p.parent.mkdir(parents=True, exist_ok=True)
-    tmp = p.with_name(p.stem + ".tmp.npy")
+    # a name of its own: a late task's copy (DaskExecutor) may write the same file at once
+    tmp = p.with_name(f"{p.stem}.{uuid.uuid4().hex[:8]}.tmp.npy")
     np.save(tmp, keep)
     os.replace(tmp, p)
     return {
@@ -949,7 +951,7 @@ def _round1_finish(plan, shard_id, df, local_codes, w, Yt, Zt, out, T, t, t0, wr
     if plan.cache_dir and write_cache and not plan.sparse_global:
         p = _cache_path(plan, shard_id)
         p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_suffix(".tmp.npz")
+        tmp = p.with_suffix(f".{uuid.uuid4().hex[:8]}.tmp.npz")  # a copy may write it at once
         np.savez(tmp, Y=Yt, Z=Zt, w=w, cl=cl if cl is not None else np.zeros(0, np.int64))
         os.replace(tmp, p)
     T["write"] = time.perf_counter() - t

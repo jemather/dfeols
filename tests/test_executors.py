@@ -452,3 +452,69 @@ def test_task_memory_follows_each_tasks_rows():
         ex.run(_rows_task, [(0, 1_000_000, (0,)), (1, 2_000_000, (1,)), (2, 4_000_000, (2,))], on, prog, "s")
         asked = {int(k.rsplit("-", 1)[1]): r["MEMORY"] for k, r in seen.items() if k.startswith("dfeols-s-")}
         assert asked == {0: 1.25e9, 1: 2.5e9, 2: 5e9}
+
+
+def test_feeder_stragglers_go_to_the_fastest_free_worker():
+    """_Feeder.stragglers: a task far past its expected time is copied to the fastest other
+    worker with a thread free; the latest first, one copy a free thread."""
+    f = _Feeder([(0, 10, ()), (1, 10, ()), (2, 1000, ())], {}, {"a": 1, "b": 1, "c": 2})
+    f.rates.update({"a": 1.0, "b": 3.0, "c": 2.0})
+    f.inflight.update({"a": 1, "b": 0, "c": 1})
+    out = {0: ("a", 100.0), 1: ("a", 40.0), 2: ("c", 100.0)}
+    # 2 is expected to take 4 x 1000 x 0.05 = 200 s: not late; 0 is later than 1
+    assert f.stragglers(out, 0.05, {}, 30.0, 4.0) == [(0, "b"), (1, "c")]
+    assert f.stragglers(out, 0.05, {"b": 1}, 30.0, 4.0) == [(0, "c")]  # b runs a copy already
+    assert f.stragglers({0: ("a", 20.0)}, 0.05, {}, 30.0, 4.0) == []  # under min_s
+
+
+def _slow_once(i, d):
+    """Task 0's first attempt hangs (a slow node) until the test ends; any other runs at once."""
+    import os
+    import time
+
+    if i == 0:
+        try:
+            os.close(os.open(os.path.join(d, "started"), os.O_CREAT | os.O_EXCL))
+            while not os.path.exists(os.path.join(d, "stop")):
+                time.sleep(0.05)
+        except FileExistsError:
+            pass
+    time.sleep(0.05)
+    return {"part": [i], "x": i, "timing": {"total": 0.05}}
+
+
+def test_late_task_copied_and_counted_once(tmp_path, monkeypatch):
+    """A task stuck on its worker gets a copy on an idle one (DFEOLS_COPY_AFTER_S) once nothing
+    is left to hand out; the copy's part is summed, the stuck one is cancelled, and every part
+    and result comes back once."""
+    import time
+
+    distributed = pytest.importorskip("distributed")
+    n = 12
+    got, seen = {}, []
+    red = Reduce(
+        get=lambda r: r["part"],
+        strip=lambda r: {k: v for k, v in r.items() if k != "part"},
+        combine=_combine,
+        done=lambda p: got.setdefault("sum", p),
+    )
+    prog = Progress(None, label="t", every=1e9)
+    prog.add_stage("s", {i: 1 for i in range(n)})
+    prog.start("s")
+    try:
+        with (
+            distributed.LocalCluster(n_workers=3, threads_per_worker=1, dashboard_address=None) as lc,
+            distributed.Client(lc) as c,
+        ):
+            ex = DaskExecutor(c, max_workers=3, tick=0.05)
+            ex.copy_after_s = 0.5
+            t = time.perf_counter()
+            ex.run(_slow_once, [(i, 1, (i, str(tmp_path))) for i in range(n)],
+                   lambda tid, r: seen.append(tid), prog, "s", reduce=red, affinity="fit")
+            took = time.perf_counter() - t
+    finally:
+        (tmp_path / "stop").touch()
+    assert (tmp_path / "started").exists()
+    assert sorted(got["sum"]) == list(range(n))  # every part once
+    assert sorted(seen) == list(range(n))
+    assert took < 15, took
