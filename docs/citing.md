@@ -24,7 +24,6 @@ support of this project:
 
 - Henry Neeman, Director
 - David Akin, Senior System Administrator
-- Thang Ha, System Administrator
 - Tim Huber, Research Computing Facilitator
 - John Mueller, System Administrator
 - Horst Severini, Associate Director for Remote & Heterogeneous Computing, Research Computing
