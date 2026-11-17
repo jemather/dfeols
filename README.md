@@ -112,3 +112,12 @@ format's specification and schemas are CC0 1.0).
 The computing for this project was performed at the
 [OU Supercomputing Center for Education & Research (OSCER)](https://www.ou.edu/oscer) at the
 University of Oklahoma (OU).
+
+We also thank the following OSCER personnel for their support:
+
+- Henry Neeman, Director
+- David Akin, Senior System Administrator
+- Thang Ha
+- Tim Huber, Research Computing Facilitator
+- Horst Severini, Associate Director for Remote & Heterogeneous Computing, Research Computing
+  Facilitator

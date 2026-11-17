@@ -26,7 +26,8 @@ break the API).
   report, `fit`'s and `plan`'s docstrings, `--level-space-gb`'s help and the docs say "the
   sparse path" and "conjugate gradient" (the CG solve, `crossing_fe="iterate"`). The JSON
   report's `path` keys (`"B"`, `"C"`) are unchanged.
-- An acknowledgement of OSCER, where the computing for this project was performed.
+- An acknowledgement of OSCER, where the computing for this project was performed, and of
+  the OSCER staff who supported it.
 
 ## [0.9.0] - 2026-11-18
 
