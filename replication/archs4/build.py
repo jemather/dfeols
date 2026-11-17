@@ -149,12 +149,33 @@ def _init(out: str):
         _W["log_nc_share"] = s["log_nc_share"].to_numpy()
 
 
-def _blocks(lo: int, hi: int):
+def _read(d, b: int, e: int) -> tuple[np.ndarray, list[int]]:
+    """Columns b..e of the H5 matrix. The published v2.5 file has a few gzip chunks that fail to
+    decompress (samples 776627, 776630, 776639, 776645, gene rows 56000-58000, found 2026-11-17).
+    On a failure, read sample by sample and leave unreadable samples all zero, so their library
+    size is 0 and the MIN_LIB rule drops them; they are returned for the log."""
+    try:
+        return d[:, b:e], []
+    except OSError:
+        X = np.zeros((d.shape[0], e - b), np.uint32)
+        bad = []
+        for i in range(b, e):
+            try:
+                X[:, i - b] = d[:, i]
+            except OSError:
+                bad.append(i)
+        return X, bad
+
+
+def _blocks(lo: int, hi: int, bad: list | None = None):
     f = h5py.File(H5, "r")
     d = f["data/expression"]
     for b in range(lo, hi, BLOCK):
         e = min(b + BLOCK, hi)
-        yield b, e, d[:, b:e]  # genes x samples, uint32
+        X, bb = _read(d, b, e)  # genes x samples, uint32
+        if bad is not None:
+            bad += bb
+        yield b, e, X
 
 
 def pass1(k: int) -> int:
@@ -165,7 +186,8 @@ def pass1(k: int) -> int:
     lib = np.zeros(hi - lo, np.int64)
     nc = np.zeros(hi - lo, np.int64)
     acc: dict[str, np.ndarray] = {}
-    for b, e, X in _blocks(lo, hi):
+    bad: list[int] = []
+    for b, e, X in _blocks(lo, hi, bad):
         L = X.sum(0, dtype=np.int64)
         lib[b - lo : e - lo] = L
         nc[b - lo : e - lo] = X[_W["nc_rows"]].sum(0, dtype=np.int64)
@@ -181,7 +203,9 @@ def pass1(k: int) -> int:
     names = np.array(sorted(acc), dtype=object)
     cnt = np.stack([acc[n] for n in names]) if len(names) else np.zeros((0, len(_W["rows"])), np.int32)
     tmp = dst.with_suffix(".tmp.npz")
-    np.savez(tmp, lib=lib, nc=nc, names=names.astype(str), cnt=cnt.astype(np.uint16))
+    np.savez(
+        tmp, lib=lib, nc=nc, bad=np.array(bad, np.int64), names=names.astype(str), cnt=cnt.astype(np.uint16)
+    )
     tmp.rename(dst)
     return k
 
@@ -257,10 +281,12 @@ def main(argv=None):
     lib = np.zeros(s.height, np.int64)
     nc = np.zeros(s.height, np.int64)
     acc: dict[str, np.ndarray] = {}
+    unreadable: list[int] = []
     for k in chunks:  # all chunks, or a test subset treated as the whole file
         z = np.load(a.out / "pass1" / f"c{k:04d}.npz", allow_pickle=False)
         lib[k * CHUNK : k * CHUNK + len(z["lib"])] = z["lib"]
         nc[k * CHUNK : k * CHUNK + len(z["nc"])] = z["nc"]
+        unreadable += z["bad"].tolist() if "bad" in z else []
         for n, v in zip(z["names"], z["cnt"].astype(np.int32)):
             acc[n] = acc[n] + v if n in acc else v
     s = s.with_columns(
@@ -341,6 +367,7 @@ def main(argv=None):
         "series": len(pick),
         "rows": pl.scan_parquet(r0 / "part-0000.parquet").select(pl.len()).collect().item(),
     }
+    info["unreadable_samples"] = sorted(unreadable)
     info["counts"] = {
         "samples_all": s.height,
         "meta_ok": int(s["meta_ok"].sum()),
