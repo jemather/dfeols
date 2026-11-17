@@ -37,6 +37,22 @@ mypy                         # advisory for now
 
 Larger test data: `pytest --rows 5e6 --data-dir /scratch/$USER/dfeols-tests`.
 
+## Documentation
+
+The docs site (https://jemather.github.io/dfeols/) is built with MkDocs Material from
+`docs/` and `mkdocs.yml`, and deployed to GitHub Pages from `main` by
+`.github/workflows/docs.yml`. Build it locally with
+
+```bash
+pip install -e ".[docs]"
+mkdocs serve                 # live preview at http://127.0.0.1:8000
+mkdocs build --strict        # what CI runs: broken links and anchors fail it
+```
+
+User-facing explanations go in `docs/` (the README is a short landing page that links
+there). The API reference is generated from docstrings: public functions and classes use
+NumPy style (`Parameters`, `Returns`, ...), and every parameter is described.
+
 ## What a change needs
 
 - **Correctness first.** Anything that touches estimation must keep agreement

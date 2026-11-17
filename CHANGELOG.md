@@ -7,6 +7,19 @@ break the API).
 
 ## [Unreleased]
 
+### Added
+
+- Documentation site at https://jemather.github.io/dfeols/ (MkDocs Material, deployed to
+  GitHub Pages by `.github/workflows/docs.yml`): getting started, a user guide, an API
+  reference generated from the docstrings, benchmarks, validation and the design notes.
+  `pip install -e ".[docs]"` and `mkdocs serve` build it locally.
+
+### Changed
+
+- Public docstrings are in NumPy style, and every parameter of the public API is described.
+- The README is a short landing page; its sections moved to the docs site. `HOWTO.md` moved to
+  `docs/guide/workflow.md` ("Workflow on a cluster").
+
 ## [0.9.0] - 2026-11-18
 
 The first release on PyPI. Late-task copies in round 1 and CG steps, row conditions at fit time

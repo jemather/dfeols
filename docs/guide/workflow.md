@@ -1,6 +1,7 @@
-# dfeols: how to use it with a real dataset
+# Workflow on a cluster
 
-This is the short version. The README covers the design; `python -m dfeols.bench --help`,
+The whole workflow on a real dataset, from setup to results. [How it works](how-it-works.md)
+covers the design; `python -m dfeols.bench --help`,
 `python -m dfeols.synth --help` and `dfeols --help` cover the tools.
 
 ## 1. One-time setup on a machine

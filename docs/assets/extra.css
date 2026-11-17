@@ -1,0 +1,37 @@
+/* dfeols colours: navy and sky, as in docs/dfeols.svg (scripts/dfeols_mark.py) */
+:root {
+  --dfeols-navy: #0b2545;
+  --dfeols-sky: #8ecae6;
+}
+
+/* light: navy header; links and accents a darker sky, so they read on white */
+[data-md-color-scheme="default"] {
+  --md-primary-fg-color: var(--dfeols-navy);
+  --md-primary-fg-color--light: #1d3c66;
+  --md-primary-fg-color--dark: #06172c;
+  --md-primary-bg-color: #ffffff;
+  --md-accent-fg-color: #1b6a96;
+  --md-accent-fg-color--transparent: rgba(27, 106, 150, 0.1);
+  --md-typeset-a-color: #1b6a96;
+}
+
+/* dark: navy header on Material's slate; links and accents in sky */
+[data-md-color-scheme="slate"] {
+  --md-primary-fg-color: var(--dfeols-navy);
+  --md-primary-fg-color--light: #1d3c66;
+  --md-primary-fg-color--dark: #06172c;
+  --md-primary-bg-color: #e8f2f8;
+  --md-accent-fg-color: var(--dfeols-sky);
+  --md-accent-fg-color--transparent: rgba(142, 202, 230, 0.12);
+  --md-typeset-a-color: var(--dfeols-sky);
+}
+
+/* the logo sits on the navy header: give it a little room */
+.md-header__button.md-logo img {
+  height: 1.6rem;
+}
+
+/* API reference: parameter tables wrap long type annotations instead of widening the page */
+.doc-contents td code {
+  word-break: break-word;
+}

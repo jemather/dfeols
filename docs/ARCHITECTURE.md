@@ -1,7 +1,7 @@
 # dfeols architecture
 
-A guide for contributors. The [README](../README.md) covers usage and the
-[HOWTO](../HOWTO.md) the workflow on a real dataset.
+A guide for contributors. The [user guide](index.md) covers usage and the
+[workflow guide](guide/workflow.md) the workflow on a real dataset.
 
 ## Overview
 
