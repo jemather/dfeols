@@ -43,14 +43,13 @@ inside.
 ## Install
 
 ```bash
-pip install "dfeols[dask] @ git+https://github.com/jemather/dfeols@v0.8.0"
+pip install "dfeols[dask]"
 # development version:
 pip install "dfeols[dask] @ git+https://github.com/jemather/dfeols"
 ```
 
-`[dask]` adds dask, distributed and dask-jobqueue. dfeols is not on PyPI
-until its dependency [estrec](https://github.com/estrec/estrec) is (see
-[Limitations](#limitations)). The R session client installs from `r/` (see
+`[dask]` adds dask, distributed and dask-jobqueue. Estimation records come from
+[estrec](https://github.com/estrec/estrec), installed with dfeols. The R session client installs from `r/` (see
 [its README](https://github.com/jemather/dfeols/blob/main/r/README.md)).
 
 Python 3.10–3.14. Linux HPC clusters are the target; CI also runs the test
@@ -419,8 +418,6 @@ of the time (iid: 85.8%, as expected with clustered errors).
 - **Schedulers:** Slurm is tested on a real cluster; the PBS, SGE and LSF
   templates are not yet. A fit's workers are single-node jobs; there is no
   multi-node launch.
-- **Not on PyPI yet:** dfeols depends on estrec by a pinned git commit until estrec
-  is on PyPI; install from GitHub.
 - **Upstream APIs:** dfeols uses polars' `PartitionBy` sink (marked unstable
   by polars) and pyfixest's compiled demeaner (a private API, with a NumPy
   fallback). Supported version ranges are pinned in `pyproject.toml` and a

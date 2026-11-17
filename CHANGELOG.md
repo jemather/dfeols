@@ -7,6 +7,11 @@ break the API).
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-11-18
+
+The first release on PyPI. Late-task copies in round 1 and CG steps, row conditions at fit time
+(`subset=`), and the scale fixes from the full-size runs.
+
 ### Added
 
 - Late tasks copied: in the iterated crossing-FE stages (round 1 and each CG step), once no
@@ -107,6 +112,9 @@ break the API).
 
 ### Changed
 
+- On PyPI: `pip install "dfeols[dask]"`. estrec is now required by version
+  (`estrec>=0.1,<0.2`, from PyPI) instead of a pinned git commit, which PyPI does not
+  accept. The README has the dfeols mark (`docs/dfeols.svg`).
 - Plan C CG steps with a pass per step (D6 r4 on 2.7-4.2B rows: ~10 min a pass; D11 L3):
   each task goes back to the worker that cached its shard in round 1 (`DaskExecutor.run(...,
   affinity=)`; job 36011018 hit the cache on 2.5% of tasks and reread every shard); a cached
@@ -637,6 +645,7 @@ Fixes from the first 1e10 attempts on OSCER (a snapshot, not published).
 - Two-round map/reduce fit, Serial and Dask executors, ETA, agreement with
   pyfixest.
 
-[Unreleased]: https://github.com/jemather/dfeols/compare/v0.8.0...HEAD
+[Unreleased]: https://github.com/jemather/dfeols/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/jemather/dfeols/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/jemather/dfeols/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/jemather/dfeols/releases/tag/v0.7.0

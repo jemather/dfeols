@@ -43,9 +43,9 @@ dependencies = [
   "pyarrow>=14",
   "pyfixest>=0.50.1,<1",
   "psutil>=5.9",
-  # estimation records (reader, writer, validator, schemas). Pinned to a commit until
-  # estrec is on PyPI; dfeols can't be released to PyPI before then.
-  "estrec @ git+https://github.com/estrec/estrec@b269d9f92bbf119b01e06c370132b178d430b2f2",
+  # estimation records (reader, writer, validator, schemas). Capped below the next minor
+  # version: estrec is pre-1.0, so a minor release may change the format.
+  "estrec>=0.1,<0.2",
   "tomli>=2.0; python_version < '3.11'",
 ]
 

@@ -68,9 +68,9 @@ draft profile against dfeols records, point `ESTREC_SCHEMA_PATH` (or
 ## Releasing (maintainers)
 
 1. Update the version in `src/dfeols/__init__.py`, `CITATION.cff` and the
-   changelog. PyPI rejects dependencies given as git URLs, so while
-   `estrec` is pinned to a commit in `pyproject.toml`, first
-   publish it to PyPI and require it by version.
+   changelog. PyPI rejects dependencies given as git URLs, so every
+   dependency, `estrec` included, must be required by version. If dfeols
+   needs an unreleased estrec change, release estrec first.
 2. Tag `vX.Y.Z` and push the tag. The release workflow builds the sdist and
    wheel, publishes to TestPyPI, then to PyPI (trusted publishing).
 

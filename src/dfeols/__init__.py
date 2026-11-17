@@ -39,7 +39,7 @@ __all__ = [
     "sample_groups",
     "fit_glm",
 ]
-__version__ = "0.8.0"
+__version__ = "0.9.0"
 
 _log = _logging.getLogger("dfeols")
 if not _log.handlers:
