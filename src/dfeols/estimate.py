@@ -1216,23 +1216,23 @@ def fit(
     crossing_fe : {"auto", "dense", "sparse", "iterate"}, default "auto"
         How FEs that cross the partition are absorbed: `"dense"` dummy columns, `"sparse"`
         per-level sums with a dense solve on the coordinator, `"iterate"` conjugate gradient
-        across shards (plan C; `iter_tol`, `iter_maxiter`), or `"auto"` to pick from the FE
+        across shards (`iter_tol`, `iter_maxiter`), or `"auto"` to pick from the FE
         structure.
     collin_tol : float, default 1e-9
         A regressor whose sum of squares net of the FEs is at most this share of its centered
         sum of squares is absorbed by the FEs, and dropped as collinear.
     iter_tol : float, default 1e-8
-        Plan C: CG stops when every column's residual is below this, relative to its
+        With `"iterate"`: CG stops when every column's residual is below this, relative to its
         right-hand side.
     iter_maxiter : int, default 5000
-        Plan C: most CG steps.
+        With `"iterate"`: most CG steps.
     level_space_gb : float, optional
-        Plan C: coordinator memory for A = D~'W D~, built in round 1 so CG runs with no
+        With `"iterate"`: coordinator memory for A = D~'W D~, built in round 1 so CG runs with no
         further passes. Default a quarter of the profile's coordinator memory, or of this
         machine's; 0 turns it off. Above it each CG step is a pass over the shards, and dfeols
         warns (`crossing.SlowConvergenceWarning`).
     crossing_precond : {"auto", "jacobi", "bjacobi", "sgs"}, default "auto"
-        Plan C preconditioner: `"auto"` picks from A's block structure; `"sgs"` is an
+        With `"iterate"`, the preconditioner: `"auto"` picks from A's block structure; `"sgs"` is an
         alternating-projections sweep, level space only.
     cells : bool, default False
         Fit from per-cell sums (`dfeols.cells`): one pass groups each shard's rows by every

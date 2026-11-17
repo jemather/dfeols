@@ -19,6 +19,14 @@ break the API).
 - Public docstrings are in NumPy style, and every parameter of the public API is described.
 - The README is a short landing page; its sections moved to the docs site. `HOWTO.md` moved to
   `docs/guide/workflow.md` ("Workflow on a cluster").
+- The benchmarks page compares dfeols with pyfixest, fixest and reghdfe in speed and memory on
+  four public datasets (9.5M to 1.6B rows), and dfeols on one large-memory node with dfeols on
+  10-80 cluster workers.
+- User-facing text no longer uses the internal names "plan B" and "plan C": `dfeols plan`'s
+  report, `fit`'s and `plan`'s docstrings, `--level-space-gb`'s help and the docs say "the
+  sparse path" and "conjugate gradient" (the CG solve, `crossing_fe="iterate"`). The JSON
+  report's `path` keys (`"B"`, `"C"`) are unchanged.
+- An acknowledgement of OSCER, where the computing for this project was performed.
 
 ## [0.9.0] - 2026-11-18
 
@@ -66,7 +74,7 @@ The first release on PyPI. Late-task copies in round 1 and CG steps, row conditi
   `distributed` and `dask_jobqueue` log (the scheduler runs there) to `scheduler.log` next
   to the worker logs. `scheduler_profile.jsonl` (per stage, and for CG steps 1, 2 and every
   10th): the scheduler event loop's busy seconds and its top functions, from Dask's own
-  profile of that thread (the client shares it). Stage summaries count plan C cache hits
+  profile of that thread (the client shares it). Stage summaries count CG cache hits
   and the seconds tasks spent reading shards. `DFEOLS_DIAG=0` turns the JSONL files off.
 
 - HDFE GLMs by IRLS: `dfeols.fit_glm(ds, formula, family="poisson" | "cloglog", cluster=...)`.
@@ -76,7 +84,7 @@ The first release on PyPI. Late-task copies in round 1 and CG steps, row conditi
   only deviances reach the coordinator. FE groups whose outcome never varies (Poisson: all
   zero; binary: all 0 or all 1) are dropped first, repeated until stable. Poisson equals
   pyfixest's `fepois` (N, coefficients, CRV1, HC1 and iid SEs) with local FEs, the sparse
-  crossing path and plan C; cloglog equals R fixest's `feglm(binomial("cloglog"))`.
+  crossing path and the CG solve; cloglog equals R fixest's `feglm(binomial("cloglog"))`.
   Convergence on relative deviance change (`tol`, default 1e-8 as fixest; tighten it for
   agreement beyond about 1e-5). Not yet: prior weights, varying slopes, `cells=True`.
 - In-sample prediction including FEs: `fit(..., predict=folder, predict_keep=["row_id"])`
@@ -84,7 +92,7 @@ The first release on PyPI. Late-task copies in round 1 and CG steps, row conditi
   local and crossing) and `resid`, one Parquet part per shard, during round 2 (no extra
   pass over the shards beyond re-reading each shard's rows). Equal to pyfixest's
   `predict()` and `resid()` with local FEs, dense dummies, the sparse crossing path and
-  plan C, with weights and several outcomes. OLS only; not with `cells=True`.
+  the CG solve, with weights and several outcomes. OLS only; not with `cells=True`.
 - Stacked regressions with per-equation FEs (`dfeols.stack`, `dfeols.Equation`): each
   equation's rows tagged by `k`, its outcome in `y`, regressor roles as per-equation
   columns (`x_k1`, `x_k2`, ... zero off the equation), and every FE interacted with `k`
@@ -112,7 +120,7 @@ The first release on PyPI. Late-task copies in round 1 and CG steps, row conditi
   and with no discount for nesting in the cluster), and a model with only slope-only FEs
   reports its intercept. Equal to fixest 0.14.2 (coefficients 1e-9, SEs 1e-8) on 19 specs:
   local and crossing slopes, weights, iid, HC1, one- and two-way CRV1, IV
-  (`tests/test_slopes.py`). The sparse path, plan C, `cells=True` and sessions refuse
+  (`tests/test_slopes.py`). The sparse path, the CG solve, `cells=True` and sessions refuse
   slopes with a message; `dfeols plan` counts slope columns and marks such keys not built.
 - Sessions take `i()` on text variables and interacted, `x:i(c)` and `x:i(c, ref=...)`, as
   `fit` does (columns `c::level:x`), equal to `fit` on dense and iterated crossing FEs.
@@ -128,7 +136,7 @@ The first release on PyPI. Late-task copies in round 1 and CG steps, row conditi
 - On PyPI: `pip install "dfeols[dask]"`. estrec is now required by version
   (`estrec>=0.1,<0.2`, from PyPI) instead of a pinned git commit, which PyPI does not
   accept. The README has the dfeols mark (`docs/dfeols.svg`).
-- Plan C CG steps with a pass per step (D6 r4 on 2.7-4.2B rows: ~10 min a pass; D11 L3):
+- CG steps with a pass per step (D6 r4 on 2.7-4.2B rows: ~10 min a pass; D11 L3):
   each task goes back to the worker that cached its shard in round 1 (`DaskExecutor.run(...,
   affinity=)`; job 36011018 hit the cache on 2.5% of tasks and reread every shard); a cached
   shard keeps its dummies on its own levels, so a step's product is over those, not a dense
@@ -140,7 +148,7 @@ The first release on PyPI. Late-task copies in round 1 and CG steps, row conditi
   to one task at a time); the CG checkpoint is written at most every 5 min. The shard cache
   keeps what it holds when full instead of evicting (LRU on a loop that does not fit hit
   nothing, D11 L3: 2 of 1,443) and takes 40% of a worker (was 25%).
-- Plan C CG steps on OSCER after the above (D6 lt365 r4 job 36097628, D11 L3 36097608): task
+- CG steps on OSCER after the above (D6 lt365 r4 job 36097628, D11 L3 36097608): task
   time fell 3-5x but passes did not get faster. Now every step task is placed by the
   coordinator, largest first, on the worker where it would finish first (its shard cached
   there counts once, elsewhere 4x), so a worker holding many shards no longer queues 51-68
@@ -153,7 +161,7 @@ The first release on PyPI. Late-task copies in round 1 and CG steps, row conditi
   are fetched by 16 threads (`DFEOLS_FETCH_THREADS`) instead of one at a time: one fetch
   from a busy worker held up the rest (cg5: 148 s, with 1,078 results waiting), and
   fetching took 300-700 s of each 500-900 s pass.
-- Plan C CG steps (with the placement above, D11 L3 job 36113341, cg836): a placement fixed
+- CG steps (with the placement above, D11 L3 job 36113341, cg836): a placement fixed
   at the start of a step still left six workers with 18-29 tasks queued at 100 s of a
   ~190 s step while the other 17 ran nothing. Step tasks are now handed out as workers free
   up: each worker holds at most 2x its threads submitted (`DFEOLS_QUEUE_DEPTH`), takes its
@@ -162,7 +170,7 @@ The first release on PyPI. Late-task copies in round 1 and CG steps, row conditi
   (4x). Each worker's pace is learnt from its tasks' times and kept across steps, so a slow
   node sheds its queue. Workers that join mid-step get tasks at once; a gone worker's queue
   goes back to the shared one.
-- Plan C CG steps asked far more worker memory than they use: every step task asked for the
+- CG steps asked far more worker memory than they use: every step task asked for the
   largest shard's estimate, with the cache share applied twice (round 1's estimate was
   already scaled for it), so D6 r4 (job 36113346) asked 14.7 GB of a 24 GB worker per task
   and ran one step task per worker: 4-5 tasks running on 34 workers, 400-900 s a step for
@@ -174,14 +182,14 @@ The first release on PyPI. Late-task copies in round 1 and CG steps, row conditi
   levels and cluster codes and the CG step combines use `crossing.sorted_unique`: a D6 step
   combine of 4 x 300k levels 0.77 -> 0.16 s (~970 combines a step). Combines switch to the
   dense P-row sum when the parts hold half the levels (was a quarter), where it is faster.
-- Plan C without level space: round 1's per-level sums are summed in a tree on the workers
+- The CG solve without level space: round 1's per-level sums are summed in a tree on the workers
   (D11 L3 36016180: 27 min fetching ~98 MB results one at a time). With level space, once a
   combine finds the summed parts of A past the budget, the shards still to run build only
   their diagonal blocks, or nothing (D6 r4 35948257 built ~4.5e10 nonzeros for a 4e8 budget).
 - The progress line's rows/s and stage ETA follow the rows whose results have arrived (over
   the last 10 min), not the tasks' own seconds (D6 r4 35953385 round 1: 5.2M rows/s shown,
   0.25M achieved, ETA 7 min for 4 h).
-- A plan C fit logs its CG mode (level space budget or off) before round 1, not only after.
+- A fit using the CG solve logs its CG mode (level space budget or off) before round 1, not only after.
 - `dfeols submit` refuses a script path that does not exist, and takes `--coordinator-memory`.
 
 - Worker logs go in `<scratch>/logs/<coordinator job id>/` (outside a batch job,
@@ -204,7 +212,7 @@ The first release on PyPI. Late-task copies in round 1 and CG steps, row conditi
 
 ### Fixed
 
-- A resumed plan C CG solve (`cg_checkpoint.npz`) estimated the steps left from a fall
+- A resumed CG solve (`cg_checkpoint.npz`) estimated the steps left from a fall
   measured against step 0's residual of 1, so for its first 30 steps it said "about 10 more
   steps" when hundreds were left (D11 L3 resumed at step 808). The estimate now uses only the
   resumed steps.
@@ -218,11 +226,11 @@ The first release on PyPI. Late-task copies in round 1 and CG steps, row conditi
   (900 s) with the worker named.
 - A coordinator ended by SIGTERM (scancel, walltime) cancels its worker jobs, queued ones too.
 
-- Plan C's per-process shard cache (`worker._ITER_CACHE`) is now guarded by a lock. A worker's
+- The CG solve's per-process shard cache (`worker._ITER_CACHE`) is now guarded by a lock. A worker's
   threads clearing the previous fit's entries together raised `KeyError` (OSCER job 35991256:
   43 round-1 tasks failed and were retried), and a CG step's check-then-read could lose its
   entry to another thread's eviction.
-- Plan C's worker-memory estimate counts round 1's arrays over every crossing level
+- The CG solve's worker-memory estimate counts round 1's arrays over every crossing level
   (P x (2(k+m)+4) doubles, ~0.6 GB a task at 6.24M levels) and the sparse level matrices, and
   a round-1 task's memory request reserves the worker's CG cache (scaled by W / (W - cache)),
   so fewer round-1 tasks share a worker when the cache is large.
@@ -235,7 +243,7 @@ The first release on PyPI. Late-task copies in round 1 and CG steps, row conditi
   still merge.
 - The IV first-stage R² is net of every FE, as the outcomes' within R² is. It was net of the
   FEs nested in the partition only (or of none), so it changed with the partition key.
-- Plan C in level space no longer runs workers out of memory. Shards cap their part of A by
+- The CG solve in level space no longer runs workers out of memory. Shards cap their part of A by
   the worker's memory, not the coordinator's, so four parts fit in one combine. Combines add
   their inputs one at a time, and keep only the diagonal blocks (then nothing) before passing
   60% of the worker's memory, so the fit falls back to a pass per CG step instead of losing
@@ -250,7 +258,7 @@ The first release on PyPI. Late-task copies in round 1 and CG steps, row conditi
 - `dfeols plan` caps A's budget at what the workers can sum (60% of a worker's memory), as
   fit does.
 - Arguments shared by every task that are dicts of large arrays (round 2's linear maps, with
-  plan C's FE solution) go to the workers once instead of inside every task: a 758,405-level
+  the CG solve's FE solution) go to the workers once instead of inside every task: a 758,405-level
   fit sent a 46 MiB task graph.
 - Distributed prep's reduce no longer gathers the scan's level sets and nesting checks in the
   coordinator's memory. Scan tasks write those frames to `<shard_dir>/_scan/` and return only
@@ -306,12 +314,12 @@ absorbs are dropped as collinear (see Changed and Fixed).
   difference, and levels absent from the sample are reported as `excluded_levels`.
   Reproduces Farbmacher and Tauchmann's Table 3 (Brown and Laschever 2012) to the printed
   digits.
-- Plan B: crossing FEs on the sparse path with several FEs nested in the partition. The
+- Crossing FEs on the sparse path with several FEs nested in the partition. The
   dummy block's projection on the local FEs is a Schur complement solved per connected
   component (pseudo-inverse, so redundant local FEs are fine); round 2 demeans the dummy
   terms with all local FEs. `crossing_fe="auto"` takes it when a crossing FE exceeds
   `max_dummy_levels` (below that, several local FEs keep dense dummies); `"sparse"` forces it.
-- Plan C: `crossing_fe="iterate"`, crossing-FE coefficients by preconditioned conjugate
+- `crossing_fe="iterate"` (the CG solve): crossing-FE coefficients by preconditioned conjugate
   gradient, then OLS or IV by Frisch-Waugh-Lovell and the sparse path's round 2. Works with
   any number of local FEs, including none; `"auto"` takes it above 30,000 crossing-FE dummies
   or for a crossing FE above `max_dummy_levels` with no FE nested in the partition.
@@ -332,7 +340,7 @@ absorbs are dropped as collinear (see Changed and Fixed).
     progress line shows the step, the residual and roughly how many steps are left.
 - `fit(..., cells=True)`: the fit from per-cell sums (`dfeols.cells`). One pass groups each
   shard's rows by every FE key and the cluster; the coordinator drops singletons on the
-  cells, absorbs the FE with most levels by group means and solves the others with plan C's
+  cells, absorbs the FE with most levels by group means and solves the others with the CG solve's
   level-space CG, then b by Frisch-Waugh-Lovell, RSS and CRV1 scores from the cell moments.
   Exact. OLS; vcov CRV1 (one-way) and iid. DB1B 2005Q2-Q3: 10.3M rows in 329k cells, 9.8 s
   against 27 s (level space) and 43 s (dense solve); b within 1e-11.
@@ -340,7 +348,7 @@ absorbs are dropped as collinear (see Changed and Fixed).
 #### Interactive sessions
 - `dfeols.Session` and `dfeols session start|serve|status|where|fit|refit|add-variable|export|persist|replay|stop`
   (docs/design/sessions.md). A manager demeans the declared variables on the session's FEs
-  once (local FEs, dense crossing FEs, or plan C with one CG solve for every declared
+  once (local FEs, dense crossing FEs, or one CG solve for every declared
   variable), keeps the residualised columns per shard and their Gram matrix, and fits models
   from request files: b and iid SEs with no pass over the data, hetero and CRV1 (one- or
   two-way) with one. OLS and IV (2SLS, LIML, Fuller) share the pass. Results equal
@@ -379,14 +387,14 @@ absorbs are dropped as collinear (see Changed and Fixed).
   aggregates on the source report rows and missingness, levels and singletons of every FE,
   nesting of each FE and the cluster in each candidate key, the largest groups, and per key
   the solver path fit would take, shard count, and worker and coordinator memory against a
-  profile (on plan C, A's size against the level-space budget). It recommends the key that
+  profile (with the CG solve, A's size against the level-space budget). It recommends the key that
   makes the crossing system smallest among keys whose largest group is within `target_rows`
   or half a worker's share of the rows, and `fit(cells=True)` from 2 rows per cell. DB1B's
   683M-row market table probes in 72 s with 8.8 GB.
 - Wall-time estimates: every `fit` appends its path, rows, columns, passes, seconds and
   workers to `<scratch>/timings/fits.jsonl` (`dfeols.timings`), and `dfeols plan` gives each
   key a wall-time range from earlier runs on the same path. It recommends demeaning first in
-  a session for plan C, for estimates over half the profile's `max_walltime`, or with
+  a session for the CG solve, for estimates over half the profile's `max_walltime`, or with
   `--specs N` > 1, else one job. `fit` warns when another formula was fitted on the same
   data, FEs and weights before, naming the session command.
 - `prep(partition="auto", formula=...)` shards by the key `dfeols plan` recommends and keeps
@@ -424,7 +432,7 @@ absorbs are dropped as collinear (see Changed and Fixed).
 #### Execution
 - Workers run several shards at once when they fit: a worker job gets a Dask thread per core
   and declares its memory as the resource MEMORY, and each fit task asks for its memory
-  estimate, so a 24 GB, 4-core worker runs up to 4 tasks together. Prep tasks and plan C's
+  estimate, so a 24 GB, 4-core worker runs up to 4 tasks together. Prep tasks and the CG solve's
   round 1 in level space still take a whole worker.
 - `DaskExecutor` scatters large arrays that every task takes once per round instead of
   sending them with each task. Executors take an optional `reduce` (`executors.Reduce`).
@@ -450,7 +458,7 @@ absorbs are dropped as collinear (see Changed and Fixed).
 
 ### Fixed
 - Regressors an FE absorbs are dropped as collinear, as fixest does, on every path. A column
-  constant within a local FE is rounding noise net of it, and was kept (b ~ 4e11, plan C and
+  constant within a local FE is rounding noise net of it, and was kept (b ~ 4e11, the CG solve and
   the cell path failed to converge); a regressor a crossing FE absorbs (carrier x quarter
   with `carrier^time`) was kept while a dummy was dropped. Each column is now tested against
   its sum of squares before the FEs, dummies first (OLS and IV).
@@ -472,7 +480,7 @@ absorbs are dropped as collinear (see Changed and Fixed).
   builds.
 - `dfeols plan` crashed when a candidate key shared a column with an FE, and counted NaN
   outcomes that fit drops.
-- Plan C's progress line showed round 2 with a 6-second ETA for the whole CG run.
+- The CG solve's progress line showed round 2 with a 6-second ETA for the whole CG run.
 - The CLI exits 141 without a traceback when its output is piped into `head`.
 - Distributed prep with a relative `shard_dir` wrote its pieces under the PartitionBy base
   folder (Polars 2 reads relative paths against it) and failed its row check; task roots

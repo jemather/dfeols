@@ -1,4 +1,4 @@
-# Citing and license
+# Citing, license and acknowledgement
 
 ## Citing
 
@@ -12,3 +12,9 @@ dfeols is free software, licensed under the
 [GNU General Public License v3.0 or later](https://github.com/jemather/dfeols/blob/main/LICENSE).
 Its `estimation` result records are written and validated with
 [estrec](https://estrec.org) (MIT; the format's specification and schemas are CC0 1.0).
+
+## Acknowledgement
+
+The computing for this project was performed at the
+[OU Supercomputing Center for Education & Research (OSCER)](https://www.ou.edu/oscer) at the
+University of Oklahoma (OU).

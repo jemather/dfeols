@@ -87,7 +87,7 @@ nav:
   - Project:
       - Changelog: changelog.md
       - Contributing: contributing.md
-      - Citing and license: citing.md
+      - Citing, license and acknowledgement: citing.md
 
 markdown_extensions:
   - admonition

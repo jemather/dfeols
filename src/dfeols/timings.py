@@ -218,7 +218,7 @@ def shape(option: dict, est: dict | None, *, specs: int, max_walltime: float | N
     """One job or demean-first (docs/design/planner.md, Ted 2026-10-28), with the reasons."""
     why = []
     if option.get("solve") in ("level", "fallback", "maybe") or option.get("path") == "iterate":
-        why.append("the crossing FEs are solved iteratively (plan C): demean once for every specification")
+        why.append("the crossing FEs are solved iteratively: demean once for every specification")
     if est and max_walltime and est["high"] > DEMEAN_FIRST_SHARE * max_walltime:
         why.append(
             f"the estimate's high end is over {DEMEAN_FIRST_SHARE:.0%} of the walltime limit "

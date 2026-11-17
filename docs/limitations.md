@@ -2,11 +2,11 @@
 
 - **Not yet supported:** clustering on three or more variables.
 - **Varying slopes (`fe[x]`)** with crossing FEs take dense dummies only, so every crossing
-  FE must fit `max_dummy_levels`; not on the sparse path, plan C, `cells=True` or in
+  FE must fit `max_dummy_levels`; not on the sparse path, the conjugate-gradient solve, `cells=True` or in
   sessions yet.
 - **The cell path** (`cells=True`) has no HC1 SEs (they need each row's residual) and no
   varying slopes.
-- **Plan C's speed depends on the FE graph.** Crossing FEs too large for a direct solve
+- **The conjugate-gradient solve's speed depends on the FE graph.** Crossing FEs too large for a direct solve
   are absorbed by conjugate gradient; when A does not fit `level_space_gb` each step is
   a pass over the shards, and steps grow as the FEs connect less well. `iter_tol` (1e-8)
   and `iter_maxiter` (5,000) control it, the step count is in

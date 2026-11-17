@@ -41,8 +41,8 @@ PATHS = {
     "local": ("local demeaning in each shard", "exists"),
     "dense": ("dense dummy columns for the crossing FEs", "exists"),
     "sparse": ("sparse path, dense solve on the coordinator", "exists"),
-    "B": ("sparse path, several nested FEs projected in the shard (plan B)", "exists"),
-    "C": ("conjugate gradient across shards (plan C; 2 passes + one round per step)", "exists"),
+    "B": ("sparse path, several nested FEs projected in the shard", "exists"),
+    "C": ("conjugate gradient across shards (2 passes + one round per step)", "exists"),
     "none": ("varying slopes (fe[x]) with a crossing FE above max_dummy_levels", "not built"),
 }
 FIT_PATH = {
@@ -53,8 +53,8 @@ FIT_PATH = {
     "C": "iterate",
     "none": None,
 }  # as fit logs it
-LEVEL_SPACE = "plan C in level space: A built in round 1, CG on the coordinator (2 passes)"
-FALLBACK = "plan C, a pass over the shards per CG step (A over the budget; may converge slowly)"
+LEVEL_SPACE = "conjugate gradient in level space: A built in round 1, CG on the coordinator (2 passes)"
+FALLBACK = "conjugate gradient, a pass over the shards per CG step (A over the budget; may converge slowly)"
 
 SHARDS_PER_WORKER = 2  # balanced: largest group within target_rows or n / (this x workers)
 DEFAULT_WORKERS = 20  # the default profile's max_workers, when plan is given no profile
@@ -264,8 +264,8 @@ def plan(
     max_dummy_levels : int, default 2000
         `fit`'s limit for dense crossing-FE dummies.
     level_space_gb : float, optional
-        `fit`'s budget for A on plan C. Default a quarter of the profile's coordinator
-        memory, else of this machine's.
+        `fit`'s budget for A when crossing FEs are solved by conjugate gradient. Default a
+        quarter of the profile's coordinator memory, else of this machine's.
     profile : str or Profile, optional
         Site profile to check worker and coordinator memory against.
     workers : int, optional

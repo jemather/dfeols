@@ -404,7 +404,7 @@ def main(argv=None):
     pl_.add_argument("--partition", help="candidate keys, comma-separated (a^b for a compound key)")
     pl_.add_argument("--target-rows", type=int, default=1_000_000)
     pl_.add_argument("--max-dummy-levels", type=int, default=2000)
-    pl_.add_argument("--level-space-gb", type=float, default=None, help="plan C's budget for A")
+    pl_.add_argument("--level-space-gb", type=float, default=None, help="CG solve's memory budget for A")
     pl_.add_argument("--profile", help="check memory against this site profile")
     pl_.add_argument(
         "--workers", type=int, help="workers for shard balance (default: the profile's max_workers)"

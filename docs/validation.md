@@ -28,7 +28,7 @@ python -m dfeols.bench --rows 1e7 1e8 --profile cluster
 | `test_prep_distributed.py` | distributed prep equals single-node prep under every strategy (merge, two-level shuffle, hash ids, range shards, multi-column keys) |
 | `test_demean.py` | compiled and NumPy demeaning agree; exact two-way equals iteration |
 | `test_iv.py`, `test_iv_iterate.py` | 2SLS, LIML and Fuller equal pyfixest, fixest, linearmodels and ivreghdfe on every FE path |
-| `test_crossing.py` | plan C's pieces: block pseudo-inverses, the bounded sum of the shards' parts of A, the preconditioner choice, CG |
+| `test_crossing.py` | the conjugate-gradient solve's pieces: block pseudo-inverses, the bounded sum of the shards' parts of A, the preconditioner choice, CG |
 | `test_fit_twoway.py` | two-way clustering equals pyfixest for each kind of cluster pair on every crossing-FE path, and for IV |
 | `test_session*.py` | session models equal `fit` (OLS, IV, created variables, `i()`, two-way clustering); the R client equals Python |
 | `test_dthazard.py` | `lpm_dthazard` equals hand-built IV samples fitted with pyfixest and `fit` |

@@ -19,7 +19,7 @@ Other extras:
 |---|---|
 | `dask` | dask, distributed, dask-jobqueue: fits and prep on cluster workers |
 | `estrec` | jsonschema, so records are validated against estrec's JSON Schemas (otherwise built-in checks) |
-| `amg` | pyamg, for plan C's preconditioner on large sparse crossing-FE components |
+| `amg` | pyamg, for the conjugate-gradient preconditioner on large sparse crossing-FE components |
 
 The R session client installs from `r/`; see [R client](guide/r-client.md).
 

@@ -20,7 +20,7 @@ singletons, every slope coefficient counts in K, and with only slope-only FEs th
 is reported. On an FE nested in the partition key, slopes are projected out exactly per
 group (one local FE) or by alternating projections (several, in NumPy, as pyfixest's
 compiled demeaner has no slopes). With slopes in the model, crossing FEs are dense dummies,
-up to `max_dummy_levels`; the sparse path, plan C, `cells=True` and sessions don't take them yet.
+up to `max_dummy_levels`; the sparse path, the conjugate-gradient solve, `cells=True` and sessions don't take them yet.
 
 Multiple outcomes share one pass and a common sample (rows missing any
 outcome are dropped). IV takes `estimator="2sls"` (default) or `"liml"`, and
