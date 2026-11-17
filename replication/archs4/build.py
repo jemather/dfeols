@@ -130,7 +130,7 @@ def read_meta(out: Path) -> tuple[pl.DataFrame, pl.DataFrame]:
 _W: dict = {}
 
 
-def _init(out: str):
+def _init(out: str, phase: int):
     o = Path(out)
     s = pl.read_parquet(o / "samples.parquet")
     g = pl.read_parquet(o / "genes.parquet")
@@ -140,9 +140,8 @@ def _init(out: str):
             _W[k] = s[k].fill_null(-1).to_numpy()
     _W["histone"], _W["mt"] = g["histone_gene"].to_numpy(), g["mt_gene"].to_numpy()
     _W["nc_rows"] = np.load(o / "nc_rows.npy")
-    kp = o / "keep.npz"
-    if kp.exists():
-        z = np.load(kp)
+    if phase == 2:  # keep.npz and samples.parquet from the merge (a stale keep.npz from a rerun is ignored)
+        z = np.load(o / "keep.npz")
         _W["keep"] = np.unpackbits(z["keep"], axis=1, count=len(_W["rows"])).astype(bool)
         _W["lib"] = s["lib"].to_numpy()
         _W["kept"] = s["kept"].to_numpy()
@@ -274,7 +273,7 @@ def main(argv=None):
     )
     ctx = mp.get_context("spawn")  # Polars ran in this process: fork can hang (memory note)
 
-    with ctx.Pool(a.procs, initializer=_init, initargs=(str(a.out),)) as pool:
+    with ctx.Pool(a.procs, initializer=_init, initargs=(str(a.out), 1)) as pool:
         for i, k in enumerate(pool.imap_unordered(pass1, chunks)):
             print(f"pass1 chunk {k} ({i + 1}/{len(chunks)}, {time.time() - t0:.0f} s)", flush=True)
     # merge pass 1: library sizes, kept samples and series, per-series gene filter
@@ -324,7 +323,7 @@ def main(argv=None):
         "rules": {"min_lib": MIN_LIB, "min_series": MIN_SERIES, "cpm_min": CPM_MIN, "share_min": SHARE_MIN}
     }
     info["parts"] = {}
-    with ctx.Pool(a.procs, initializer=_init, initargs=(str(a.out),)) as pool:
+    with ctx.Pool(a.procs, initializer=_init, initargs=(str(a.out), 2)) as pool:
         for r in pool.imap_unordered(pass2, chunks):
             info["parts"][str(r["chunk"])] = r
             print(f"pass2 chunk {r['chunk']}: {r['rows']:,} rows ({time.time() - t0:.0f} s)", flush=True)
