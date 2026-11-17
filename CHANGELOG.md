@@ -26,6 +26,19 @@ break the API).
   report, `fit`'s and `plan`'s docstrings, `--level-space-gb`'s help and the docs say "the
   sparse path" and "conjugate gradient" (the CG solve, `crossing_fe="iterate"`). The JSON
   report's `path` keys (`"B"`, `"C"`) are unchanged.
+- Faster crossing-FE solves on the coordinator (EVE contracts market r1-r4: 42 to 8 minutes
+  locally, results equal to 1e-10):
+  - `crossing_fe="auto"` takes conjugate gradient above 5,000 crossing-FE dummies (was 30,000).
+    Between the two, the dense solve's Gram (up to 43 GB) took minutes where CG took seconds
+    (28,879 dummies: 306 s dense, 15 s by CG). `crossing_fe="sparse"` still forces the dense
+    solve. Fits in that range now meet `iter_tol` rather than being exact.
+  - In level space, `crossing_precond="auto"` runs a short trial of Jacobi and of the
+    block-structure choice (block-Jacobi or the AP-sweep) and keeps the one that reaches the
+    tolerance sooner by the clock. The block preconditioner can cut steps 7-30x (DB1B, NFIP)
+    or barely at all at 4-5x the cost a step (EVE). The trial is in the run record
+    (`crossing_cg.precond_trial`).
+  - The product with A in level space runs on up to 16 threads (`DFEOLS_MATVEC_THREADS`), with
+    the same result to the bit.
 - An acknowledgement of OSCER, where the computing for this project was performed, and of
   the OSCER staff who supported it.
 

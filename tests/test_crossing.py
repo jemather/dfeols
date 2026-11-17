@@ -326,3 +326,66 @@ def test_combine_past_the_budget_tells_the_shards_still_to_run():
     assert not out["full"] and not out["blocks"]
     assert cx.over_flag("fitA", "full") and cx.over_flag("fitA", "blocks")
     assert not cx.over_flag("fitB", "blocks")  # per fit
+
+
+def test_level_matvec_threads_equal_one(monkeypatch):
+    # A's rows split in blocks of equal nonzeros, multiplied on threads: A @ p to the bit
+    monkeypatch.setattr(cx, "MATVEC_MIN_NNZ", 0)
+    rng = np.random.default_rng(4)
+    A = sp.random(3000, 3000, density=0.01, random_state=5, format="csr")
+    A = (A + A.T).tocsr()
+    p = rng.standard_normal((3000, 3))
+    for t in (1, 2, 7):
+        mv = cx.level_matvec(A, threads=t)
+        np.testing.assert_array_equal(mv(p), A @ p)
+        np.testing.assert_array_equal(mv(p[:, 0]), A @ p[:, 0])
+    monkeypatch.setenv("DFEOLS_MATVEC_THREADS", "3")
+    assert cx.matvec_threads() == 3
+
+
+def _block_system(seed=0):
+    """Two crossing FEs whose own blocks hold nearly all of A: block-Jacobi solves it in a few
+    steps, Jacobi in many."""
+    rng = np.random.default_rng(seed)
+    n = 200
+    blocks = []
+    for _ in range(2):
+        B = rng.standard_normal((n, n))
+        blocks.append(B @ B.T + n * 0.05 * np.eye(n))
+    import scipy.linalg as sla
+
+    A = sla.block_diag(*blocks)
+    A += 1e-3 * np.abs(rng.standard_normal(A.shape)) * (rng.random(A.shape) < 0.01)
+    A = (A + A.T) / 2 + 1.0 * np.eye(2 * n)
+    offs = np.array([0, n, 2 * n])
+    solvers = [cx.BlockSolve(sp.csr_matrix(A[:n, :n]), False), cx.BlockSolve(sp.csr_matrix(A[n:, n:]), False)]
+    R = A @ rng.standard_normal((2 * n, 2))
+    return A, offs, solvers, R
+
+
+def test_precond_trial_picks_by_the_clock(monkeypatch):
+    A, offs, solvers, R = _block_system()
+    diag = A.diagonal()
+    act = np.ones(len(diag), bool)
+    mv = lambda p: A @ p  # noqa: E731
+    jac = cx.make_precond("jacobi", diag, offs)
+    bj = cx.make_precond("bjacobi", diag, offs, solvers)
+    name, state, rep = cx.precond_trial(mv, R, act, 1e-10, 5000, {"jacobi": jac, "bjacobi": bj})
+    assert name == "bjacobi" and rep["bjacobi"]["est_seconds"] < rep["jacobi"]["est_seconds"]
+    # the winner continues from its trial state, to the same solution
+    X, it, rel = cx.pcg(mv, R, bj, act, 1e-10, 5000, state=state)
+    assert rel <= 1e-10 and it >= rep["bjacobi"]["steps"]
+    assert np.linalg.norm(A @ X - R) <= 1e-9 * np.linalg.norm(R)
+
+    # the same blocks, made dear: Jacobi wins, and the block trial stops early (cannot win)
+    def slow(r):
+        import time
+
+        time.sleep(0.05)
+        return bj(r)
+
+    name, state, rep = cx.precond_trial(mv, R, act, 1e-10, 5000, {"jacobi": jac, "bjacobi": slow})
+    assert name == "jacobi"
+    assert rep["bjacobi"]["stopped"] and rep["bjacobi"]["steps"] < cx.PRECOND_TRIAL_STEPS
+    X, it, rel = cx.pcg(mv, R, jac, act, 1e-10, 5000, state=state)
+    assert rel <= 1e-10 and np.linalg.norm(A @ X - R) <= 1e-9 * np.linalg.norm(R)

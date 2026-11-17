@@ -263,9 +263,7 @@ def absorb(
             shape=(C, P),
         )
         if level:
-
-            def matvec(v):
-                return A @ v
+            matvec = cx.level_matvec(A)
         else:
             Gt = sp.csr_matrix((W, (g, np.arange(C))), shape=(len(Ng), C))
 
@@ -275,7 +273,14 @@ def absorb(
                 return D.T @ (U * W[:, None])
 
         R[:, gone] = 0.0  # its CG column could not reach a relative tolerance; Gamma 0
-        Gam, steps, rel = cx.pcg(matvec, R, Mp, act, tol, maxiter)
+        trial = state = None
+        if level and precond == "auto" and method != "jacobi" and A.nnz >= cx.PRECOND_TRIAL_MIN_NNZ:
+            cands = {"jacobi": cx.make_precond("jacobi", diag, offs), method: Mp}
+            method, state, trial = cx.precond_trial(matvec, R, act, tol, maxiter, cands, prefer=method)
+            Mp = cands[method]
+        Gam, steps, rel = cx.pcg(matvec, R, Mp, act, tol, maxiter, state=state)
+        if hasattr(matvec, "pool"):
+            matvec.pool.shutdown(wait=False)
         if rel > tol:
             raise RuntimeError(
                 f"fit {label}: crossing-FE CG on the cells did not converge in {maxiter} steps "
@@ -288,6 +293,7 @@ def absorb(
         info.update(
             mode="level" if level else "cells",
             preconditioner=method,
+            precond_trial=trial,
             steps=steps,
             max_relative_residual=rel,
             A_nnz=int(nnz) if level else None,

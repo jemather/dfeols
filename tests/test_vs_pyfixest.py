@@ -279,7 +279,7 @@ def test_iterate_crossing_fes(ds_cw, f):
 @pytest.mark.parametrize(
     "f", ["eng ~ feat + posts | spell + fw + cw", "eng + eng2 ~ feat + posts | id_a^week + fw + cw"]
 )
-def test_iterate_level_space_and_fallback(ds_cw, f):
+def test_iterate_level_space_and_fallback(ds_cw, f, monkeypatch):
     # plan C's two modes: A = D~'W D~ summed in round 1 and CG on the coordinator (level space),
     # or a pass per step when A is over level_space_gb (with A's diagonal blocks as block-Jacobi
     # if those fit, else Jacobi), which warns; every mode and preconditioner equals pyfixest
@@ -289,10 +289,21 @@ def test_iterate_level_space_and_fallback(ds_cw, f):
     kw = dict(cluster="id_a", crossing_fe="iterate", log_every=1e9)
     a = dfeols.fit(ds, f, **kw)
     cg = a.options["crossing_cg"]
+    # auto: the structural choice (AP-sweep: all blocks exact); A is too small for a trial
     assert (cg["mode"], cg["preconditioner"], cg["passes"]) == ("level", "sgs", 0)
+    assert cg["precond_trial"] is None
+    # with the trial on (A this small only in tests): Jacobi first, then the structural choice
+    import dfeols.crossing as cxm
+
+    monkeypatch.setattr(cxm, "PRECOND_TRIAL_MIN_NNZ", 0)
+    t = dfeols.fit(ds, f, **kw, workdir=str(ds.root / "runs" / f"trial_{len(f)}"))
+    monkeypatch.undo()
+    tr = t.options["crossing_cg"]["precond_trial"]
+    assert list(tr)[0] == "jacobi" and set(tr) <= {"jacobi", "sgs"}
+    assert t.options["crossing_cg"]["preconditioner"] in tr
     assert sum(cg["block_nnz"]) < cg["A_nnz"]
     mid = (sum(cg["block_nnz"]) + cg["A_nnz"]) // 2 * NNZ_BYTES / 1e9  # blocks fit, A does not
-    runs = {"level": a}
+    runs = {"level": a, "trial": t}
     for name, opt, want in [
         ("bjacobi", dict(crossing_precond="bjacobi"), ("level", "bjacobi")),
         ("jacobi", dict(crossing_precond="jacobi"), ("level", "jacobi")),

@@ -605,6 +605,126 @@ def make_precond(method: str, diag: np.ndarray, offs: np.ndarray, solvers=None, 
     raise ValueError(method)
 
 
+def matvec_threads() -> int:
+    """Threads for A @ p in level space: DFEOLS_MATVEC_THREADS, else the CPUs this process may
+    use, at most MATVEC_THREADS_MAX."""
+    env = os.environ.get("DFEOLS_MATVEC_THREADS")
+    if env:
+        return max(1, int(env))
+    try:
+        n = len(os.sched_getaffinity(0))
+    except AttributeError:  # not Linux
+        n = os.cpu_count() or 1
+    return max(1, min(n, MATVEC_THREADS_MAX))
+
+
+MATVEC_THREADS_MAX = 16
+MATVEC_MIN_NNZ = 2_000_000  # below this one thread is as fast (a product takes a few ms)
+
+
+def level_matvec(A: sp.csr_matrix, threads: int | None = None):
+    """p -> A @ p, with A's rows in `threads` blocks of equal nonzeros multiplied in parallel
+    (scipy's sparse product releases the GIL; one thread was 0.64 s of a 3 s CG step on EVE
+    market r2's 182M nonzeros, idling 15 of the coordinator's 16 cores). Same result as A @ p
+    to the bit: each row's sum is computed exactly as before, in one block."""
+    threads = matvec_threads() if threads is None else threads
+    if threads <= 1 or A.nnz < MATVEC_MIN_NNZ:
+        return lambda p: A @ p
+    from concurrent.futures import ThreadPoolExecutor
+
+    P = A.shape[0]
+    cuts = np.unique(np.r_[0, np.searchsorted(A.indptr, np.linspace(0, A.nnz, threads + 1)[1:-1]), P])
+    blocks = [(int(a), int(b), A[a:b]) for a, b in zip(cuts[:-1], cuts[1:])]
+    pool = ThreadPoolExecutor(len(blocks), thread_name_prefix="dfeols-matvec")
+
+    def mv(p):
+        out = np.empty((P,) + p.shape[1:], dtype=np.result_type(A.dtype, p.dtype))
+
+        def one(blk):
+            a, b, B = blk
+            out[a:b] = B @ p
+
+        for f in [pool.submit(one, blk) for blk in blocks]:
+            f.result()
+        return out
+
+    mv.pool = pool  # the caller may shut it down; idle threads otherwise end with the process
+    return mv
+
+
+PRECOND_TRIAL_STEPS = 10
+# a candidate's trial stops once it has spent this many times the best estimate so far: it
+# cannot win (the estimates run low, early CG falling faster, hence the margin)
+PRECOND_TRIAL_CAP = 3.0
+# below this many nonzeros of A a solve takes milliseconds whatever the preconditioner, and a
+# trial's clock is noise (a serial and a Dask fit of the same data chose differently), so the
+# structural choice stands; above it, it gives way only to a candidate this many times faster
+PRECOND_TRIAL_MIN_NNZ = 5_000_000
+PRECOND_TRIAL_MARGIN = 2.0
+
+
+class _TrialStop(Exception):
+    pass
+
+
+def precond_trial(
+    matvec, R, act, tol, maxiter, candidates: dict, prefer: str | None = None, steps: int = PRECOND_TRIAL_STEPS
+):
+    """Pick the preconditioner that reaches `tol` soonest by the clock, from up to `steps` CG
+    steps with each candidate ({name: M}; put the cheapest first). A block preconditioner cuts
+    the steps 7-30x on DB1B and NFIP but only ~12% on EVE contracts, where its block solves made
+    a step 4-5x dearer than Jacobi's (planner.md), so the block structure alone does not decide
+    it. Each estimate is the trial's seconds a step times the steps its rate of fall needs; a
+    candidate whose trial outlasts PRECOND_TRIAL_CAP x the best estimate so far is stopped (it
+    cannot win). `prefer` (the structural choice) is kept unless another is PRECOND_TRIAL_MARGIN
+    times faster. The winner's state is returned, so its trial steps are kept. Returns (name,
+    state or None, report)."""
+    report, states = {}, {}
+    for name, M in candidates.items():
+        keep = {}
+        best = min((v["est_seconds"] for v in report.values()), default=float("inf"))
+        t = time.time()
+
+        def on_step(it, rel, t=t, best=best):
+            if it >= 2 and time.time() - t > PRECOND_TRIAL_CAP * best:
+                raise _TrialStop
+
+        try:
+            _, it, rel = pcg(
+                matvec, R, M, act, tol, min(steps, maxiter), on_step, on_state=lambda s, keep=keep: keep.update(s)
+            )
+            stopped = False
+        except _TrialStop:
+            it, stopped = int(keep["it"]), True
+            rel = float((np.linalg.norm(keep["r"], axis=0) / _bnorm(R, act)).max())
+        dt = time.time() - t
+        per = dt / max(it, 1)
+        if stopped:
+            est = float("inf")
+        elif rel <= tol:
+            est = dt
+        elif it and 0 < rel < 1:
+            est = per * np.log(tol) / (np.log(rel) / it)
+        else:
+            est = float("inf")
+        report[name] = {"steps": int(it), "seconds": dt, "residual": float(rel), "est_seconds": float(est),
+                        "stopped": stopped}  # fmt: skip
+        states[name] = {k: (v.copy() if isinstance(v, np.ndarray) else v) for k, v in keep.items()} or None
+        if rel <= tol and not stopped:  # converged within the trial: nothing to compare
+            break
+    best = min(report, key=lambda n: report[n]["est_seconds"])
+    if prefer in report and best != prefer and np.isfinite(report[prefer]["est_seconds"]):
+        if report[best]["est_seconds"] * PRECOND_TRIAL_MARGIN > report[prefer]["est_seconds"]:
+            best = prefer
+    return best, states[best], report
+
+
+def _bnorm(R, act):
+    b = np.linalg.norm(R * act[:, None], axis=0)
+    b[b == 0] = 1.0
+    return b
+
+
 def pcg(
     matvec,
     R: np.ndarray,

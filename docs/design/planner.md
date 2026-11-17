@@ -73,8 +73,8 @@ For each candidate key the planner picks the first path that applies:
 |---|---|---|---|
 | every FE nested | local demeaning in each shard | 2 | exists |
 | crossing FEs ≤ 2,000 levels, any nested FEs | dense dummy columns | 2 | exists |
-| one nested FE, crossing block ≤ ~30k levels | sparse path, dense solve on the coordinator | 2 | plan A, done |
-| several nested FEs, crossing block ≤ ~30k | sparse path, nested FEs projected in the shard | 2 | plan B, done |
+| one nested FE, crossing block ≤ 5k dummies (was ~30k; 2026-11-17) | sparse path, dense solve on the coordinator | 2 | plan A, done |
+| several nested FEs, crossing block ≤ 5k | sparse path, nested FEs projected in the shard | 2 | plan B, done |
 | crossing block too large to solve directly, A fits the coordinator | level space: A built in round 1, preconditioned CG on the coordinator | 2 | proposed (below) |
 | anything else | conjugate gradient across shards, with a slow-convergence warning | 2 + iterations | plan C, done; warning to build |
 
@@ -204,7 +204,13 @@ build has in hand: the sizes of its connected components (levels linked through 
 | neither affordable | Jacobi (as built) | Jacobi |
 
 Steps to 1e-10: DB1B Jacobi 294, block-Jacobi 40, AP-sweep 19; NFIP A 537, 17, 8; synthetic
-(0.5% mobility) 91, 22 and 18 with AMG blocks. Two rules from the bench:
+(0.5% mobility) 91, 22 and 18 with AMG blocks. But EVE contracts (market r2 / r3, 2026-11-17):
+Jacobi 230 / 511, block-Jacobi 200 / 452, and a block-Jacobi step cost 4-5x a Jacobi one (a dense
+Cholesky solve of a 15,334-level component 1.07 s, AMG 0.8 s, the product with A 0.64 s), so
+Jacobi was 4x faster. *Built (2026-11-17):* in level space with `crossing_precond="auto"`, 10
+trial steps of the structural choice and of Jacobi, each extrapolated to the tolerance by its rate
+of fall and seconds a step; the faster continues from its trial state
+(`crossing.precond_trial`; `crossing_cg.precond_trial` in the run record). Two rules from the bench:
 
 - *Block solves are pseudo-inverses, never regularised.* Each A_kk is singular, one constant per
   component, absorbed by the local FE. Pin one level per component and remove the component mean

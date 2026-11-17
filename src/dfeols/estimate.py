@@ -441,9 +441,11 @@ def _check_worker_memory(executor, label: str, rows: int, need_gb: float) -> Non
         log.warning("%s; workers may run out of memory", msg)
 
 
-# Above this many crossing-FE dummies the coordinator's dense solve (about 43 GB at 30k)
-# gives way to conjugate gradient across shards (plan C)
-DENSE_SOLVE_LEVELS = 30_000
+# Above this many crossing-FE dummies the coordinator's dense solve gives way to conjugate
+# gradient (plan C). Was 30k (about 43 GB): EVE contracts market r1, 28,879 dummies, took 306 s
+# dense (588 s on OSCER) against 15 s by CG in 21 steps; at 5k the dense Gram is 0.2 GB and its
+# solve a few seconds (Ted 2026-11-17)
+DENSE_SOLVE_LEVELS = 5_000
 
 
 def _use_iterate(crossing_fe: str, local, glob, big: bool, n_dummy: int) -> bool:
@@ -848,8 +850,36 @@ def _crossing_cg(
             # the rate of fall is the resumed steps' own: the 1.0 at the start of hist is
             # step 0's, so after a resume at step 808 it read as 808 steps' fall in a few
             hist.clear()
+    mv = cx.level_matvec(A) if level else matvec_pass
+    trial = None
+    if level and precond == "auto" and method != "jacobi" and A.nnz >= cx.PRECOND_TRIAL_MIN_NNZ:
+        # the structural choice against Jacobi, by the clock (crossing.precond_trial)
+        cands = {"jacobi": cx.make_precond("jacobi", diag, offs), method: M}
+        method, t_state, trial = cx.precond_trial(mv, R, act, tol, maxiter, cands, prefer=method)
+        M = cands[method]
+        names_ = {"jacobi": "Jacobi", "bjacobi": "block-Jacobi", "sgs": "AP-sweep"}
+        log.info(
+            "fit %s: preconditioner trial: %s; using %s",
+            label,
+            "; ".join(
+                f"{names_[k]} {v['steps']} steps {v['seconds'] / max(v['steps'], 1):.2f} s a step, "
+                f"residual {v['residual']:.1e}, "
+                + (
+                    "stopped (cannot win)"
+                    if v["stopped"]
+                    else f"about {fmt_td(v['est_seconds'])} to tol"
+                    if np.isfinite(v["est_seconds"])
+                    else "not falling"
+                )
+                for k, v in trial.items()
+            ),
+            names_[method],
+        )
+        if t_state is not None:
+            state = t_state  # the winner's trial steps are kept
+            hist.append(trial[method]["residual"])
     X, it, rel = cx.pcg(
-        (lambda p: A @ p) if level else matvec_pass,
+        mv,
         R,
         M,
         act,
@@ -859,6 +889,8 @@ def _crossing_cg(
         state=state,
         on_state=ck.save if ck else None,
     )
+    if level and hasattr(mv, "pool"):
+        mv.pool.shutdown(wait=False)
     if ck is not None:
         ck.remove() if rel <= tol else ck.flush()
     prog.note, prog.extra_eta = "", None
@@ -877,7 +909,8 @@ def _crossing_cg(
         "mode": "level" if level else "pass",
         "preconditioner": method,
         "passes": 0 if level else it - (int(state["it"]) if state is not None else 0),
-        "resumed_from": int(state["it"]) if state is not None else None,
+        "resumed_from": int(state["it"]) if state is not None and not level else None,
+        "precond_trial": trial,
         "A_nnz": int(A.nnz) if level else None,
         "parts_nnz": int(gram.parts_nnz) if gram is not None else None,  # the shards' parts, summed
         "shipped_nnz": int(gram.shipped_nnz) if gram is not None else None,  # what reached the coordinator
@@ -1217,7 +1250,7 @@ def fit(
         How FEs that cross the partition are absorbed: `"dense"` dummy columns, `"sparse"`
         per-level sums with a dense solve on the coordinator, `"iterate"` conjugate gradient
         across shards (`iter_tol`, `iter_maxiter`), or `"auto"` to pick from the FE
-        structure.
+        structure (conjugate gradient above 5,000 crossing-FE dummies).
     collin_tol : float, default 1e-9
         A regressor whose sum of squares net of the FEs is at most this share of its centered
         sum of squares is absorbed by the FEs, and dropped as collinear.
@@ -1232,8 +1265,9 @@ def fit(
         machine's; 0 turns it off. Above it each CG step is a pass over the shards, and dfeols
         warns (`crossing.SlowConvergenceWarning`).
     crossing_precond : {"auto", "jacobi", "bjacobi", "sgs"}, default "auto"
-        With `"iterate"`, the preconditioner: `"auto"` picks from A's block structure; `"sgs"` is an
-        alternating-projections sweep, level space only.
+        With `"iterate"`, the preconditioner: `"auto"` picks from A's block structure and, in
+        level space, keeps that choice only if a short trial against `"jacobi"` says it reaches
+        `iter_tol` sooner; `"sgs"` is an alternating-projections sweep, level space only.
     cells : bool, default False
         Fit from per-cell sums (`dfeols.cells`): one pass groups each shard's rows by every
         FE key and the cluster, and the coordinator solves on the cells, exactly. Pays when
