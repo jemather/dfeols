@@ -652,6 +652,10 @@ def level_matvec(A: sp.csr_matrix, threads: int | None = None):
     return mv
 
 
+# pcg: a column's residual below this share of its no-cancellation scale is rounding (see pcg)
+ROUND_REL = 1e-13
+# estimate: stop a CG solve whose largest residual has had no new low in this many steps
+STALL_STEPS = 300
 PRECOND_TRIAL_STEPS = 10
 # a candidate's trial stops once it has spent this many times the best estimate so far: it
 # cannot win (the estimates run low, early CG falling faster, hence the margin)
@@ -735,6 +739,8 @@ def pcg(
     on_step=None,
     state: dict | None = None,
     on_state=None,
+    scale: np.ndarray | None = None,
+    stall_steps: int = 0,
 ):
     """Preconditioned CG for A X = R, one column per right-hand side, in lockstep: stops when
     every column's residual is below `tol` relative to its right-hand side. A is singular (one
@@ -742,12 +748,28 @@ def pcg(
     converges to a solution whose D~ X, the only part used, is unique. `on_step(it, rel)` is
     called after each step and may raise. Returns X, steps and the largest relative residual.
 
+    `scale` (one per column; estimate._cg_scale): the size R's column would have without
+    cancellation, sqrt(max diag A) x the column's norm. A column whose residual is below
+    ROUND_REL of it is at the rounding level of the sums that formed R and counts as converged:
+    so a column whose R is nearly all cancellation (a regressor with no crossing-FE component,
+    D10 G g1's rin:log_gene_length, |R| 5e-3 against 1e7) is not driven to `tol` relative to
+    its own rounding noise. Rounding also leaves R a component along A's null space, which CG
+    cannot remove: driven below it, the column's iterates wander and grow (36188818: 3.8e-9 at
+    step 1, then 1e-7 to 0.29 for 700 steps). A converged column is frozen (its step and search
+    direction set to 0), so the lockstep steps of the other columns do not disturb it.
+
+    `stall_steps` > 0: stop early when the largest residual among the unconverged columns has
+    not reached a new low in that many steps (the caller sees rel > tol before maxiter).
+
     `state` (X, r, p, rz, it, as `on_state(state)` receives it after each step) resumes an
     interrupted solve exactly where it stopped: CG's whole state is these few P x c blocks."""
     P, c = R.shape
     r0 = R * act[:, None]
     bnorm = np.linalg.norm(r0, axis=0)
     bnorm[bnorm == 0] = 1.0
+    if scale is not None:
+        # ||r|| <= tol ||R||  or  ||r|| <= ROUND_REL scale, as one relative measure
+        bnorm = np.maximum(bnorm, ROUND_REL / tol * np.asarray(scale, float))
     if state is not None:
         X, r, p = state["X"].copy(), state["r"].copy(), state["p"].copy()
         rz, it = state["rz"].copy(), int(state["it"])
@@ -759,21 +781,31 @@ def pcg(
         rz = (r * z).sum(0)
         it = 0
     rel = np.linalg.norm(r, axis=0) / bnorm
+    done = rel <= tol
+    p[:, done] = 0.0
+    best, best_it = float(rel.max()), it
     while rel.max() > tol:
         if it >= maxiter:
+            return X, it, float(rel.max())
+        if stall_steps and it - best_it >= stall_steps:
             return X, it, float(rel.max())
         it += 1
         Ap = matvec(p)
         pAp = (p * Ap).sum(0)
         alpha = np.divide(rz, pAp, out=np.zeros(c), where=pAp > 0)
+        alpha[done] = 0.0
         X += alpha * p
         r -= alpha * Ap
         z = precond(r)
         rz_new = (r * z).sum(0)
         beta = np.divide(rz_new, rz, out=np.zeros(c), where=rz > 0)
         p = z + beta * p
-        rz = rz_new
+        rz = np.where(done, rz, rz_new)
         rel = np.linalg.norm(r, axis=0) / bnorm
+        done |= rel <= tol
+        p[:, done] = 0.0
+        if rel.max() < best:
+            best, best_it = float(rel.max()), it
         if on_state is not None:
             on_state({"X": X, "r": r, "p": p, "rz": rz, "it": it})
         if on_step is not None:

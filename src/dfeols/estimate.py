@@ -697,6 +697,19 @@ def _tss(plan: Plan, acc: dict, m: int, collin_tol: float, cols=None) -> np.ndar
 CG_CHECKPOINT_EVERY_S = 300.0
 
 
+def _cg_scale(acc: dict, diag: np.ndarray, act: np.ndarray, c: int) -> np.ndarray | None:
+    """Per column of the CG right-hand side R = D~'W [Z~ Y~]: the size it would have without
+    cancellation, sqrt(max diag A) x sqrt(the column's Z~'W Z~ or Y~'W Y~), an upper bound on
+    |R|'s column up to A's largest eigenvalue against its largest diagonal (crossing.pcg)."""
+    if "ZtZ" not in acc or "YtY" not in acc:  # Session solves: the plain relative criterion
+        return None
+    ss = np.r_[np.diag(acc["ZtZ"]), np.diag(acc["YtY"])]
+    if len(ss) != c:
+        return None
+    dmax = float(diag[act].max(initial=0.0)) if act.any() else 0.0
+    return np.sqrt(dmax * np.clip(ss, 0.0, None))
+
+
 def _cg_steps_left(hist: list[float], tol: float, window: int = 30) -> int | None:
     """Steps until the residual reaches tol at its average rate of fall over the last
     `window` steps (CG residuals stall and drop, so this is rough); None before 3 steps
@@ -878,6 +891,7 @@ def _crossing_cg(
         if t_state is not None:
             state = t_state  # the winner's trial steps are kept
             hist.append(trial[method]["residual"])
+    scale = _cg_scale(acc, diag, act, c)
     X, it, rel = cx.pcg(
         mv,
         R,
@@ -888,12 +902,21 @@ def _crossing_cg(
         on_step,
         state=state,
         on_state=ck.save if ck else None,
+        scale=scale,
+        stall_steps=cx.STALL_STEPS,
     )
     if level and hasattr(mv, "pool"):
         mv.pool.shutdown(wait=False)
     if ck is not None:
         ck.remove() if rel <= tol else ck.flush()
     prog.note, prog.extra_eta = "", None
+    if rel > tol and it < maxiter:
+        raise RuntimeError(
+            f"fit {label}: crossing-FE CG stalled at step {it}: its largest relative residual "
+            f"({rel:.1e} > {tol:g}) had no new low in {cx.STALL_STEPS} steps, so it is at the "
+            "rounding level of the shards' sums; a looser iter_tol, or partition so more FEs "
+            "are nested in the key"
+        )
     if rel > tol:
         raise RuntimeError(
             f"fit {label}: crossing-FE CG did not converge in {maxiter} steps (largest relative "

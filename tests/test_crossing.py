@@ -389,3 +389,51 @@ def test_precond_trial_picks_by_the_clock(monkeypatch):
     assert rep["bjacobi"]["stopped"] and rep["bjacobi"]["steps"] < cx.PRECOND_TRIAL_STEPS
     X, it, rel = cx.pcg(mv, R, jac, act, 1e-10, 5000, state=state)
     assert rel <= 1e-10 and np.linalg.norm(A @ X - R) <= 1e-9 * np.linalg.norm(R)
+
+
+def _balanced_g1(G=2000, S=19616.0, seed=0, noise=1e-14):
+    """D10 G g1's crossing system after the sample FE: a complete panel, so A = S (I - J/G)
+    with null vector 1, and a matvec whose sums round in a different order each pass."""
+    rng = np.random.default_rng(seed)
+
+    def matvec(p):
+        e = noise * S * np.linalg.norm(p, axis=0) / np.sqrt(G) * rng.standard_normal(p.shape)
+        return S * (p - p.mean(0)) + e
+
+    R = S * rng.standard_normal((G, 3))
+    R -= R.mean(0)
+    # column 2 is nearly all cancellation (rin:log_gene_length: |R| 5e-3 against a scale of 1e7),
+    # with rounding along the null vector (3.8e-9 of it in job 36188818's checkpoint)
+    R[:, 2] = 5e-3 * R[:, 2] / np.linalg.norm(R[:, 2])
+    R[:, 2] += 3.8e-9 * 5e-3 / np.sqrt(G)
+    scale = np.array([np.linalg.norm(R[:, 0]), np.linalg.norm(R[:, 1]), 1e7])
+    return matvec, R, scale, (lambda r: r / S), np.ones(G, bool)
+
+
+def test_pcg_cancelled_column_counts_as_rounding():
+    mv, R, scale, M, act = _balanced_g1()
+    # without the scale, column 2 is driven toward 1e-10 of its own rounding (36188818 wandered
+    # for 700 steps); with it, that column is at rounding after step 1
+    X, it, rel = cx.pcg(mv, R, M, act, 1e-10, 400, scale=scale)
+    assert rel <= 1e-10 and it <= 3
+    S = 19616.0
+    for j in (0, 1):  # the ordinary columns are solved to tol
+        assert np.linalg.norm(S * (X[:, j] - X[:, j].mean()) - R[:, j]) <= 1e-9 * np.linalg.norm(R[:, j])
+
+
+def test_pcg_freezes_converged_columns():
+    mv, R, scale, M, act = _balanced_g1()
+    R = R.copy()
+    R[:, 1] *= 1e-3  # converges with the rest; nothing else should move it afterwards
+    seen = []
+    X, it, rel = cx.pcg(
+        mv, R, M, act, 1e-10, 50, on_state=lambda s: seen.append(s["X"][:, 0].copy()), scale=scale
+    )
+    assert rel <= 1e-10
+    assert all(np.array_equal(seen[-1], s) for s in seen[1:])
+
+
+def test_pcg_stops_when_stalled():
+    mv, R, scale, M, act = _balanced_g1(noise=1e-9)  # sums too noisy for 1e-12
+    X, it, rel = cx.pcg(mv, R, M, act, 1e-12, 5000, stall_steps=40)
+    assert rel > 1e-12 and it < 500
