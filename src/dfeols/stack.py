@@ -68,11 +68,25 @@ _SAMPLE_SEED = 0x5DEECE66D
 
 
 def sample_groups(by: str | list[str], frac: float, seed: int = 0) -> pl.Expr:
-    """Boolean expression: True for rows whose group (`by`) falls in a `frac` share.
+    """A Polars expression that is True for rows whose group falls in a `frac` share.
 
     The same group is in or out on any machine and for any row order or file split:
-    hash(group, seed) / 2^64 < frac, with the stable row hash of `dfeols.rowhash`.
-    Nested fractions are nested samples (same seed): a 5% sample is inside the 15% one.
+    hash(group, seed) / 2^64 < frac, with the stable row hash of `dfeols.rowhash`. Nested
+    fractions are nested samples (same seed): a 5% sample is inside the 15% one.
+
+    Parameters
+    ----------
+    by : str or list of str
+        The group columns.
+    frac : float
+        Share of groups to keep, in (0, 1].
+    seed : int, default 0
+        Different seeds give independent samples.
+
+    Returns
+    -------
+    polars.Expr
+        Boolean, for `filter` or `fit(subset=...)`-style selection.
     """
     if not 0 < frac <= 1:
         raise ValueError(f"frac must be in (0, 1], got {frac}")
@@ -90,13 +104,20 @@ def sample_groups(by: str | list[str], frac: float, seed: int = 0) -> pl.Expr:
 
 @dataclass
 class Equation:
-    """One equation of a stacked system.
+    """One equation of a stacked system (see `stack`).
 
-    k     equation index (a positive integer, unique within the system)
-    y     outcome column
-    x     regressor roles -> this equation's column, e.g. {"x": "lfeat", "p": "lposts"}
-    fe    absorbed FEs (column names or a^b interactions of integer columns)
-    rows  Polars expression selecting this equation's rows (None: every row)
+    Parameters
+    ----------
+    k : int
+        Equation index: a positive integer, unique within the system.
+    y : str
+        Outcome column.
+    x : dict
+        Regressor roles -> this equation's column, e.g. `{"x": "lfeat", "p": "lposts"}`.
+    fe : list of str
+        Absorbed FEs: column names or `a^b` interactions of integer columns.
+    rows : polars.Expr, optional
+        Selects this equation's rows; default every row.
     """
 
     k: int
@@ -108,6 +129,22 @@ class Equation:
 
 @dataclass
 class Stacked:
+    """The stacked regression built by `stack`.
+
+    Attributes
+    ----------
+    frame : polars.LazyFrame
+        The stacked rows, ready for `prep` (or `sink_parquet`).
+    equations : list of Equation
+        The system's equations.
+    fixed_effects : list of str
+        The FEs to pass to `prep(fixed_effects=...)`.
+    slots : dict
+        FE slot -> {equation: the FE it holds, or a filler label}.
+    roles : dict
+        Regressor role -> the equations that have it.
+    """
+
     frame: pl.LazyFrame
     equations: list[Equation]
     fixed_effects: list[str]  # for prep(fixed_effects=...): "k^_fe_l0", ...
@@ -116,6 +153,7 @@ class Stacked:
 
     @property
     def fe(self) -> str:
+        """The stacked FEs joined with `+`, for a formula's FE part."""
         return " + ".join(self.fixed_effects)
 
     def terms(self, spec: str) -> str:
@@ -141,9 +179,11 @@ class Stacked:
         return f"{y} ~ {self.terms(spec)} | {self.fe}"
 
     def coef_index(self, coefnames: list[str], role: str, k: int, pattern: str = "") -> np.ndarray:
-        """Positions in `coefnames` of equation k's terms for `role` (e.g. role "x", k 1 ->
-        every coefficient whose name contains the token x_k1), in their fitted order; an
-        optional regex `pattern` narrows them further (e.g. "tbin")."""
+        """Positions in `coefnames` of equation k's terms for `role`, in fitted order.
+
+        E.g. role `"x"`, k 1: every coefficient whose name contains the token `x_k1`. An
+        optional regex `pattern` narrows them further (e.g. `"tbin"`).
+        """
         tok = re.compile(rf"(?<![\w.]){re.escape(f'{role}_k{k}')}(?![\w])")
         pat = re.compile(pattern) if pattern else None
         return np.array(
@@ -214,13 +254,43 @@ def stack(
     same_rows: bool = False,
     local: set[str] | list[str] | None = None,
 ) -> Stacked:
-    """Build the stacked system's rows (see the module docstring).
+    """Build a stacked regression's rows, so several equations are fitted as one.
 
-    data       LazyFrame or DataFrame (or a Parquet path/glob)
-    partition  the key the shards will be partitioned by (FEs nested in it are local)
-    keep       columns to carry unchanged (bin factors, clusters, weights)
-    same_rows  drop rows missing any outcome or regressor of any equation first
-    local      FEs nested in `partition` (skips inferring them with a pass per FE)
+    The equations share one coefficient vector and one (clustered) VCE, so tests across
+    equations need no SUR machinery. Each equation contributes its rows tagged with its
+    index `k`; each regressor role becomes one column per equation (`x_k1`, `x_k2`, ...);
+    every FE is interacted with `k`. See the module docstring for the details.
+
+    Parameters
+    ----------
+    data : polars.LazyFrame, DataFrame or path
+        The data, or a Parquet path or glob.
+    equations : list of Equation
+        The system.
+    partition : str
+        The key the shards will be partitioned by (FEs nested in it are local).
+    keep : list of str, optional
+        Columns to carry unchanged (bin factors, clusters, weights).
+    same_rows : bool, default False
+        First drop rows missing any outcome or regressor of any equation, so every equation
+        uses the same observations (mediation systems need that).
+    local : list of str, optional
+        FEs nested in `partition`, which skips inferring them with a pass per FE.
+
+    Returns
+    -------
+    Stacked
+        `.frame` for `prep`, `.fixed_effects` for `prep(fixed_effects=...)`, and
+        `.formula()` to write the stacked formula.
+
+    Examples
+    --------
+    >>> eqs = [dfeols.Equation(1, y="eng", x={"x": "feat"}, fe=["spell", "week"]),
+    ...        dfeols.Equation(2, y="unf", x={"x": "lfeat"}, fe=["id_f", "week"])]
+    >>> st = dfeols.stack(pl.scan_parquet(src), eqs, partition="id_f", keep=["id_a"])
+    >>> ds = dfeols.prep(st.frame, shard_dir=..., partition="id_f",
+    ...                  fixed_effects=st.fixed_effects, clusters=["id_a"])
+    >>> r = dfeols.fit(ds, st.formula("x"), cluster="id_a")
     """
     lf = data.lazy() if isinstance(data, pl.DataFrame) else data
     if isinstance(lf, str):

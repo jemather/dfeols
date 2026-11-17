@@ -2685,7 +2685,26 @@ class SessionError(RuntimeError):
 
 
 class Session:
-    """A client of a running session (Python). The R client speaks the same files."""
+    """A client of a running session: fit many models on data demeaned once.
+
+    A session demeans its declared variables on its FEs once, keeps them on scratch, and
+    fits models from them while it runs: coefficients and iid SEs with no pass over the
+    data, hetero and CRV1 with one pass. Start one with `Session.start` (in this process)
+    or `dfeols session start` (as a cluster job), and connect with `Session.attach`. The R
+    client in `r/` speaks the same files.
+
+    Parameters
+    ----------
+    name : str
+        The session's name.
+    root : str or path, optional
+        Folder holding sessions. Default `$DFEOLS_SESSIONS`, else the profile's
+        `<scratch>/sessions`.
+    profile : str or Profile, optional
+        Site profile, for finding `root`.
+    progress : bool, default True
+        Print progress lines and estimates to stderr while waiting.
+    """
 
     def __init__(
         self,
@@ -2728,9 +2747,55 @@ class Session:
         progress: bool = True,
         **spec_kw,
     ) -> Session:
-        """Run a manager in a background thread of this process and attach to it (for a
-        workstation or a job's own coordinator; on a cluster, `dfeols session start`
-        submits the manager as a job). Returns once the data are demeaned."""
+        """Run a session in a background thread of this process and attach to it.
+
+        For a workstation, or a job's own coordinator. On a cluster, `dfeols session start`
+        submits the session as a job instead. Returns once the data are demeaned.
+
+        Parameters
+        ----------
+        name : str
+            The session's name.
+        data : str or path
+            The prepared dataset (its shard directory).
+        fe : str or list of str
+            The session's FEs, e.g. `"route + carrier^quarter"`.
+        variables : str or list of str
+            The variables to demean, e.g. `"lfare,hhi,dist"`; models can use these and
+            variables added later.
+        cluster : str or list of str, optional
+            Cluster variables models may use.
+        weights : str, optional
+            Column of analytic weights, fixed for the session.
+        root : str or path, optional
+            Folder holding sessions (see the class).
+        demeaned : str or path, optional
+            Folder for the demeaned data. Default `$DFEOLS_DEMEANED`, else the profile's
+            `<scratch>/demeaned`.
+        executor : DaskExecutor, optional
+            Where the demeaning and the SE passes run. Default this process.
+        hours : float, optional
+            End the session this long after it is ready. Default no limit.
+        idle_minutes : float, default 30
+            End the session after this long without a request; None never.
+        persist : bool, default True
+            Keep the demeaned data after the session ends, for later sessions with the same
+            inputs.
+        poll : float, default 0.5
+            Seconds between the session's checks for new requests.
+        timeout : float, optional
+            Seconds to wait for the session before `TimeoutError`; default no limit.
+        progress : bool, default True
+            Print progress lines and estimates to stderr while waiting.
+        **spec_kw
+            Demeaning settings as in `fit`: `drop_singletons`, `fe_tol`, `fe_method`,
+            `max_dummy_levels`, `crossing_fe`, `iter_tol`, `iter_maxiter`,
+            `level_space_gb`, `crossing_precond`.
+
+        Returns
+        -------
+        Session
+        """
         spec = Spec.make(data, fe, variables, cluster, weights=weights, **spec_kw)
         mgr = Manager(
             name,
@@ -2754,8 +2819,33 @@ class Session:
     def attach(
         cls, name: str, root=None, profile=None, timeout: float | None = None, progress: bool = True
     ) -> Session:
-        """Attach to a running session (waits for it to be ready, showing the demeaning's
-        progress)."""
+        """Attach to a running session, waiting until it is ready.
+
+        While the session is still demeaning, its progress is shown.
+
+        Parameters
+        ----------
+        name : str
+            The session's name.
+        root : str or path, optional
+            Folder holding sessions. Default `$DFEOLS_SESSIONS`, else the profile's
+            `<scratch>/sessions`.
+        profile : str or Profile, optional
+            Site profile, for finding `root`.
+        timeout : float, optional
+            Seconds to wait for the session before `TimeoutError`; default no limit.
+        progress : bool, default True
+            Print progress lines to stderr while waiting.
+
+        Returns
+        -------
+        Session
+
+        Raises
+        ------
+        SessionError
+            If the session has failed or ended.
+        """
         s = cls(name, root=root, profile=profile, progress=progress)
         s._attach(timeout)
         return s
@@ -2791,6 +2881,7 @@ class Session:
 
     # ---- requests
     def state(self) -> dict | None:
+        """The session's state file (status, workers, progress), or None before it exists."""
         p = self.dir / "session.json"
         try:
             return _read_json(p)
@@ -2883,9 +2974,31 @@ class Session:
         estimator: str | None = None,
         fuller: float | None = None,
     ) -> Result:
-        """Fit `formula` on declared or created variables; the FEs are the session's. OLS
-        (`y ~ x1 + x2`) or IV (`y ~ x | d ~ z1 + z2`; `estimator="liml"`, `fuller=`).
-        `cluster` is one variable, or two ("a+b") for two-way clustering."""
+        """Fit a model on the session's declared or created variables.
+
+        The FEs are the session's, so the formula has no FE part.
+
+        Parameters
+        ----------
+        formula : str
+            OLS (`y ~ x1 + x2`) or IV (`y ~ x | d ~ z1 + z2`).
+        vcov : str or list of str, optional
+            As in `fit`.
+        cluster : str, optional
+            One cluster variable, or two (`"a+b"`) for two-way clustering.
+        label : str, optional
+            The model's name in the session's collection.
+        timeout : float, optional
+            Seconds to wait for the session before `TimeoutError`; default no limit.
+        estimator : {"2sls", "liml"}, optional
+            For IV formulas.
+        fuller : float, optional
+            Fuller's modified LIML constant.
+
+        Returns
+        -------
+        Result
+        """
         r = self._request(
             "fit",
             timeout=timeout,
@@ -2911,9 +3024,28 @@ class Session:
         label: str | None = None,
         timeout: float | None = None,
     ) -> Result:
-        """An earlier model (a Result, or its label) with another vcov or cluster: the
-        coefficients come from the Gram matrix again, the new SEs take one pass (iid none).
-        A CRV1 refit keeps the model's cluster unless `cluster` names another."""
+        """Fit an earlier model again with another vcov or cluster.
+
+        The coefficients come from the Gram matrix again; the new SEs take one pass (iid
+        none). A CRV1 refit keeps the model's cluster unless `cluster` names another.
+
+        Parameters
+        ----------
+        model : Result or str
+            The earlier model, or its label.
+        vcov : str or list of str, optional
+            As in `fit`.
+        cluster : str, optional
+            One cluster variable, or two (`"a+b"`).
+        label : str, optional
+            The new model's name.
+        timeout : float, optional
+            Seconds to wait for the session before `TimeoutError`; default no limit.
+
+        Returns
+        -------
+        Result
+        """
         ref = model.label if isinstance(model, Result) else model
         r = self._request(
             "refit",
@@ -2930,11 +3062,27 @@ class Session:
         return Result.load(self.dir / m["dir"] / "result.json")
 
     def add_variable(self, name: str, expression: str, *, timeout: float | None = None) -> Session:
-        """Create `name` from raw columns of the dataset (`log(x)`, `a * b`, `x > 0`,
-        `ifelse(x > 0, y, 0)`; R's `^`, `&`, `|`, `!` are fine), demeaned on the session's
-        FEs; models can then use it like a declared variable. It must be defined on every row
-        of the session's sample. Kept with the demeaned data, so another session on them
-        reuses it. Returns the session, so calls chain."""
+        """Create a variable from raw columns of the dataset, demeaned on the session's FEs.
+
+        Models can then use it like a declared variable. It must be defined on every row of
+        the session's sample. It is kept with the demeaned data, so another session on them
+        reuses it.
+
+        Parameters
+        ----------
+        name : str
+            The new variable's name.
+        expression : str
+            E.g. `log(x)`, `a * b`, `x > 0`, `ifelse(x > 0, y, 0)`; R's `^`, `&`, `|`, `!`
+            work too.
+        timeout : float, optional
+            Seconds to wait for the session before `TimeoutError`; default no limit.
+
+        Returns
+        -------
+        Session
+            This session, so calls chain.
+        """
         r = self._request(
             "add_variable", timeout=timeout, watch=self._watch_fit, name=name, expression=expression
         )
@@ -2945,8 +3093,20 @@ class Session:
         return self
 
     def add_variables(self, variables: dict, *, timeout: float | None = None) -> Session:
-        """Several created variables ({name: expression}); the new ones are demeaned together,
-        in one pass of the demeaning, however many there are."""
+        """Create several variables, demeaned together in one pass.
+
+        Parameters
+        ----------
+        variables : dict
+            `{name: expression}`, as in `add_variable`.
+        timeout : float, optional
+            Seconds to wait for the session before `TimeoutError`; default no limit.
+
+        Returns
+        -------
+        Session
+            This session, so calls chain.
+        """
         r = self._request("add_variables", timeout=timeout, watch=self._watch_fit, variables=dict(variables))
         made = [v for v in r["variables"] if not v.get("already")]
         if made:
@@ -2977,11 +3137,16 @@ class Session:
         return ef.read(Path(res.workdir) / name)
 
     def status(self) -> dict:
+        """Ask the session for its status: spec, created variables, models fitted, workers
+        and when it ends."""
         return self._request("status")["session"]
 
     def export(self, path=None, table_path=None, **table) -> Path:
-        """Write the session collection now (status open); returns its path. Given a list of
-        models first, `export([m1, m2], "table2.tex", ...)` is `export_table`."""
+        """Write the session's collection now (status open) and return its path.
+
+        Given a list of models first, `export([m1, m2], "table2.tex", ...)` is
+        `export_table`.
+        """
         if isinstance(path, list | tuple):
             if table_path is None:
                 raise TypeError("export(models, path): the table's path is needed")
@@ -2997,11 +3162,30 @@ class Session:
         headers=None,
         **table,
     ) -> Path:
-        """A table of `models` (Results or labels) through the estrec table tool, in the
-        format of `path`'s suffix (.tex, .md, .html, .csv, .txt, .doc). Beside it: the table
-        spec (`<stem>.estrec-table.json`) and the session collection it reads
-        (`<stem>.estrec-collection.json`). `table` goes to estrec's `new_table` (`stats`,
-        `rows`, `uncertainty`, `stars`, `keep`, `drop`, ...). Returns the rendered file."""
+        """Write a table of models through the estrec table tool.
+
+        Beside the table go its spec (`<stem>.estrec-table.json`) and the session collection
+        it reads (`<stem>.estrec-collection.json`).
+
+        Parameters
+        ----------
+        models : list
+            Results or their labels, one column each.
+        path : str or path
+            The table file; its suffix sets the format (.tex, .md, .html, .csv, .txt, .doc).
+        title : str, optional
+            The table's title.
+        headers : optional
+            Column headers.
+        **table
+            Passed to estrec's `new_table`: `stats`, `rows`, `uncertainty`, `stars`, `keep`,
+            `drop`, ...
+
+        Returns
+        -------
+        Path
+            The rendered table.
+        """
         refs = [m.label if isinstance(m, Result) else str(m) for m in models]
         r = self._request(
             "export",
@@ -3014,9 +3198,12 @@ class Session:
         return Path(r["path"])
 
     def persist(self) -> Path:
-        """Keep the demeaned data after the session ends (for a session started with
-        persist=False / --no-persist); later sessions with the same spec load it. Returns
-        where it is now; a no-op for a session that already persists."""
+        """Keep the demeaned data after the session ends.
+
+        For a session started with `persist=False` (`--no-persist`); later sessions with the
+        same inputs load it. A no-op for a session that already persists. Returns where the
+        demeaned data are now.
+        """
         r = self._request("persist")
         if not r.get("already"):
             self._say(f"demeaned data kept in {r['location']}")

@@ -62,7 +62,28 @@ def clear_incomplete(root: Path) -> None:
 
 @dataclass
 class Dataset:
-    """A prepared, sharded dataset. Open an existing one with Dataset.open()."""
+    """A prepared, sharded dataset, as written by `prep`.
+
+    Open an existing one with `Dataset.open(shard_dir)`; `fit` also accepts the folder.
+
+    Attributes
+    ----------
+    root : Path
+        The shard directory.
+    partition : list of str
+        The partition key.
+    shards : list of dict
+        One entry per shard: `"id"`, `"files"` and `"rows"`.
+    fes, clusters : dict
+        The encoded FEs and cluster variables: name -> `{"column", "n_levels",
+        "nested_in_partition"}`.
+    columns : list of str
+        The data columns.
+    n_rows : int
+        Rows in all shards.
+    meta : dict
+        The full `dfeols_meta.json`, including the source's checksum.
+    """
 
     root: Path
     partition: list[str]
@@ -75,6 +96,7 @@ class Dataset:
 
     @classmethod
     def open(cls, root: str | os.PathLike) -> Dataset:
+        """Open the prepared dataset in shard directory `root`."""
         root = Path(root)
         m = json.loads((root / META).read_text())
         return cls(
@@ -89,9 +111,11 @@ class Dataset:
         )
 
     def shard_paths(self, shard: dict) -> list[str]:
+        """Full paths of one shard's Parquet files."""
         return [str(self.root / f) for f in shard["files"]]
 
     def scan(self, columns: list[str] | None = None) -> pl.LazyFrame:
+        """All shards as one Polars LazyFrame, optionally only `columns`."""
         files = [str(self.root / f) for s in self.shards for f in s["files"]]
         lf = pl.scan_parquet(files)
         return lf.select(columns) if columns else lf

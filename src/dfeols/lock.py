@@ -36,7 +36,11 @@ log = logging.getLogger("dfeols")
 
 
 class LockedError(RuntimeError):
-    """Another job holds the lock on this folder."""
+    """Another job holds the lock on this folder.
+
+    Raised when a fit, prep or session would write to a folder (shards, a run's `workdir`,
+    demeaned data) that another running job has locked.
+    """
 
 
 def _job_id() -> str:

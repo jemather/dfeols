@@ -196,11 +196,44 @@ def fit_glm(
     keep_sidecars: bool = False,
     **fit_kw,
 ):
-    """Fit an HDFE GLM (`family` "poisson" or "cloglog") by IRLS over dfeols fits.
+    """Fit a Poisson or binary cloglog model with high-dimensional FEs, by IRLS.
 
-    `formula`, `cluster`, `vcov` and the remaining keywords (fe_tol, crossing_fe, ...) are
-    `fit`'s. Returns the converged fit's Result, with `options["glm"]` holding the family,
-    iterations, deviance, convergence and the rows dropped as separated."""
+    Each iteration is a weighted dfeols `fit` of the working response, so every FE path and
+    executor works unchanged. Before the first, rows in FE groups whose outcome never varies
+    are dropped (separation), as ppmlhdfe and fixest do. Standard errors equal pyfixest's
+    `fepois`.
+
+    Parameters
+    ----------
+    ds : Dataset or str
+        The prepared dataset, or its shard directory.
+    formula : str
+        As in `fit`, e.g. `"y ~ x1 + x2 | fe1 + fe2"`.
+    family : {"poisson", "cloglog"}, default "poisson"
+        Poisson with a log link, or binary with a complementary log-log link.
+    cluster, vcov : optional
+        As in `fit`.
+    executor : optional
+        As in `fit`.
+    workdir : str or path, optional
+        Folder for the iterations' fits and working columns.
+    tol : float, default 1e-8
+        Converged when the deviance changes by less than this, relative to 0.1 + deviance.
+    maxiter : int, default 50
+        Most IRLS iterations; a warning is logged if it has not converged.
+    separation : bool, default True
+        Drop FE groups whose outcome never varies before fitting.
+    keep_sidecars : bool, default False
+        Keep the per-shard working-column files after the fit.
+    **fit_kw
+        Other `fit` options (`fe_tol`, `crossing_fe`, ...).
+
+    Returns
+    -------
+    Result
+        The converged fit, with `options["glm"]` holding the family, iterations, deviance,
+        convergence and the rows dropped as separated.
+    """
     from .estimate import fit
     from .executors import SerialExecutor
     from .prep import Dataset

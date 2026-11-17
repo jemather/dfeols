@@ -439,41 +439,67 @@ def lpm_dthazard(
     record: bool = True,
     **fit_options,
 ) -> HazardResult:
-    """Discrete-time hazard linear probability model by the Farbmacher-Tauchmann IV
-    (docs/design/hazard.md).
+    """Discrete-time hazard linear probability model by the Farbmacher-Tauchmann IV.
 
-    formula   `y ~ x1 + x2 + x1:x2 + i(age, ref=55) + x1:i(g) | fe1 + fe2`: y is the
-              absorbing-state indicator; every term is instrumented by its own j-th difference
-              (unless named in `levels`), the FEs are absorbed as exogenous. An intercept is
-              always included (the paper's constant) unless FEs absorb it. An i() term is
-              estimated on the levels present in the sample (minus ref=, or the first level):
-              each dummy is instrumented by Δ^j of itself. Levels that never occur in the
-              sample (e.g. the youngest age, seen only in a unit's first period) get no
-              coefficient and are reported (`excluded_levels`), as the paper drops age 53.
-              Absorbing such a variable as a FE instead gives the same other coefficients
-              (docs/design/hazard.md). A FE involving `unit` is refused (that is the within
-              estimator, which is biased here).
-    unit      the spell (unit) identifier; the dataset must be prepared with partition=unit
-              (or a FE/cluster on unit nested in the partition), so a unit's rows are in one
-              shard
-    time      the period: integers, consecutive periods differ by 1 (a Date counts days)
-    diff      j: instruments are Δ^j x (1 = first differences; 0 would be pooled OLS)
-    levels    terms assumed uncorrelated with the unit effect in levels: they instrument
-              themselves (default none)
-    cluster, vcov, weights
-              as in fit(); default vcov is "hetero" (the paper's), "CRV1" with a cluster
-    after_event  rows after a unit's first y = 1: "error" (default) or "drop" (counted)
-    compare   also fit first differences (the reduced form) and pooled OLS on the sample
-    record    write estimation records to <workdir>: result.estrec.json (the IV), and with
-              compare fd.estrec.json and ols.estrec.json, each with the hazard sample rules
-              (a path names the IV record; the others go beside it). Always written:
-              estimates.csv (every coefficient of every fit) and first_stage_G.csv
+    See `docs/design/hazard.md` for the method.
 
+    Parameters
+    ----------
+    ds : Dataset or str
+        The prepared dataset, or its shard directory. It must be prepared with
+        `partition=unit` (or a FE or cluster on `unit` nested in the partition), so a unit's
+        rows are in one shard.
+    formula : str
+        `y ~ x1 + x2 + x1:x2 + i(age, ref=55) + x1:i(g) | fe1 + fe2`, where y is the
+        absorbing-state indicator. Every term is instrumented by its own j-th difference
+        (unless named in `levels`); the FEs are absorbed as exogenous. An intercept is
+        always included (the paper's constant) unless FEs absorb it. An `i()` term is
+        estimated on the levels present in the sample (minus `ref=`, or the first level):
+        each dummy is instrumented by its own j-th difference. Levels that never occur in the
+        sample (e.g. the youngest age, seen only in a unit's first period) get no
+        coefficient and are reported (`excluded_levels`), as the paper drops age 53.
+        Absorbing such a variable as a FE instead gives the same other coefficients. A FE
+        involving `unit` is refused: that is the within estimator, which is biased here.
+    unit : str
+        The spell (unit) identifier.
+    time : str
+        The period: integers, consecutive periods differing by 1 (a Date counts days).
+    diff : int, default 1
+        j: instruments are j-th differences (1 = first differences; 0 would be pooled OLS).
+    levels : list of str, optional
+        Terms assumed uncorrelated with the unit effect in levels: they instrument
+        themselves. Default none.
+    cluster, vcov, weights : optional
+        As in `fit`. The default vcov is `"hetero"` (the paper's), `"CRV1"` with a cluster.
+    after_event : {"error", "drop"}, default "error"
+        Rows after a unit's first y = 1: raise, or drop them (counted).
+    compare : bool, default True
+        Also fit first differences (the reduced form) and pooled OLS on the same sample.
+    executor : optional
+        As in `fit`.
+    workdir : str or path, optional
+        Folder for the fits, records and CSV outputs.
+    label : str, optional
+        Name of the fit.
+    record : bool or path, default True
+        Write estimation records to `workdir`: `result.estrec.json` (the IV), and with
+        `compare`, `fd.estrec.json` and `ols.estrec.json`, each with the hazard sample rules
+        (a path names the IV record; the others go beside it). Always written:
+        `estimates.csv` (every coefficient of every fit) and `first_stage_G.csv`.
+    **fit_options
+        Other `fit` options.
+
+    Returns
+    -------
+    HazardResult
+
+    Notes
+    -----
     The sample. Starting from the prepared data, a row is dropped (and counted, under the
-    first reason that applies; see DROP_REASONS) if it comes after the unit's event
-    (after_event="drop"), if y, a regressor or the weight is missing or non-finite, if it is
-    one of the first j rows of the unit's spell, if any of t-1..t-j is not in the data (a gap),
-    or if a regressor is missing in one of those predecessor rows. fit() then drops FE
+    first reason that applies; see `DROP_REASONS`) if it comes after the unit's event
+    (`after_event="drop"`), if y, a regressor or the weight is missing or non-finite, if it
+    is one of the first j rows of the unit's spell, if any of t-1..t-j is not in the data (a
+    gap), or if a regressor is missing in one of those predecessor rows. `fit` then drops FE
     singletons as usual. y must be 0/1, with at most one (unit, time) row each.
 
     Extra FEs: absorbing a FE as exogenous equals instrumenting its dummies by their

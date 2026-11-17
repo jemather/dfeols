@@ -174,8 +174,24 @@ def build_plan(
     extra_columns: tuple[str, ...] = (),
     subset: str | None = None,
 ) -> Plan:
-    """`extra_columns`: columns supplied per shard at load time (GLM sidecars), not in ds.
-    `subset`: fit(subset=)'s row condition (i() levels are the subset's)."""
+    """Resolve a specification against a dataset into the plan `fit` runs.
+
+    Used by `fit`; call it directly to see how a formula's FEs will be absorbed without
+    running anything. Arguments are `fit`'s, plus:
+
+    Parameters
+    ----------
+    cache_dir : path, optional
+        Where demeaned arrays are cached between passes.
+    extra_columns : tuple of str
+        Columns supplied per shard at load time (GLM sidecars), not in `ds`.
+    subset : str, optional
+        `fit`'s row condition (`i()` levels are the subset's).
+
+    Returns
+    -------
+    Plan
+    """
     f = parse(formula)
     local, glob, slopes = [], [], {}
     for t in f.fe_terms:
