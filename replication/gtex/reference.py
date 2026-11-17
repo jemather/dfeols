@@ -23,6 +23,10 @@ import common
 
 Y, X = "log_tpm", "male:y_gene + male:xist + rin:log_gene_length"
 PARTS = {"sample": "sample", "tissue": "tissue"}
+# g3 by tissue: sample and gene^tissue both nest in the partition, so "auto" builds gene^center's
+# 2,736 dummies densely (about 88 GB per worker; killed the 2026-11-17 run). "sparse" takes them
+# as per-level sums with per-component Schur solves.
+SPARSE = {("g3", "tissue"): {"crossing_fe": "sparse"}}
 FES = ("sample", "gene", "gene^tissue", "gene^center")
 LADDER = {
     "g1": "sample + gene",
@@ -75,7 +79,8 @@ def main(argv=None):
             ds = common.prep_dataset(src, a.work / f"shards_{name}", dspec, a.target_rows)
             print(f"prep by {name}: {time.time() - t0:.0f} s", flush=True)
             for s in todo:
-                r = common.fit_dfeols(ds, s, name, executor=ex, workdir=a.work / f"fit_{name}", **fit_kw)
+                kw = fit_kw | SPARSE.get((s.label, name), {})
+                r = common.fit_dfeols(ds, s, name, executor=ex, workdir=a.work / f"fit_{name}", **kw)
                 ours[r["label"]] = r
                 save()
                 print(
