@@ -1,5 +1,12 @@
 # Design: `dfeols plan` (probe the FE structure, pick the path, size the job)
 
+!!! note "Plan A, B and C"
+    These design notes use the project's working names for the solver paths. **Plan A** is
+    the sparse path with one nested FE and a dense solve of the crossing block on the
+    coordinator. **Plan B** is the sparse path with several nested FEs, projected in each
+    shard. **Plan C** is the conjugate gradient (CG) solve, `crossing_fe="iterate"`. The
+    user guide calls them "the sparse path" and "the CG solve".
+
 Status: draft for review (2026-10-27; Ted's answers folded in 2026-10-28). Build step 1 (probe
 and report) is implemented in `src/dfeols/planner.py`, and `config init --from-slurm` in
 `src/dfeols/slurm_site.py` (2026-10-28); the rest is not. Plan A (crossing FEs
