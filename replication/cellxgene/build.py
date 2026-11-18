@@ -146,17 +146,24 @@ def build_part(task: dict, out_dir: str) -> dict:
     # dense parts (H, R1: a few dropped cells) read the joinid range and filter;
     # sparse ones (R0's sampled cells) read the listed cells only
     dense = len(ids) >= 0.2 * span
+    # dropped cells are filtered batch by batch as tiledbsoma streams them: in H a part's joinid
+    # range can hold up to ~12x its kept rows (1.76B read for 150M kept), which read whole
+    # would need ~35 GB a worker before filtering
+    cs, gs, vs = [], [], []
     with ts.open(_W["X"]) as X:
         coords = (slice(int(ids[0]), int(ids[-1])),) if dense else (ids,)
-        tb = pa.concat_tables(list(X.read(coords=coords).tables()))
-    c = tb["soma_dim_0"].to_numpy()
-    g = tb["soma_dim_1"].to_numpy()
-    v = tb["soma_data"].to_numpy()
-    del tb
-    if len(ids) < span:
-        keep = np.isin(c, ids)
-        if not keep.all():
-            c, g, v = c[keep], g[keep], v[keep]
+        for tb in X.read(coords=coords).tables():
+            c = tb["soma_dim_0"].to_numpy()
+            g = tb["soma_dim_1"].to_numpy()
+            v = tb["soma_data"].to_numpy()
+            del tb
+            if len(ids) < span:
+                keep = np.isin(c, ids)
+                if not keep.all():
+                    c, g, v = c[keep], g[keep], v[keep]
+            cs.append(c), gs.append(g), vs.append(v)
+    c, g, v = np.concatenate(cs), np.concatenate(gs), np.concatenate(vs)
+    del cs, gs, vs
     order = np.argsort(c * np.int64(1 << 20) + g, kind="stable")
     c, g, v = c[order], g[order], v[order]
     del order
