@@ -131,19 +131,45 @@ def without_part(res: dict) -> dict:
 
 def level_sums_of(res: dict):
     """A plan C round-1 result's per-level sums, D'W [X Y] and D'W 1 side by side, as
-    step_combine's (levels, sums) (executors.Reduce.get without level space)."""
+    step_combine's (levels, sums) (executors.Reduce.get without level space), and its
+    cross-tab (worker.shard_xtab) or None: ((levels, sums), xtab)."""
     cr = res.get("crossing")
     if not cr:
         return None
-    return np.asarray(cr["idx"]), np.hstack([cr["DR"], np.asarray(cr["ddiag"])[:, None]])
+    return (np.asarray(cr["idx"]), np.hstack([cr["DR"], np.asarray(cr["ddiag"])[:, None]])), cr.get("xtab")
 
 
 def without_level_sums(res: dict) -> dict:
-    """A round-1 result without its per-level sums (executors.Reduce.strip)."""
+    """A round-1 result without its per-level sums and cross-tab (executors.Reduce.strip)."""
     if "crossing" not in res:
         return res
-    cr = {k: v for k, v in res["crossing"].items() if k not in ("idx", "DR", "ddiag")}
+    cr = {k: v for k, v in res["crossing"].items() if k not in ("idx", "DR", "ddiag", "xtab")}
     return {**res, "crossing": cr}
+
+
+def level_sums_combine(*parts, P: int | None = None):
+    """Sum round-1 parts (level_sums_of): step_combine on the per-level sums, xtab_combine on
+    the cross-tabs."""
+    parts = [p for p in parts if p is not None]
+    if not parts:
+        return None
+    return step_combine(*[p[0] for p in parts], P=P), xtab_combine(*[p[1] for p in parts])
+
+
+def xtab_combine(*parts):
+    """Sum cross-tabs (sorted distinct keys, sums): the union of the keys, sums added."""
+    parts = [p for p in parts if p is not None]
+    if not parts:
+        return None
+    if len(parts) == 1:
+        return parts[0]
+    k = np.concatenate([p[0] for p in parts])
+    v = np.concatenate([p[1] for p in parts])
+    o = np.argsort(k, kind="stable")
+    k, v = k[o], v[o]
+    first = np.r_[True, k[1:] != k[:-1]] if len(k) else np.zeros(0, bool)
+    starts = np.flatnonzero(first)
+    return k[starts], np.add.reduceat(v, starts) if len(k) else v
 
 
 # Round 1's verdict on A, shared by its combines and the shards still to run (over_flag):
@@ -544,14 +570,185 @@ class BlockSolve:
         return self._demean(z)
 
 
+class XtabSolve:
+    """Exact pseudo-inverse of the cross-tab preconditioner M = D'WD for two crossing FEs.
+
+    With no local FE, D'WD = [[D1, B], [B', D2]]: D1 and D2 diagonal (a row has one level of
+    each FE) and B the FEs' cross-tab (the sum of w over the rows with each pair of levels).
+    A = D~'W D~ differs from it only by the local FEs' part. Where the crossing FEs overlap
+    heavily, M carries what makes A hard: D11 L3 (cell + gene^cell_type + gene^dataset, cell
+    local), where M is one small cell type x dataset block per gene, took 13 CG steps to 1e-10
+    against ~505 with Jacobi on R0 and 11 on a 2% cell sample of R1 (Jacobi 1,503 on R1;
+    docs/cgprecond.md in the data project). A pass-mode fit needs only B, summed over the
+    shards in round 1, and a coordinator solve per step.
+
+    M is singular: on each connected component of B's levels, +1 on FE 1 and -1 on FE 2 is
+    in its null space (D v = 0 row by row), so also in A's. The solve removes that direction
+    from r and from z, and per component either
+    - eliminates the larger side (diagonal) and takes the dense pseudo-inverse of the Schur
+      complement on the smaller side, when that side has at most SCHUR_MAX levels, or
+    - factorises the component's signed Laplacian [[D1, -B], [-B', D2]] (M up to the signs of
+      FE 2) with one level pinned, by sparse LU in chunks of components (LU_CHUNK_NNZ).
+    The Schur pseudo-inverse cuts eigenvalues below CUT times the smaller side's largest
+    diagonal entry, not its own largest eigenvalue: where a component's levels of the larger
+    FE each pair with one level of the smaller (a gene's cell types each in one dataset), the
+    Schur complement is all cancellation, zero up to rounding, and a relative cut inverts that
+    noise (eigenvalues near 1e18 on D11 R1; CG diverged once past 1e-8)."""
+
+    SCHUR_MAX = 64
+    LU_CHUNK_NNZ = 5_000_000
+    CUT = 1e-10
+
+    def __init__(self, key: np.ndarray, val: np.ndarray, P1: int, P2: int, name: str = ""):
+        from scipy.sparse.csgraph import connected_components
+
+        t = time.time()
+        key = np.asarray(key, np.int64)
+        val = np.asarray(val, np.float64)
+        a, b = key // P2, key % P2
+        self.P1, self.P2, self.P = P1, P2, P1 + P2
+        D1 = np.bincount(a, weights=val, minlength=P1)
+        D2 = np.bincount(b, weights=val, minlength=P2)
+        B = sp.csr_matrix((val, (a, b)), shape=(P1, P2))
+        ncomp, lab = connected_components(sp.bmat([[None, B], [B.T, None]], format="csr"), directed=False)
+        self.ncomp, self.lab = ncomp, lab
+        n1 = np.bincount(lab[:P1], minlength=ncomp)
+        n2 = np.bincount(lab[P1:], minlength=ncomp)
+        live = (n1 > 0) & (n2 > 0)  # else a level with no rows: z = 0 there
+        self.sign = np.r_[np.ones(P1), -np.ones(P2)]
+        self.cnt = np.where(live, n1 + n2, 1).astype(np.float64)
+        self.live_level = live[lab]
+        schur = live & (np.minimum(n1, n2) <= self.SCHUR_MAX)
+        small2 = schur & (n2 <= n1)  # eliminate FE 1, Schur on FE 2
+        small1 = schur & ~small2
+        lu = live & ~schur
+        self.schur = []
+        lab1, lab2 = lab[:P1], lab[P1:]
+        for comps, flip in ((small2, False), (small1, True)):
+            if not comps.any():
+                continue
+            if not flip:  # big side FE 1 (offset 0), small side FE 2 (offset P1)
+                Bo, Db, Ds, labb, labs, ob, os_ = B, D1, D2, lab1, lab2, 0, P1
+            else:
+                Bo, Db, Ds, labb, labs, ob, os_ = B.T.tocsr(), D2, D1, lab2, lab1, P1, 0
+            ib = np.flatnonzero(comps[labb])
+            is_ = np.flatnonzero(comps[labs])
+            Bc = Bo[ib][:, is_].tocsr()
+            dbinv = 1.0 / Db[ib]
+            S = (sp.diags(Ds[is_]) - Bc.T @ sp.diags(dbinv) @ Bc).tocoo()
+            # dense blocks per component, batched by size
+            cs = labs[is_]
+            order = np.argsort(cs, kind="stable")
+            cnt_s = np.bincount(cs, minlength=ncomp)
+            start = np.r_[0, np.cumsum(cnt_s)]
+            pos = np.empty(len(is_), np.int64)
+            pos[order] = np.arange(len(is_)) - start[cs[order]]
+            groups = []
+            for m in np.unique(cnt_s[comps]):
+                cg = np.flatnonzero(comps & (cnt_s == m))
+                slot = np.full(ncomp, -1, np.int64)
+                slot[cg] = np.arange(len(cg))
+                blk = np.zeros((len(cg), m, m))
+                sel = slot[cs[S.row]] >= 0
+                np.add.at(blk, (slot[cs[S.row[sel]]], pos[S.row[sel]], pos[S.col[sel]]), S.data[sel])
+                blk = 0.5 * (blk + np.swapaxes(blk, 1, 2))
+                where = order[start[cg][:, None] + np.arange(m)[None, :]]  # (n_comp, m) into is_
+                lam, V = np.linalg.eigh(blk)
+                cut = self.CUT * np.maximum(Ds[is_][where].max(axis=1), 1e-300)[:, None]
+                inv = np.where(lam > cut, 1.0 / np.where(lam > cut, lam, 1.0), 0.0)
+                groups.append((where, (V * inv[:, None, :]) @ np.swapaxes(V, 1, 2)))
+            self.schur.append((ib + ob, is_ + os_, Bc, dbinv, groups))
+        # sparse LU of the pinned signed Laplacian, components in chunks
+        self.lu = []
+        fnnz = 0
+        if lu.any():
+            import scipy.sparse.linalg as spla
+
+            L = sp.bmat([[sp.diags(D1), -B], [-B.T, sp.diags(D2)]], format="csr")
+            comps = np.flatnonzero(lu)
+            idx_all = np.flatnonzero(lu[lab])
+            idx_all = idx_all[np.argsort(lab[idx_all], kind="stable")]
+            cl = lab[idx_all]
+            first = np.r_[True, cl[1:] != cl[:-1]]
+            deg = np.diff(L.indptr)[idx_all]
+            chunk, nz = [], 0
+            bounds = np.r_[np.flatnonzero(first), len(idx_all)]
+            for c0, c1 in zip(bounds[:-1], bounds[1:]):
+                chunk.append((c0, c1))
+                nz += int(deg[c0:c1].sum())
+                if nz >= self.LU_CHUNK_NNZ or c1 == len(idx_all):
+                    keep = np.concatenate([idx_all[s + 1 : e] for s, e in chunk])  # pin each first level
+                    f = spla.splu(L[keep][:, keep].tocsc(), permc_spec="MMD_AT_PLUS_A")
+                    fnnz += f.L.nnz + f.U.nnz
+                    self.lu.append((keep, f))
+                    chunk, nz = [], 0
+            del comps
+        self.kinds = {
+            "schur": int(np.isin(lab, np.flatnonzero(schur)).sum()),
+            "lu": int(np.isin(lab, np.flatnonzero(lu)).sum()),
+        }
+        log.info(
+            "crossing FEs %s: cross-tab %s nonzeros over %s + %s levels, %s components (largest %s): "
+            "%s levels by Schur blocks, %s by sparse LU (%s factor nonzeros) (%.1fs)",
+            name,
+            f"{len(val):,}",
+            f"{P1:,}",
+            f"{P2:,}",
+            f"{int(live.sum()):,}",
+            f"{int((n1 + n2)[live].max(initial=0)):,}",
+            f"{self.kinds['schur']:,}",
+            f"{self.kinds['lu']:,}",
+            f"{fnnz:,}",
+            time.time() - t,
+        )
+
+    def _project(self, v):
+        """v minus its component along each component's null vector (+1 FE 1, -1 FE 2)."""
+        s = self.sign[:, None]
+        mu = np.column_stack(
+            [
+                np.bincount(self.lab, weights=self.sign * v[:, j], minlength=self.ncomp)
+                for j in range(v.shape[1])
+            ]
+        )
+        return (v - s * (mu / self.cnt[:, None])[self.lab]) * self.live_level[:, None]
+
+    def solve(self, r):
+        r = self._project(np.asarray(r, np.float64))
+        z = np.zeros_like(r)
+        for ib, is_, Bc, dbinv, groups in self.schur:
+            rb = r[ib] * dbinv[:, None]
+            t = r[is_] - Bc.T @ rb
+            zs = np.zeros_like(t)
+            for where, Sinv in groups:  # where: (components, m) positions in is_
+                zs[where] = np.einsum("gab,gbc->gac", Sinv, t[where])
+            z[is_] = zs
+            z[ib] = rb - (Bc @ zs) * dbinv[:, None]
+        for keep, f in self.lu:
+            z[keep] = self.sign[keep, None] * f.solve(np.ascontiguousarray(self.sign[keep, None] * r[keep]))
+        return self._project(z)
+
+
 # ---------------------------------------------------------------- preconditioners
 
 
-def choose_method(solvers: list[BlockSolve] | None, level_space: bool, want: str = "auto") -> str:
-    """The preconditioner, from the block structure (planner.md's table) unless `want` names one."""
+def choose_method(
+    solvers: list[BlockSolve] | None, level_space: bool, want: str = "auto", xtab: XtabSolve | None = None
+) -> str:
+    """The preconditioner, from the block structure (planner.md's table) unless `want` names
+    one. With a pass per step and the crossing FEs' cross-tab (two crossing FEs), "auto" takes
+    the cross-tab preconditioner (XtabSolve): a step costs one pass whatever the
+    preconditioner, and on D11 L3 it cut the steps ~40x against Jacobi."""
+    if want == "xtab":
+        if xtab is None:
+            log.warning("crossing_precond='xtab' needs two crossing FEs and their cross-tab: Jacobi")
+            return "jacobi"
+        return "xtab"
+    if want == "auto" and not level_space and xtab is not None:
+        return "xtab"
     if want != "auto":
         if want not in ("jacobi", "bjacobi", "sgs"):
-            raise ValueError("crossing_precond must be auto, jacobi, bjacobi or sgs")
+            raise ValueError("crossing_precond must be auto, jacobi, bjacobi, sgs or xtab")
         if want != "jacobi" and solvers is None:
             log.warning("crossing_precond=%r needs the diagonal blocks, which are too large: Jacobi", want)
             return "jacobi"
@@ -566,13 +763,16 @@ def choose_method(solvers: list[BlockSolve] | None, level_space: bool, want: str
     return "bjacobi"
 
 
-def make_precond(method: str, diag: np.ndarray, offs: np.ndarray, solvers=None, A=None):
+def make_precond(method: str, diag: np.ndarray, offs: np.ndarray, solvers=None, A=None, xtab=None):
     """z = M^-1 r for CG. `diag` is A's diagonal (levels with none are inactive), `offs` the
-    crossing FEs' offsets in the level index, `A` the whole matrix (sgs only)."""
+    crossing FEs' offsets in the level index, `A` the whole matrix (sgs only), `xtab` the
+    cross-tab solve (xtab only)."""
     act = diag > 1e-12 * max(float(diag.max(initial=0.0)), 1.0)
     dinv = np.where(act, 1.0 / np.where(act, diag, 1.0), 0.0)
     if method == "jacobi":
         return lambda r: r * dinv[:, None]
+    if method == "xtab":
+        return lambda r: xtab.solve(r) * act[:, None]
     sl = [slice(int(a), int(b)) for a, b in zip(offs[:-1], offs[1:])]
     K = len(sl)
     if method == "bjacobi":
@@ -813,6 +1013,12 @@ def pcg(
     return X, it, float(rel.max())
 
 
+# in Checkpoint's digest: a checkpoint resumes only under the pcg and preconditioners that wrote
+# it (GTEx g1 resumed pre-be311ff state under be311ff's pcg and stalled). Bump it whenever what
+# CG's state means changes
+CG_STATE_VERSION = "cg2"
+
+
 class Checkpoint:
     """A CG solve's state on disk, written after each step (atomically) and read back by a
     rerun of the same solve: the same shape, tolerance and preconditioner, and a right-hand
@@ -826,7 +1032,7 @@ class Checkpoint:
         state is 4 blocks of 12.1M x 7 doubles, 2.7 GB a step on the coordinator."""
         self.path = Path(path)
         self.R = R
-        self.digest = f"{R.shape}|{tol!r}|{method}"
+        self.digest = f"{R.shape}|{tol!r}|{method}|{CG_STATE_VERSION}"
         self.every_s = every_s
         self._last = None  # (state, written)
         self._t = float("-inf")

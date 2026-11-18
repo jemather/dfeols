@@ -114,3 +114,33 @@ def test_cg_checkpoint_resumes_a_fit(ds, tmp_path, caplog):
     cg = again.options["crossing_cg"]
     assert cg["resumed_from"] == 3 and cg["passes"] == cg["steps"] - 3
     _same(clean, again, 1e-10)
+
+
+def test_cg_checkpoint_kept_until_the_fit_is_done(ds, tmp_path, monkeypatch, caplog):
+    """A fit that dies after CG converged (in round 2: D11 H 2026-11-18) keeps the converged
+    CG state; the rerun resumes with CG done (no pass), and the finished fit removes it."""
+    import logging
+
+    import dfeols.estimate as est
+
+    kw = dict(crossing_fe="iterate", iter_tol=1e-12, level_space_gb=0, cluster="id_a")
+    clean = _fit(ds, tmp_path / "clean", **kw)
+    assert not (tmp_path / "clean" / "cg_checkpoint.npz").exists()
+    wd = tmp_path / "w"
+
+    def boom(*a, **k):
+        raise RuntimeError("worker killed in round 2")
+
+    monkeypatch.setattr(est, "_ols_solve", boom)
+    monkeypatch.setattr(est, "_iv_solve_iterate", boom)
+    with pytest.raises(RuntimeError, match="killed in round 2"):
+        _fit(ds, wd, **kw)
+    monkeypatch.undo()
+    assert (wd / "cg_checkpoint.npz").exists()
+    with caplog.at_level(logging.INFO, logger="dfeols"):
+        again = _fit(ds, wd, **kw)
+    cg = again.options["crossing_cg"]
+    assert "resumes at step" in caplog.text
+    assert cg["passes"] == 0 and cg["resumed_from"] == cg["steps"] > 0
+    assert not (wd / "cg_checkpoint.npz").exists()
+    _same(clean, again, 1e-10)

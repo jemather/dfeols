@@ -132,6 +132,7 @@ class Plan:
     cg_checkpoint: str | None = None  # plan C with a pass per step: where its CG state is kept
     level_nnz: int = 0  # plan C: most nonzeros of A a shard returns (0: no level space)
     part_nnz: int = 0  # and at most this many, for the workers' memory (0: level_nnz alone)
+    xtab: bool = False  # plan C, two crossing FEs: round 1 also returns their cross-tab (crossing.XtabSolve)
     keep_dir: str | None = None  # per-shard singleton keep masks (when FEs cross the partition)
     row_key_cols: tuple[str, ...] = ()  # raw columns hashed into the record's row_key
     endog_names: list[str] = field(default_factory=list)  # IV: endogenous columns (outcome block)
@@ -471,6 +472,16 @@ def _global_matrix(df, plan: Plan, n: int):
     )
 
 
+def shard_xtab(gcodes: np.ndarray, w: np.ndarray, P1: int, P: int) -> tuple[np.ndarray, np.ndarray]:
+    """The cross-tab of two crossing FEs over this shard's rows: sorted distinct keys
+    level1 * P2 + level2 (each FE's own codes; FE 2's start at P1 of P levels) and the sum of
+    w over each pair's rows."""
+    P2 = P - P1
+    key = gcodes[0].astype(np.int64) * P2 + (gcodes[1].astype(np.int64) - P1)
+    u, inv = np.unique(key, return_inverse=True)
+    return u, np.bincount(inv.ravel(), weights=w, minlength=len(u))
+
+
 def _fe_matrix(codes: np.ndarray, P: int):
     """n x P indicator of one crossing FE's levels (codes carry its offset)."""
     import scipy.sparse as sp
@@ -775,6 +786,8 @@ def _round1_sparse(plan: Plan, shard_id: int, df, n0: int, local_codes, w, T, t0
                 CA = sp.csr_matrix((w, (a, np.arange(n))), shape=(len(WA), n)) @ Dm
                 d -= np.asarray(CA.multiply(CA).T @ (1.0 / WA)).ravel()
         aux["ddiag"] = d[idx]
+        if plan.xtab and n:
+            aux["xtab"] = shard_xtab(gcodes, w, int(offs[1]), P)
         T["crossprod"] = time.perf_counter() - t
         return Y, Yt, Xt, Xw.T @ Xt, Xw.T @ Yt, (local_codes, Dm), converged, aux
     sparse_out = P > SPARSE_GRAM_LEVELS

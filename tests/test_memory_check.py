@@ -18,10 +18,25 @@ def test_refuses_far_over_worker_memory():
         _check_worker_memory(_ex("24GB"), "twfe", 993_842_500, 379.2)
 
 
-def test_warns_slightly_over(caplog):
-    with caplog.at_level(logging.WARNING, logger="dfeols"):
+def test_refuses_past_the_nanny_kill_point(monkeypatch):
+    # D11 H 2026-11-18: 23.9 GB estimated, 22.35 GiB (24.0 GB) workers, killed after 2.5 h
+    ex = SimpleNamespace(worker_memory=int(22.35 * 2**30), profile=None)
+    with pytest.raises(MemoryError, match="Dask kills a worker past 95%"):
+        _check_worker_memory(ex, "h_l1", 150_000_000, 23.9)
+    with pytest.raises(MemoryError):
         _check_worker_memory(_ex("24GB"), "twfe", 50_000_000, 30.0)
-    assert "may run out of memory" in caplog.text
+    monkeypatch.setenv("DFEOLS_MEMORY_CHECK", "warn")
+    _check_worker_memory(ex, "h_l1", 150_000_000, 23.9)  # an override for a run known to fit
+
+
+def test_warns_past_the_pause_point(caplog):
+    with caplog.at_level(logging.WARNING, logger="dfeols"):
+        _check_worker_memory(_ex("24GB"), "twfe", 50_000_000, 20.0)
+    assert "may stall or run out of memory" in caplog.text
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="dfeols"):
+        _check_worker_memory(_ex("24GB"), "twfe", 50_000_000, 15.0)
+    assert not caplog.text
 
 
 def test_no_profile_no_check():

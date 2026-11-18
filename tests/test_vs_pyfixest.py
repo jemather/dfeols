@@ -308,7 +308,9 @@ def test_iterate_level_space_and_fallback(ds_cw, f, monkeypatch):
         ("bjacobi", dict(crossing_precond="bjacobi"), ("level", "bjacobi")),
         ("jacobi", dict(crossing_precond="jacobi"), ("level", "jacobi")),
         ("blocks", dict(level_space_gb=mid), ("pass", "bjacobi")),
-        ("off", dict(level_space_gb=0), ("pass", "jacobi")),
+        ("off", dict(level_space_gb=0, crossing_precond="jacobi"), ("pass", "jacobi")),
+        # two crossing FEs with a pass per step: auto takes their cross-tab
+        ("xtab", dict(level_space_gb=0), ("pass", "xtab")),
     ]:
         if want[0] == "pass":
             with pytest.warns(SlowConvergenceWarning, match="convergence may be slow"):
@@ -321,6 +323,8 @@ def test_iterate_level_space_and_fallback(ds_cw, f, monkeypatch):
     assert "nonzeros" in runs["blocks"].options["crossing_cg"]["fallback_reason"]
     # block-Jacobi beats Jacobi on the same passes
     assert runs["blocks"].options["crossing_cg"]["steps"] < runs["off"].options["crossing_cg"]["steps"]
+    # and the cross-tab beats it too (23 against 53, 27 against 52)
+    assert runs["xtab"].options["crossing_cg"]["steps"] < runs["off"].options["crossing_cg"]["steps"]
     pdf = d.to_pandas().dropna(subset=["eng"])
     for y in f.split("~")[0].split("+"):
         y = y.strip()

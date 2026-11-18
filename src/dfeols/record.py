@@ -857,6 +857,7 @@ def to_estimation(
             "jacobi": "Jacobi",
             "bjacobi": "block-Jacobi",
             "sgs": "AP-sweep (symmetric block Gauss-Seidel)",
+            "xtab": "cross-tab (exact solve of the crossing FEs' D'WD)",
         }
         numerics.update(
             algorithm=f"{numerics['algorithm']} within shards (local FEs); crossing FEs by "

@@ -437,3 +437,126 @@ def test_pcg_stops_when_stalled():
     mv, R, scale, M, act = _balanced_g1(noise=1e-9)  # sums too noisy for 1e-12
     X, it, rel = cx.pcg(mv, R, M, act, 1e-12, 5000, stall_steps=40)
     assert rel > 1e-12 and it < 500
+
+
+# ---------------------------------------------------------------- cross-tab preconditioner
+
+
+def _two_fe_rows(seed=0, groups=((40, 6), (3, 70), (2, 2), (9, 9)), rows=120):
+    """Rows of two crossing FEs in several disconnected groups (each a component): sizes
+    (FE 1 levels, FE 2 levels), so the Schur side is FE 2 in some and FE 1 in others; plus
+    one unused level of each FE (no rows)."""
+    rng = np.random.default_rng(seed)
+    a, b, o1, o2 = [], [], 0, 0
+    for n1, n2 in groups:
+        a.append(o1 + np.r_[np.arange(n1), rng.integers(0, n1, rows)])
+        b.append(o2 + np.r_[rng.integers(0, n2, n1), rng.integers(0, n2, rows)])
+        b[-1][: min(n1, n2)] = o2 + np.arange(min(n1, n2))  # every level has a row
+        if n2 > n1:
+            a[-1] = np.r_[a[-1], o1 + rng.integers(0, n1, n2)]
+            b[-1] = np.r_[b[-1], o2 + np.arange(n2)]
+        o1, o2 = o1 + n1, o2 + n2
+    a, b = np.concatenate(a), np.concatenate(b)
+    P1, P2 = o1 + 1, o2 + 1  # the last level of each FE has no rows
+    w = rng.uniform(0.5, 2.0, len(a))
+    return a, b, w, P1, P2
+
+
+def _xtab_dense(a, b, w, P1, P2):
+    D = np.zeros((len(a), P1 + P2))
+    D[np.arange(len(a)), a] = 1.0
+    D[np.arange(len(a)), P1 + b] = 1.0
+    return D, D.T @ (w[:, None] * D)
+
+
+@pytest.mark.parametrize("schur_max", [64, 0, 5])  # Schur everywhere, LU everywhere, mixed
+def test_xtab_solve_is_the_pseudo_inverse(monkeypatch, schur_max):
+    from dfeols.worker import shard_xtab
+
+    a, b, w, P1, P2 = _two_fe_rows()
+    D, M = _xtab_dense(a, b, w, P1, P2)
+    # the shard's cross-tab, in two shards summed as round 1's tree does
+    h = len(a) // 2
+    g = np.vstack([a, P1 + b])
+    xt = cx.xtab_combine(shard_xtab(g[:, :h], w[:h], P1, P1 + P2), shard_xtab(g[:, h:], w[h:], P1, P1 + P2))
+    whole = shard_xtab(g, w, P1, P1 + P2)
+    np.testing.assert_array_equal(xt[0], whole[0])
+    np.testing.assert_allclose(xt[1], whole[1], rtol=1e-14)
+    monkeypatch.setattr(cx.XtabSolve, "SCHUR_MAX", schur_max)
+    X = cx.XtabSolve(xt[0], xt[1], P1, P2)
+    if schur_max == 64:
+        assert X.kinds["lu"] == 0
+    if schur_max == 0:
+        assert X.kinds["schur"] == 0
+    if schur_max == 5:
+        assert X.kinds["lu"] and X.kinds["schur"]
+    r = D.T @ (w[:, None] * np.random.default_rng(1).standard_normal((len(a), 3)))  # in M's range
+    want = np.linalg.pinv(M, rcond=1e-12) @ r
+    np.testing.assert_allclose(X.solve(r), want, atol=1e-12 * np.abs(want).max())
+
+
+def test_xtab_schur_all_cancellation():
+    from dfeols.worker import shard_xtab
+
+    # each FE 1 level pairs with one FE 2 level (a gene's cell types each in one dataset):
+    # FE 2's Schur complement is zero up to rounding. A cut relative to its own eigenvalues
+    # inverted the noise (1e18 on D11 R1); the cut relative to D2 gives the pseudo-inverse
+    rng = np.random.default_rng(3)
+    P2, per = 4, 30
+    a = np.repeat(np.arange(P2 * per), 3)
+    b = a // per
+    w = rng.uniform(0.1, 10.0, len(a)) * 1e3
+    D, M = _xtab_dense(a, b, w, P2 * per, P2)
+    k, v = shard_xtab(np.vstack([a, P2 * per + b]), w, P2 * per, P2 * per + P2)
+    X = cx.XtabSolve(k, v, P2 * per, P2)
+    assert X.kinds["schur"] == P2 * per + P2
+    r = D.T @ (w[:, None] * rng.standard_normal((len(a), 2)))
+    z = X.solve(r)
+    want = np.linalg.pinv(M, rcond=1e-12) @ r
+    assert np.abs(z).max() < 10 * np.abs(want).max()
+    np.testing.assert_allclose(M @ z, r, atol=1e-9 * np.abs(r).max())
+
+
+def test_xtab_pcg_and_method():
+    from dfeols.worker import shard_xtab
+
+    # A = D~'W D~ with a local FE: CG preconditioned by the cross-tab reaches tol, and its
+    # solution gives the same D~ X as Jacobi's
+    a, b, w, P1, P2 = _two_fe_rows(seed=4)
+    n = len(a)
+    loc = np.random.default_rng(5).integers(0, 25, n)
+    D, _ = _xtab_dense(a, b, w, P1, P2)
+    G = np.zeros((n, 25))
+    G[np.arange(n), loc] = 1.0
+    WG = w[:, None] * G
+    Q = np.eye(n) - G @ np.linalg.pinv(G.T @ WG) @ WG.T
+    Dt = Q @ D
+    A = Dt.T @ (w[:, None] * Dt)
+    R = Dt.T @ (w[:, None] * np.random.default_rng(6).standard_normal((n, 2)))
+    k, v = cx.xtab_combine(shard_xtab(np.vstack([a, P1 + b]), w, P1, P1 + P2))
+    X = cx.XtabSolve(k, v, P1, P2)
+    offs = np.array([0, P1, P1 + P2])
+    diag = A.diagonal()
+    act = diag > 1e-12 * diag.max()
+    assert cx.choose_method(None, level_space=False, xtab=X) == "xtab"
+    assert cx.choose_method(None, level_space=True, xtab=X) == "jacobi"  # level space: its own choice
+    assert cx.choose_method(None, level_space=True, want="xtab", xtab=X) == "xtab"
+    assert cx.choose_method(None, level_space=False, want="xtab") == "jacobi"  # no cross-tab
+    out = {}
+    for m in ("jacobi", "xtab"):
+        M = cx.make_precond(m, diag, offs, xtab=X)
+        Xs, it, rel = cx.pcg(lambda p: A @ p, R, M, act, 1e-10, 2000)
+        assert rel <= 1e-10
+        out[m] = (Dt @ Xs, it)
+    np.testing.assert_allclose(out["xtab"][0], out["jacobi"][0], atol=1e-8 * np.abs(out["jacobi"][0]).max())
+    assert out["xtab"][1] < out["jacobi"][1]
+
+
+def test_checkpoint_digest_has_the_solver_version(tmp_path, monkeypatch):
+    R = np.ones((5, 2))
+    st = {"X": R, "r": R, "p": R, "rz": np.ones(2), "it": 3}
+    cx.Checkpoint(tmp_path / "cg.npz", R, 1e-8, "xtab").save(st)
+    assert cx.Checkpoint(tmp_path / "cg.npz", R, 1e-8, "xtab").load() is not None
+    assert cx.Checkpoint(tmp_path / "cg.npz", R, 1e-8, "jacobi").load() is None
+    monkeypatch.setattr(cx, "CG_STATE_VERSION", "cg-older")
+    assert cx.Checkpoint(tmp_path / "cg.npz", R, 1e-8, "xtab").load() is None

@@ -414,31 +414,51 @@ def coordinator_gb(k_tot: int) -> float:
     return k_tot**2 * 8 * 6 / 1e9
 
 
+# Dask's nanny kills a worker at 95% of its memory limit and pauses it at 80%
+# (distributed.worker.memory.terminate / .pause)
+WORKER_KILL_SHARE = 0.95
+WORKER_PAUSE_SHARE = 0.80
+
+
 def _check_worker_memory(executor, label: str, rows: int, need_gb: float) -> None:
     """Fail before submitting work that cannot fit on a worker.
 
-    A shard that exceeds worker memory kills every worker that tries it (the
-    scheduler retries it on a fresh worker each time), which wastes the queue
-    wait of each one. The estimate is rough, so warn above the profile's
-    worker memory and refuse only well above it."""
+    A shard that exceeds worker memory kills every worker that tries it (the scheduler
+    retries it on a fresh worker each time), which wastes the queue wait of each one, and a
+    fit can die hours in (D11 H, 2026-11-18: "peak worker memory roughly 23.9 GB" logged at
+    the start, workers of 22.35 GiB = 24.0 GB, killed in round 2 after 2.5 h). So refuse when
+    the estimate passes the point where Dask's nanny kills a worker (WORKER_KILL_SHARE of the
+    workers' memory: the executor's worker_memory, else the profile's), and warn above the
+    point where it pauses one. DFEOLS_MEMORY_CHECK=warn turns the refusal into a warning (the
+    estimate is rough: an override for a run known to fit)."""
+    have = getattr(executor, "worker_memory", None)
     prof = getattr(executor, "profile", None)
     mem = getattr(prof, "worker", {}).get("memory") if prof is not None else None
-    if not mem:
-        return
-    from .cluster import _memory_bytes
+    if not have and mem:
+        from .cluster import _memory_bytes
 
-    have_gb = _memory_bytes(mem) / 1e9
+        have = _memory_bytes(mem)
+    if not have:
+        return
+    have_gb = have / 1e9
+    where = f"profile {prof.name!r} gives workers {mem}" if mem else "workers have"
     msg = (
-        f"fit {label}: the largest shard ({rows:,} rows) needs roughly {need_gb:.0f} GB, "
-        f"and profile {prof.name!r} gives workers {mem}"
+        f"fit {label}: the largest shard ({rows:,} rows) needs roughly {need_gb:.1f} GB, and "
+        f"{where} {have_gb:.1f} GB ({have / 2**30:.2f} GiB), of which Dask kills a worker past "
+        f"{WORKER_KILL_SHARE:.0%} ({WORKER_KILL_SHARE * have_gb:.1f} GB)"
     )
-    if need_gb > 1.5 * have_gb:
+    if need_gb > WORKER_KILL_SHARE * have_gb:
+        if os.environ.get("DFEOLS_MEMORY_CHECK", "").lower() == "warn":
+            log.warning("%s; going ahead (DFEOLS_MEMORY_CHECK=warn): workers may be killed", msg)
+            return
         raise MemoryError(
             msg + ". Re-prep with a smaller target_rows or a partition key without one huge "
-            "group (`dfeols info <shard_dir>` shows shard sizes), or raise [worker] memory."
+            "group (`dfeols info <shard_dir>` shows shard sizes), or raise [worker] memory; "
+            "DFEOLS_MEMORY_CHECK=warn goes ahead anyway."
         )
-    if need_gb > have_gb:
-        log.warning("%s; workers may run out of memory", msg)
+    if need_gb > WORKER_PAUSE_SHARE * have_gb:
+        log.warning("%s; past %.0f%% Dask pauses it: workers may stall or run out of memory", msg,
+                    100 * WORKER_PAUSE_SHARE)
 
 
 # Above this many crossing-FE dummies the coordinator's dense solve gives way to conjugate
@@ -732,12 +752,18 @@ def _crossing_cg(
     tol: float,
     maxiter: int,
     precond: str = "auto",
+    keep_checkpoint: bool = False,
 ) -> np.ndarray:
     """Plan C: solve A Gamma = D~'W [X~ Y~], A = D~'W D~, by preconditioned conjugate gradient,
     one column per regressor and outcome (crossing.pcg). In level space (A summed from the
     shards' parts in round 1, acc["gram"]) every step is a product on the coordinator; otherwise
     each step is one map/reduce round (worker.shard_matvec), and dfeols warns that convergence
-    may be slow. The preconditioner follows A's block structure (crossing.choose_method)."""
+    may be slow. The preconditioner follows A's block structure (crossing.choose_method).
+
+    `keep_checkpoint`: a converged solve's checkpoint stays (acc["cg_checkpoint"]) for the
+    caller to remove once the whole fit is done, so a fit that dies after CG (in round 2)
+    resumes with CG converged and no step to redo (D11 H 2026-11-18: killed in round 2 after
+    2.5 h, the checkpoint already deleted). Otherwise it is removed on convergence."""
     from . import crossing as cx
 
     t0 = time.time()
@@ -770,15 +796,21 @@ def _crossing_cg(
     if blocks is not None and precond != "jacobi":
         singular = bool(plan.local_fes)
         solvers = [cx.BlockSolve(b, singular, n) for b, n in zip(blocks, names)]
-    method = cx.choose_method(solvers, level, precond)
-    M = cx.make_precond(method, diag, offs, solvers, A)
+    xtab = None
+    xt = acc.pop("xtab", None)
+    if xt is not None and len(offs) == 3 and (precond == "xtab" or (precond == "auto" and not level)):
+        P1 = int(offs[1])
+        xtab = cx.XtabSolve(xt[0], xt[1], P1, P - P1, " x ".join(names))
+    del xt
+    method = cx.choose_method(solvers, level, precond, xtab)
+    M = cx.make_precond(method, diag, offs, solvers, A, xtab)
     act = diag > 1e-12 * max(float(diag.max(initial=0.0)), 1.0)
     t_setup = time.time() - t0
     log.info(
         "fit %s: crossing-FE CG %s, %s preconditioner%s (setup %s)",
         label,
         "in level space" if level else "with a pass per step",
-        {"jacobi": "Jacobi", "bjacobi": "block-Jacobi", "sgs": "AP-sweep"}[method],
+        {"jacobi": "Jacobi", "bjacobi": "block-Jacobi", "sgs": "AP-sweep", "xtab": "cross-tab"}[method],
         f"; A {A.nnz:,} nonzeros over {P:,} levels" if level else "",
         fmt_td(t_setup),
     )
@@ -870,7 +902,7 @@ def _crossing_cg(
         cands = {"jacobi": cx.make_precond("jacobi", diag, offs), method: M}
         method, t_state, trial = cx.precond_trial(mv, R, act, tol, maxiter, cands, prefer=method)
         M = cands[method]
-        names_ = {"jacobi": "Jacobi", "bjacobi": "block-Jacobi", "sgs": "AP-sweep"}
+        names_ = {"jacobi": "Jacobi", "bjacobi": "block-Jacobi", "sgs": "AP-sweep", "xtab": "cross-tab"}
         log.info(
             "fit %s: preconditioner trial: %s; using %s",
             label,
@@ -908,7 +940,12 @@ def _crossing_cg(
     if level and hasattr(mv, "pool"):
         mv.pool.shutdown(wait=False)
     if ck is not None:
-        ck.remove() if rel <= tol else ck.flush()
+        if rel <= tol and not keep_checkpoint:
+            ck.remove()
+        else:
+            ck.flush()  # the latest state, converged or not, is on disk
+            if rel <= tol:
+                acc["cg_checkpoint"] = ck
     prog.note, prog.extra_eta = "", None
     if rel > tol and it < maxiter:
         raise RuntimeError(
@@ -1287,10 +1324,13 @@ def fit(
         further passes. Default a quarter of the profile's coordinator memory, or of this
         machine's; 0 turns it off. Above it each CG step is a pass over the shards, and dfeols
         warns (`crossing.SlowConvergenceWarning`).
-    crossing_precond : {"auto", "jacobi", "bjacobi", "sgs"}, default "auto"
+    crossing_precond : {"auto", "jacobi", "bjacobi", "sgs", "xtab"}, default "auto"
         With `"iterate"`, the preconditioner: `"auto"` picks from A's block structure and, in
         level space, keeps that choice only if a short trial against `"jacobi"` says it reaches
         `iter_tol` sooner; `"sgs"` is an alternating-projections sweep, level space only.
+        `"xtab"` solves the two crossing FEs' cross-tab D'WD exactly (two crossing FEs only;
+        round 1 sums it over the shards); `"auto"` takes it when there are two crossing FEs and
+        a pass per step (`level_space_gb=0`), where it costs no extra pass.
     cells : bool, default False
         Fit from per-cell sums (`dfeols.cells`): one pass groups each shard's rows by every
         FE key and the cluster, and the coordinator solves on the cells, exactly. Pays when
@@ -1424,6 +1464,11 @@ def fit(
         plan.iter_cache_bytes = iter_cache_budget(worker_bytes(executor))
         plan.level_nnz = level_space_budget(executor, level_space_gb)
         plan.part_nnz = part_budget(worker_bytes(executor)) if plan.level_nnz else 0
+        # two crossing FEs: their cross-tab for the cross-tab preconditioner (crossing.XtabSolve),
+        # which "auto" takes with a pass per step (level space keeps its own choice)
+        plan.xtab = len(plan.global_fes) == 2 and (
+            crossing_precond == "xtab" or (crossing_precond == "auto" and not plan.level_nnz)
+        )
     f = plan.formula
     label = label or spec_id
     m = len(f.depvars)
@@ -1576,6 +1621,10 @@ def fit(
                 if "DR" in cr:  # else summed on the workers (reduce below)
                     acc["DR"][cr["idx"]] += cr["DR"]
                     acc["ddiag"][cr["idx"]] += cr["ddiag"]
+                if cr.get("xtab") is not None:  # likewise
+                    from .crossing import xtab_combine
+
+                    acc["xtab"] = xtab_combine(acc.get("xtab"), cr["xtab"])
                 if "gram" in acc and "part" in cr:  # else summed on the workers (reduce below)
                     acc["gram"].add(cr["part"], tid)
             acc["row_n"][tid] = r["n"]
@@ -1630,19 +1679,23 @@ def fit(
             # no level space: the per-level sums still go in a tree on the workers, so the
             # coordinator takes one block, not a shard's at a time (D11 L3 job 36016180: 27 min
             # fetching ~98 MB results one by one after the workers had finished)
-            from .crossing import level_sums_of, step_combine, step_combine_gb, without_level_sums
+            from .crossing import level_sums_combine, level_sums_of, step_combine_gb, without_level_sums
 
             def level_sums_done(total):
                 if total is not None:
-                    acc["DR"][total[0]] += total[1][:, :-1]
-                    acc["ddiag"][total[0]] += total[1][:, -1]
+                    (idx, S), xt = total
+                    acc["DR"][idx] += S[:, :-1]
+                    acc["ddiag"][idx] += S[:, -1]
+                    if xt is not None:
+                        acc["xtab"] = xt
 
             reduce = Reduce(
                 get=level_sums_of,
                 strip=without_level_sums,
-                combine=functools.partial(step_combine, P=len(acc["ddiag"])),
+                combine=functools.partial(level_sums_combine, P=len(acc["ddiag"])),
                 done=level_sums_done,
-                combine_gb=step_combine_gb(len(acc["ddiag"]), acc["DR"].shape[1] + 1),
+                # the cross-tab's size is not known before round 1: a whole worker for its combines
+                combine_gb=None if plan.xtab else step_combine_gb(len(acc["ddiag"]), acc["DR"].shape[1] + 1),
             )
         params = inspect.signature(executor.run).parameters
         # plan C: round 1 leaves each shard's state in its worker's cache, where the CG steps go
@@ -1663,7 +1716,17 @@ def fit(
             plan.cg_checkpoint = str(wd / "cg_checkpoint.npz")
             _zero_absorbed(plan, acc, collin_tol)
             acc["Gamma"] = _crossing_cg(
-                plan, ds, executor, prog, rows, acc, label, iter_tol, iter_maxiter, crossing_precond
+                plan,
+                ds,
+                executor,
+                prog,
+                rows,
+                acc,
+                label,
+                iter_tol,
+                iter_maxiter,
+                crossing_precond,
+                keep_checkpoint=True,
             )
         if f.iv and plan.crossing_iterate:
             sol = _iv_solve_iterate(plan, acc, N, estimator, fuller, collin_tol)
@@ -1972,6 +2035,8 @@ def fit(
         iv=iv_info,
     )
     res.save(wd / "result.json")
+    if acc.get("cg_checkpoint") is not None:  # kept through round 2 (_crossing_cg)
+        acc.pop("cg_checkpoint").remove()
     _record_timing(res, plan, ds, executor, acc, sing, cells, f)
     if record:
         rpath = wd / "result.estrec.json" if record is True else Path(record)

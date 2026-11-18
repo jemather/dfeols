@@ -226,6 +226,23 @@ of fall and seconds a step; the faster continues from its trial state
   aggregation filled in 293x on the 0.5%-mobility firm block (4 s a cycle, against 13 ms).
   Exact sparse LU of such blocks took over 185 s to set up; AMG setup is under a second.
 
+**Cross-tab preconditioner (pass mode, two crossing FEs).** *Built (2026-11-18, Ted):* with a
+pass per step and no A_kk (D11: each A_kk is dense within a cell type), Jacobi was all there was,
+and D11 L3 (`cell + gene^cell_type + gene^dataset`, cell local) took 361 steps on R0 at 1e-8 and
+1,503 on R1 at 1e-10. Without the local FE the two crossing FEs' system is
+D'WD = [[D1, B], [B', D2]], D1 and D2 diagonal and B their cross-tab; on D11 it is one small
+cell type x dataset block per gene, and the local FE couples genes only weakly. `XtabSolve`
+solves it exactly per connected component (dense Schur on the smaller FE up to 64 levels, else a
+pinned sparse LU of the signed Laplacian), as M for CG; round 1 sums B over the shards (one more
+output beside D'W 1), and a step stays one pass. D11 L3 to 1e-10: R0 13 steps (Jacobi ~505), a 2%
+cell sample of R1 11. `crossing_precond="auto"` takes it with a pass per step and exactly two
+crossing FEs; level space keeps its own choice. One rule: the Schur pseudo-inverse cuts relative
+to the pre-cancellation diagonal (D2), not the block's own eigenvalues, because where each level
+of the larger FE pairs with one level of the smaller the Schur complement is pure rounding, and a
+relative cut inverted it (eigenvalues ~1e18; CG diverged past 1e-8). Approximate solves of the
+block (symmetric Gauss-Seidel sweeps) were far weaker: 85-270 steps on R0. Bench and H sizing in
+the data project's `docs/cgprecond.md`.
+
 **Tolerance.** *Decided:* default 1e-8 on the relative residual (was 1e-10, next to the
 floating-point floor of ~1e-11 on DB1B). beta settles well before: within 1e-4 SE after 3 to 9
 steps of the AP-sweep or block-Jacobi on DB1B and NFIP A.
