@@ -16,7 +16,8 @@
   dfeols config show [--profile P]     print the resolved profile
   dfeols jobscript "CMD" [--profile P] print a coordinator job script for CMD
   dfeols submit SCRIPT.py [--profile P] [--name N] [--coordinator-memory M]
-                [--coordinator-queue Q] [--coordinator-walltime T] [-- ARGS]
+                [--coordinator-queue Q] [--coordinator-walltime T]
+                [--coordinator-directives D] [-- ARGS]
   dfeols submit -m MODULE  [--profile P] [--name N] [-- ARGS]
                                        submit as a coordinator job
   dfeols bench [--profile P] [BENCH OPTIONS]
@@ -215,10 +216,12 @@ def _submit_options(args):
     op.add_argument("-m", "--module", default=args.module)
     for k in COORDINATOR_OPTIONS:
         op.add_argument(f"--coordinator-{k}", default=getattr(args, f"coordinator_{k}", None))
+    op.add_argument("--coordinator-directives", default=getattr(args, "coordinator_directives", None))
     known, extra = op.parse_known_args(own)
     args.profile, args.name, args.module = known.profile, known.name, known.module
     for k in COORDINATOR_OPTIONS:
         setattr(args, f"coordinator_{k}", getattr(known, f"coordinator_{k}"))
+    args.coordinator_directives = known.coordinator_directives
     return extra + rest
 
 
@@ -236,6 +239,9 @@ def submit_cmd(args):
     # e.g. --coordinator-memory 120G for a fit whose coordinator holds large level arrays
     over = {k: getattr(args, f"coordinator_{k}", None) for k in COORDINATOR_OPTIONS}
     over = {k: v for k, v in over.items() if v}
+    if getattr(args, "coordinator_directives", None) is not None:
+        # "" drops the profile's directives for the coordinator; "--constraint=fdr --x=y" replaces them
+        over["extra_directives"] = _sh.split(args.coordinator_directives)
     if over:
         import dataclasses
 
@@ -399,6 +405,9 @@ def main(argv=None):
     s_.add_argument("--coordinator-queue", default=None,
                     help="the coordinator job's partition (default: the profile's queue), e.g. longjobs")
     s_.add_argument("--coordinator-walltime", default=None, help="the coordinator job's walltime, e.g. 7-00:00:00")
+    s_.add_argument("--coordinator-directives", default=None,
+                    help="the coordinator job's extra directives in place of the profile's, as one "
+                         "string: --coordinator-directives= for none, or --coordinator-directives='--constraint=fdr'")
     bn = sub.add_parser("bench", help="submit a benchmark as a coordinator job (other options go to it)")
     bn.add_argument("--profile")
     bn.add_argument("--name", default="dfeols-bench")

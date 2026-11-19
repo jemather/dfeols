@@ -119,8 +119,10 @@ def test_submit_sets_the_coordinator_queue_and_walltime(monkeypatch, tmp_path):
     seen = {}
     monkeypatch.setattr(dfeols.cluster, "coordinator_script", lambda p, cmd, **k: seen.setdefault("p", p))
     monkeypatch.setattr(cli, "_submit_and_report", lambda *a: None)
-    main(["submit", "run.py", "--coordinator-queue", "longjobs", "--coordinator-walltime", "7-00:00:00", "--", "x"])
+    main(["submit", "run.py", "--coordinator-queue", "longjobs", "--coordinator-walltime", "7-00:00:00",
+          "--coordinator-directives=", "--", "x"])
     assert seen["p"].coordinator["queue"] == "longjobs"
+    assert seen["p"].coordinator["extra_directives"] == []
     assert seen["p"].coordinator["walltime"] == "7-00:00:00"
     assert seen["p"].coordinator["memory"] == "16GB"  # untouched
 
@@ -135,3 +137,8 @@ def test_coordinator_script_uses_its_own_queue():
     assert "#SBATCH -p normal" in coordinator_script(p, "python x.py")
     s = coordinator_script(own, "python x.py")
     assert "#SBATCH -p longjobs" in s and "#SBATCH -p normal" not in s
+    # its own directives replace the profile's (longjobs on OSCER has no hdr nodes)
+    hdr = p.with_overrides(extra_directives=["--constraint=hdr"])
+    assert "--constraint=hdr" in coordinator_script(hdr, "python x.py")
+    bare = hdr.with_overrides(coordinator={**hdr.coordinator, "queue": "longjobs", "extra_directives": []})
+    assert "--constraint=hdr" not in coordinator_script(bare, "python x.py")

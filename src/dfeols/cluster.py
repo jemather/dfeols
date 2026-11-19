@@ -421,6 +421,9 @@ def coordinator_script(p: Profile, command: str, job_name: str = "dfeols", outpu
         kw = _job_kwargs(p, c["cores"], c["memory"], c["walltime"], worker=False)
         if c.get("queue"):  # its own partition: a long one, while the workers use a short one
             kw["queue"] = c["queue"]
+        if c.get("extra_directives") is not None:  # replace the profile's, e.g. without a node
+            # constraint the long partition can't meet (OSCER longjobs has no hdr nodes)
+            kw["job_extra_directives"] = list(c["extra_directives"])
         job = Job(scheduler="tcp://0.0.0.0:0", name="coordinator", job_name=job_name, **kw)
         lines.append(job.job_header)
         out = output or f"{job_name}-%j.out"
