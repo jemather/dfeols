@@ -105,3 +105,33 @@ def test_env_lines_pin_polars_spill_to_scratch(tmp_path):
     assert f"export POLARS_TEMP_DIR={spill}" in lines
     assert f"export POLARS_OOC_SPILL_DIR={spill}/spill" in lines
     assert lines.index(f"mkdir -p {spill}") < lines.index(f"export POLARS_OOC_SPILL_DIR={spill}/spill")
+
+
+def test_submit_sets_the_coordinator_queue_and_walltime(monkeypatch, tmp_path):
+    """--coordinator-queue/--coordinator-walltime: the coordinator in a long partition while the
+    workers stay in the profile's queue (D11 H 2026-11-19: 48 h on normal nearly ran out)."""
+    import dfeols.cli as cli
+    import dfeols.cluster
+
+    monkeypatch.setenv("DFEOLS_CONFIG", str(tmp_path / "none.toml"))
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "run.py").write_text("")
+    seen = {}
+    monkeypatch.setattr(dfeols.cluster, "coordinator_script", lambda p, cmd, **k: seen.setdefault("p", p))
+    monkeypatch.setattr(cli, "_submit_and_report", lambda *a: None)
+    main(["submit", "run.py", "--coordinator-queue", "longjobs", "--coordinator-walltime", "7-00:00:00", "--", "x"])
+    assert seen["p"].coordinator["queue"] == "longjobs"
+    assert seen["p"].coordinator["walltime"] == "7-00:00:00"
+    assert seen["p"].coordinator["memory"] == "16GB"  # untouched
+
+
+def test_coordinator_script_uses_its_own_queue():
+    pytest.importorskip("dask_jobqueue")
+    from dfeols.cluster import coordinator_script
+    from dfeols.site import profile
+
+    p = profile("local", scheduler="slurm", queue="normal")
+    own = p.with_overrides(coordinator={**p.coordinator, "queue": "longjobs"})
+    assert "#SBATCH -p normal" in coordinator_script(p, "python x.py")
+    s = coordinator_script(own, "python x.py")
+    assert "#SBATCH -p longjobs" in s and "#SBATCH -p normal" not in s

@@ -15,7 +15,8 @@
                                        draft a profile's node classes from sinfo/scontrol
   dfeols config show [--profile P]     print the resolved profile
   dfeols jobscript "CMD" [--profile P] print a coordinator job script for CMD
-  dfeols submit SCRIPT.py [--profile P] [--name N] [--coordinator-memory M] [-- ARGS]
+  dfeols submit SCRIPT.py [--profile P] [--name N] [--coordinator-memory M]
+                [--coordinator-queue Q] [--coordinator-walltime T] [-- ARGS]
   dfeols submit -m MODULE  [--profile P] [--name N] [-- ARGS]
                                        submit as a coordinator job
   dfeols bench [--profile P] [BENCH OPTIONS]
@@ -189,6 +190,13 @@ def jobscript_cmd(args):
     print(coordinator_script(profile(args.profile), args.command, job_name=args.name))
 
 
+# submit's per-job coordinator settings, each a key of the profile's [coordinator] table. queue:
+# the coordinator's own partition, so it can sit in a long queue (OSCER longjobs, 7 days) while
+# the workers stay in a short one where they start sooner (D11 H 2026-11-19: the coordinator's
+# 48 h on normal nearly ran out while its workers waited in the queue)
+COORDINATOR_OPTIONS = ("memory", "queue", "walltime")
+
+
 def _submit_options(args):
     """Split the REMAINDER after SCRIPT: submit's own options before `--`, the script's after.
 
@@ -205,10 +213,12 @@ def _submit_options(args):
     op.add_argument("--profile", default=args.profile)
     op.add_argument("--name", default=args.name)
     op.add_argument("-m", "--module", default=args.module)
-    op.add_argument("--coordinator-memory", default=getattr(args, "coordinator_memory", None))
+    for k in COORDINATOR_OPTIONS:
+        op.add_argument(f"--coordinator-{k}", default=getattr(args, f"coordinator_{k}", None))
     known, extra = op.parse_known_args(own)
     args.profile, args.name, args.module = known.profile, known.name, known.module
-    args.coordinator_memory = known.coordinator_memory
+    for k in COORDINATOR_OPTIONS:
+        setattr(args, f"coordinator_{k}", getattr(known, f"coordinator_{k}"))
     return extra + rest
 
 
@@ -223,10 +233,13 @@ def submit_cmd(args):
         # the job would start, fail at once, and leave only a "can't open file" in its output
         sys.exit(f"dfeols submit: no script at {Path(args.script).resolve()} (from {Path.cwd()})")
     p = profile(args.profile)
-    if args.coordinator_memory:  # e.g. 120G for a fit whose coordinator holds large level arrays
+    # e.g. --coordinator-memory 120G for a fit whose coordinator holds large level arrays
+    over = {k: getattr(args, f"coordinator_{k}", None) for k in COORDINATOR_OPTIONS}
+    over = {k: v for k, v in over.items() if v}
+    if over:
         import dataclasses
 
-        p = dataclasses.replace(p, coordinator={**p.coordinator, "memory": args.coordinator_memory})
+        p = dataclasses.replace(p, coordinator={**p.coordinator, **over})
     jobs = p.scratch_dir("jobs")
     jobs.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S")
@@ -383,6 +396,9 @@ def main(argv=None):
     s_.add_argument("--profile")
     s_.add_argument("--name", default="dfeols")
     s_.add_argument("--coordinator-memory", default=None, help="the coordinator job's memory, e.g. 120G")
+    s_.add_argument("--coordinator-queue", default=None,
+                    help="the coordinator job's partition (default: the profile's queue), e.g. longjobs")
+    s_.add_argument("--coordinator-walltime", default=None, help="the coordinator job's walltime, e.g. 7-00:00:00")
     bn = sub.add_parser("bench", help="submit a benchmark as a coordinator job (other options go to it)")
     bn.add_argument("--profile")
     bn.add_argument("--name", default="dfeols-bench")

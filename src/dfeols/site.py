@@ -73,7 +73,8 @@ DEFAULTS = {
         "idle_minutes": 15,
         "local_directory": None,
     },
-    "coordinator": {"cores": 4, "memory": "16GB", "walltime": "7-00:00:00"},
+    # queue: the coordinator's own partition (None: the profile's queue, as the workers)
+    "coordinator": {"cores": 4, "memory": "16GB", "walltime": "7-00:00:00", "queue": None},
     # site facts for `dfeols plan` (docs/design/planner.md); `dfeols config init --from-slurm`
     # drafts them
     "max_walltime": None,  # longest general job; a node class may override it
@@ -135,6 +136,7 @@ idle_minutes = 15              # release a worker only after this long with noth
 cores = 4
 memory = "16GB"
 walltime = "7-00:00:00"
+# queue = "long"               # its own partition; default: the profile's queue
 """
 
 

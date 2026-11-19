@@ -419,6 +419,8 @@ def coordinator_script(p: Profile, command: str, job_name: str = "dfeols", outpu
         mod, name = _JOBS[p.scheduler]
         Job = getattr(importlib.import_module(mod), name)
         kw = _job_kwargs(p, c["cores"], c["memory"], c["walltime"], worker=False)
+        if c.get("queue"):  # its own partition: a long one, while the workers use a short one
+            kw["queue"] = c["queue"]
         job = Job(scheduler="tcp://0.0.0.0:0", name="coordinator", job_name=job_name, **kw)
         lines.append(job.job_header)
         out = output or f"{job_name}-%j.out"
