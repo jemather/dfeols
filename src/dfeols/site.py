@@ -71,6 +71,10 @@ DEFAULTS = {
         "min_workers": 1,
         "retire_minutes": 60,
         "idle_minutes": 15,
+        # how long a worker job's Dask process may take to start and reach the scheduler before
+        # it gives up (dask-jobqueue's death-timeout, 60 s; on OSCER 16 of 40 workers starting
+        # together from the shared filesystem missed it, 2026-11-19)
+        "start_minutes": 10,
         "local_directory": None,
     },
     # queue: the coordinator's own partition (None: the profile's queue, as the workers);
@@ -133,6 +137,7 @@ max_workers = 20
 min_workers = 1
 retire_minutes = 60            # stop taking shards this long before walltime
 idle_minutes = 15              # release a worker only after this long with nothing to do
+start_minutes = 10             # a worker job's Dask process may take this long to reach the scheduler
 
 [profiles.cluster.coordinator]
 cores = 4

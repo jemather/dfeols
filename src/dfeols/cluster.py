@@ -267,6 +267,7 @@ def make_cluster(p: Profile, log_directory: str | None = None):
         ld.mkdir(parents=True, exist_ok=True)
         kw["log_directory"] = str(ld)
         log.info("cluster: worker logs in %s", ld)
+    kw["death_timeout"] = max(int(60 * float(w.get("start_minutes", 10))), 60)
     cls = getattr(dask_jobqueue, _CLASSES[p.scheduler])
     cl = cls(
         job_name="dfeols-worker",
@@ -349,6 +350,8 @@ def executor(
             wait_count=wait,
         )
     client = Client(cl)
+    if p.scheduler == "slurm":
+        _replace_lost_jobs(cl, w["max_workers"])
     if p.scheduler != "local" or log_directory:
         from .diag import attach_scheduler_log
 
@@ -370,6 +373,79 @@ def executor(
         w["walltime"],
     )
     return ex
+
+
+def _slurm_live_jobs() -> set[str] | None:
+    """Job ids of this user's jobs Slurm still has (queued or running); None if squeue fails."""
+    user = os.environ.get("USER") or os.environ.get("LOGNAME") or ""
+    try:
+        r = subprocess.run(["squeue", "-h", "-u", user, "-o", "%i"], capture_output=True, text=True, timeout=60)
+    except Exception:  # noqa: BLE001
+        return None
+    if r.returncode:
+        return None
+    return {x.strip() for x in r.stdout.split() if x.strip()}
+
+
+def lost_jobs(jobs: dict, connected: set, live: set) -> set:
+    """Names of worker jobs that never connected and that the batch system no longer has.
+
+    `jobs` maps a cluster's worker names to their batch job ids, `connected` holds the worker
+    names the scheduler has seen, `live` the batch system's job ids. dask-jobqueue counts such a
+    job as pending forever (it only drops workers that connected and then left), so adaptive
+    scaling never replaces it."""
+    return {n for n, j in jobs.items() if j and n not in connected and str(j) not in live}
+
+
+def _replace_lost_jobs(cl, max_workers: int, every: float = 60.0, live_jobs=_slurm_live_jobs) -> None:
+    """Every `every` s, drop worker jobs that ended without connecting (seen gone twice in a
+    row), so the cluster submits replacements. Stops replacing, and says so, after
+    3 x max_workers losses with no worker ever connected (a broken worker environment)."""
+    import asyncio
+
+    from tornado.ioloop import PeriodicCallback
+
+    st = {"suspect": set(), "lost": 0, "ever": False, "stopped": False, "busy": False}
+
+    async def check():
+        if st["stopped"] or st["busy"] or cl.status.name in ("closing", "closed"):
+            return
+        st["busy"] = True
+        try:
+            seen = {d.get("name") for d in cl.scheduler_info.get("workers", {}).values()}
+            st["ever"] = st["ever"] or bool(seen)
+            jobs = {n: getattr(j, "job_id", None) for n, j in list(cl.workers.items())}
+            cand = {n: j for n, j in jobs.items() if j and n not in seen}
+            if not cand:
+                st["suspect"] = set()
+                return
+            live = await asyncio.get_running_loop().run_in_executor(None, live_jobs)
+            if live is None:
+                return
+            gone = lost_jobs(cand, seen, live)
+            drop, st["suspect"] = gone & st["suspect"], gone - st["suspect"]
+            if not drop:
+                return
+            for n in sorted(drop):
+                log.warning("cluster: worker job %s ended without reaching the scheduler (see its log); "
+                            "asking for a replacement", jobs[n])
+                cl.workers.pop(n, None)
+            st["lost"] += len(drop)
+            if not st["ever"] and st["lost"] >= 3 * max_workers:
+                st["stopped"] = True
+                log.error("cluster: %d worker jobs ended without reaching the scheduler and none ever "
+                          "has; not replacing more (check the worker logs)", st["lost"])
+                return
+            await cl._correct_state()
+        except Exception as e:  # noqa: BLE001 (a watcher must not take the cluster down)
+            log.warning("cluster: checking for lost worker jobs failed: %r", e)
+        finally:
+            st["busy"] = False
+
+    pc = PeriodicCallback(check, every * 1000)
+    cl.loop.add_callback(pc.start)
+    cl.dfeols_lost_jobs = st
+    cl.dfeols_lost_jobs_check = check
 
 
 def _close_on_exit(cl) -> None:
