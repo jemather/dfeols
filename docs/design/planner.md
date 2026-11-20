@@ -150,6 +150,28 @@ step to the fit's workdir, `cg_checkpoint.npz`, or beside a session's demeaned f
 rerun of the same solve, with a right-hand side equal to 1e-10, resumes bit for bit; the
 record's `crossing_cg` gives `resumed_from`). The sketch below was the starting point.
 
+*Resuming everything before CG (2026-11-20, after D11 H L2 job 36294727 lost 7:21 of singleton
+passes and 2:27 of round 1 when CG step 1 failed):*
+- *Singleton masks:* the finished passes leave `singletons/DONE.json` beside the per-shard masks,
+  with a digest of the spec (`spec_id`), the shards and the source checksum. A rerun in the same
+  workdir reuses them (`timing.singletons_reused`), unless a mask is missing or the digest
+  differs.
+- *Round 1:* plan C with a pass per step pickles round 1's sums to `round1_checkpoint.pkl`
+  (digest: singletons' plus the plan fields round 1 depends on, `_ROUND1_FIELDS`). A rerun
+  loads them instead of a pass (`timing.round1_reused`). The workers' shard state is rebuilt by
+  the first CG step's cache misses. Level space and GLM fits are not saved.
+- All three files (masks, round 1, CG) are removed once `result.json` is written.
+
+*Level-range trees (2026-11-20):* `Reduce.trees` sums each shard's part in k slices, one combine
+tree a slice (`crossing.reduce_trees`, `tree_bounds`, `level_sums_slice`, `step_part_slice`).
+The slices are the per-level sums by level range and the cross-tab by FE 1's levels, and the
+coordinator gets k roots. k keeps one tree's top combine within `REDUCE_TREE_SHARE` (25%) of
+a worker, by an estimate that takes the cross-tab at `XTAB_PER_LEVEL` (4) entries a level in
+each input; `DFEOLS_REDUCE_TREES` overrides. D11 H L3 on 24 GB workers gets 8 trees in round 1
+(~5 GB a combine against ~38 GB in one) and 2 a CG step; fits that fit in one tree are
+unchanged (k = 1, the same tasks). The cost is k small slicing tasks a shard. `step_combine`'s
+dense block spans the parts' own levels, so a slice's block is its width, not P.
+
 Alternating projections distribute as map/reduce rounds: nested FEs are demeaned inside each
 shard with no communication; for a crossing FE each shard returns per-level sums and counts,
 the coordinator combines them into means, and broadcasts them back. One cycle is one round;

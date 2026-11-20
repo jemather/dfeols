@@ -518,3 +518,36 @@ def test_late_task_copied_and_counted_once(tmp_path, monkeypatch):
     assert sorted(got["sum"]) == list(range(n))  # every part once
     assert sorted(seen) == list(range(n))
     assert took < 15, took
+
+
+@pytest.mark.parametrize("n", [1, 5, 17])
+@pytest.mark.parametrize("dask", [False, True])
+def test_reduce_trees_sum_each_slice_once(n, dask):
+    # Reduce.trees: each result's part taken in slices get(result, j), one tree a slice; done
+    # gets the list of the trees' sums
+    got = {}
+    k = 3
+    red = Reduce(
+        get=lambda r, j: [x for x in r["part"] if x % k == j],
+        strip=lambda r: {a: b for a, b in r.items() if a != "part"},
+        combine=_combine,
+        done=lambda sums: got.setdefault("sums", sums),
+        trees=k,
+    )
+    prog = Progress(None, label="t", every=1e9)
+    prog.add_stage("s", {i: 1 for i in range(n)})
+    prog.start("s")
+    tasks = [(i, 1, (i,)) for i in range(n)]
+    if dask:
+        distributed = pytest.importorskip("distributed")
+        with (
+            distributed.LocalCluster(n_workers=2, threads_per_worker=2, dashboard_address=None) as lc,
+            distributed.Client(lc) as c,
+        ):
+            DaskExecutor(c, max_workers=2, tick=0.1).run(_task, tasks, lambda t, r: None, prog, "s", reduce=red)
+    else:
+        SerialExecutor().run(_task, tasks, lambda t, r: None, prog, "s", reduce=red)
+    sums = got["sums"]
+    assert len(sums) == k
+    for j, s in enumerate(sums):
+        assert sorted(s or []) == [i for i in range(n) if i % k == j]

@@ -37,7 +37,11 @@ class Reduce:
     """A part of each task's result summed in a tree instead of handed to on_result: `get`
     takes the part from a result, `strip` the rest (what on_result sees), `combine` sums
     parts (fan_in at a time), and `done` receives the sum (None with no tasks). On Dask the
-    parts and sums stay on the workers; the coordinator fetches only the final sum."""
+    parts and sums stay on the workers; the coordinator fetches only the final sum.
+
+    With `trees` > 1 each result's part is taken in that many slices, `get(result, j)`, each
+    summed in its own tree (a combine then holds 1/trees of the sum: D11 H L3's top combines,
+    ~38 GB in one tree), and `done` receives the list of the trees' sums."""
 
     get: Callable
     strip: Callable
@@ -49,6 +53,10 @@ class Reduce:
     # memory the worker starts nothing else: with whole-worker combines D6 r4's CG passes ran
     # one task per worker (36011018: ~970 combines a pass, 4-thread workers)
     combine_gb: float | None = None
+    trees: int = 1
+
+    def part(self, res, j: int = 0):
+        return self.get(res) if self.trees == 1 else self.get(res, j)
 
 
 class _Tree:
@@ -119,6 +127,50 @@ class _Pool:
 
     def root(self):
         return self.ready[0] if self.ready else None
+
+
+class _Pools:
+    """One _Pool per tree (Reduce.trees), routing each part and sum to its own tree. They share
+    one `running` set, which DaskExecutor.run consults for every future it is given."""
+
+    def __init__(self, reduce: Reduce, submit_for: Callable):
+        self.running: set = set()
+        self.tree_of: dict = {}
+        self.pools = []
+        for j in range(reduce.trees):
+            def sub(fn, *items, j=j):
+                f = submit_for(fn, *items)
+                self.tree_of[f] = j
+                return f
+
+            p = _Pool(reduce, sub)
+            p.running = self.running
+            self.pools.append(p)
+
+    @property
+    def combines(self) -> int:
+        return sum(p.combines for p in self.pools)
+
+    def expect(self, n: int) -> None:
+        for p in self.pools:
+            p.expect(n)
+
+    def add(self, part, j: int = 0) -> None:
+        self.tree_of[part] = j
+        self.pools[j].add(part)
+
+    def arrived(self, f, is_part: bool) -> None:
+        self.pools[self.tree_of.pop(f)].arrived(f, is_part)
+
+    def discard(self, f) -> None:
+        self.running.discard(f)
+        self.tree_of.pop(f, None)
+
+    def finished(self) -> bool:
+        return all(p.finished() for p in self.pools)
+
+    def roots(self) -> list:
+        return [p.root() for p in self.pools]
 
 
 def _nbytes(a) -> int:
@@ -353,19 +405,21 @@ class SerialExecutor:
         affinity: str | None = None,  # one process: every task's state is here
     ):
         progress.set_slots(1, 1)
-        tree = _Tree(reduce, lambda f, *a: f(*a)) if reduce else None
+        trees = [_Tree(reduce, lambda f, *a: f(*a)) for _ in range(reduce.trees)] if reduce else []
         for tid, _rows, args in _order(tasks):
             progress.running[stage].add(tid)
             t = time.perf_counter()
             res = fn(*args)
             secs = time.perf_counter() - t
-            if tree:
-                tree.add(reduce.get(res))
+            if trees:
+                for j, tree in enumerate(trees):
+                    tree.add(reduce.part(res, j))
                 res = reduce.strip(res)
             on_result(tid, res)
             progress.task_done(stage, tid, res.get("timing", {}).get("total", secs), res.get("timing"))
-        if tree:
-            reduce.done(tree.finish())
+        if trees:
+            roots = [t.finish() for t in trees]
+            reduce.done(roots[0] if reduce.trees == 1 else roots)
 
 
 class DaskExecutor:
@@ -644,17 +698,21 @@ class DaskExecutor:
                 *run_fn(*sargs), key=key, priority=n - pos[tid], retries=self.retries, pure=False,
                 **task_kw(tid), **place,
             )
-            part = None
+            parts = []
             if reduce:  # on_result sees the result without its part; the part goes in the tree
                 hi = {"priority": n + 1, "pure": False}  # ahead of the shards still queued
-                part = self.client.submit(reduce.get, m, key=f"{key}-part", **hi)
-                pool.add(part)
-                part_futs.add(part)
-                part.add_done_callback(doneq.put)
+                for j in range(reduce.trees):  # one slice a tree (Reduce.trees)
+                    pk = f"{key}-part" + (f"{j}" if reduce.trees > 1 else "")
+                    part = self.client.submit(reduce.part, m, j, key=pk, **hi)
+                    pool.add(part, j)
+                    part_futs.add(part)
+                    part.add_done_callback(doneq.put)
+                    parts.append(part)
                 f = self.client.submit(reduce.strip, m, key=f"{key}-rest", **hi)
-                part_of[part] = f
+                for part in parts:
+                    part_of[part] = f
             f.add_done_callback(doneq.put)
-            attempt[f] = (m, part)
+            attempt[f] = (m, parts)
             futs[f] = tid
             fargs[f] = args
             key_to_tid[f.key] = tid
@@ -670,17 +728,17 @@ class DaskExecutor:
 
         def drop(f):  # an attempt that lost, or a copy that failed: cancelled and forgotten
             tid = futs[f]
-            m, part = attempt[f]
+            m, parts = attempt[f]
             pending.discard(f)
-            if part is not None:
-                pool.running.discard(part)
+            for part in parts:
+                pool.discard(part)
                 part_futs.discard(part)
             if f in fworker:  # its worker's slot is free; its pace: as slow as it was
                 feeder.done(fworker.pop(f), tid)
                 feeder.observe(tid, time.monotonic() - handed[tid])
             if f in copy_w:
                 busy[copy_w.pop(f)] -= 1
-            for x in (f, part, m):
+            for x in (f, *parts, m):
                 if x is not None:
                     x.cancel()
 
@@ -857,8 +915,10 @@ class DaskExecutor:
                 stage, progress.label, len(copied), n_won,
             )
         if pool:
-            root = pool.root()
-            reduce.done(self._fetch(root, f"the sum of {stage}'s parts") if root is not None else None)
+            sums = [
+                self._fetch(r, f"the sum of {stage}'s parts") if r is not None else None for r in pool.roots()
+            ]
+            reduce.done(sums[0] if reduce.trees == 1 else sums)
             log.info(
                 "%s %s: parts summed on the workers in %d combines (%.0f s after the last task)",
                 stage,
@@ -867,7 +927,7 @@ class DaskExecutor:
                 time.perf_counter() - (last_task or time.perf_counter()),
             )
 
-    def _pool(self, reduce: Reduce, stage: str, run_id: str, priority: int, on_done=None) -> _Pool:
+    def _pool(self, reduce: Reduce, stage: str, run_id: str, priority: int, on_done=None) -> _Pools:
         """Combine tasks, each summing fan_in parts as soon as they exist, ahead of the shards
         still queued (parts do not pile up on the workers). A combine holds fan_in parts at
         once: it asks for reduce.combine_gb, else a whole worker."""
@@ -885,4 +945,4 @@ class DaskExecutor:
                 f.add_done_callback(on_done)
             return f
 
-        return _Pool(reduce, submit)
+        return _Pools(reduce, submit)

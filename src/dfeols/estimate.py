@@ -501,12 +501,131 @@ def _use_sparse(crossing_fe: str, local, glob, big: bool = False) -> bool:
     return use
 
 
+ROUND1_VERSION = 1
+ROUND1_CHECKPOINT = "round1_checkpoint.pkl"
+# Plan fields round 1's sums depend on (not paths, tokens or budgets of where state is kept)
+_ROUND1_FIELDS = (
+    "spec_id", "local_fes", "global_fes", "cluster", "cluster_local", "cluster2", "cluster2_local",
+    "weights", "cat_levels", "colnames", "n_dummy", "drop_singletons", "fe_tol", "fe_maxiter",
+    "fe_method", "sparse_global", "crossing_iterate", "level_nnz", "xtab", "row_key_cols",
+    "endog_names", "inst_names", "filter_vars", "created", "slopes", "subset",
+)
+
+
+def _round1_checkpointed(plan: Plan) -> bool:
+    """Round 1 is saved for plan C with a pass per step (D11 H: 2.5 h, lost with the fit when
+    CG failed). Not with level space (its A is summed in round 1 too, and those fits are
+    short), nor for GLM's IRLS fits, whose sidecar columns change between fits of one spec."""
+    return plan.crossing_iterate and not plan.level_nnz and not plan.glm and not plan.sidecar_dir
+
+
+def _round1_digest(plan: Plan, ds: Dataset) -> str:
+    key = {"version": ROUND1_VERSION, "singletons": _singletons_digest(plan, ds),
+           "plan": {k: getattr(plan, k) for k in _ROUND1_FIELDS}}
+    return hashlib.sha256(json.dumps(key, sort_keys=True, default=repr).encode()).hexdigest()
+
+
+def _round1_load(plan: Plan, ds: Dataset, wd: Path, label: str):
+    """An earlier run's round 1 (its sums and peak worker memory) if it is for this plan and
+    these shards, else None."""
+    import pickle
+
+    p = wd / ROUND1_CHECKPOINT
+    if not p.exists():
+        return None
+    try:
+        with open(p, "rb") as fh:
+            rec = pickle.load(fh)
+    except Exception as e:  # noqa: BLE001 (a damaged checkpoint costs a rerun, not the fit)
+        log.warning("fit %s: cannot read round 1's checkpoint %s (%r): rerunning round 1", label, p, e)
+        return None
+    if not isinstance(rec, dict) or rec.get("digest") != _round1_digest(plan, ds):
+        log.info("fit %s: round 1's checkpoint in %s is for another plan or shards: rerunning round 1", label, wd)
+        return None
+    return rec
+
+
+def _round1_save(plan: Plan, ds: Dataset, wd: Path, acc: dict, peak: float, seconds: float, label: str) -> None:
+    import pickle
+
+    p = wd / ROUND1_CHECKPOINT
+    tmp = p.with_suffix(".tmp")
+    t = time.time()
+    try:
+        with open(tmp, "wb") as fh:
+            pickle.dump({"digest": _round1_digest(plan, ds), "acc": acc, "peak": peak, "seconds": seconds},
+                        fh, protocol=5)
+        tmp.replace(p)
+    except Exception as e:  # noqa: BLE001 (the checkpoint is a convenience)
+        log.warning("fit %s: could not save round 1's checkpoint (%r)", label, e)
+        tmp.unlink(missing_ok=True)
+        return
+    log.info("fit %s: round 1 saved to %s (%.1f GB, %.0f s)", label, p, p.stat().st_size / 1e9, time.time() - t)
+
+
+# Bump when shard_singletons' masks change meaning: a fit then recomputes them instead of
+# reusing an earlier run's (_singletons_done)
+SINGLETONS_VERSION = 1
+SINGLETONS_DONE = "DONE.json"
+
+
+def _singletons_digest(plan: Plan, ds: Dataset) -> str:
+    """What the keep masks depend on: the spec (its FEs, sample, weights and singleton rule:
+    spec_id), the shards (ids, rows, files) and the source's checksum."""
+    src = (ds.meta or {}).get("source") or {}
+    key = {
+        "version": SINGLETONS_VERSION,
+        "spec": plan.spec_id,
+        "shards": [[s["id"], s["rows"], list(s["files"])] for s in ds.shards],
+        "source": src.get("checksum") if isinstance(src, dict) else None,
+    }
+    return hashlib.sha256(json.dumps(key, sort_keys=True, default=str).encode()).hexdigest()
+
+
+def _singletons_done(plan: Plan, ds: Dataset, label: str) -> dict | None:
+    """The record of an earlier run's finished singleton passes in plan.keep_dir, if it is
+    for this spec and these shards and every shard's mask is there: the passes are then not
+    rerun (D11 H L2, job 36294727: 7:21 of singleton passes lost when CG failed after them)."""
+    p = Path(plan.keep_dir) / SINGLETONS_DONE
+    if not p.exists():
+        return None
+    try:
+        rec = json.loads(p.read_text())
+    except (OSError, ValueError):
+        return None
+    if rec.get("digest") != _singletons_digest(plan, ds):
+        log.info("fit %s: the singleton masks in %s are for another spec or shards: recomputing", label, plan.keep_dir)
+        return None
+    from .worker import _keep_path
+
+    miss = [s["id"] for s in ds.shards if not _keep_path(plan, s["id"]).exists()]
+    if miss:
+        log.warning("fit %s: %d shards' singleton masks are missing from %s: recomputing", label, len(miss), plan.keep_dir)
+        return None
+    return rec
+
+
 def _drop_singletons(plan: Plan, ds: Dataset, executor, prog: Progress, rows: dict, label: str) -> dict:
     """Singletons over all FEs, as fixest and reghdfe do, when some FE crosses the
     partition (a shard can't see a crossing FE's other rows). Pass 1 drops singletons
     of the local FEs and counts the crossing FEs' levels; each later pass drops rows
     whose level count (from the previous pass) is 1, within shards iterating to a
-    fixed point, until a pass drops nothing. Usually two or three passes."""
+    fixed point, until a pass drops nothing. Usually two or three passes.
+
+    The masks stay in plan.keep_dir until the fit is done, with a record of the finished passes
+    (SINGLETONS_DONE): a rerun of the same spec on the same shards (same workdir) reuses them."""
+    rec = _singletons_done(plan, ds, label)
+    if rec is not None:
+        log.info(
+            "fit %s: reusing the singleton masks of an earlier run (%s): %s rows dropped in %d passes",
+            label,
+            plan.keep_dir,
+            f"{rec['dropped']:,}",
+            rec["passes"],
+        )
+        return {"passes": 0, "seconds": 0.0, "reused": True, "dropped": rec["dropped"]}
+    done = Path(plan.keep_dir) / SINGLETONS_DONE
+    done.unlink(missing_ok=True)  # a run that stops in the passes leaves no record
     t0 = time.time()
     gcount, p, total = None, 0, 0
     while True:
@@ -537,7 +656,12 @@ def _drop_singletons(plan: Plan, ds: Dataset, executor, prog: Progress, rows: di
         p,
         fmt_td(time.time() - t0),
     )
-    return {"passes": p, "seconds": time.time() - t0}
+    done.parent.mkdir(parents=True, exist_ok=True)
+    tmp = done.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"digest": _singletons_digest(plan, ds), "passes": p, "dropped": int(total),
+                               "seconds": time.time() - t0, "written": time.strftime("%Y-%m-%d %H:%M:%S")}))
+    tmp.replace(done)
+    return {"passes": p, "seconds": time.time() - t0, "reused": False, "dropped": int(total)}
 
 
 def _at(ref, idx):
@@ -848,6 +972,11 @@ def _crossing_cg(
 
         gb_step = gb_step_of(max(rows.values(), default=1))
 
+    # each step's sums in level-range trees when one tree's top combine would crowd a worker
+    n_trees = cx.reduce_trees(P, c, cx.worker_bytes(executor))
+    if n_trees > 1 and not level:
+        log.info("fit %s: each CG step's sums in %d trees of level ranges", label, n_trees)
+
     def matvec_pass(p):
         Ap = np.zeros((P, c))
 
@@ -855,8 +984,9 @@ def _crossing_cg(
             Ap[res["idx"]] += res["S"]
 
         def done(total, Ap=Ap):
-            if total is not None:
-                Ap[total[0]] += total[1]
+            for t in total if n_trees > 1 else [total]:
+                if t is not None:
+                    Ap[t[0]] += t[1]
 
         name = f"cg{step['it'] + 1}"
         tasks = [(s["id"], rows[s["id"]], (plan, s["id"], ds.shard_paths(s), p)) for s in ds.shards]
@@ -866,11 +996,12 @@ def _crossing_cg(
         if "reduce" in inspect.signature(executor.run).parameters:
             # the shards' sums in a tree on the workers: one block reaches the coordinator
             red = Reduce(
-                get=cx.step_part,
+                get=cx.step_part if n_trees == 1 else functools.partial(cx.step_part_slice, bounds=cx.tree_bounds(P, n_trees)),
                 strip=cx.step_strip,
                 combine=functools.partial(cx.step_combine, P=P),
                 done=done,
-                combine_gb=cx.step_combine_gb(P, c),
+                combine_gb=cx.step_combine_gb(P, c) / n_trees,
+                trees=n_trees,
             )
             executor.run(shard_matvec, tasks, lambda tid, res: None, prog, name, reduce=red, **affinity)
         else:
@@ -1665,65 +1796,101 @@ def fit(
                 for i, mm in enumerate(rc["global_minmax"]):
                     merge_minmax(c2["glo"][i], c2["ghi"][i], mm)
 
-        tasks = [(s["id"], rows[s["id"]], (plan, s["id"], ds.shard_paths(s))) for s in ds.shards]
-        prog.start("round1")
-        prog.task_gb = task_slot_gb(plan, need_gb, executor)  # round 1 builds the level arrays
-        reduce = None
-        if plan.crossing_iterate and plan.level_nnz:
-            from .crossing import combine_parts, part_of, without_part, worker_bytes
+        r1 = _round1_load(plan, ds, wd, label) if _round1_checkpointed(plan) else None
+        if r1 is not None:  # an earlier run of this fit got past round 1: its sums
+            acc, peak["rss"] = r1["acc"], r1["peak"]
+            prog.start("round1")
+            prog.finish("round1", log=False)
+            log.info("fit %s: round 1 from the checkpoint of an earlier run (%s; it took %s)",
+                     label, wd / ROUND1_CHECKPOINT, fmt_td(r1["seconds"]))
+        else:
+            tasks = [(s["id"], rows[s["id"]], (plan, s["id"], ds.shard_paths(s))) for s in ds.shards]
+            prog.start("round1")
+            prog.task_gb = task_slot_gb(plan, need_gb, executor)  # round 1 builds the level arrays
+            reduce = None
+            if plan.crossing_iterate and plan.level_nnz:
+                from .crossing import combine_parts, part_of, without_part, worker_bytes
 
-            prog.task_gb = None  # each shard's part of A is not in the estimate: a whole worker
-            gram = acc["gram"]
-            reduce = Reduce(
-                get=part_of,
-                strip=without_part,
-                combine=functools.partial(
-                    combine_parts,
-                    offs=gram.offs,
-                    max_nnz=plan.level_nnz,
-                    worker_bytes=worker_bytes(executor),
-                    token=plan.iter_token,
-                ),
-                done=lambda part: gram.add(part, None),  # None: a shard could not form its part
-            )
-        elif plan.crossing_iterate:
-            # no level space: the per-level sums still go in a tree on the workers, so the
-            # coordinator takes one block, not a shard's at a time (D11 L3 job 36016180: 27 min
-            # fetching ~98 MB results one by one after the workers had finished)
-            from .crossing import level_sums_combine, level_sums_of, step_combine_gb, without_level_sums, worker_bytes
+                prog.task_gb = None  # each shard's part of A is not in the estimate: a whole worker
+                gram = acc["gram"]
+                reduce = Reduce(
+                    get=part_of,
+                    strip=without_part,
+                    combine=functools.partial(
+                        combine_parts,
+                        offs=gram.offs,
+                        max_nnz=plan.level_nnz,
+                        worker_bytes=worker_bytes(executor),
+                        token=plan.iter_token,
+                    ),
+                    done=lambda part: gram.add(part, None),  # None: a shard could not form its part
+                )
+            elif plan.crossing_iterate:
+                # no level space: the per-level sums still go in a tree on the workers, so the
+                # coordinator takes one block, not a shard's at a time (D11 L3 job 36016180: 27 min
+                # fetching ~98 MB results one by one after the workers had finished)
+                from .crossing import level_sums_combine, level_sums_of, step_combine_gb, without_level_sums, worker_bytes
 
-            def level_sums_done(total):
-                if total is not None:
-                    (idx, S), xt = total
-                    acc["DR"][idx] += S[:, :-1]
-                    acc["ddiag"][idx] += S[:, -1]
+                from .crossing import combine_need_gb, join_xtabs, level_sums_slice, reduce_trees, tree_bounds
+
+                P_all, c1 = len(acc["ddiag"]), acc["DR"].shape[1] + 1
+                wb = worker_bytes(executor)
+                # level ranges summed in trees of their own, so no combine holds the whole sum
+                # (crossing.reduce_trees; D11 H L3 on 24 GB workers: 8)
+                k1 = reduce_trees(P_all, c1, wb, xtab=plan.xtab)
+
+                def level_sums_done(total):
+                    xts = []
+                    for t in total if k1 > 1 else [total]:
+                        if t is not None:
+                            (idx, S), xt = t
+                            acc["DR"][idx] += S[:, :-1]
+                            acc["ddiag"][idx] += S[:, -1]
+                            xts.append(xt)
+                    xt = join_xtabs(xts)
                     if xt is not None:
                         acc["xtab"] = xt
 
-            reduce = Reduce(
-                get=level_sums_of,
-                strip=without_level_sums,
-                # the cross-tabs' sum counts against the worker's memory: past it the
-                # cross-tab is dropped (CG with Jacobi) rather than the worker killed
-                combine=functools.partial(
-                    level_sums_combine,
-                    P=len(acc["ddiag"]),
-                    worker_bytes=worker_bytes(executor) if plan.xtab else None,
-                    token=plan.iter_token,
-                ),
-                done=level_sums_done,
-                # the cross-tab's size is not known before round 1: a whole worker for its combines
-                combine_gb=None if plan.xtab else step_combine_gb(len(acc["ddiag"]), acc["DR"].shape[1] + 1),
-            )
-        params = inspect.signature(executor.run).parameters
-        # plan C: round 1 leaves each shard's state in its worker's cache, where the CG steps go
-        aff = {"affinity": plan.iter_token} if plan.crossing_iterate and "affinity" in params else {}
-        if reduce and "reduce" in params:
-            executor.run(shard_round1, tasks, on1, prog, "round1", reduce=reduce, **aff)
-        else:  # an executor without reduce: each shard's part reaches on1
-            executor.run(shard_round1, tasks, on1, prog, "round1", **aff)
-        prog.task_gb = need_gb
-        prog.finish("round1")
+                if k1 > 1:
+                    P1x = int(plan.global_fes[0][2])
+                    get = functools.partial(
+                        level_sums_slice,
+                        bounds=tree_bounds(P_all, k1),
+                        xbounds=tree_bounds(P1x, k1) * (P_all - P1x) if plan.xtab else None,
+                    )
+                    log.info("fit %s: round 1's sums in %d trees of level ranges (a combine ~%.1f GB, workers %.0f GB)",
+                             label, k1, combine_need_gb(P_all, c1, plan.xtab) / k1, wb / 1e9)
+                else:
+                    get = level_sums_of
+                reduce = Reduce(
+                    get=get,
+                    strip=without_level_sums,
+                    # the cross-tabs' sum counts against the worker's memory: past it the
+                    # cross-tab is dropped (CG with Jacobi) rather than the worker killed
+                    combine=functools.partial(
+                        level_sums_combine,
+                        P=P_all,
+                        worker_bytes=wb if plan.xtab else None,
+                        token=plan.iter_token,
+                    ),
+                    done=level_sums_done,
+                    # one tree: the cross-tab's size is not known before round 1, so a whole worker
+                    # for its combines; several: each its share of the estimate
+                    combine_gb=None if plan.xtab and k1 == 1 else combine_need_gb(P_all, c1, plan.xtab) / k1,
+                    trees=k1,
+                )
+            params = inspect.signature(executor.run).parameters
+            # plan C: round 1 leaves each shard's state in its worker's cache, where the CG steps go
+            aff = {"affinity": plan.iter_token} if plan.crossing_iterate and "affinity" in params else {}
+            if reduce and "reduce" in params:
+                executor.run(shard_round1, tasks, on1, prog, "round1", reduce=reduce, **aff)
+            else:  # an executor without reduce: each shard's part reaches on1
+                executor.run(shard_round1, tasks, on1, prog, "round1", **aff)
+            prog.task_gb = need_gb
+            prog.finish("round1")
+            if _round1_checkpointed(plan):
+                st = prog.stages["round1"]
+                _round1_save(plan, ds, wd, acc, peak["rss"], st.finished - st.started, label)
         if not acc["converged"]:
             log.warning("fit %s: FE demeaning did not converge in some shards", label)
 
@@ -1873,6 +2040,8 @@ def fit(
             "solve_seconds": prog.stages["round2"].started - prog.stages["round1"].finished,
             "singleton_passes": sing["passes"],
             "singleton_seconds": sing["seconds"],
+            "singletons_reused": bool(sing.get("reused")),
+            "round1_reused": r1 is not None,
         }
 
     # ---------------- inference ----------------
@@ -2055,6 +2224,7 @@ def fit(
     res.save(wd / "result.json")
     if acc.get("cg_checkpoint") is not None:  # kept through round 2 (_crossing_cg)
         acc.pop("cg_checkpoint").remove()
+    (wd / ROUND1_CHECKPOINT).unlink(missing_ok=True)  # kept, like CG's, until the result is saved
     _record_timing(res, plan, ds, executor, acc, sing, cells, f)
     if record:
         rpath = wd / "result.estrec.json" if record is True else Path(record)

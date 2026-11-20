@@ -839,3 +839,126 @@ def test_cells_worker_memory_has_no_dummies(ds_cw):
     assert cells < 3 < estimate_worker_gb(p, 2_000_000, len(ds.columns))
     p.n_dummy = 71_908
     assert estimate_worker_gb(p, 2_000_000, len(ds.columns), cells=True) == cells
+
+
+def test_singleton_masks_reused_after_a_failed_fit(singleton_data, tmp_path, monkeypatch):
+    # a fit that dies after its singleton passes (D11 H L2: 7:21 of passes, then CG failed)
+    # leaves the masks and their record; a rerun in the same workdir reuses them, and only
+    # for the same spec on the same shards
+    import dfeols.estimate as est
+
+    ds = dfeols.prep(
+        singleton_data,
+        shard_dir=tmp_path / "s",
+        partition="id_a",
+        fixed_effects=["spell", "week", "tenure", "rare"],
+        clusters=["id_a"],
+        target_rows=3000,
+    )
+    f = "eng ~ feat + posts | spell + tenure + rare"
+    kw = dict(cluster="id_a", crossing_fe="dense", max_dummy_levels=10_000, log_every=1e9)
+    wd = tmp_path / "wd"
+    ref = dfeols.fit(ds, f, **kw, workdir=str(tmp_path / "ref"))
+    assert ref.timing["singleton_passes"] >= 2 and not ref.timing["singletons_reused"]
+    assert not (tmp_path / "ref" / "singletons").exists()  # a finished fit removes them
+
+    def boom(*a, **k):
+        raise RuntimeError("killed after the singleton passes")
+
+    monkeypatch.setattr(est, "check_sample", boom)
+    with pytest.raises(RuntimeError, match="killed after"):
+        dfeols.fit(ds, f, **kw, workdir=str(wd))
+    monkeypatch.undo()
+    assert (wd / "singletons" / est.SINGLETONS_DONE).exists()
+    r = dfeols.fit(ds, f, **kw, workdir=str(wd))
+    assert r.timing["singleton_passes"] == 0 and r.timing["singletons_reused"]
+    assert r.N == ref.N
+    np.testing.assert_allclose(r.coef(), ref.coef(), rtol=1e-12)
+    # another spec in that workdir: the record does not match, the passes rerun
+    monkeypatch.setattr(est, "check_sample", boom)
+    with pytest.raises(RuntimeError):
+        dfeols.fit(ds, f, **kw, workdir=str(wd))
+    monkeypatch.undo()
+    g = "eng ~ feat | spell + tenure + rare"
+    r2 = dfeols.fit(ds, g, **kw, workdir=str(wd))
+    assert r2.timing["singleton_passes"] >= 2 and not r2.timing["singletons_reused"]
+    # a record whose masks are partly gone: recomputed
+    monkeypatch.setattr(est, "check_sample", boom)
+    with pytest.raises(RuntimeError):
+        dfeols.fit(ds, f, **kw, workdir=str(wd))
+    monkeypatch.undo()
+    next((wd / "singletons").glob("shard_*.npy")).unlink()
+    r3 = dfeols.fit(ds, f, **kw, workdir=str(wd))
+    assert r3.timing["singleton_passes"] >= 2 and r3.N == ref.N
+
+
+def test_round1_checkpoint_resumes_a_failed_fit(ds_cw, tmp_path, monkeypatch):
+    # plan C with a pass per step saves round 1; a fit that dies after it (D11 H L2: CG failed
+    # 2.5 h after round 1) resumes there in the same workdir, with the same result, and only
+    # for the same plan; a finished fit removes the checkpoint
+    import dfeols.estimate as est
+    from dfeols.crossing import SlowConvergenceWarning
+
+    d, ds = ds_cw
+    f = "eng ~ feat + posts | spell + fw + cw"
+    kw = dict(cluster="id_a", crossing_fe="iterate", level_space_gb=0, log_every=1e9)
+    wd = tmp_path / "wd"
+    with pytest.warns(SlowConvergenceWarning):
+        ref = dfeols.fit(ds, f, **kw, workdir=str(tmp_path / "ref"))
+    assert not ref.timing["round1_reused"]
+    assert not (tmp_path / "ref" / est.ROUND1_CHECKPOINT).exists()
+
+    real = est._crossing_cg
+
+    def boom(*a, **k):
+        raise RuntimeError("killed in CG")
+
+    monkeypatch.setattr(est, "_crossing_cg", boom)
+    with pytest.raises(RuntimeError, match="killed in CG"):
+        dfeols.fit(ds, f, **kw, workdir=str(wd))
+    assert (wd / est.ROUND1_CHECKPOINT).exists()
+    assert (wd / "singletons" / est.SINGLETONS_DONE).exists()
+    monkeypatch.setattr(est, "_crossing_cg", real)
+    with pytest.warns(SlowConvergenceWarning):
+        r = dfeols.fit(ds, f, **kw, workdir=str(wd))
+    assert r.timing["round1_reused"] and r.timing["singletons_reused"]
+    assert r.N == ref.N
+    np.testing.assert_allclose(r.coef(), ref.coef(), rtol=1e-10)
+    np.testing.assert_allclose(r.vcov(), ref.vcov(), rtol=1e-8)
+    assert not (wd / est.ROUND1_CHECKPOINT).exists()
+    # a different plan (another FE tolerance) in that workdir does not take it
+    monkeypatch.setattr(est, "_crossing_cg", boom)
+    with pytest.raises(RuntimeError):
+        dfeols.fit(ds, f, **kw, workdir=str(wd))
+    monkeypatch.setattr(est, "_crossing_cg", real)
+    with pytest.warns(SlowConvergenceWarning):
+        r2 = dfeols.fit(ds, f, **kw, fe_tol=1e-11, workdir=str(wd))
+    assert not r2.timing["round1_reused"]
+
+
+@pytest.mark.parametrize("dask", [False, True])
+def test_reduce_trees_give_the_same_fit(ds_cw, monkeypatch, dask):
+    # round 1's per-level sums and cross-tab, and each CG step's sums, in level-range trees
+    # (crossing.reduce_trees; D11 H L3 on small workers): the same fit as one tree
+    from dfeols.crossing import SlowConvergenceWarning
+
+    _, ds = ds_cw
+    f = "eng ~ feat + posts | spell + fw + cw"
+    kw = dict(cluster="id_a", crossing_fe="iterate", level_space_gb=0, log_every=1e9)
+    with pytest.warns(SlowConvergenceWarning):
+        a = dfeols.fit(ds, f, **kw, workdir=str(ds.root / "runs" / f"trees1_{dask}"))
+    monkeypatch.setenv("DFEOLS_REDUCE_TREES", "3")
+    wd = str(ds.root / "runs" / f"trees3_{dask}")
+    if dask:
+        distributed = pytest.importorskip("distributed")
+        with distributed.LocalCluster(n_workers=2, threads_per_worker=1, processes=False) as lc:
+            with distributed.Client(lc) as client, pytest.warns(SlowConvergenceWarning):
+                b = dfeols.fit(ds, f, executor=dfeols.DaskExecutor(client, tick=0.2), workdir=wd, **kw)
+    else:
+        with pytest.warns(SlowConvergenceWarning):
+            b = dfeols.fit(ds, f, **kw, workdir=wd)
+    ca, cb = a.options["crossing_cg"], b.options["crossing_cg"]
+    assert ca["preconditioner"] == cb["preconditioner"] == "xtab"
+    assert cb["steps"] == ca["steps"]
+    np.testing.assert_allclose(a.coef(), b.coef(), rtol=1e-10)
+    np.testing.assert_allclose(a.vcov(), b.vcov(), rtol=1e-9)

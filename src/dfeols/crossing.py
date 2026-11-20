@@ -1163,7 +1163,8 @@ def step_combine(*parts, P: int | None = None):
     share of them (parts' levels adding to half of P or more; below that the sort is as fast,
     1-4 x 1.5M levels: 0.7 s against 0.9 s) is summed in a dense P-row block instead of
     sorting. The union is sorted_unique, not np.unique (0.73 of a 0.85 s combine of 4 x 300k
-    levels at D6's P)."""
+    levels at D6's P). The block spans the parts' own levels (first to last), so a slice of the
+    levels (Reduce.trees) takes a block of its own width, not P rows."""
     parts = [p for p in parts if p is not None]
     if not parts:
         return None
@@ -1171,14 +1172,18 @@ def step_combine(*parts, P: int | None = None):
         return parts[0]
     c = parts[0][1].shape[1]
     total = sum(len(p[0]) for p in parts)
-    if P is not None and total >= P // 2:
-        out = np.zeros((P, c))
-        seen = np.zeros(P, bool)
+    if P is not None:  # the dense block spans the parts' levels, not all P (a tree's slice)
+        have = [p for p in parts if len(p[0])]
+        lo = min((int(p[0][0]) for p in have), default=0)
+        span = max((int(p[0][-1]) + 1 for p in have), default=0) - lo
+    if P is not None and total >= min(P, span) // 2 and span:
+        out = np.zeros((span, c))
+        seen = np.zeros(span, bool)
         for idx, S in parts:
-            out[idx] += S
-            seen[idx] = True
+            out[idx - lo] += S
+            seen[idx - lo] = True
         uniq = np.flatnonzero(seen)
-        return uniq, out[uniq]
+        return uniq + lo, out[uniq]
     uniq = sorted_unique(np.concatenate([p[0] for p in parts]))
     out = np.zeros((len(uniq), c))
     for idx, S in parts:
@@ -1190,3 +1195,77 @@ def step_combine_gb(P: int, c: int, fan_in: int = FAN_IN) -> float:
     """Most memory a step_combine needs: fan_in parts and the sum over at most P levels, the
     dense block and its gathered copy (8 bytes a value, 8 an index)."""
     return ((fan_in + 2) * P * (8 * c + 8) + P) / 1e9 + 0.2
+
+
+# Combine trees (executors.Reduce.trees): per-level sums and cross-tabs cut into level ranges,
+# each summed in its own tree, so no combine holds more than 1/trees of the sum (D11 H L3 on
+# 24 GB workers: ~38 GB in one tree's top combine, ~5 GB in each of 8)
+REDUCE_TREE_SHARE = 0.25  # of a worker's memory, a tree's top combine may take by the estimate
+# cross-tab entries per crossing level, for sizing trees before round 1 knows the cross-tab
+# (D11 H 124M over 36.5M levels: 3.4; R1 7.4M over 6.46M: 1.15); level_sums_combine's guard
+# still counts the real size
+XTAB_PER_LEVEL = 4
+MAX_TREES = 16
+
+
+def reduce_trees(P: int, c: int, wbytes: int, xtab: bool = False, fan_in: int = FAN_IN) -> int:
+    """Trees for sums over P levels of c columns (and the cross-tab), so each tree's top
+    combine needs at most REDUCE_TREE_SHARE of a worker (DFEOLS_REDUCE_TREES overrides)."""
+    env = os.environ.get("DFEOLS_REDUCE_TREES")
+    if env:
+        return max(1, int(env))
+    return int(min(MAX_TREES, max(1, np.ceil(combine_need_gb(P, c, xtab, fan_in) * 1e9 / (REDUCE_TREE_SHARE * wbytes)))))
+
+
+def combine_need_gb(P: int, c: int, xtab: bool = False, fan_in: int = FAN_IN) -> float:
+    """A one-tree top combine's estimate: the per-level sums, and the cross-tab at
+    XTAB_PER_LEVEL entries a level in each of fan_in inputs."""
+    return step_combine_gb(P, c, fan_in) + (xtab_gb(fan_in * XTAB_PER_LEVEL * P) if xtab else 0.0)
+
+
+def tree_bounds(P: int, k: int) -> np.ndarray:
+    """k contiguous level ranges over [0, P): their k + 1 edges."""
+    return np.linspace(0, P, k + 1).round().astype(np.int64)
+
+
+def _slice_levels(part, lo: int, hi: int):
+    idx, S = part
+    a, b = np.searchsorted(idx, [lo, hi])
+    return idx[a:b], S[a:b]
+
+
+def _slice_xtab(xt, lo: int, hi: int):
+    if xt is None or _xtab_dropped(xt):
+        return xt
+    k, v = xt
+    a, b = np.searchsorted(k, [lo, hi])
+    return k[a:b], v[a:b]
+
+
+def step_part_slice(res: dict, j: int, bounds: np.ndarray):
+    """step_part's tree j of len(bounds) - 1 (its levels in bounds[j], bounds[j + 1])."""
+    return _slice_levels(step_part(res), int(bounds[j]), int(bounds[j + 1]))
+
+
+def level_sums_slice(res: dict, j: int, bounds: np.ndarray, xbounds: np.ndarray | None = None):
+    """level_sums_of's tree j: the per-level sums in its level range, and the cross-tab's keys
+    (level1 * P2 + level2) in xbounds' range j (ranges of FE 1's levels)."""
+    p = level_sums_of(res)
+    if p is None:
+        return None
+    lev, xt = p
+    lev = _slice_levels(lev, int(bounds[j]), int(bounds[j + 1]))
+    if xbounds is not None:
+        xt = _slice_xtab(xt, int(xbounds[j]), int(xbounds[j + 1]))
+    return lev, xt
+
+
+def join_xtabs(xts: list):
+    """The trees' cross-tabs (disjoint key ranges, in order) as one; dropped if any is."""
+    dropped = [x for x in xts if _xtab_dropped(x)]
+    if dropped:
+        return min(dropped, key=lambda p: bool(p.get("skipped")))
+    xts = [x for x in xts if x is not None]
+    if not xts:
+        return None
+    return np.concatenate([x[0] for x in xts]), np.concatenate([x[1] for x in xts])
