@@ -44,6 +44,16 @@ ITER_CACHE_SHARE = 0.4
 # Bytes per nonzero of a combine's inputs while it sums them, on top of the inputs themselves
 # (one at a time: the sum so far and its next copy; measured 21-24 on 4 x 5M random parts)
 MERGE_BYTES = 24
+# Bytes per input entry while xtab_combine sums cross-tabs, on top of the inputs themselves (the
+# keys, their sort order and sorted copy, then the values', and the sum; measured with
+# tracemalloc on 4 x 5M random parts: 32 with the parts' keys all shared or half shared, 40 with
+# none shared, where the sum is as large as its inputs)
+XTAB_MERGE_BYTES = 40
+# A worker's memory a round-1 combine with cross-tabs may use (the per-level sums' step_combine
+# and xtab_combine) before it drops the cross-tab rather than be killed: nearer the nanny's 95%
+# than WORKER_SHARE, because what it drops is the preconditioner (CG goes on with Jacobi, at
+# ~40x the steps on D11 L3), not a level-space A the passes can stand in for
+XTAB_WORKER_SHARE = 0.85
 FAN_IN = 4  # parts per combine (executors.Reduce.fan_in)
 
 
@@ -147,29 +157,71 @@ def without_level_sums(res: dict) -> dict:
     return {**res, "crossing": cr}
 
 
-def level_sums_combine(*parts, P: int | None = None):
+def level_sums_combine(*parts, P: int | None = None, worker_bytes: int | None = None, token: str | None = None):
     """Sum round-1 parts (level_sums_of): step_combine on the per-level sums, xtab_combine on
-    the cross-tabs."""
+    the cross-tabs. With `worker_bytes` the cross-tabs' sum counts against the worker's memory
+    (xtab_gb beside step_combine_gb): past XTAB_WORKER_SHARE of it the cross-tab is dropped
+    (XTAB_DROPPED, and over_flag "xtab" for the shards still to run) instead of the worker being
+    killed (D11 H: up to ~4 x 124M entries in round 1's last combine, ~28 GB)."""
     parts = [p for p in parts if p is not None]
     if not parts:
         return None
-    return step_combine(*[p[0] for p in parts], P=P), xtab_combine(*[p[1] for p in parts])
+    sums = step_combine(*[p[0] for p in parts], P=P)
+    xts = [p[1] for p in parts]
+    if worker_bytes and not any(_xtab_dropped(x) for x in xts):
+        c = parts[0][0][1].shape[1]
+        n_lev = sum(len(p[0][0]) for p in parts)
+        need = xtab_gb(sum(len(x[0]) for x in xts if x is not None))
+        need += step_combine_gb(min(n_lev, P or n_lev), c, fan_in=len(parts)) - 0.2
+        if need * 1e9 > XTAB_WORKER_SHARE * worker_bytes:
+            over_flag(token, "xtab", set_it=True)
+            xts = [
+                xtab_dropped(
+                    f"summing the shards' cross-tabs on a worker needs ~{need:.1f} GB, past "
+                    f"{XTAB_WORKER_SHARE:.0%} of its {worker_bytes / 1e9:.1f} GB"
+                )
+            ]
+    return sums, xtab_combine(*xts)
+
+
+def xtab_gb(entries: int) -> float:
+    """Memory xtab_combine needs for inputs of `entries` keys in all: the inputs (8-byte key,
+    8-byte value) and XTAB_MERGE_BYTES of working copies an entry."""
+    return entries * (16 + XTAB_MERGE_BYTES) / 1e9
+
+
+def xtab_dropped(reason: str, skipped: bool = False) -> dict:
+    """A cross-tab given up in round 1 (too large to sum on a worker): CG uses Jacobi.
+    `skipped`: a shard's, which skipped its cross-tab after the verdict (worker.shard_round1)."""
+    return {"none": True, "reason": reason, "skipped": skipped}
+
+
+def _xtab_dropped(x) -> bool:
+    return isinstance(x, dict) and bool(x.get("none"))
 
 
 def xtab_combine(*parts):
-    """Sum cross-tabs (sorted distinct keys, sums): the union of the keys, sums added."""
+    """Sum cross-tabs (sorted distinct keys, sums): the union of the keys, sums added. A dropped
+    part (xtab_dropped) drops the sum: a cross-tab missing shards is not D'WD."""
     parts = [p for p in parts if p is not None]
     if not parts:
         return None
+    dropped = [p for p in parts if _xtab_dropped(p)]
+    if dropped:  # the verdict's own reason over a shard's "skipped"
+        return min(dropped, key=lambda p: bool(p.get("skipped")))
     if len(parts) == 1:
         return parts[0]
+    # one array at a time, each freed once gathered: the keys, their order and their sorted
+    # copy, then the values' (40 bytes an entry at most, against 49 gathering both at once)
     k = np.concatenate([p[0] for p in parts])
-    v = np.concatenate([p[1] for p in parts])
-    o = np.argsort(k, kind="stable")
-    k, v = k[o], v[o]
-    first = np.r_[True, k[1:] != k[:-1]] if len(k) else np.zeros(0, bool)
-    starts = np.flatnonzero(first)
-    return k[starts], np.add.reduceat(v, starts) if len(k) else v
+    o = np.argsort(k, kind="stable")  # stable: timsort over the parts' sorted runs
+    k = k[o]
+    v = np.concatenate([p[1] for p in parts])[o]
+    del o
+    if not len(k):
+        return k, v
+    starts = np.flatnonzero(np.r_[True, k[1:] != k[:-1]])
+    return k[starts], np.add.reduceat(v, starts)
 
 
 # Round 1's verdict on A, shared by its combines and the shards still to run (over_flag):

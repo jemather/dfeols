@@ -798,6 +798,16 @@ def _crossing_cg(
         solvers = [cx.BlockSolve(b, singular, n) for b, n in zip(blocks, names)]
     xtab = None
     xt = acc.pop("xtab", None)
+    xtab_dropped = acc.pop("xtab_dropped", None)
+    if isinstance(xt, dict):  # round 1 gave the cross-tab up (crossing.level_sums_combine)
+        xtab_dropped, xt = xt.get("reason") or "the cross-tab was dropped in round 1", None
+    if xtab_dropped:
+        log.warning(
+            "fit %s: no cross-tab preconditioner: %s; CG uses Jacobi (many more passes: raise the "
+            "workers' memory, --worker-memory, to keep it)",
+            label,
+            xtab_dropped,
+        )
     if xt is not None and len(offs) == 3 and (precond == "xtab" or (precond == "auto" and not level)):
         P1 = int(offs[1])
         xtab = cx.XtabSolve(xt[0], xt[1], P1, P - P1, " x ".join(names))
@@ -976,6 +986,7 @@ def _crossing_cg(
         "shipped_nnz": int(gram.shipped_nnz) if gram is not None else None,  # what reached the coordinator
         "block_nnz": [int(b.nnz) for b in blocks] if blocks is not None else None,
         "fallback_reason": None if level else (gram.reason if gram is not None else "level_space_gb=0"),
+        "xtab_dropped": xtab_dropped,  # why round 1 gave the cross-tab up (None: it did not)
     }
     return X
 
@@ -1624,7 +1635,7 @@ def fit(
                 if cr.get("xtab") is not None:  # likewise
                     from .crossing import xtab_combine
 
-                    acc["xtab"] = xtab_combine(acc.get("xtab"), cr["xtab"])
+                    acc["xtab"] = xtab_combine(acc.get("xtab"), cr["xtab"])  # a dropped one stays dropped
                 if "gram" in acc and "part" in cr:  # else summed on the workers (reduce below)
                     acc["gram"].add(cr["part"], tid)
             acc["row_n"][tid] = r["n"]
@@ -1679,7 +1690,7 @@ def fit(
             # no level space: the per-level sums still go in a tree on the workers, so the
             # coordinator takes one block, not a shard's at a time (D11 L3 job 36016180: 27 min
             # fetching ~98 MB results one by one after the workers had finished)
-            from .crossing import level_sums_combine, level_sums_of, step_combine_gb, without_level_sums
+            from .crossing import level_sums_combine, level_sums_of, step_combine_gb, without_level_sums, worker_bytes
 
             def level_sums_done(total):
                 if total is not None:
@@ -1692,7 +1703,14 @@ def fit(
             reduce = Reduce(
                 get=level_sums_of,
                 strip=without_level_sums,
-                combine=functools.partial(level_sums_combine, P=len(acc["ddiag"])),
+                # the cross-tabs' sum counts against the worker's memory: past it the
+                # cross-tab is dropped (CG with Jacobi) rather than the worker killed
+                combine=functools.partial(
+                    level_sums_combine,
+                    P=len(acc["ddiag"]),
+                    worker_bytes=worker_bytes(executor) if plan.xtab else None,
+                    token=plan.iter_token,
+                ),
                 done=level_sums_done,
                 # the cross-tab's size is not known before round 1: a whole worker for its combines
                 combine_gb=None if plan.xtab else step_combine_gb(len(acc["ddiag"]), acc["DR"].shape[1] + 1),

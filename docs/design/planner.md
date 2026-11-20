@@ -241,7 +241,14 @@ to the pre-cancellation diagonal (D2), not the block's own eigenvalues, because 
 of the larger FE pairs with one level of the smaller the Schur complement is pure rounding, and a
 relative cut inverted it (eigenvalues ~1e18; CG diverged past 1e-8). Approximate solves of the
 block (symmetric Gauss-Seidel sweeps) were far weaker: 85-270 steps on R0. Bench and H sizing in
-the data project's `docs/cgprecond.md`.
+the data project's `docs/cgprecond.md`. *Memory:* B's size is not known before round 1 (at most
+the distinct level pairs, which only the data gives: D11 H, 124M), so round 1's combines count it
+as they go (`crossing.level_sums_combine`: inputs plus 40 bytes an entry, `XTAB_MERGE_BYTES`,
+beside the per-level sums' `step_combine_gb`). A combine past `XTAB_WORKER_SHARE` (85%) of a
+worker's memory drops the cross-tab instead of the worker being killed: the shards still to run
+skip theirs (`over_flag` "xtab"), CG takes Jacobi with a warning, and `crossing_cg.xtab_dropped`
+says why. D11 H's worst case (4 x 124M entries in the last combine) is ~38 GB: kept on 48 GB
+workers, dropped on 24 GB ones.
 
 **Tolerance.** *Decided:* default 1e-8 on the relative residual (was 1e-10, next to the
 floating-point floor of ~1e-11 on DB1B). beta settles well before: within 1e-4 SE after 3 to 9

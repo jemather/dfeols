@@ -787,7 +787,13 @@ def _round1_sparse(plan: Plan, shard_id: int, df, n0: int, local_codes, w, T, t0
                 d -= np.asarray(CA.multiply(CA).T @ (1.0 / WA)).ravel()
         aux["ddiag"] = d[idx]
         if plan.xtab and n:
-            aux["xtab"] = shard_xtab(gcodes, w, int(offs[1]), P)
+            from .crossing import over_flag, xtab_dropped
+
+            # a combine found the cross-tabs' sum past a worker's memory: the rest skip theirs
+            if over_flag(plan.iter_token, "xtab"):
+                aux["xtab"] = xtab_dropped("round 1's cross-tab was dropped by an earlier combine", skipped=True)
+            else:
+                aux["xtab"] = shard_xtab(gcodes, w, int(offs[1]), P)
         T["crossprod"] = time.perf_counter() - t
         return Y, Yt, Xt, Xw.T @ Xt, Xw.T @ Yt, (local_codes, Dm), converged, aux
     sparse_out = P > SPARSE_GRAM_LEVELS

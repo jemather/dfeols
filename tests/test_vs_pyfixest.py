@@ -321,6 +321,15 @@ def test_iterate_level_space_and_fallback(ds_cw, f, monkeypatch):
         assert (c2["mode"], c2["preconditioner"]) == want
         assert c2["passes"] == (c2["steps"] if want[0] == "pass" else 0)
     assert "nonzeros" in runs["blocks"].options["crossing_cg"]["fallback_reason"]
+    assert runs["xtab"].options["crossing_cg"]["xtab_dropped"] is None
+    # a cross-tab whose sum would pass a worker's memory is dropped in round 1: Jacobi, same fit
+    monkeypatch.setattr(cxm, "XTAB_WORKER_SHARE", 1e-12)
+    with pytest.warns(SlowConvergenceWarning):
+        runs["xtab_dropped"] = dfeols.fit(ds, f, **kw, level_space_gb=0)
+    monkeypatch.undo()
+    c2 = runs["xtab_dropped"].options["crossing_cg"]
+    assert (c2["mode"], c2["preconditioner"]) == ("pass", "jacobi")
+    assert "cross-tabs on a worker needs" in c2["xtab_dropped"]
     # block-Jacobi beats Jacobi on the same passes
     assert runs["blocks"].options["crossing_cg"]["steps"] < runs["off"].options["crossing_cg"]["steps"]
     # and the cross-tab beats it too (23 against 53, 27 against 52)

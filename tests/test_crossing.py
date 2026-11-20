@@ -560,3 +560,37 @@ def test_checkpoint_digest_has_the_solver_version(tmp_path, monkeypatch):
     assert cx.Checkpoint(tmp_path / "cg.npz", R, 1e-8, "jacobi").load() is None
     monkeypatch.setattr(cx, "CG_STATE_VERSION", "cg-older")
     assert cx.Checkpoint(tmp_path / "cg.npz", R, 1e-8, "xtab").load() is None
+
+
+def test_xtab_combine_counts_worker_memory():
+    # round 1's combines count the cross-tabs' sum against a worker's memory: past
+    # XTAB_WORKER_SHARE the cross-tab is dropped (and stays dropped up the tree), not the worker killed
+    import uuid
+
+    rng = np.random.default_rng(3)
+
+    def part(n):
+        k = np.unique(rng.integers(0, 10**6, n))
+        lev = np.unique(rng.integers(0, 50, 20))
+        return (lev, rng.random((len(lev), 3))), (k, rng.random(len(k)))
+
+    parts = [part(1000) for _ in range(4)]
+    whole = cx.level_sums_combine(*parts, P=50)
+    big = cx.level_sums_combine(*parts, P=50, worker_bytes=10**12, token="t")
+    np.testing.assert_array_equal(big[1][0], whole[1][0])
+    np.testing.assert_allclose(big[1][1], whole[1][1])
+    ref = cx.xtab_combine(*[p[1] for p in parts])
+    k = np.concatenate([p[1][0] for p in parts])
+    assert np.array_equal(ref[0], np.unique(k))
+    np.testing.assert_allclose(ref[1].sum(), sum(p[1][1].sum() for p in parts))
+    token = uuid.uuid4().hex
+    assert not cx.over_flag(token, "xtab")
+    small = cx.level_sums_combine(*parts, P=50, worker_bytes=10**4, token=token)
+    np.testing.assert_allclose(small[0][1], whole[0][1])  # the per-level sums are kept
+    assert small[1]["none"] and "needs" in small[1]["reason"]
+    assert cx.over_flag(token, "xtab")  # the shards still to run skip their cross-tabs
+    # up the tree: the verdict's reason, not a skipping shard's, whatever the order
+    skip = cx.xtab_dropped("skipped", skipped=True)
+    up = cx.level_sums_combine(((np.arange(3), np.ones((3, 3))), skip), small, P=50, worker_bytes=10**12)
+    assert up[1]["reason"] == small[1]["reason"]
+    assert cx.xtab_combine(skip, None) is skip
