@@ -75,6 +75,11 @@ DEFAULTS = {
         # it gives up (dask-jobqueue's death-timeout, 60 s; on OSCER 16 of 40 workers starting
         # together from the shared filesystem missed it, 2026-11-19)
         "start_minutes": 10,
+        # ask for a replacement this long (in queue waits seen so far) before a worker retires at
+        # its lifetime, while the fit still has work past that point; false: only after it leaves
+        # (on OSCER all 40 workers retired together and the pool took ~50 min to refill, 2026-11-20)
+        "replace_ahead": True,
+        "queue_wait_minutes": 30,  # the queue wait assumed until a worker job's own wait is seen
         "local_directory": None,
     },
     # queue: the coordinator's own partition (None: the profile's queue, as the workers);
@@ -138,6 +143,8 @@ min_workers = 1
 retire_minutes = 60            # stop taking shards this long before walltime
 idle_minutes = 15              # release a worker only after this long with nothing to do
 start_minutes = 10             # a worker job's Dask process may take this long to reach the scheduler
+replace_ahead = true           # ask for replacements before workers retire, by the queue waits seen
+queue_wait_minutes = 30        # the queue wait assumed until one is seen
 
 [profiles.cluster.coordinator]
 cores = 4

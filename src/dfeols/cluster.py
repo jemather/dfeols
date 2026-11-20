@@ -287,6 +287,7 @@ def make_cluster(p: Profile, log_directory: str | None = None):
         **kw,
     )
     cl.dfeols_log_directory = kw.get("log_directory")  # diag.attach_scheduler_log: next to them
+    cl.dfeols_lifetime = (life, 300)  # seconds, and the --lifetime-stagger either side
     return cl
 
 
@@ -349,6 +350,8 @@ def executor(
             interval=f"{interval}s",
             wait_count=wait,
         )
+        if w.get("replace_ahead", True):
+            _replace_ahead(cl, w["max_workers"], 60 * float(w.get("queue_wait_minutes", 30)))
     client = Client(cl)
     if p.scheduler == "slurm":
         _replace_lost_jobs(cl, w["max_workers"])
@@ -446,6 +449,81 @@ def _replace_lost_jobs(cl, max_workers: int, every: float = 60.0, live_jobs=_slu
     cl.loop.add_callback(pc.start)
     cl.dfeols_lost_jobs = st
     cl.dfeols_lost_jobs_check = check
+
+
+def queue_lead(waits: list[float], prior: float, life: float) -> float:
+    """Seconds before a worker's retirement to ask for its replacement: 1.25 x the longest of the
+    last 20 queue waits (submit to connect; `prior` until one is seen) plus 5 min, at most half a
+    worker's lifetime. The longest, since waits vary a lot (OSCER: 5-16 min for the first pool,
+    30-50 min for replacements) and asking early only costs some overlap."""
+    q = max(waits[-20:]) if waits else prior
+    return min(1.25 * q + 300.0, life / 2)
+
+
+def retiring(connected: dict, now: float, life: float, stagger: float, lead: float,
+             work_left: float | None, grace: float = 600.0) -> set:
+    """Names of connected workers (name -> time first seen) that retire at their lifetime within
+    `lead` s and that the work outlasts: replacements to ask for now.
+
+    A worker retires between lifetime - stagger and lifetime + stagger after it started; it
+    counts from `lead` before the earliest until `grace` after the latest (then it is late, and
+    adaptive scaling treats any extra as surplus). `work_left` None (no run reporting) counts as
+    work to come."""
+    out = set()
+    for n, t0 in connected.items():
+        early, late = t0 + life - stagger, t0 + life + stagger + grace
+        if early - lead <= now <= late and (work_left is None or work_left > max(early - now, 0) + 300):
+            out.add(n)
+    return out
+
+
+def _replace_ahead(cl, max_workers: int, prior_wait: float, clock=time.time) -> None:
+    """Add, to adaptive scaling's target, one worker for each worker about to retire at its
+    lifetime while the work outlasts it, so the replacement waits in the queue while the old
+    worker still runs. It is computed on each adapt tick, so the extra drops the moment the old
+    worker leaves. Queue waits are measured per job (first in the plan to first connected)."""
+    ad = getattr(cl, "_adaptive", None)
+    life, stagger = getattr(cl, "dfeols_lifetime", (None, None))
+    if ad is None or life is None or not hasattr(ad, "safe_target"):
+        log.warning("cluster: cannot ask for replacements ahead of retirement (no adaptive scaling)")
+        return
+    orig = ad.safe_target
+    st = {"planned": {}, "seen": {}, "waits": [], "extra": 0}
+
+    async def safe_target():
+        n = await orig()
+        try:
+            from . import progress
+
+            now = clock()
+            plan, seen = set(ad.plan), set(ad.observed)
+            for x in plan:
+                st["planned"].setdefault(x, now)
+            for x in seen:
+                if x not in st["seen"]:
+                    st["seen"][x] = now
+                    if x in st["planned"]:
+                        st["waits"].append(now - st["planned"][x])
+            for d in ("planned", "seen"):  # forget workers gone from both
+                for x in [x for x in st[d] if x not in plan and x not in seen]:
+                    del st[d][x]
+            wl = progress.WORK_LEFT
+            work_left = wl[1] - (now - wl[0]) if wl and now - wl[0] < 600 else None
+            lead = queue_lead(st["waits"], prior_wait, life)
+            due = retiring({x: st["seen"][x] for x in seen if x in st["seen"]}, now, life, stagger, lead, work_left)
+            extra = min(len(due), max_workers)
+            if extra > st["extra"]:
+                log.info("cluster: %d worker(s) retire within %.0f min; asking for %d replacement(s) now "
+                         "(queue waits so far up to %.0f min)", extra, lead / 60, extra - st["extra"],
+                         max(st["waits"], default=prior_wait) / 60)
+            st["extra"] = extra
+            return n + extra
+        except Exception as e:  # noqa: BLE001 (never take adaptive scaling down)
+            log.warning("cluster: replacing retiring workers ahead failed: %r", e)
+            return n
+
+    ad.safe_target = safe_target
+    cl.dfeols_replace_ahead = st
 
 
 def _close_on_exit(cl) -> None:

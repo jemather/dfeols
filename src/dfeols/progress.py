@@ -259,6 +259,9 @@ class Progress:
             return
         self._last = now
         snap = self.snapshot()
+        global WORK_LEFT
+        if snap["eta_total_seconds"] is not None:
+            WORK_LEFT = (now, float(snap["eta_total_seconds"]))
         hdr = status_header(snap)
         if self._header(hdr):
             log.info(hdr)
@@ -282,6 +285,12 @@ class Progress:
             tmp = p.with_suffix(".tmp")
             tmp.write_text(json.dumps(snap, indent=1, default=float))
             os.replace(tmp, p)
+
+
+# (time.time(), seconds of known work left) from the latest status line of any run in this
+# process: the coordinator's cluster reads it to decide whether a retiring worker needs a
+# replacement (cluster._replace_ahead)
+WORK_LEFT: tuple[float, float] | None = None
 
 
 HEADER_EVERY = 10  # the column header repeats every this many status lines
