@@ -79,6 +79,13 @@ DEFAULTS = {
         # its lifetime, while the fit still has work past that point; false: only after it leaves
         # (on OSCER all 40 workers retired together and the pool took ~50 min to refill, 2026-11-20)
         "replace_ahead": True,
+        # workers retire over lifetime minus up to 2 x this (None: 10% of the lifetime, at
+        # least 5 min), so a pool that started together doesn't retire together
+        "retire_spread_minutes": None,
+        # times a task may be on a worker that leaves before Dask fails it (KilledWorker) on the
+        # next; None: half of max_workers, at least Dask's 3, which counted planned retirements
+        # and slow connections and failed H L2 (OSCER, 2026-11-20)
+        "allowed_failures": None,
         "queue_wait_minutes": 30,  # the queue wait assumed until a worker job's own wait is seen
         "local_directory": None,
     },
@@ -145,6 +152,8 @@ idle_minutes = 15              # release a worker only after this long with noth
 start_minutes = 10             # a worker job's Dask process may take this long to reach the scheduler
 replace_ahead = true           # ask for replacements before workers retire, by the queue waits seen
 queue_wait_minutes = 30        # the queue wait assumed until one is seen
+# retire_spread_minutes = 60    # workers retire over this x 2 before their lifetime (default 10% of it)
+# allowed_failures = 20        # a task fails on the next worker leaving under it (default max_workers / 2, at least 3)
 
 [profiles.cluster.coordinator]
 cores = 4

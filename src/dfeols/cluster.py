@@ -223,6 +223,22 @@ def worker_log_tag() -> str:
     return f"local-{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}"
 
 
+def retire_spread_seconds(life: float, minutes: float | None = None) -> int:
+    """Half-width of the window workers retire in (Dask's --lifetime-stagger): `minutes` if
+    given, else 10% of the lifetime, at least 5 min; never more than a quarter of it."""
+    s = 60 * float(minutes) if minutes is not None else max(0.1 * life, 300)
+    return int(min(s, life / 4))
+
+
+def allowed_failures(max_workers: int, n: int | None = None) -> int:
+    """Dask's allowed-failures: a task fails (KilledWorker) once it has been on this many + 1
+    workers that left while running it. `n` if given, else half of max_workers, so a task
+    fails when it has outlived half the pool plus one; never below Dask's default 3."""
+    if n is not None:
+        return int(n)
+    return max(int(0.5 * max_workers), 3)
+
+
 def make_cluster(p: Profile, log_directory: str | None = None):
     """Create (not scale) a Dask cluster for profile p."""
     w = p.worker
@@ -259,9 +275,18 @@ def make_cluster(p: Profile, log_directory: str | None = None):
             name = private_interface() if p.interface == "auto" else p.interface
         if name:
             log.info("cluster: coordinator listens on %s (%s)", name, ", ".join(_interface_ips(name)))
-            kw["scheduler_options"] = {"interface": name}
+            kw.setdefault("scheduler_options", {})["interface"] = name
     wall = walltime_seconds(w["walltime"], p.scheduler)
     life = max(wall - min(60 * int(w["retire_minutes"]), wall // 4), 300)
+    # Dask picks each worker's lifetime uniformly in center +/- stagger; the center sits a
+    # stagger below `life`, so no worker outlives `life` (the walltime margin), and workers
+    # that started together retire over a 2 x stagger window instead of all at once
+    stagger = retire_spread_seconds(life, w.get("retire_spread_minutes"))
+    center = life - stagger
+    # tasks on a worker that leaves count against it; planned retirements and slow
+    # connections are not the task's fault (OSCER H L2, 2026-11-20: KilledWorker after 4)
+    kw.setdefault("scheduler_options", {})["allowed_failures"] = allowed_failures(
+        w["max_workers"], w.get("allowed_failures"))
     if log_directory or p.scratch:
         ld = Path(log_directory) if log_directory else p.scratch_dir("logs", worker_log_tag())
         ld.mkdir(parents=True, exist_ok=True)
@@ -278,16 +303,16 @@ def make_cluster(p: Profile, log_directory: str | None = None):
         worker_extra_args=(["--host", "$DFEOLS_WORKER_HOST"] if ib else [])
         + [
             "--lifetime",
-            f"{life}s",
+            f"{center}s",
             "--lifetime-stagger",
-            "5m",
+            f"{stagger}s",
             "--resources",
             f"MEMORY={_memory_bytes(w['memory'])}",
         ],
         **kw,
     )
     cl.dfeols_log_directory = kw.get("log_directory")  # diag.attach_scheduler_log: next to them
-    cl.dfeols_lifetime = (life, 300)  # seconds, and the --lifetime-stagger either side
+    cl.dfeols_lifetime = (center, stagger)  # seconds, and the --lifetime-stagger either side
     return cl
 
 

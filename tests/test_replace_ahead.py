@@ -98,3 +98,38 @@ def test_executor_installs_it_on_a_jobqueue_cluster(monkeypatch, tmp_path):
         assert cl.dfeols_lifetime[0] > 0
     finally:
         cl.close()
+
+
+def test_retire_spread_and_allowed_failures(monkeypatch, tmp_path):
+    """Workers retire over a window below the walltime margin (OSCER H L2, 2026-11-20: 40 workers
+    retired within 20 min); Dask allows 20 failures a task, not 3 (KilledWorker after 4)."""
+    import re
+    from dataclasses import replace
+
+    import dfeols
+
+    assert cmod.retire_spread_seconds(11 * 3600) == int(0.1 * 11 * 3600)
+    assert cmod.retire_spread_seconds(1800) == 300
+    assert cmod.allowed_failures(40) == 20  # fails on the 21st: half the pool plus one
+    assert cmod.allowed_failures(2) == 3 and cmod.allowed_failures(40, 7) == 7
+    assert cmod.retire_spread_seconds(3600, minutes=60) == 900  # at most a quarter
+    monkeypatch.setenv("DFEOLS_CONFIG", str(tmp_path / "none.toml"))
+    p = replace(dfeols.profile("local", scratch=str(tmp_path)), scheduler="slurm", interface=None)
+    p = p.with_overrides(walltime="12:00:00", retire_minutes=60)
+    cl = cmod.make_cluster(p)
+    try:
+        js = cl.job_script()
+        center = float(re.search(r"--lifetime (\d+)s", js).group(1))
+        stag = float(re.search(r"--lifetime-stagger (\d+)s", js).group(1))
+        assert center + stag == 11 * 3600  # never past walltime minus retire_minutes
+        assert stag == int(0.1 * 11 * 3600)
+        assert cl.dfeols_lifetime == (center, stag)
+        assert cl.scheduler.allowed_failures == cmod.allowed_failures(p.worker["max_workers"])
+    finally:
+        cl.close()
+    cl = cmod.make_cluster(p.with_overrides(allowed_failures=7, retire_spread_minutes=10))
+    try:
+        assert "--lifetime-stagger 600s" in cl.job_script()
+        assert cl.scheduler.allowed_failures == 7
+    finally:
+        cl.close()
