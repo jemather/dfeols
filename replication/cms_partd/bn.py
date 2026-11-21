@@ -7,7 +7,8 @@ pyfixest (in memory; ~0.7M rows). Paper: raw/papers/ (RAND J. Econ. 57(3):601-62
 docs/cms_partd.md.
 
     cd /srv/dfeols && .venv/bin/python -I repo/replication/cms_partd/bn.py --out build/cms_partd/bn
-    (--grouping tab1_4|raw_spec|none for the specialty-group sensitivity, into its own --out)
+    (--grouping tab1_4|raw_spec|none for the specialty-group sensitivity, into its own --out;
+     --window all for 2013-2024, movers and delta over that window)
 
 Spec (paper section 2, fn 10, 34; rules Ted 2026-11-21):
   y_its = a_i + g_{t,o} + sum_{tau != -1} b_tau 1(t = tau) delta_ido_s + e      (1)
@@ -36,9 +37,15 @@ import numpy as np
 import polars as pl
 
 c = pl.col
-LO, HI = 2013, 2019
+WINDOWS = {"bn": (2013, 2019), "all": (2013, 2024)}  # as in movers.py
+LO, HI = WINDOWS["bn"]
 W = "bn"
 OUTCOMES = {"log_cost": "log_cost", "log_cost_pb": "log_cost_pb"}
+# Section 4.3: each part regressed on the delta of its total (fn 33: the parts' b_post sum to the total's)
+PARTS = {
+    "log_cost": ["log_cost_per_claim", "log_claims_pb", "log_benes"],
+    "log_cost_pb": ["log_cost_per_claim", "log_claims_pb"],
+}
 VARIANTS = ("py", "pr")
 
 # Specialty groups (B&N section 3: primary care, medical, surgical, nurse practitioners, dental;
@@ -84,7 +91,7 @@ def load(panel: Path, grouping: str = "groups6") -> pl.DataFrame:
     p = (
         pl.scan_parquet(panel)
         .filter(c("year").is_between(LO, HI))
-        .select("npi", "year", "hrr", "spec", "cost", "benes", "benes_censored",
+        .select("npi", "year", "hrr", "spec", "cost", "claims", "benes", "benes_censored",
                 f"contig_{W}", f"moves_{W}", f"move_year_{W}", f"npi_any_censored_{W}")
         .collect(engine="streaming")
     )
@@ -106,6 +113,9 @@ def load(panel: Path, grouping: str = "groups6") -> pl.DataFrame:
     return p.join(mode, on="npi").with_columns(
         c("cost").log().alias("log_cost"),
         (c("cost") / c("benes")).log().alias("log_cost_pb"),
+        (c("cost") / c("claims")).log().alias("log_cost_per_claim"),
+        (c("claims") / c("benes")).log().alias("log_claims_pb"),
+        c("benes").log().alias("log_benes"),
     )
 
 
@@ -185,6 +195,26 @@ def regressors(reg: pl.DataFrame, y: str) -> tuple[pl.DataFrame, list[str], list
     return reg, [name(t) for t in taus], ["b_transition", "b_post"]
 
 
+def cohort_regressors(reg: pl.DataFrame, y: str) -> tuple[pl.DataFrame, list[str]]:
+    """Eq. (2) with transition and post slopes by move year (cohorts with a post period)."""
+    d = c(f"delta_{y}")
+    years = sorted(int(v) for v in reg.filter(c("rel") > 1)["move_year"].unique())
+    xs = []
+    for my in years:
+        k = c("move_year") == my
+        reg = reg.with_columns(
+            pl.when(k & c("rel").is_between(0, 1)).then(d).otherwise(0.0).alias(f"tr_{my}"),
+            pl.when(k & (c("rel") > 1)).then(d).otherwise(0.0).alias(f"post_{my}"),
+        )
+        xs += [f"tr_{my}", f"post_{my}"]
+    # cohorts with no post period (moved in the last two years) keep one pooled transition slope
+    late = ~c("move_year").is_in(years)
+    reg = reg.with_columns(pl.when(late & c("rel").is_between(0, 1)).then(d).otherwise(0.0).alias("tr_late"))
+    if reg["tr_late"].abs().sum() > 0:
+        xs.append("tr_late")
+    return reg, xs
+
+
 def fit(df, y: str, xs: list[str]) -> dict:
     import pyfixest as pf
 
@@ -200,16 +230,20 @@ def fit(df, y: str, xs: list[str]) -> dict:
 
 
 def main() -> None:
+    global LO, HI, W
     ap = argparse.ArgumentParser()
     ap.add_argument("--panel", type=Path, default=Path("build/cms_partd/movers/panel.parquet"))
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--no-fit", action="store_true")
     ap.add_argument("--grouping", choices=GROUPINGS, default="groups6")
+    ap.add_argument("--window", choices=list(WINDOWS), default="bn", help="bn 2013-2019 (paper), all 2013-2024")
     a = ap.parse_args()
+    W = a.window
+    LO, HI = WINDOWS[W]
     a.out.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
     p = load(a.panel, a.grouping)
-    res: dict = {"grouping": a.grouping, "groups_regex": GROUPS, "variants": {}}
+    res: dict = {"grouping": a.grouping, "window": [W, LO, HI], "groups_regex": GROUPS, "variants": {}}
     for v in VARIANTS:
         reg, info = build(p, v)
         reg.sort("npi", "year").write_parquet(a.out / f"movers_{v}.parquet")
@@ -218,11 +252,16 @@ def main() -> None:
         if a.no_fit:
             continue
         for y in OUTCOMES:
-            r, es, summ = regressors(reg.filter(c(y).is_finite() & c(f"delta_{y}").is_not_null()), y)
-            df = r.select("npi", "rel_origin", y, *es, *summ).to_pandas()
-            res["variants"][v]["fits"][y] = {"eq1": fit(df, y, es), "eq2": fit(df, y, summ)}
-            e2 = res["variants"][v]["fits"][y]["eq2"]
-            print(v, y, "eq2", e2["N"], e2["coef"], flush=True)
+            ok = c(f"delta_{y}").is_not_null() & pl.all_horizontal([c(z).is_finite() for z in [y, *PARTS[y]]])
+            r, es, summ = regressors(reg.filter(ok), y)
+            r, coh = cohort_regressors(r, y)
+            df = r.select("npi", "rel_origin", y, *PARTS[y], *es, *summ, *coh).to_pandas()
+            fy = res["variants"][v]["fits"][y] = {"eq1": fit(df, y, es), "eq2": fit(df, y, summ),
+                                                  "eq2_cohort": fit(df, y, coh)}
+            # decomposition: each part on the total's delta, same rows
+            fy["parts"] = {z: fit(df, z, summ) for z in PARTS[y]}
+            tot = sum(fy["parts"][z]["coef"]["b_post"][0] for z in PARTS[y])
+            print(v, y, "eq2", fy["eq2"]["N"], fy["eq2"]["coef"]["b_post"], "parts sum", round(tot, 6), flush=True)
     res["seconds"] = round(time.time() - t0, 1)
     (a.out / "results.json").write_text(json.dumps(res, indent=1, default=str))
 
