@@ -522,6 +522,64 @@ def test_late_task_copied_and_counted_once(tmp_path, monkeypatch):
     assert took < 15, took
 
 
+def _quick(i):
+    import time
+
+    time.sleep(0.05)
+    return {"part": [i], "x": i, "timing": {"total": 0.05}}
+
+
+def test_task_whose_part_is_in_is_not_copied(tmp_path):
+    """A task whose part has come back but whose result is late (its strip waits for a thread)
+    has won: it is not copied, and nothing of it is cancelled. H L2 36337907 copied such a task;
+    the copy won and dropping the first attempt cancelled its part, already in the combine tree,
+    and the scheduler's cancel asserted (`assert ts.who_wants`) and dropped the client at the
+    end of CG step 1."""
+    import os
+    import threading
+    import time
+
+    distributed = pytest.importorskip("distributed")
+    n, d = 12, str(tmp_path)
+    got, seen = {}, []
+
+    def strip(r):  # task 0's first strip is late (3 s); its part is not
+        if r["x"] == 0:
+            try:
+                os.close(os.open(os.path.join(d, "late"), os.O_CREAT | os.O_EXCL))
+                time.sleep(3)
+            except FileExistsError:
+                pass
+        return {k: v for k, v in r.items() if k != "part"}
+
+    red = Reduce(get=lambda r: r["part"], strip=strip, combine=_combine, done=lambda p: got.setdefault("sum", p))
+    prog = Progress(None, label="t", every=1e9)
+    prog.add_stage("s", {i: 1 for i in range(n)})
+    prog.start("s")
+    err = []
+    with (
+        distributed.LocalCluster(n_workers=3, threads_per_worker=2, dashboard_address=None) as lc,
+        distributed.Client(lc) as c,
+    ):
+        ex = DaskExecutor(c, max_workers=3, tick=0.05)
+        ex.copy_after_s = 0.5
+
+        def go():
+            try:
+                ex.run(_quick, [(i, 1, (i,)) for i in range(n)], lambda tid, r: seen.append(tid), prog, "s",
+                       reduce=red, affinity="fit")
+            except BaseException as e:
+                err.append(e)
+
+        t = threading.Thread(target=go, daemon=True)
+        t.start()
+        t.join(30)
+        assert not t.is_alive(), "run hung"
+    assert not err, err
+    assert sorted(got["sum"]) == list(range(n))  # every part once
+    assert sorted(seen) == list(range(n))
+
+
 @pytest.mark.parametrize("n", [1, 5, 17])
 @pytest.mark.parametrize("dask", [False, True])
 def test_reduce_trees_sum_each_slice_once(n, dask):

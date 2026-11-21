@@ -753,9 +753,14 @@ class DaskExecutor:
         def settle(f):  # f's attempt brought back something first: the other one goes
             nonlocal n_won
             tid = futs[f]
-            if tid not in copied or tid in won:
+            if tid in won:
                 return
+            # won even with no copy yet: a task whose part is in the tree but whose result is
+            # late must not be copied, since dropping it would cancel into the combines (H L2
+            # 36337907: the scheduler's cancel asserted and dropped the client)
             won.add(tid)
+            if tid not in copied:
+                return
             n_won += f in copy_w
             for g in (first[tid], copied[tid]):
                 if g is not f and g in pending:
@@ -895,7 +900,7 @@ class DaskExecutor:
                             out = {
                                 futs[f]: (w, now - handed[futs[f]])
                                 for f, w in fworker.items()
-                                if futs[f] not in copied
+                                if futs[f] not in copied and futs[f] not in won
                             }
                             rate = sorted(per_row)[len(per_row) // 2]
                             late = feeder.stragglers(out, rate, busy, self.copy_after_s, self.copy_factor)
