@@ -1,5 +1,7 @@
 """Executors: the combine tree (Reduce) on Dask and in-process."""
 
+import threading
+
 import pytest
 
 from dfeols.executors import MISS_COST, DaskExecutor, Reduce, SerialExecutor, _Feeder
@@ -525,13 +527,21 @@ def test_late_task_copied_and_counted_once(tmp_path, monkeypatch):
 def test_reduce_trees_sum_each_slice_once(n, dask):
     # Reduce.trees: each result's part taken in slices get(result, j), one tree a slice; done
     # gets the list of the trees' sums
+    # done holds an unpicklable lock: the tasks must not carry the Reduce (b0df5d7 submitted the
+    # bound Reduce.part, which put round 1's done and its sums in every task: H L2 36318522)
     got = {}
     k = 3
+    lock = threading.Lock()
+
+    def done(sums):
+        with lock:
+            got.setdefault("sums", sums)
+
     red = Reduce(
         get=lambda r, j: [x for x in r["part"] if x % k == j],
         strip=lambda r: {a: b for a, b in r.items() if a != "part"},
         combine=_combine,
-        done=lambda sums: got.setdefault("sums", sums),
+        done=done,
         trees=k,
     )
     prog = Progress(None, label="t", every=1e9)

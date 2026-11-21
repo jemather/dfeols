@@ -628,13 +628,24 @@ def _drop_singletons(plan: Plan, ds: Dataset, executor, prog: Progress, rows: di
     done.unlink(missing_ok=True)  # a run that stops in the passes leaves no record
     t0 = time.time()
     gcount, p, total = None, 0, 0
+    # each shard's kept rows after the last pass: a pass's drops are counted from them, not from
+    # the task's own "dropped", which is 0 when the task ran twice (a worker lost after the mask
+    # was written: H L2 36294727 undercounted by 5,078 rows, and a pass so undercounted to 0
+    # would end the passes early)
+    kept: dict = {}
     while True:
         p += 1
         name = f"singletons{p}"
         acc = {"g": [np.zeros(L, np.int64) for *_, L in plan.global_fes], "dropped": 0}
 
-        def on(tid, r, acc=acc):
-            acc["dropped"] += r["dropped"]
+        def on(tid, r, acc=acc, p=p):
+            k = r.get("kept")
+            if k is None or p == 1 or tid not in kept:
+                acc["dropped"] += r["dropped"]
+            else:
+                acc["dropped"] += kept[tid] - k
+            if k is not None:
+                kept[tid] = k
             for i, (lv, c) in enumerate(r["gcount"]):  # sparse: this shard's levels
                 np.add.at(acc["g"][i], lv, c)
 

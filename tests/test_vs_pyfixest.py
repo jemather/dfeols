@@ -3,6 +3,7 @@
 Run:  pytest -q tests/        (add -k dask to run only the Dask tests)
 """
 
+import json
 import sys
 import warnings
 from pathlib import Path
@@ -839,6 +840,43 @@ def test_cells_worker_memory_has_no_dummies(ds_cw):
     assert cells < 3 < estimate_worker_gb(p, 2_000_000, len(ds.columns))
     p.n_dummy = 71_908
     assert estimate_worker_gb(p, 2_000_000, len(ds.columns), cells=True) == cells
+
+
+def test_singleton_count_with_task_reruns(singleton_data, tmp_path, monkeypatch):
+    # a singleton task can run twice (its worker lost after the mask was written): the rerun
+    # reads the mask it wrote, so its own "dropped" is 0. The pass's count must not depend on
+    # it (H L2: 2,113,976 rows with a pool lost in pass 2, 2,119,054 without)
+    import dfeols.estimate as est
+
+    ds = dfeols.prep(
+        singleton_data,
+        shard_dir=tmp_path / "s",
+        partition="id_a",
+        fixed_effects=["spell", "week", "tenure", "rare"],
+        clusters=["id_a"],
+        target_rows=3000,
+    )
+    f = "eng ~ feat + posts | spell + tenure + rare"
+    kw = dict(cluster="id_a", crossing_fe="dense", max_dummy_levels=10_000, log_every=1e9)
+    real = est.shard_singletons
+
+    def twice(plan, sid, files, gcount, first):
+        real(plan, sid, files, gcount, first)
+        return real(plan, sid, files, gcount, first)
+
+    counts = {}
+    for name, fn in (("once", real), ("twice", twice)):
+        monkeypatch.setattr(est, "shard_singletons", fn)
+        monkeypatch.setattr(est, "check_sample", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("stop")))
+        with pytest.raises(RuntimeError, match="stop"):
+            dfeols.fit(ds, f, **kw, workdir=str(tmp_path / name))
+        rec = json.loads((tmp_path / name / "singletons" / est.SINGLETONS_DONE).read_text())
+        counts[name] = (rec["dropped"], rec["passes"])
+    assert counts["once"][1] >= 3  # rows dropped after pass 1, where reruns undercounted
+    assert counts["twice"] == counts["once"]
+    monkeypatch.undo()
+    a = dfeols.fit(ds, f, **kw, workdir=str(tmp_path / "once"))
+    assert a.timing["singletons_reused"]
 
 
 def test_singleton_masks_reused_after_a_failed_fit(singleton_data, tmp_path, monkeypatch):

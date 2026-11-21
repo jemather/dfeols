@@ -56,7 +56,15 @@ class Reduce:
     trees: int = 1
 
     def part(self, res, j: int = 0):
-        return self.get(res) if self.trees == 1 else self.get(res, j)
+        return _take_part(self.get, self.trees, res, j)
+
+
+def _take_part(get: Callable, trees: int, res, j: int):
+    """A result's part (slice j with several trees). Dask tasks submit this with `get`, never
+    the bound `Reduce.part`: that pickles the whole Reduce, `done` and what it holds, into every
+    task (b0df5d7, H L2 36318522: round 1's done held its 22.5M-level sums, a 1.2 GiB graph,
+    and the coordinator ran out of memory)."""
+    return get(res) if trees == 1 else get(res, j)
 
 
 class _Tree:
@@ -703,7 +711,7 @@ class DaskExecutor:
                 hi = {"priority": n + 1, "pure": False}  # ahead of the shards still queued
                 for j in range(reduce.trees):  # one slice a tree (Reduce.trees)
                     pk = f"{key}-part" + (f"{j}" if reduce.trees > 1 else "")
-                    part = self.client.submit(reduce.part, m, j, key=pk, **hi)
+                    part = self.client.submit(_take_part, reduce.get, reduce.trees, m, j, key=pk, **hi)
                     pool.add(part, j)
                     part_futs.add(part)
                     part.add_done_callback(doneq.put)

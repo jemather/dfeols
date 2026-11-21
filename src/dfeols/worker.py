@@ -432,6 +432,9 @@ def shard_singletons(plan: Plan, shard_id: int, files: list[str], gcount, first:
     return {
         "shard": shard_id,
         "dropped": before - int(keep.sum()),
+        # the coordinator counts a pass's drops from these (_drop_singletons): a rerun of a task
+        # whose first attempt already wrote the mask reports dropped 0 (H L2 36294727)
+        "kept": int(keep.sum()),
         "gcount": [_sparse_count(lv, inv, keep) for lv, inv in glob],
         "timing": {"total": time.perf_counter() - t0, "maxrss_gb": _maxrss_gb()},
     }
