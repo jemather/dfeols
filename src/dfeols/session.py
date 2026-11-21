@@ -1706,6 +1706,9 @@ class Manager:
         self.status = "ready"
         if self.hours:
             self.ends = time.time() + self.hours * 3600
+        # the idle clock, like the walltime, starts at ready: demeaning longer than
+        # idle_minutes closed the session the moment it was ready (fpp_eng3, 2026-11-20)
+        self.last_request = time.time()
         self._save_state()
         log.info("session %s: ready (%s)", self.name, self.id)
 

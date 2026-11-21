@@ -316,6 +316,26 @@ def test_idle_end_is_closed_and_hours_count_from_ready(ds, roots, tmp_path):
     assert coll["events"][-1]["message"].startswith("idle for")
 
 
+def test_idle_counts_from_ready_not_from_launch(ds, roots, tmp_path, monkeypatch):
+    """Demeaning that outlasts idle_minutes must not close the session as it becomes ready."""
+    import time
+
+    r = {"root": tmp_path / "s", "demeaned": roots["demeaned"]}
+    m = Manager("slow", Spec.make(ds.root, "spell", ["eng", "feat"]), idle_minutes=0.05, poll=0.05, **r)
+    load = m._load_data
+
+    def slow_load():
+        time.sleep(4)  # longer than the 3 s idle limit
+        load()
+
+    monkeypatch.setattr(m, "_load_data", slow_load)
+    m.start()
+    assert time.time() - m.last_request < 1
+    t0 = time.time()
+    assert m.serve() == "closed"
+    assert time.time() - t0 >= 2.5  # it waited out the idle limit after ready
+
+
 @pytest.mark.parametrize("level_space_gb", [None, 0])
 def test_crossing_fe_iterate(ds, tmp_path, level_space_gb):
     """Crossing FEs above max_dummy_levels: plan C, one CG solve for every declared variable
