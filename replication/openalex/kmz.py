@@ -23,6 +23,20 @@ Here (choices agreed with Ted 2026-11-22, docs/openalex.md):
                at the gap's midpoint (midpoint) or at a uniformly drawn year (random, --seed). Years before
                the first or after the last active year are not filled. The sample (>= 2 top-25 years) is
                always judged on active years, so the authors are the same under every --fill.
+  --affil-fallback  author-years with no institution on any paper take OpenAlex's author-level
+               affiliation years (author_affil), weight 1 per listed institution
+  --lag L      output is credited L years before publication (KMZ: Ellison's submission-acceptance lag
+               + 1 year, about 2-3 years); default 0
+  pages        an article's length is last - first + 1 when OpenAlex has a last page, else the next
+               distinct first page in the same journal and year minus its own first page (pages run on
+               within a volume); the year's last article gets the journal-decade median. Articles under
+               3 pages are dropped (KMZ do too). Outcomes impact_pages (pages x IF / coauthors, KMZ's unit
+               without the AER-equivalent font adjustment) and articles3 (count of 3+ page articles)
+  core samples econ_core / econbus_core: also a career span (first to last active year) of 5+ years and
+               3+ articles in the 41 journals 1970-2001, a stand-in for KMZ's faculty-only sample
+  --prefer-edu the main institution is chosen among education-type institutions when the author-year has
+               one (a CV's primary appointment, not the Fed, NBER or World Bank listed alongside)
+  aliases      ALIAS maps system-office roots to the KMZ school (always on, from 2026-11-22)
 Not available: rank, chaired, visiting, editor.
 
     cd /srv/dfeols && .venv/bin/python -I repo/replication/openalex/kmz.py --out build/openalex/kmz
@@ -44,6 +58,8 @@ TOP25 = {40347166: "Chicago", 79576946: "Penn", 136199984: "Harvard", 57206974: 
          20089843: "Princeton", 52357470: "Ohio State", 205783295: "Cornell", 135310074: "Wisconsin",
          170897317: "Duke", 141945490: "UBC", 219193219: "Purdue", 201448701: "Washington",
          592451: "Indiana", 86519309: "UT Austin", 74973139: "Carnegie Mellon", 1174212: "USC"}
+# OpenAlex roots that stand for a KMZ school (system offices): Wisconsin System -> Madison, UT System -> Austin
+ALIAS = {1304256225: 135310074, 16452829: 86519309}
 # KMZ Table 2: impact factor by decade (1970s, 1980s, 1990s); journals founded in the 1980s get the 1980s value
 IF = {"AER": (1.00, 1.00, 1.00), "JPE": (.93, .75, .72), "JFE": (.85, 1.04, .88), "REStat": (.74, .43, .51),
       "Econometrica": (.71, .89, .49), "REStud": (.69, .59, .67), "RAND": (.61, .66, .41), "Bell": (.61, .66, .41),
@@ -61,8 +77,10 @@ Y0, Y1 = 1970, 2001
 DEC = pl.when(c("year") >= 1990).then(1990).otherwise(c("year") // 10 * 10)
 
 
-def main_inst(df: pl.DataFrame) -> pl.DataFrame:
-    d = df.group_by("author_id", "year", "root").agg(c("weight").sum())
+def main_inst(df: pl.DataFrame, prefer_edu: bool = False) -> pl.DataFrame:
+    d = df.group_by("author_id", "year", "root").agg(c("weight").sum(), c("edu").max())
+    if prefer_edu:
+        d = d.filter(c("edu") | ~c("edu").any().over("author_id", "year"))
     return (d.sort(["author_id", "year", "weight", "root"], descending=[False, False, True, False])
             .group_by("author_id", "year", maintain_order=True)
             .agg(c("root").first().alias("inst"), (c("weight").first() / c("weight").sum()).alias("share")))
@@ -92,9 +110,10 @@ def fill_gaps(s: pl.DataFrame, how: str, seed: int) -> pl.DataFrame:
 
 def build(a) -> pl.DataFrame:
     stage, pan = a.openalex / "stage", a.openalex / "panel"
-    inst = pl.read_parquet(stage / "institutions" / "*.parquet", columns=["institution_id", "lineage"])
+    inst = pl.read_parquet(stage / "institutions" / "*.parquet", columns=["institution_id", "lineage", "type"])
+    edu = inst.select(c("institution_id").alias("root"), (c("type") == "education").alias("edu"))
     tops = inst.filter(c("lineage").list.len() == 1).select(c("institution_id").alias("lineage"))
-    root = (inst.explode("lineage").join(tops, on="lineage", how="semi").sort("institution_id", "lineage")
+    root = (inst.select("institution_id", "lineage").explode("lineage").join(tops, on="lineage", how="semi").sort("institution_id", "lineage")
             .group_by("institution_id").agg(c("lineage").first().alias("root")))
     jb = pl.read_parquet(a.openalex / "kmz" / "journals.parquet")
     jauth = pl.read_parquet(a.openalex / "kmz" / "authors.parquet").select("author_id")
@@ -106,12 +125,22 @@ def build(a) -> pl.DataFrame:
         econ = fld.filter(c("field_id") == 20).select("author_id")
         eb = fld.filter(c("field_id").is_in([20, 14])).join(jauth, on="author_id", how="semi").select("author_id")
         u = pl.concat([econ, eb]).unique()
-        start = p.join(u, on="author_id", how="semi").group_by("author_id").agg(c("year").min().alias("first_year"))
+        start = p.join(u, on="author_id", how="semi").group_by("author_id").agg(c("year").min().alias("first_year"),
+                                                                                  c("year").max().alias("last_year"))
         yrs = p.join(u, on="author_id", how="semi").filter(c("year").is_between(Y0 - 15, Y1 + 5)).select("author_id", "year")
         ayi = (pl.scan_parquet(pan / "a" / "ayi" / f"b={b:02d}" / "*.parquet")
                .filter(c("year").is_between(Y0 - 15, Y1 + 5)).join(u.lazy(), on="author_id", how="semi")
-               .collect().join(root, on="institution_id", how="left").with_columns(c("root").fill_null(c("institution_id"))))
-        m = main_inst(ayi).sort("author_id", "year")
+               .collect())
+        if a.affil_fallback:
+            fb = (pl.scan_parquet(stage / "author_affil" / "*.parquet")
+                  .filter(c("year").is_between(Y0 - 15, Y1 + 5) & c("institution_id").is_not_null())
+                  .join(u.lazy(), on="author_id", how="semi").unique().collect()
+                  .join(ayi.select("author_id", "year").unique(), on=["author_id", "year"], how="anti")
+                  .with_columns(pl.lit(1.0).alias("weight")))
+            ayi = pl.concat([ayi, fb.select(ayi.columns)], how="vertical_relaxed")
+        ayi = (ayi.join(root, on="institution_id", how="left").with_columns(c("root").fill_null(c("institution_id")))
+               .with_columns(c("root").replace(ALIAS)).join(edu, on="root", how="left").with_columns(c("edu").fill_null(False)))
+        m = main_inst(ayi, a.prefer_edu).sort("author_id", "year")
         o = "author_id"
         m = m.with_columns(c("inst").shift(1).over(o).alias("p_inst"), c("share").shift(1).over(o).alias("p_share"),
                            c("inst").shift(-1).over(o).alias("n_inst"), c("year").shift(-1).over(o).alias("n_year"),
@@ -138,17 +167,35 @@ def build(a) -> pl.DataFrame:
     # outcomes from the 41 journals
     ifd = pl.DataFrame([{"abbr": k, "decade": d, "if": v[i]} for k, v in IF.items() for i, d in enumerate((1970, 1980, 1990))])
     w = (pl.scan_parquet(stage / "works" / "*.parquet").join(jb.lazy(), on="source_id", how="inner")
-         .filter(c("type").is_in(["article", "review"]) & c("year").is_between(Y0, Y1)
+         .filter(c("type").is_in(["article", "review"]) & c("year").is_between(Y0, Y1 + a.lag)
                  & ~c("is_paratext").fill_null(False) & ~c("is_retracted").fill_null(False))
-         .select("work_id", "abbr", "authors_count").collect(engine="streaming"))
+         .select("work_id", "source_id", "abbr", "year", "authors_count",
+                 c("first_page").cast(pl.Int32, strict=False).alias("fp"), c("last_page").cast(pl.Int32, strict=False).alias("lp"))
+         .collect(engine="streaming"))
+    nxt = (w.filter(c("fp").is_not_null()).select("source_id", "year", "fp").unique().sort("source_id", "year", "fp")
+           .with_columns(c("fp").shift(-1).over("source_id", "year").alias("nfp")))
+    w = w.join(nxt, on=["source_id", "year", "fp"], how="left").with_columns(
+        pl.when(c("lp") > c("fp")).then(c("lp") - c("fp") + 1)
+        .when(c("nfp") > c("fp")).then(c("nfp") - c("fp")).alias("pages"))
+    w = w.with_columns(pl.when(c("pages").is_between(1, 100)).then(c("pages")).alias("pages"))
+    w = w.with_columns(DEC.alias("decade")).with_columns(
+        c("pages").fill_null(c("pages").median().over("source_id", "decade")).fill_null(10).alias("pages"))
+    w = w.select("work_id", "abbr", "authors_count", "pages")
     au = s.select("author_id").unique()
     aw = (pl.scan_parquet(stage / "authorships" / "*.parquet").select("work_id", "author_id", "year")
           .join(w.lazy(), on="work_id", how="inner").join(au.lazy(), on="author_id", how="semi")
           .unique(["work_id", "author_id"]).collect(engine="streaming")
-          .with_columns(DEC.alias("decade")).join(ifd, on=["abbr", "decade"], how="left"))
+          .with_columns(DEC.alias("decade")).join(ifd, on=["abbr", "decade"], how="left")
+          .with_columns((c("year") - a.lag).cast(pl.Int16).alias("year")))
+    fr = c("if") / c("authors_count").clip(lower_bound=1)
+    ok = c("pages") >= 3
     y = aw.group_by("author_id", "year").agg(
-        (c("if") / c("authors_count").clip(lower_bound=1)).sum().alias("impact"), pl.len().cast(pl.Float64).alias("articles"))
-    s = s.join(y, on=["author_id", "year"], how="left").with_columns(c("impact").fill_null(0.0), c("articles").fill_null(0.0))
+        fr.sum().alias("impact"), pl.len().cast(pl.Float64).alias("articles"),
+        (fr * c("pages")).filter(ok).sum().alias("impact_pages"), ok.sum().cast(pl.Float64).alias("articles3"))
+    ys = ("impact", "articles", "impact_pages", "articles3")
+    kart = aw.filter(c("year").is_between(Y0, Y1)).group_by("author_id").agg(pl.len().alias("kmz_articles"))
+    s = (s.join(y, on=["author_id", "year"], how="left").with_columns(*[c(v).fill_null(0.0) for v in ys])
+         .join(kart, on="author_id", how="left").with_columns(c("kmz_articles").fill_null(0)))
     cy = (c("year") - c("first_year")).cast(pl.Float64)
     s = s.with_columns(cy.alias("cy"), (cy**2 / 100).alias("cy2"), (cy**3 / 1000).alias("cy3"),
                        *[(c("top25") & (c("decade") == d)).cast(pl.Float64).alias(f"t{d % 100:02d}") for d in (1970, 1980, 1990)])
@@ -161,15 +208,19 @@ def estimate(s: pl.DataFrame, work: Path, label: str) -> dict:
     import dfeols
 
     xs = "t70 + t80 + t90 + cy + cy2 + cy3"
+    ys = ("impact", "articles", "impact_pages", "articles3")
+    desc = (s.group_by("decade", "top25").agg(*[c(v).mean() for v in ("impact_pages", "articles3")], pl.len())
+            .sort("decade", "top25").to_dicts())
     out = {"label": label, "N": s.height, "authors": s["author_id"].n_unique(), "moves": int(s["move"].sum()),
-           "filled_share": float(s["filled"].mean()),
-           "means": {k: float(s[k].mean()) for k in ("impact", "articles")}}
+           "filled_share": float(s["filled"].mean()), "years_per_author": s.height / s["author_id"].n_unique(),
+           "means": {k: float(s[k].mean()) for k in ys}, "by_decade_top25": desc}
     work.mkdir(parents=True, exist_ok=True)
-    s.select("author_id", "decade", "impact", "articles", "t70", "t80", "t90", "cy", "cy2", "cy3").write_parquet(work / "data.parquet")
+    cols = ["author_id", "decade", *ys, "t70", "t80", "t90", "cy", "cy2", "cy3"]
+    s.select(cols).write_parquet(work / "data.parquet")
     ds = dfeols.prep(str(work / "data.parquet"), shard_dir=work / "shards", partition="author_id",
                      fixed_effects=["author_id", "decade"], clusters=["author_id"], target_rows=50_000, overwrite=True)
-    pdf = s.select("author_id", "decade", "impact", "articles", "t70", "t80", "t90", "cy", "cy2", "cy3").to_pandas()
-    for yv in ("impact", "articles"):
+    pdf = s.select(cols).to_pandas()
+    for yv in ys:
         f = f"{yv} ~ {xs} | author_id + decade"
         t0 = time.time()
         r = dfeols.fit(ds, f, cluster="author_id", workdir=str(work / f"fit_{yv}"), log_every=1e9, record=False)
@@ -192,6 +243,9 @@ def main() -> None:
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--fill", choices=["none", "midpoint", "random"], default="none")
     ap.add_argument("--seed", type=int, default=20261122)
+    ap.add_argument("--lag", type=int, default=0)
+    ap.add_argument("--affil-fallback", action="store_true")
+    ap.add_argument("--prefer-edu", action="store_true")
     a = ap.parse_args()
     a.out.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
@@ -204,13 +258,16 @@ def main() -> None:
         "econbus_f20": s.filter(c("in_econbus") & (c("field_id") == 20)),
         "econbus_f14": s.filter(c("in_econbus") & (c("field_id") == 14)),
     }
-    res = {"fill": a.fill, "seed": a.seed if a.fill == "random" else None, "kmz": KMZ, "kmz_b_over_mean": {k: [b / KMZ["impact_mean"] for b in v] for k, v in KMZ.items() if k in ("econ", "finance")},
+    core = (c("last_year") - c("first_year") >= 5) & (c("kmz_articles") >= 3)
+    samples["econ_core"] = s.filter(c("in_econ") & core)
+    samples["econbus_core"] = s.filter(c("in_econbus") & core)
+    res = {"fill": a.fill, "seed": a.seed if a.fill == "random" else None, "lag": a.lag, "affil_fallback": a.affil_fallback, "prefer_edu": a.prefer_edu, "kmz": KMZ, "kmz_b_over_mean": {k: [b / KMZ["impact_mean"] for b in v] for k, v in KMZ.items() if k in ("econ", "finance")},
            "results": []}
     for k, d in samples.items():
         r = estimate(d, a.out / "work" / k, k)
         res["results"].append(r)
         print(json.dumps({"sample": k, "N": r["N"], "authors": r["authors"], "moves": r["moves"],
-                          **{yv: {v: round(r[yv]["coef"][v]["b"], 4) for v in ("t70", "t80", "t90")} for yv in ("impact", "articles")}}), flush=True)
+                          **{yv: {v: round(r[yv]["coef"][v]["b"], 4) for v in ("t70", "t80", "t90")} for yv in ("impact_pages", "articles3")}}), flush=True)
     (a.out / "results.json").write_text(json.dumps(res, indent=1))
 
 
