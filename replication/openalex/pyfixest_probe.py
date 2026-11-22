@@ -379,6 +379,8 @@ def run(engine: str, data: str, work: Path, mem_cap: float, time_cap: float, log
         rec["coef"] = {t: {"b": float(f["coef"][t]), "se": float(f["se"][t])} for t in TS}
     if engine.startswith("fixest") and rec.get("estrec_error"):
         rec["estrec_error"] = str(rec["estrec_error"])[:500]
+    if t_done is None and done.exists():  # the engine exited before the watchdog's next look
+        t_done = done.stat().st_mtime
     if t_done is not None:  # the fit finished; only the record step ran after fit_done
         rec["record_wall_sec"] = round(time.time() - t_done, 1)
         rec["record_peak_rss_gb"] = round(rec_peak, 2)
