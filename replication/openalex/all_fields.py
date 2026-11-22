@@ -1,16 +1,19 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """D14 stage 4: the KMZ (2009) Table 5 Panel D specification in every OpenAlex field.
 
-Uses a `full.py` variant (default edu). Field = the author's modal OpenAlex field (26 fields).
-Top institutions, two definitions:
+Reads the OSCER package (`package.py`, outbox/openalex_kmz_panel_v1), so the local fits use the
+same flags as OSCER. Field = the author's modal OpenAlex field (26 fields).
+Top institutions (--tops; Ted 2026-11-22):
   kmz     KMZ's 25 economics schools, the same 25 in every field
-  field   per field, the 25 education institutions with the most frac_cites by authors whose main
-          institution it was in 1990-1999 (fixed ranking, as KMZ's)
-Sample per field and definition: authors with 2+ unfilled years at a top institution in 1970-2025,
-career span 5+ years and 3+ works (the all-journal analogue of KMZ's core); years 1970-2025.
+  f1990   per field, the 25 education institutions with the most frac_cites in the 1990s, fixed
+  f2010   the same ranked on the 2010s (the latest complete decade), fixed
+  fdec    the same ranked within each row's own decade
+  (f1970, f1980, f2000 are in the package too)
+Sample per field and definition: ever_<top> (2+ unfilled years at a top institution in 1970-2025)
+and core (career span 5+ years, 3+ works); years 1970-2025.
 Outcomes frac_works and frac_cites (all journals; impact_pages exists only for economics).
 y = author FE + decade FE + sum_d b_d [top x decade d] + career cubic, CRV1 by author, per field.
-Pooled: all fields together, y divided by its field x year mean in the sample, FE author +
+Pooled: all fields together, y divided by its field x year mean over the whole panel, FE author +
 field x decade, top x decade terms common to all fields.
 
     cd /srv/dfeols && .venv/bin/python -I repo/replication/openalex/all_fields.py --out build/openalex/all_fields
@@ -20,14 +23,10 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
 import time
 from pathlib import Path
 
 import polars as pl
-
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from kmz import TOP25  # noqa: E402
 
 c = pl.col
 FIELDS = {11: "Agricultural and Biological Sciences", 12: "Arts and Humanities", 13: "Biochemistry, Genetics and Molecular Biology",
@@ -40,36 +39,18 @@ FIELDS = {11: "Agricultural and Biological Sciences", 12: "Arts and Humanities",
 YS = ("frac_works", "frac_cites")
 
 
-def load(full: Path, variant: str) -> pl.DataFrame:
-    return (pl.scan_parquet(full / variant / "*.parquet").filter(c("year").is_between(1970, 2025) & c("field_id").is_in(list(FIELDS)))
-            .select("author_id", "year", "inst", "filled", "first_year", "last_year", "field_id", "works", "frac_works", "frac_cites",
-                    c("top25").alias("top_kmz"))
-            .collect(engine="streaming"))
+def load(pkg: Path, tops: list[str]) -> pl.LazyFrame:
+    keep = ["author_id", "year", "field_id", "decade", "field_decade", "cy", "cy2", "cy3", "core",
+            *YS, *[f"{y}_n" for y in YS], *[f"top_{t}" for t in tops], *[f"ever_{t}" for t in tops]]
+    return (pl.scan_parquet(pkg / "data" / "*.parquet")
+            .filter(c("year").is_between(1970, 2025) & c("field_id").is_in(list(FIELDS)) & c("core")).select(keep))
 
 
-def field_tops(s: pl.DataFrame, oa: Path) -> pl.DataFrame:
-    inst = pl.read_parquet(oa / "stage" / "institutions" / "*.parquet", columns=["institution_id", "display_name", "type"])
-    edu = inst.filter(c("type") == "education").select(c("institution_id").alias("inst"), "display_name")
-    return (s.filter(c("year").is_between(1990, 1999) & ~c("filled")).join(edu, on="inst", how="semi")
-            .group_by("field_id", "inst").agg(c("frac_cites").sum())
-            .sort(["field_id", "frac_cites", "inst"], descending=[False, True, False])
-            .group_by("field_id", maintain_order=True).head(25)
-            .join(edu, on="inst", how="left").with_columns(pl.int_range(pl.len()).over("field_id").alias("rank")))
-
-
-def sample(s: pl.DataFrame, top: str) -> pl.DataFrame:
-    ev = s.filter(c(top) & ~c("filled")).group_by("author_id").len().filter(c("len") >= 2).select("author_id")
-    core = (s.group_by("author_id").agg(c("works").sum().alias("k"), (c("last_year") - c("first_year")).first().alias("span"))
-            .filter((c("k") >= 3) & (c("span") >= 5)).select("author_id"))
-    w = s.join(ev, on="author_id", how="semi").join(core, on="author_id", how="semi")
-    cy = (c("year") - c("first_year")).cast(pl.Float64)
-    w = w.with_columns((c("year") // 10 * 10).cast(pl.Int16).alias("decade"), cy.alias("cy"), (cy**2 / 100).alias("cy2"),
-                       (cy**3 / 1000).alias("cy3"))
+def sample(s: pl.LazyFrame, top: str) -> pl.DataFrame:
+    w = (s.filter(c(f"ever_{top}")).with_columns(c(f"top_{top}").alias("top"))
+         .drop([x for x in s.collect_schema().names() if x.startswith(("top_", "ever_"))]).collect(engine="streaming"))
     decs = sorted(w["decade"].unique().to_list())
-    w = w.with_columns(*[(c(top) & (c("decade") == d)).cast(pl.Float64).alias(f"t{d}") for d in decs],
-                       c(top).alias("top"))
-    m = [(c(y) / c(y).mean().over("field_id", "year")).alias(f"{y}_n") for y in YS]
-    return w.with_columns(*m, (c("field_id").cast(pl.Int32) * 10000 + c("decade")).alias("field_decade"))
+    return w.with_columns(*[(c("top") & (c("decade") == d)).cast(pl.Float64).alias(f"t{d}") for d in decs])
 
 
 def fit(w: pl.DataFrame, work: Path, ys: list[str], fe: list[str], pyfixest: bool) -> dict:
@@ -106,28 +87,22 @@ def fit(w: pl.DataFrame, work: Path, ys: list[str], fe: list[str], pyfixest: boo
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--openalex", type=Path, default=Path("build/openalex"))
-    ap.add_argument("--full", type=Path, default=Path("build/openalex/full"))
-    ap.add_argument("--variant", default="edu")
+    ap.add_argument("--package", type=Path, default=Path("outbox/openalex_kmz_panel_v1"))
     ap.add_argument("--out", type=Path, required=True)
-    ap.add_argument("--tops", nargs="+", default=["kmz", "field"])
+    ap.add_argument("--tops", nargs="+", default=["kmz", "f1990", "f2010", "fdec"])
     ap.add_argument("--fields", type=int, nargs="*", help="only these fields (testing)")
     ap.add_argument("--no-pooled", action="store_true")
     ap.add_argument("--pyfixest-max-rows", type=int, default=20_000_000)
     a = ap.parse_args()
     a.out.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
-    s = load(a.full, a.variant)
+    s = load(a.package, a.tops)
     if a.fields:
         s = s.filter(c("field_id").is_in(a.fields))
-    ft = field_tops(s, a.openalex)
-    ft.write_parquet(a.out / "field_tops.parquet")
-    s = s.join(ft.select("field_id", "inst", pl.lit(True).alias("top_field")), on=["field_id", "inst"], how="left") \
-         .with_columns(c("top_field").fill_null(False))
-    print(f"{time.time() - t0:.0f}s loaded {s.height:,} rows", flush=True)
-    res = {"variant": a.variant, "fields": FIELDS, "results": []}
+    res = {"package": str(a.package), "fields": FIELDS, "results": []}
     for top in a.tops:
-        w = sample(s, f"top_{top}")
+        w = sample(s, top)
+        print(f"{time.time() - t0:.0f}s {top}: {w.height:,} rows", flush=True)
         for fid in sorted(w["field_id"].unique().to_list()):
             wf = w.filter(c("field_id") == fid)
             r = {"top": top, "field_id": fid, "field": FIELDS[fid],
@@ -144,6 +119,7 @@ def main() -> None:
             print(json.dumps({"top": top, "pooled": True, "N": r["N"],
                               "frac_works_n": {t: round(e["b"], 3) for t, e in r["frac_works_n"]["coef"].items()}}), flush=True)
             (a.out / "results.json").write_text(json.dumps(res, indent=1))
+        del w
     print(f"{time.time() - t0:.0f}s done", flush=True)
 
 
