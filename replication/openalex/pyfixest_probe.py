@@ -395,7 +395,8 @@ def main() -> None:
                 "polars_max_threads": os.environ.get("POLARS_MAX_THREADS"),
                 "dfeols_workers": a.dfeols_workers, "dfeols_cores": a.dfeols_cores})
     done = {(r["engine"], r["m"]) for r in res["runs"] if r["status"] == "ok" and r["of"] == a.of}
-    failed = {r["engine"] for r in res["runs"] if r["status"] != "ok" and r["of"] == a.of}
+    # a forced engine runs again from the first rung and stops at its first failure in this run
+    failed = {r["engine"] for r in res["runs"] if r["status"] != "ok" and r["of"] == a.of} - set(a.force_engines)
     with open(a.out / "workers.log", "a") as log:
         for m in a.rungs:
             rung = make_rung(a.package, a.out, m, a.of)
