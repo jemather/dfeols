@@ -12,6 +12,7 @@ from .glm import fit_glm
 from .lock import LockedError
 from .planner import plan
 from .prep import Dataset, prep
+from .progress import set_verbosity
 from .record import write_collection
 from .results import Result
 from .session import Session
@@ -38,12 +39,15 @@ __all__ = [
     "Stacked",
     "sample_groups",
     "fit_glm",
+    "set_verbosity",
 ]
 __version__ = "0.9.0"
 
 _log = _logging.getLogger("dfeols")
 if not _log.handlers:
-    _h = _logging.StreamHandler()
+    from .progress import LiveAwareHandler as _LiveAwareHandler
+
+    _h = _LiveAwareHandler()
     _h.setFormatter(_logging.Formatter("%(asctime)s %(message)s", "%H:%M:%S"))
     _log.addHandler(_h)
     _log.setLevel(_logging.INFO)

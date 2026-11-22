@@ -159,6 +159,10 @@ def _env_lines(p: Profile, cores: int, memory: str | None = None, worker: bool =
         lines.append(f"export POLARS_OVERRIDE_TOTAL_MEMORY_MB={int(_memory_bytes(memory) * 0.9 / 2**20)}")
     spill = str(p.scratch_dir("tmp", "polars")) if p.scratch else "${TMPDIR:-/tmp}/polars-$USER"
     lines += [f"mkdir -p {spill}", f"export POLARS_TEMP_DIR={spill}", f"export POLARS_OOC_SPILL_DIR={spill}/spill"]
+    # Dask logs "Event loop was unresponsive" at INFO whenever a task holds the GIL over 3 s,
+    # which on OSCER was 95% of a worker's .err (cellxgene H:L2, 36372921: 6521 messages, 26
+    # over 30 s). Report only stalls long enough to matter; a profile's env can lower it.
+    lines.append("export DASK_DISTRIBUTED__ADMIN__TICK__LIMIT=30s")
     lines += [f"export {k}={shlex.quote(str(v))}" for k, v in p.env.items()]
     return lines
 

@@ -17,6 +17,17 @@ break the API).
 
 ### Changed
 
+- Progress output is quieter on long runs. By default (`dfeols.set_verbosity(1)`, or
+  `DFEOLS_VERBOSITY=1`) the log gets a line when the stage, CG step or worker state changes,
+  and otherwise once the stage has moved 5% or 10 minutes have passed, whichever comes first.
+  Between those, a live line is redrawn in place every `log_every` seconds (30) and wiped by
+  the next log line, in a terminal and in a file, so `tail -f` shows the run moving.
+  `sed 's/.*\x1b\[K//' <log>` prints a log without the redraws. Verbosity 2 restores a line
+  every `log_every` seconds; 0 prints no progress lines. `status.json` is still written every
+  `log_every` seconds.
+- Workers report Dask's "Event loop was unresponsive" only for stalls over 30 s
+  (`DASK_DISTRIBUTED__ADMIN__TICK__LIMIT=30s`; it was 3 s and filled about 95% of a worker's
+  `.err` on OSCER). A profile's `env` can set it lower.
 - Public docstrings are in NumPy style, and every parameter of the public API is described.
 - The README is a short landing page; its sections moved to the docs site. `HOWTO.md` moved to
   `docs/guide/workflow.md` ("Workflow on a cluster").

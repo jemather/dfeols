@@ -141,3 +141,112 @@ def test_rows_per_sec_is_what_the_stage_achieves():
     assert 150 < s["rows_per_sec"] < 250
     assert s["eta_seconds"] >= 80_000 / 250
     assert "0.00M" in status_line(snap)  # ~200 rows/s, not 4 x 100k
+
+
+def _replay(tmp_path, level, caplog, monkeypatch, ticks=480, every=30.0):
+    """A 4-hour stage of 27011 shards ticked every 30 s, as in cellxgene H:L2 (36372921)."""
+    import logging
+
+    from dfeols import progress as pm
+
+    pm.set_verbosity(level)
+    try:
+        clock = [1e6]
+        monkeypatch.setattr(pm.time, "time", lambda: clock[0])
+        prog = Progress(tmp_path, label="cx:H:L2", every=every)
+        n = 27011
+        prog.add_stage("cg13", {i: 5_000_000 for i in range(n)})
+        prog.set_slots(40, 40)
+        prog.start("cg13")
+        prog.note = "CG step 12, residual 5.7e-08 (tol 1e-10)"
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="dfeols"):
+            for k in range(ticks):
+                clock[0] += every
+                target = n * (k + 1) // ticks
+                st = prog.stages["cg13"]
+                while len(st.done) < target:
+                    st.done[len(st.done)] = 1.0
+                    st.done_at[len(st.done) - 1] = clock[0]
+                prog.tick()
+        return [r.getMessage() for r in caplog.records]
+    finally:
+        pm._VERBOSITY = None
+
+
+def test_verbosity_1_logs_milestones_and_a_heartbeat(tmp_path, caplog, monkeypatch):
+    msgs = _replay(tmp_path, 1, caplog, monkeypatch)
+    lines = [m for m in msgs if m.startswith("cx:H:L2")]
+    # 5% of this stage is 12 minutes, so the 10-minute heartbeat sets the pace: ~24 lines
+    # in 4 hours, not 480
+    assert 22 <= len(lines) <= 26, len(lines)
+    assert sum("CG step 12" in m for m in lines) == 1  # the note shows once, not on every line
+    assert len((tmp_path / "history.jsonl").read_text().splitlines()) == 480  # status every tick
+
+
+def test_verbosity_2_logs_every_tick_and_0_none(tmp_path, caplog, monkeypatch):
+    lines = [m for m in _replay(tmp_path / "a", 2, caplog, monkeypatch) if m.startswith("cx:H:L2")]
+    assert len(lines) == 480 and all("CG step 12" in m for m in lines)
+    assert _replay(tmp_path / "b", 0, caplog, monkeypatch) == []
+
+
+def test_heartbeat_when_nothing_moves(tmp_path, caplog, monkeypatch):
+    import logging
+
+    from dfeols import progress as pm
+
+    clock = [1e6]
+    monkeypatch.setattr(pm.time, "time", lambda: clock[0])
+    prog = Progress(tmp_path, label="t", every=30.0)
+    prog.verbosity = 1
+    prog.add_stage("round1", {0: 10})
+    prog.set_slots(0, 40)
+    with caplog.at_level(logging.INFO, logger="dfeols"):
+        for _ in range(41):  # 20 minutes waiting for workers
+            clock[0] += 30
+            prog.tick()
+    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("t ")]
+    assert len(lines) == 3  # the first, then one each HEARTBEAT_S
+
+
+def test_live_line_is_wiped_by_the_next_record(monkeypatch):
+    import io
+    import logging
+
+    from dfeols import progress as pm
+
+    class Tty(io.StringIO):
+        def isatty(self):
+            return True
+
+    s = Tty()
+    h = pm.LiveAwareHandler(s)
+    h.setFormatter(logging.Formatter("%(message)s"))
+    monkeypatch.setattr(pm.log, "handlers", [h])
+    assert pm._live_target() is s
+    pm._draw_live(s, "live status")
+    pm.log.warning("a record")
+    out = s.getvalue()
+    assert out.endswith("\r\033[Ka record\n") and "live status" in out
+    assert pm._live_stream is None
+    f = io.StringIO()  # a file (Slurm's .out) gets the live line too, so tail -f shows it move
+    h.stream = f
+    assert pm._live_target() is f
+    monkeypatch.setattr(pm.log, "handlers", [logging.StreamHandler(f)])
+    assert pm._live_target() is None  # a handler the user set up: left alone
+
+
+def test_a_warning_wipes_the_live_line(monkeypatch):
+    import io
+    import warnings
+
+    from dfeols import progress as pm
+
+    s = io.StringIO()
+    pm._draw_live(s, "live status")
+    with warnings.catch_warnings():
+        warnings.simplefilter("always")
+        monkeypatch.setattr(pm, "_showwarning", lambda *a, **k: s.write("WARN\n"))
+        warnings.showwarning = pm._showwarning_clear
+        warnings.warn("slow")
+    assert s.getvalue().endswith("live status\r\033[KWARN\n")

@@ -16,22 +16,113 @@ The ETA model:
     breakdown (read/write + cross-product share), then replaced by measured
     round-2 rates once tasks finish.
 
-Status is logged and written atomically to <workdir>/status.json, which
-`dfeols status <workdir>` prints from any login node.
+Status is written atomically to <workdir>/status.json every `every` seconds, which
+`dfeols status <workdir>` prints from any login node. How much of it reaches the log is set
+by the verbosity (set_verbosity, or DFEOLS_VERBOSITY in the environment):
+
+  0  no progress lines (warnings and the fit's own notes still show)
+  1  (default) a line when the stage, CG step or worker state changes, and otherwise once
+     the stage has moved LOG_PCT% or HEARTBEAT_S seconds have passed since the last line;
+     between those, a live line redrawn every `every` seconds and wiped by the next line
+  2  a line every `every` seconds
 """
 
 from __future__ import annotations
 
+import atexit
 import json
 import logging
 import os
 import time
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
 
 log = logging.getLogger("dfeols")
+
+LOG_PCT = 5.0  # verbosity 1: a line once a stage has moved this % of its rows since the last
+HEARTBEAT_S = 600.0  # ... or this many seconds have passed, whichever comes first
+_VERBOSITY: int | None = None
+
+
+def set_verbosity(level: int) -> None:
+    """Progress lines in the log: 0 none, 1 milestones and a heartbeat (default), 2 every
+    tick. Applies to runs started after the call; DFEOLS_VERBOSITY sets it for a process."""
+    global _VERBOSITY
+    if int(level) not in (0, 1, 2):
+        raise ValueError(f"verbosity must be 0, 1 or 2, not {level!r}")
+    _VERBOSITY = int(level)
+
+
+def verbosity() -> int:
+    if _VERBOSITY is not None:
+        return _VERBOSITY
+    try:
+        v = int(os.environ.get("DFEOLS_VERBOSITY", "1"))
+    except ValueError:
+        return 1
+    return min(max(v, 0), 2)
+
+
+# The live line: verbosity 1 redraws the latest status in place (\r and erase-line, no
+# newline) between log lines. LiveAwareHandler, the package's default handler, wipes it
+# before it writes a record, so only the latest one is ever on screen. It goes to files too
+# (Slurm's .out), so `tail -f` shows the run moving; there each redraw stays in the file as
+# bytes (about 15 KB an hour), and `sed 's/.*\x1b\[K//' log` prints the file without them.
+_live_stream = None
+
+
+def _clear_live():
+    global _live_stream
+    if _live_stream is not None:
+        try:
+            _live_stream.write("\r\033[K")
+            _live_stream.flush()
+        except (OSError, ValueError):
+            pass
+        _live_stream = None
+
+
+class LiveAwareHandler(logging.StreamHandler):
+    def emit(self, record):
+        _clear_live()
+        super().emit(record)
+
+
+def _live_target():
+    """The stream the default handler writes to (terminal or file), or None when the user
+    configured their own handlers."""
+    for h in log.handlers:
+        if isinstance(h, LiveAwareHandler):
+            return getattr(h, "stream", None)
+    return None
+
+
+def _draw_live(stream, text: str):
+    global _live_stream
+    try:
+        stream.write("\r\033[K" + time.strftime("%H:%M:%S ") + text)
+        stream.flush()
+    except (OSError, ValueError):
+        return
+    _live_stream = stream
+
+
+atexit.register(_clear_live)
+
+# warnings (SlowConvergenceWarning, ...) go straight to stderr, not through the handler:
+# wipe the live line first so a warning does not land on the end of it
+_showwarning = warnings.showwarning
+
+
+def _showwarning_clear(*args, **kwargs):
+    _clear_live()
+    _showwarning(*args, **kwargs)
+
+
+warnings.showwarning = _showwarning_clear
 
 
 def fmt_td(s: float | None) -> str:
@@ -123,6 +214,8 @@ class Progress:
         self.t0 = time.time()
         self._last = 0.0
         self._header = HeaderEvery()
+        self.verbosity = verbosity()
+        self._printed: dict | None = None  # what the last log line showed (verbosity 1)
         self.stage2_prior_frac: float | None = None  # round2 secs / round1 secs per row
         self.slots = 1
         self.max_slots: int | None = None
@@ -262,10 +355,7 @@ class Progress:
         global WORK_LEFT
         if snap["eta_total_seconds"] is not None:
             WORK_LEFT = (now, float(snap["eta_total_seconds"]))
-        hdr = status_header(snap)
-        if self._header(hdr):
-            log.info(hdr)
-        log.info(self.line(snap))
+        self._report(snap, now, force)
         rows_all = sum(st.total_rows for st in self.stages.values())
         done_all = sum(st.done_rows for st in self.stages.values())
         self.history.append(
@@ -285,6 +375,57 @@ class Progress:
             tmp = p.with_suffix(".tmp")
             tmp.write_text(json.dumps(snap, indent=1, default=float))
             os.replace(tmp, p)
+
+    def _milestone(self, snap: dict, now: float) -> dict:
+        """What decides whether verbosity 1 logs a line: the current stage, its state (waiting
+        for workers, calibrating, running), the share of its rows done and the note."""
+        stages = snap["stages"]
+        cur = next((s for s in stages if not s["finished"]), stages[-1])
+        eta = cur["eta_seconds"]
+        if snap["workers"] == 0 and not cur["finished"]:
+            state = "waiting"
+        elif eta is None or not np.isfinite(eta):
+            state = "calibrating"
+        else:
+            state = "running"
+        return {
+            "stage": cur["stage"],
+            "state": state,
+            "pct": float(cur["pct_rows"]),
+            "note": snap.get("note") or "",
+            "t": now,
+        }
+
+    def _report(self, snap: dict, now: float, force: bool):
+        if self.verbosity <= 0:
+            return
+        if self.verbosity >= 2:
+            self._log_line(snap)
+            return
+        m, last = self._milestone(snap, now), self._printed
+        due = (
+            force
+            or last is None
+            or any(m[k] != last[k] for k in ("stage", "state", "note"))
+            or m["pct"] - last["pct"] >= LOG_PCT  # both count from the last line printed:
+            or now - last["t"] >= HEARTBEAT_S  # a line at whichever comes first
+        )
+        if due:
+            shown = snap
+            if last is not None and m["note"] == last["note"] and m["stage"] == last["stage"]:
+                shown = {**snap, "note": ""}  # the note is on the line above; don't repeat it
+            self._log_line(shown)
+            self._printed = m
+            return
+        out = _live_target()
+        if out is not None:
+            _draw_live(out, self.line(snap))
+
+    def _log_line(self, snap: dict):
+        hdr = status_header(snap)
+        if self._header(hdr):
+            log.info(hdr)
+        log.info(self.line(snap))
 
 
 # (time.time(), seconds of known work left) from the latest status line of any run in this

@@ -1492,7 +1492,9 @@ def fit(
     label : str, optional
         Name of the fit in the log, `status.json` and the record. Default the spec id.
     log_every : float, default 30.0
-        Seconds between progress lines in the log.
+        Seconds between progress updates: `status.json`, and the log line or live line as
+        `dfeols.set_verbosity` says (by default a log line only at milestones, every 5% of
+        a stage and every 10 minutes).
     record : bool or path, default True
         Write `estimation` records, one per response. True puts them at
         `<workdir>/result.estrec.json` (`result.<y>.estrec.json` with several responses), a
