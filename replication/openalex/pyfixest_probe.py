@@ -67,7 +67,7 @@ def make_dta(rung: dict) -> str:
         tmp = f.with_suffix(".dta.part")
         d.to_pandas().to_stata(tmp, write_index=False, version=118)
         tmp.rename(f)
-    return str(f)
+    return str(f.resolve())  # Stata runs in the fit's work folder
 
 
 def reghdfe_do(dta: str) -> str:
@@ -100,7 +100,9 @@ file close fh
 def read_reghdfe(work: Path) -> dict:
     f = work / "reghdfe.txt"
     if not f.exists():
-        return {"engine": "reghdfe"}
+        log = (work / "fit.log").read_text(errors="replace").splitlines() if (work / "fit.log").exists() else []
+        msg = [x for x in log if x.strip()][-4:]
+        return {"engine": "reghdfe", "status": "error", "error": " | ".join(msg) or "no fit.log"}
     rec: dict = {"engine": "reghdfe", "coef": {}}
     for line in f.read_text().splitlines():
         k, *v = line.split("\t")
