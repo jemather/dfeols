@@ -85,11 +85,16 @@ def spec_group(s: str | None) -> str:
 GROUPINGS = ("groups6", "tab1_4", "raw_spec", "none")
 
 
-def load(panel: Path, grouping: str = "groups6") -> pl.DataFrame:
+def load(panel: Path, grouping: str = "groups6", keep_npis: Path | None = None) -> pl.DataFrame:
     """grouping: groups6 = GROUPS; tab1_4 = Table 1's four (np, dental into other); raw_spec =
-    the CMS Prscrbr_Type label; none = one group (HRR means over all prescribers)."""
+    the CMS Prscrbr_Type label; none = one group (HRR means over all prescribers).
+    keep_npis: Parquet with an `npi` column; only those prescribers are kept, for the cell means
+    (delta) and the movers alike (e.g. NPIs found in Physician Compare, as B&N's sample)."""
+    lf = pl.scan_parquet(panel)
+    if keep_npis is not None:
+        lf = lf.join(pl.scan_parquet(keep_npis).select("npi").unique(), on="npi", how="semi")
     p = (
-        pl.scan_parquet(panel)
+        lf
         .filter(c("year").is_between(LO, HI))
         .select("npi", "year", "hrr", "spec", "cost", "claims", "benes", "benes_censored",
                 f"contig_{W}", f"moves_{W}", f"move_year_{W}", f"npi_any_censored_{W}")
@@ -237,13 +242,15 @@ def main() -> None:
     ap.add_argument("--no-fit", action="store_true")
     ap.add_argument("--grouping", choices=GROUPINGS, default="groups6")
     ap.add_argument("--window", choices=list(WINDOWS), default="bn", help="bn 2013-2019 (paper), all 2013-2024")
+    ap.add_argument("--keep-npis", type=Path, help="Parquet of NPIs to keep (e.g. build/cms_partd/physcomp/npis_2014_2021.parquet)")
     a = ap.parse_args()
     W = a.window
     LO, HI = WINDOWS[W]
     a.out.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
-    p = load(a.panel, a.grouping)
-    res: dict = {"grouping": a.grouping, "window": [W, LO, HI], "groups_regex": GROUPS, "variants": {}}
+    p = load(a.panel, a.grouping, a.keep_npis)
+    res: dict = {"grouping": a.grouping, "window": [W, LO, HI], "groups_regex": GROUPS,
+                 "keep_npis": str(a.keep_npis) if a.keep_npis else None, "variants": {}}
     for v in VARIANTS:
         reg, info = build(p, v)
         reg.sort("npi", "year").write_parquet(a.out / f"movers_{v}.parquet")
