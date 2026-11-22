@@ -11,7 +11,11 @@ Engines, each fit in its own process under a watchdog (peak RSS of the process t
   pyfixest_lean   lean=True, copy_data=False, store_data=False
   fixest          R fixest feols, defaults but fixef.rm = "singleton" (fixest_fit.R; $RSCRIPT, default Rscript)
   fixest_lean     also lean = TRUE, mem.clean = TRUE
-  dfeols          dfeols.prep (partition author_id) + dfeols.fit on the local executor
+  reghdfe         Stata/MP reghdfe with its defaults ($STATA, default /usr/local/stata18/stata-mp) on a
+                  .dta of the rung (author_id recoded 1..K; written once per rung, not timed)
+  dfeols          dfeols.prep (partition author_id) + dfeols.fit on a local Dask executor of
+                  --dfeols-workers x --dfeols-cores (default $THREADS // 4 workers of 4 cores)
+  dfeols_serial   the same on dfeols's default SerialExecutor (one process; the first runs, 2026-11-22)
 An in-memory engine stops at its first failed rung. Results: <out>/results.json.
 
     cd /srv/dfeols && .venv/bin/python -I repo/replication/openalex/pyfixest_probe.py --out build/openalex/pyfixest_probe
@@ -52,6 +56,67 @@ def make_rung(pkg: Path, out: Path, m: int, of: int = 16) -> dict:
     return {"m": m, "of": of, "file": str(f), "bytes": f.stat().st_size, **s.to_dicts()[0]}
 
 
+def make_dta(rung: dict) -> str:
+    """The rung as a Stata .dta (author_id recoded to dense 1..K, which fits Stata's long)."""
+    import polars as pl
+
+    f = Path(rung["file"]).with_suffix(".dta")
+    if not f.exists():
+        d = pl.read_parquet(rung["file"]).with_columns(pl.col("author_id").rank("dense").cast(pl.Int32),
+                                                       pl.col("field_decade").cast(pl.Int32))
+        tmp = f.with_suffix(".dta.part")
+        d.to_pandas().to_stata(tmp, write_index=False, version=118)
+        tmp.rename(f)
+    return str(f)
+
+
+def reghdfe_do(dta: str) -> str:
+    ts = " ".join(TS)
+    return f"""set more off
+timer clear
+timer on 1
+use "{dta}", clear
+timer off 1
+quietly timer list 1
+local tload = r(t1)
+timer on 2
+capture noisily reghdfe frac_works_n {ts} cy cy2 cy3, absorb(author_id field_decade) vce(cluster author_id)
+local rc = _rc
+timer off 2
+quietly timer list 2
+local tfit = r(t2)
+file open fh using "reghdfe.txt", write replace
+file write fh "load" _tab "`tload'" _n "rc" _tab "`rc'" _n "fit" _tab "`tfit'" _n "processors" _tab "`c(processors)'" _n
+if `rc' == 0 {{
+    file write fh "N" _tab "`e(N)'" _n
+    foreach v in {ts} {{
+        file write fh "coef" _tab "`v'" _tab %21.0g (_b[`v']) _tab %21.0g (_se[`v']) _n
+    }}
+}}
+file close fh
+"""
+
+
+def read_reghdfe(work: Path) -> dict:
+    f = work / "reghdfe.txt"
+    if not f.exists():
+        return {"engine": "reghdfe"}
+    rec: dict = {"engine": "reghdfe", "coef": {}}
+    for line in f.read_text().splitlines():
+        k, *v = line.split("\t")
+        if k == "coef":
+            rec["coef"][v[0]] = {"b": float(v[1]), "se": float(v[2])}
+        elif k in ("load", "fit"):
+            rec[f"{k}_sec"] = round(float(v[0]), 1) if v and v[0] else None
+        elif k in ("rc", "N", "processors"):
+            rec[k] = int(float(v[0]))
+    rec["status"] = "ok" if rec.get("rc") == 0 and len(rec["coef"]) == len(TS) else "error"
+    if rec["status"] != "ok":
+        rec["error"] = f"Stata rc {rec.get('rc')}; see {work / 'fit.log'}"
+        rec.pop("coef")
+    return rec
+
+
 def worker(engine: str, data: str, work: str) -> None:
     rec: dict = {"engine": engine}
     t0 = time.time()
@@ -76,9 +141,19 @@ def worker(engine: str, data: str, work: str) -> None:
                              fixed_effects=["author_id", "field_decade"], clusters=["author_id"],
                              target_rows=2_000_000, overwrite=True)
             rec["load_sec"] = round(time.time() - t0, 1)
+            ex = None
+            if engine == "dfeols":
+                nw, nc = int(os.environ["PROBE_DFEOLS_WORKERS"]), int(os.environ["PROBE_DFEOLS_CORES"])
+                ex = dfeols.executor("local", cores=nc, max_workers=nw, min_workers=nw,
+                                     memory=os.environ["PROBE_DFEOLS_MEMORY"])
+                rec.update(workers=nw, cores_per_worker=nc)
             t1 = time.time()
-            r = dfeols.fit(ds, FML, cluster="author_id", workdir=str(Path(work) / "fit"), log_every=1e9, record=False)
+            r = dfeols.fit(ds, FML, cluster="author_id", workdir=str(Path(work) / "fit"), log_every=1e9, record=False,
+                           **({"executor": ex} if ex else {}))
             td = r.tidy(None, "CRV1")
+            if ex is not None:
+                ex.client.close()
+                ex.cluster.close()
             rec["fit_sec"] = round(time.time() - t1, 1)
             rec["N"] = int(r.N)
             rec["coef"] = {t: {"b": float(td.loc[t, "Estimate"]), "se": float(td.loc[t, "Std. Error"])} for t in TS}
@@ -98,12 +173,17 @@ def run(engine: str, data: str, work: Path, mem_cap: float, time_cap: float, log
     work.mkdir(parents=True, exist_ok=True)
     (work / "worker.json").unlink(missing_ok=True)
     t0 = time.time()
-    if engine.startswith("fixest"):
+    cwd = None
+    if engine == "reghdfe":
+        (work / "fit.do").write_text(reghdfe_do(data))
+        (work / "reghdfe.txt").unlink(missing_ok=True)
+        cmd, cwd = [os.environ.get("STATA", "/usr/local/stata18/stata-mp"), "-b", "do", "fit.do"], work
+    elif engine.startswith("fixest"):
         cmd = [os.environ.get("RSCRIPT", "Rscript"), str(Path(__file__).with_name("fixest_fit.R")), data,
                str(work / "worker.json"), "lean" if engine == "fixest_lean" else "default", "author_id", FML]
     else:
         cmd = [sys.executable, "-I", __file__, "--worker", engine, data, str(work)]
-    p = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, env=os.environ.copy())
+    p = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, env=os.environ.copy(), cwd=cwd)
     pp = psutil.Process(p.pid)
     peak, killed = 0.0, None
     while p.poll() is None:
@@ -125,7 +205,10 @@ def run(engine: str, data: str, work: Path, mem_cap: float, time_cap: float, log
             p.wait()
             break
         time.sleep(0.25)
-    rec = json.loads((work / "worker.json").read_text()) if (work / "worker.json").exists() else {"engine": engine}
+    if engine == "reghdfe":
+        rec = read_reghdfe(work)
+    else:
+        rec = json.loads((work / "worker.json").read_text()) if (work / "worker.json").exists() else {"engine": engine}
     if engine.startswith("fixest") and rec.get("status") == "ok":
         f = rec.pop("fits")[FML]
         rec["N"] = int(f["N"])
@@ -146,15 +229,22 @@ def main() -> None:
     ap.add_argument("--out", type=Path, default=Path("build/openalex/pyfixest_probe"))
     ap.add_argument("--rungs", type=int, nargs="+", default=[1, 2, 4, 8, 16])
     ap.add_argument("--of", type=int, default=16, help="rung m keeps hash %% of < m (testing: large of)")
-    ap.add_argument("--engines", nargs="+", default=["dfeols", "fixest_lean", "fixest", "pyfixest_lean", "pyfixest"])
+    ap.add_argument("--engines", nargs="+", default=["dfeols", "fixest_lean", "fixest", "pyfixest_lean", "pyfixest", "reghdfe"])
+    threads = int(os.environ.get("THREADS") or os.environ.get("POLARS_MAX_THREADS") or os.cpu_count())
+    ap.add_argument("--dfeols-cores", type=int, default=4, help="cores per dfeols worker")
+    ap.add_argument("--dfeols-workers", type=int, default=None, help="default: $THREADS // cores")
     ap.add_argument("--mem-cap-gb", type=float, default=float(os.environ.get("MEM_CAP_GB", 96)))
     ap.add_argument("--time-cap-min", type=float, default=float(os.environ.get("TIME_CAP_MIN", 180)))
     a = ap.parse_args()
+    a.dfeols_workers = a.dfeols_workers or max(1, threads // a.dfeols_cores)
+    os.environ.update(PROBE_DFEOLS_WORKERS=str(a.dfeols_workers), PROBE_DFEOLS_CORES=str(a.dfeols_cores),
+                      PROBE_DFEOLS_MEMORY=f"{max(4, int(0.8 * a.mem_cap_gb / a.dfeols_workers))}GB")
     a.out.mkdir(parents=True, exist_ok=True)
     resf = a.out / "results.json"
     res = json.loads(resf.read_text()) if resf.exists() else {"spec": FML, "runs": []}
     res.update({"mem_cap_gb": a.mem_cap_gb, "time_cap_min": a.time_cap_min, "cpus": os.cpu_count(),
-                "polars_max_threads": os.environ.get("POLARS_MAX_THREADS")})
+                "polars_max_threads": os.environ.get("POLARS_MAX_THREADS"),
+                "dfeols_workers": a.dfeols_workers, "dfeols_cores": a.dfeols_cores})
     done = {(r["engine"], r["m"]) for r in res["runs"] if r["status"] == "ok" and r["of"] == a.of}
     failed = {r["engine"] for r in res["runs"] if r["status"] != "ok" and r["of"] == a.of}
     with open(a.out / "workers.log", "a") as log:
@@ -166,7 +256,8 @@ def main() -> None:
                     continue
                 log.write(f"\n===== {time.strftime('%H:%M:%S')} {e} m={m} =====\n")
                 log.flush()
-                r = {**run(e, rung["file"], a.out / "work" / f"{e}_m{m:02d}_of{a.of}", a.mem_cap_gb, a.time_cap_min, log),
+                data = make_dta(rung) if e == "reghdfe" else rung["file"]
+                r = {**run(e, data, a.out / "work" / f"{e}_m{m:02d}_of{a.of}", a.mem_cap_gb, a.time_cap_min, log),
                      "m": m, "of": a.of, "rows": rung["rows"], "authors": rung["authors"]}
                 r.pop("traceback", None) if r["status"] == "ok" else None
                 res["runs"].append(r)
@@ -178,11 +269,13 @@ def main() -> None:
     # agreement with dfeols on each rung
     ok = {(r["engine"], r["m"], r["of"]): r for r in res["runs"] if r["status"] == "ok"}
     for (e, m, of), r in ok.items():
-        if e != "dfeols" and ("dfeols", m, of) in ok:
-            d = ok[("dfeols", m, of)]["coef"]
+        ref = next((k for k in ("dfeols", "dfeols_serial") if (k, m, of) in ok and k != e), None)
+        if e not in ("dfeols", "dfeols_serial") and ref:
+            d = ok[(ref, m, of)]["coef"]
+            r["vs"] = ref
             r["max_rel_b_vs_dfeols"] = max(abs(r["coef"][t]["b"] - d[t]["b"]) / max(abs(d[t]["b"]), 1e-12) for t in TS)
             r["max_rel_se_vs_dfeols"] = max(abs(r["coef"][t]["se"] - d[t]["se"]) / d[t]["se"] for t in TS)
-            r["N_minus_dfeols"] = r["N"] - ok[("dfeols", m, of)]["N"]
+            r["N_minus_dfeols"] = r["N"] - ok[(ref, m, of)]["N"]
     resf.write_text(json.dumps(res, indent=1))
 
 
