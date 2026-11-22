@@ -277,7 +277,9 @@ def fit_glm(
         d.mkdir(parents=True)
     t0 = time.time()
 
-    # separation: drop FE groups whose outcome never varies, until none changes
+    # separation: drop FE groups whose outcome never varies, and (unless drop_singletons=False)
+    # singleton groups, until none changes; each can create the other, so they share one loop
+    drop_singletons = fit_kw.get("drop_singletons", True)
     dead: dict[str, np.ndarray] = {c: np.zeros(0, np.int64) for c in fes}
     passes, n0 = 0, None
     spec = {"family": family, "y": y, "vars": xvars, "fes": fes, "dead": dead, "mode": "scan", "subset": subset}
@@ -297,6 +299,8 @@ def fit_glm(
             u, inv = np.unique(lv, return_inverse=True)
             S, C = np.bincount(inv, weights=sy), np.bincount(inv, weights=ct)
             bad = (S <= 0) | ((S >= C) if fam.binary else False)
+            if drop_singletons:  # in the same loop, so a singleton drop that leaves an all-zero group is caught (as fixest)
+                bad |= C == 1
             if bad.any():
                 dead[c] = np.union1d(dead[c], u[bad])
                 changed = True

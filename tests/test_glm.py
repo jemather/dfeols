@@ -96,3 +96,23 @@ def test_bad_outcome_and_options(ds, tmp_path):
         dfeols.fit_glm(ds, "cnt ~ feat | spell", "poisson", weights="wt", workdir=tmp_path)
     with pytest.raises(ValueError, match="family"):
         dfeols.fit_glm(ds, "cnt ~ feat | spell", "logit", workdir=tmp_path)
+
+
+
+def test_singletons_and_separation_iterate_jointly(tmp_path):
+    """A singleton drop can leave an FE group with only zeros; that group must go too, as in
+    fixest (Weidner & Zylkin Table 4, isic 10, kept 8 extra rows before this was one loop).
+
+    Group a=0 has rows (b=0, y=1), (b=1, y=0), (b=1, y=0). b=0 is a singleton; once it goes, a=0
+    is all zeros and is separated, so N = 400 (a=1..100, each with b=1..4 and y >= 1)."""
+    rng = np.random.default_rng(3)
+    a = np.r_[0, 0, 0, np.repeat(np.arange(1, 101), 4)]
+    b = np.r_[0, 1, 1, np.tile(np.arange(1, 5), 100)]
+    x = rng.normal(size=len(a))
+    y = np.r_[1.0, 0.0, 0.0, 1.0 + rng.poisson(np.exp(0.3 * x[3:]))]
+    df = pl.DataFrame({"a": a, "b": b, "x": x, "y": y})
+    ds = dfeols.prep(df, shard_dir=tmp_path / "sh", partition="a", fixed_effects=["a", "b"], target_rows=200)
+    r = dfeols.fit_glm(ds, "y ~ x | a + b", "poisson", workdir=tmp_path / "w", log_every=1e9)
+    assert r.N == 400
+    m = pf.fepois("y ~ x | a + b", data=df.filter(pl.col("a") > 0).to_pandas(), iwls_tol=1e-12, fixef_tol=1e-13)
+    np.testing.assert_allclose(r.coef(), m.coef().to_numpy(), **TOL)
