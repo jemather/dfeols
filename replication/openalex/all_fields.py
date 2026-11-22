@@ -23,11 +23,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import warnings
 import time
 from pathlib import Path
 
 import polars as pl
 
+warnings.filterwarnings("ignore", "The `demeaner_backend`", DeprecationWarning)
 c = pl.col
 FIELDS = {11: "Agricultural and Biological Sciences", 12: "Arts and Humanities", 13: "Biochemistry, Genetics and Molecular Biology",
           14: "Business, Management and Accounting", 15: "Chemical Engineering", 16: "Chemistry", 17: "Computer Science",
@@ -73,10 +75,15 @@ def fit(w: pl.DataFrame, work: Path, ys: list[str], fe: list[str], pyfixest: boo
         r = dfeols.fit(ds, f, cluster="author_id", workdir=str(work / f"fit_{y}"), log_every=1e9, record=False)
         td = r.tidy(None, "CRV1")
         rec = {"N": int(r.N), "sec": round(time.time() - t0, 1), "coef": {}}
-        tp = pf.feols(f, data=pdf, vcov={"CRV1": "author_id"}, fixef_tol=1e-12).tidy() if pyfixest else None
+        tp = None
+        if pyfixest:  # 1e-12 is below the float64 floor for frac_cites (fdec, field 13 never converged); 1e-10 is not
+            try:
+                tp = pf.feols(f, data=pdf, vcov={"CRV1": "author_id"}, fixef_tol=1e-10).tidy()
+            except Exception as ex:
+                rec["pyfixest_error"] = f"{type(ex).__name__}: {ex}"[:500]
         for t in ts:
             e = {"b": float(td.loc[t, "Estimate"]), "se": float(td.loc[t, "Std. Error"])}
-            if pyfixest:
+            if tp is not None:
                 pb, ps = float(tp.loc[t, "Estimate"]), float(tp.loc[t, "Std. Error"])
                 e["rel_b_pyfixest"] = abs(e["b"] - pb) / max(abs(pb), 1e-12)
                 e["rel_se_pyfixest"] = abs(e["se"] - ps) / ps
@@ -99,7 +106,10 @@ def main() -> None:
     s = load(a.package, a.tops)
     if a.fields:
         s = s.filter(c("field_id").is_in(a.fields))
+    resf = a.out / "results.json"
     res = {"package": str(a.package), "fields": FIELDS, "results": []}
+    if resf.exists():  # keep results for definitions not rerun
+        res["results"] = [r for r in json.loads(resf.read_text())["results"] if r["top"] not in a.tops]
     for top in a.tops:
         w = sample(s, top)
         print(f"{time.time() - t0:.0f}s {top}: {w.height:,} rows", flush=True)
