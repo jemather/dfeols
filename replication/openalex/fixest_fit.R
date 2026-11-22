@@ -11,8 +11,10 @@
 #
 # With $FIXEST_RECORD set (pyfixest_probe.py sets it), each fit is also written as an estrec record
 # by estrec R's write_estimation() at disclosure level 5, to that path (numbered _<i> when there are
-# several formulas). A missing estrec package or a writer error is recorded as estrec_error and the
-# fit stands.
+# several formulas). That happens after every fit is done and <out.json> is written with its times
+# and VmHWM, and after an empty file fit_done is created next to <out.json>: the probe's watchdog
+# counts the peak memory before and after it apart, so writing records never changes what is
+# measured. A missing estrec package or a writer error is recorded as estrec_error; the fit stands.
 
 suppressPackageStartupMessages({
   library(fixest)
@@ -48,6 +50,7 @@ tryCatch({
   out$load_sec <- round(proc.time()[["elapsed"]] - t0, 1)
   t1 <- proc.time()[["elapsed"]]
   out$fits <- list()
+  models <- list()
   for (f in fmls) {
     m <- if (mode == "lean") {
       feols(as.formula(f), d, cluster = as.formula(paste0("~", clus)), fixef.rm = "singleton",
@@ -56,16 +59,7 @@ tryCatch({
       feols(as.formula(f), d, cluster = as.formula(paste0("~", clus)), fixef.rm = "singleton")
     }
     out$fits[[f]] <- list(N = nobs(m), coef = as.list(coef(m)), se = as.list(se(m)))
-    rpath <- Sys.getenv("FIXEST_RECORD")
-    if (nzchar(rpath)) {
-      if (length(fmls) > 1) rpath <- sub("\\.estrec\\.json$", paste0("_", match(f, fmls), ".estrec.json"), rpath)
-      out$estrec_error <- if (!requireNamespace("estrec", quietly = TRUE)) "estrec R package not installed" else
-        tryCatch({
-          estrec::write_estimation(m, rpath, data = d, level = 5L)
-          NULL
-        }, error = function(e) substr(conditionMessage(e), 1, 500))
-      if (!is.null(out$estrec_error) && file.exists(rpath)) unlink(rpath)
-    }
+    if (nzchar(Sys.getenv("FIXEST_RECORD"))) models[[f]] <- m
     rm(m)
   }
   out$fit_sec <- round(proc.time()[["elapsed"]] - t1, 1)
@@ -76,3 +70,27 @@ tryCatch({
 out$sec <- round(proc.time()[["elapsed"]] - t0, 1)
 out$self_maxrss_gb <- vmhwm_gb()
 writeLines(toJSON(out, auto_unbox = TRUE, digits = NA, pretty = TRUE), out_path)
+rpath <- Sys.getenv("FIXEST_RECORD")
+if (nzchar(rpath) && out$status == "ok") {
+  file.create(file.path(dirname(out_path), "fit_done"))
+  t2 <- proc.time()[["elapsed"]]
+  errs <- character()
+  if (!requireNamespace("estrec", quietly = TRUE)) {
+    errs <- "estrec R package not installed"
+  } else {
+    for (i in seq_along(models)) {
+      rp <- if (length(models) > 1) sub("\\.estrec\\.json$", paste0("_", i, ".estrec.json"), rpath) else rpath
+      e <- tryCatch({
+        estrec::write_estimation(models[[i]], rp, data = d, level = 5L)
+        NULL
+      }, error = function(e) substr(conditionMessage(e), 1, 500))
+      if (!is.null(e)) {
+        errs <- c(errs, e)
+        if (file.exists(rp)) unlink(rp)
+      }
+    }
+  }
+  if (length(errs)) out$estrec_error <- paste(errs, collapse = " | ")
+  out$record_sec <- round(proc.time()[["elapsed"]] - t2, 1)
+  writeLines(toJSON(out, auto_unbox = TRUE, digits = NA, pretty = TRUE), out_path)
+}

@@ -107,6 +107,8 @@ if `rc' == 0 {{
     }}
 }}
 file close fh
+file open fd using "fit_done", write replace
+file close fd
 if `rc' == 0 {{
     capture which estrec
     if _rc == 0 {{
@@ -184,7 +186,8 @@ def probe_block(r: dict, rung: dict, a) -> dict:
          "load_seconds": g("load_sec"), "fit_seconds": g("fit_sec"), "self_maxrss_gb": g("self_maxrss_gb"),
          "mem_cap_bytes": int(a.mem_cap_gb * 2**30), "time_cap_minutes": a.time_cap_min, "host": g("host"),
          "threads": int(os.environ.get("THREADS") or 0) or None}
-    for k in ("killed", "error", "estrec_error", "workers", "cores_per_worker", "processors", "nthreads"):
+    for k in ("killed", "error", "estrec_error", "record_sec", "record_wall_sec", "record_peak_rss_gb", "workers",
+              "cores_per_worker", "processors", "nthreads"):
         if r.get(k) is not None:
             b[k] = r[k]
     return b
@@ -269,6 +272,12 @@ def worker(engine: str, data: str, work: str) -> None:
             rec["fit_sec"] = round(time.time() - t1, 1)
             rec["N"] = int(fit._N)
             rec["coef"] = {t: {"b": float(td.loc[t, "Estimate"]), "se": float(td.loc[t, "Std. Error"])} for t in TS}
+            # what was measured is saved before the record is written (fit_done: see run())
+            rec.update(status="ok", sec=round(time.time() - t0, 1),
+                       self_maxrss_gb=round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2**20, 2))
+            Path(work, "worker.json").write_text(json.dumps(rec, indent=1))
+            Path(work, "fit_done").touch()
+            t2 = time.time()
             try:
                 import estrec as ef
 
@@ -278,6 +287,9 @@ def worker(engine: str, data: str, work: str) -> None:
                          Path(work, RECORD), level=5)
             except Exception as e:  # the fit stands; the probe writes the record from rec
                 rec["estrec_error"] = f"{type(e).__name__}: {e}"[:500]
+            rec["record_sec"] = round(time.time() - t2, 1)
+            Path(work, "worker.json").write_text(json.dumps(rec, indent=1))
+            return
         else:
             import dfeols
 
@@ -316,6 +328,8 @@ def run(engine: str, data: str, work: Path, mem_cap: float, time_cap: float, log
 
     work.mkdir(parents=True, exist_ok=True)
     (work / "worker.json").unlink(missing_ok=True)
+    done = work / "fit_done"  # the engine creates it when the fit is measured and saved, before writing the record
+    done.unlink(missing_ok=True)
     t0 = time.time()
     cwd = None
     if engine == "reghdfe":
@@ -330,13 +344,18 @@ def run(engine: str, data: str, work: Path, mem_cap: float, time_cap: float, log
         cmd = [sys.executable, "-I", __file__, "--worker", engine, data, str(work)]
     p = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, env=os.environ.copy(), cwd=cwd)
     pp = psutil.Process(p.pid)
-    peak, killed = 0.0, None
+    peak, rec_peak, killed, t_done = 0.0, 0.0, None, None
     while p.poll() is None:
         try:
             rss = sum(x.memory_info().rss for x in [pp, *pp.children(recursive=True)]) / 2**30
         except psutil.Error:
             rss = 0.0
-        peak = max(peak, rss)
+        if t_done is None and done.exists():
+            t_done = time.time()
+        if t_done is None:
+            peak = max(peak, rss)
+        else:
+            rec_peak = max(rec_peak, rss)
         if rss > mem_cap:
             killed = f"memory cap {mem_cap:g} GB"
         elif time.time() - t0 > time_cap * 60:
@@ -360,7 +379,16 @@ def run(engine: str, data: str, work: Path, mem_cap: float, time_cap: float, log
         rec["coef"] = {t: {"b": float(f["coef"][t]), "se": float(f["se"][t])} for t in TS}
     if engine.startswith("fixest") and rec.get("estrec_error"):
         rec["estrec_error"] = str(rec["estrec_error"])[:500]
-    rec.update({"_started": t0, "wall_sec": round(time.time() - t0, 1), "peak_rss_gb": round(peak, 2), "returncode": p.returncode,
+    if t_done is not None:  # the fit finished; only the record step ran after fit_done
+        rec["record_wall_sec"] = round(time.time() - t_done, 1)
+        rec["record_peak_rss_gb"] = round(rec_peak, 2)
+        if killed:
+            rec["estrec_error"] = f"record step killed: {killed}"
+            killed = None
+        wall_end = t_done
+    else:
+        wall_end = time.time()
+    rec.update({"_started": t0, "wall_sec": round(wall_end - t0, 1), "peak_rss_gb": round(peak, 2), "returncode": p.returncode,
                 "mem_cap_gb": mem_cap, "host": os.uname().nodename})
     if killed:
         rec["status"] = "killed"
