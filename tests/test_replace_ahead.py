@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 from dfeols import cluster as cmod
 from dfeols import progress
-from dfeols.cluster import queue_lead, retiring
+from dfeols.cluster import braked, queue_lead, retiring, spares_cap
 
 LIFE, STAG = 3 * 3600.0, 300.0
 
@@ -45,7 +45,7 @@ def test_target_rises_ahead_and_falls_when_the_old_worker_leaves(monkeypatch):
     now = [0.0]
     ad = FakeAdaptive(target=2)
     cl = SimpleNamespace(_adaptive=ad, dfeols_lifetime=(LIFE, STAG))
-    cmod._replace_ahead(cl, max_workers=2, prior_wait=1800, clock=lambda: now[0])
+    cmod._replace_ahead(cl, max_workers=2, prior_wait=1800, clock=lambda: now[0], max_spares=2)
     tgt = lambda: asyncio.run(ad.safe_target())  # noqa: E731
 
     ad.plan = {"w0", "w1"}
@@ -133,3 +133,67 @@ def test_retire_spread_and_allowed_failures(monkeypatch, tmp_path):
         assert cl.scheduler.allowed_failures == 7
     finally:
         cl.close()
+
+
+def test_spares_cap_and_brake_rules():
+    assert spares_cap(40) == 4 and spares_cap(5) == 1 and spares_cap(40, 0) == 0 and spares_cap(40, 7) == 7
+    assert not braked([60.0], 180)  # one quick wait is not enough
+    assert braked([600.0, 60.0, 90.0], 180)  # the last two were quick
+    assert not braked([60.0, 90.0, 600.0], 180)  # a long one again: ask ahead
+
+
+def _pool(n, t0):
+    return {f"w{i}" for i in range(n)}
+
+
+def test_a_pool_due_together_gets_at_most_the_cap(monkeypatch):
+    """40 workers that started together all come due at once (H L2 36358879 asked for 40 at
+    21:44 and ran 79 workers): only spares_cap of them get a replacement ahead; each one that
+    leaves frees a place for the next."""
+    monkeypatch.setattr(progress, "WORK_LEFT", None)
+    now = [0.0]
+    ad = FakeAdaptive(target=40)
+    cl = SimpleNamespace(_adaptive=ad, dfeols_lifetime=(LIFE, STAG))
+    cmod._replace_ahead(cl, max_workers=40, prior_wait=1800, clock=lambda: now[0])
+    tgt = lambda: asyncio.run(ad.safe_target())  # noqa: E731
+    old = _pool(40, 0)
+    ad.plan = set(old)
+    tgt()
+    now[0] = 480.0  # an 8 min wait each: no brake
+    ad.observed = set(old)
+    assert tgt() == 40
+    now[0] = 480.0 + LIFE - STAG - 60  # all 40 inside the lead
+    assert tgt() == 44  # at most 4 ahead
+    new = {f"r{i}" for i in range(4)}
+    ad.plan = old | new
+    tgt()
+    now[0] += 480.0  # the 4 arrive after 8 min; one old worker leaves
+    ad.observed = (old - {"w0"}) | new
+    ad.plan = ad.observed
+    assert tgt() == 44  # still 39 to cover: the place w0 left goes to a fifth replacement
+
+
+def test_quick_waits_brake_asking_ahead(monkeypatch):
+    """Two workers that connected within quick_wait of being asked for: none asked ahead, and a
+    retiring worker is replaced after it leaves; a long wait again lifts the brake."""
+    monkeypatch.setattr(progress, "WORK_LEFT", None)
+    now = [0.0]
+    ad = FakeAdaptive(target=2)
+    cl = SimpleNamespace(_adaptive=ad, dfeols_lifetime=(LIFE, STAG))
+    cmod._replace_ahead(cl, max_workers=2, prior_wait=1800, clock=lambda: now[0], max_spares=2, quick_wait=180)
+    tgt = lambda: asyncio.run(ad.safe_target())  # noqa: E731
+    ad.plan = {"w0", "w1"}
+    tgt()
+    now[0] = 60.0  # both connect within a minute
+    ad.observed = {"w0", "w1"}
+    tgt()
+    now[0] = 60.0 + LIFE - STAG - 60  # both inside the lead
+    assert tgt() == 2  # braked: nothing ahead
+    assert cl.dfeols_replace_ahead["braked"]
+    ad.plan = {"w0", "w1", "w2"}  # a replacement asked for after w0 left ...
+    ad.observed = {"w1"}
+    tgt()
+    now[0] += 1200.0  # ... waits 20 min
+    ad.observed = {"w1", "w2"}
+    assert tgt() == 3  # the brake is off: w1 gets its replacement ahead
+    assert not cl.dfeols_replace_ahead["braked"]

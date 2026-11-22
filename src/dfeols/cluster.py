@@ -376,7 +376,9 @@ def executor(
             wait_count=wait,
         )
         if w.get("replace_ahead", True):
-            _replace_ahead(cl, w["max_workers"], 60 * float(w.get("queue_wait_minutes", 30)))
+            _replace_ahead(cl, w["max_workers"], 60 * float(w.get("queue_wait_minutes", 30)),
+                           max_spares=w.get("replace_ahead_max"),
+                           quick_wait=60 * float(w.get("quick_wait_minutes", 3)))
     client = Client(cl)
     if p.scheduler == "slurm":
         _replace_lost_jobs(cl, w["max_workers"])
@@ -502,18 +504,38 @@ def retiring(connected: dict, now: float, life: float, stagger: float, lead: flo
     return out
 
 
-def _replace_ahead(cl, max_workers: int, prior_wait: float, clock=time.time) -> None:
+def spares_cap(max_workers: int, n: int | None = None) -> int:
+    """Most replacements asked for ahead at once: `n` if given, else 10% of max_workers, at
+    least 1. Dask draws each worker's lifetime at random within the window, so every worker of
+    a pool that started together comes due at once: uncapped, H L2 (OSCER 36358879, 2026-11-21)
+    asked for 40 at 21:44 and ran 79 workers for 2 h, slower than 40 (/scratch-bound)."""
+    if n is not None:
+        return max(int(n), 0)
+    return max(int(round(0.1 * max_workers)), 1)
+
+
+def braked(waits: list[float], quick: float, k: int = 2) -> bool:
+    """The last k queue waits were all within `quick` s: workers start at once, so none are
+    asked for ahead (a retiring worker is replaced after it leaves)."""
+    return len(waits) >= k and max(waits[-k:]) <= quick
+
+
+def _replace_ahead(cl, max_workers: int, prior_wait: float, clock=time.time,
+                   max_spares: int | None = None, quick_wait: float = 180.0) -> None:
     """Add, to adaptive scaling's target, one worker for each worker about to retire at its
     lifetime while the work outlasts it, so the replacement waits in the queue while the old
-    worker still runs. It is computed on each adapt tick, so the extra drops the moment the old
-    worker leaves. Queue waits are measured per job (first in the plan to first connected)."""
+    worker still runs; at most `spares_cap` at once, and none while the last two queue waits
+    were within `quick_wait` s (`braked`). It is computed on each adapt tick, so the extra drops
+    the moment the old worker leaves. Queue waits are measured per job (first in the plan to
+    first connected)."""
     ad = getattr(cl, "_adaptive", None)
     life, stagger = getattr(cl, "dfeols_lifetime", (None, None))
     if ad is None or life is None or not hasattr(ad, "safe_target"):
         log.warning("cluster: cannot ask for replacements ahead of retirement (no adaptive scaling)")
         return
     orig = ad.safe_target
-    st = {"planned": {}, "seen": {}, "waits": [], "extra": 0}
+    cap = spares_cap(max_workers, max_spares)
+    st = {"planned": {}, "seen": {}, "waits": [], "extra": 0, "braked": False}
 
     async def safe_target():
         n = await orig()
@@ -536,11 +558,17 @@ def _replace_ahead(cl, max_workers: int, prior_wait: float, clock=time.time) -> 
             work_left = wl[1] - (now - wl[0]) if wl and now - wl[0] < 600 else None
             lead = queue_lead(st["waits"], prior_wait, life)
             due = retiring({x: st["seen"][x] for x in seen if x in st["seen"]}, now, life, stagger, lead, work_left)
-            extra = min(len(due), max_workers)
+            brake = braked(st["waits"], quick_wait)
+            if brake != st["braked"]:
+                log.info("cluster: the last 2 queue waits were %s %.0f min: %s", "within" if brake else "not all within",
+                         quick_wait / 60, "replacements only after workers leave" if brake
+                         else f"asking for replacements ahead again (at most {cap} at once)")
+                st["braked"] = brake
+            extra = 0 if brake else min(len(due), cap, max_workers)
             if extra > st["extra"]:
-                log.info("cluster: %d worker(s) retire within %.0f min; asking for %d replacement(s) now "
-                         "(queue waits so far up to %.0f min)", extra, lead / 60, extra - st["extra"],
-                         max(st["waits"], default=prior_wait) / 60)
+                log.info("cluster: %d worker(s) retire within %.0f min; asking for %d replacement(s) now, "
+                         "%d ahead in all (at most %d; queue waits so far up to %.0f min)", len(due), lead / 60,
+                         extra - st["extra"], extra, cap, max(st["waits"], default=prior_wait) / 60)
             st["extra"] = extra
             return n + extra
         except Exception as e:  # noqa: BLE001 (never take adaptive scaling down)

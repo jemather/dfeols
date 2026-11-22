@@ -79,6 +79,11 @@ DEFAULTS = {
         # its lifetime, while the fit still has work past that point; false: only after it leaves
         # (on OSCER all 40 workers retired together and the pool took ~50 min to refill, 2026-11-20)
         "replace_ahead": True,
+        # most replacements asked for ahead at once (None: 10% of max_workers, at least 1); a pool
+        # that started together comes due at once (H L2, 2026-11-21: 40 asked, 79 workers for 2 h)
+        "replace_ahead_max": None,
+        # none asked for ahead while the last 2 queue waits were within this: workers start at once
+        "quick_wait_minutes": 3,
         # workers retire over lifetime minus up to 2 x this (None: 10% of the lifetime, at
         # least 5 min), so a pool that started together doesn't retire together
         "retire_spread_minutes": None,
@@ -152,6 +157,8 @@ idle_minutes = 15              # release a worker only after this long with noth
 start_minutes = 10             # a worker job's Dask process may take this long to reach the scheduler
 replace_ahead = true           # ask for replacements before workers retire, by the queue waits seen
 queue_wait_minutes = 30        # the queue wait assumed until one is seen
+# replace_ahead_max = 4        # most replacements asked for ahead at once (default 10% of max_workers, at least 1)
+quick_wait_minutes = 3         # none asked for ahead while the last 2 queue waits were within this
 # retire_spread_minutes = 60    # workers retire over this x 2 before their lifetime (default 10% of it)
 # allowed_failures = 20        # a task fails on the next worker leaving under it (default max_workers / 2, at least 3)
 
