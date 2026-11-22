@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""D14: where in-memory estimation stops working on the OpenAlex panel, and dfeols on the same fits.
+"""D14: where in-memory estimation (pyfixest, R fixest) stops working on the OpenAlex panel, and dfeols on the same fits.
 
 Spec: the all-authors pooled KMZ fit on outbox/openalex_kmz_panel_v1, years 1970-2025, core
 authors, all fields:  frac_works_n ~ top_kmz x decade (1970s-2020s) + cy + cy2 + cy3
@@ -9,10 +9,13 @@ Engines, each fit in its own process under a watchdog (peak RSS of the process t
 0.25 s; killed above --mem-cap-gb or --time-cap-min):
   pyfixest        pf.feols defaults (what a user would type), pandas input
   pyfixest_lean   lean=True, copy_data=False, store_data=False
+  fixest          R fixest feols, defaults but fixef.rm = "singleton" (fixest_fit.R; $RSCRIPT, default Rscript)
+  fixest_lean     also lean = TRUE, mem.clean = TRUE
   dfeols          dfeols.prep (partition author_id) + dfeols.fit on the local executor
-A pyfixest engine stops at its first failed rung. Results: <out>/results.json.
+An in-memory engine stops at its first failed rung. Results: <out>/results.json.
 
     cd /srv/dfeols && .venv/bin/python -I repo/replication/openalex/pyfixest_probe.py --out build/openalex/pyfixest_probe
+On OSCER: scripts/oscer_openalex_probe.sbatch (a whole normal node, cap = node memory - 24 GB).
 """
 
 from __future__ import annotations
@@ -95,8 +98,12 @@ def run(engine: str, data: str, work: Path, mem_cap: float, time_cap: float, log
     work.mkdir(parents=True, exist_ok=True)
     (work / "worker.json").unlink(missing_ok=True)
     t0 = time.time()
-    p = subprocess.Popen([sys.executable, "-I", __file__, "--worker", engine, data, str(work)],
-                         stdout=log, stderr=subprocess.STDOUT, env=os.environ.copy())
+    if engine.startswith("fixest"):
+        cmd = [os.environ.get("RSCRIPT", "Rscript"), str(Path(__file__).with_name("fixest_fit.R")), data,
+               str(work / "worker.json"), "lean" if engine == "fixest_lean" else "default", "author_id", FML]
+    else:
+        cmd = [sys.executable, "-I", __file__, "--worker", engine, data, str(work)]
+    p = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, env=os.environ.copy())
     pp = psutil.Process(p.pid)
     peak, killed = 0.0, None
     while p.poll() is None:
@@ -119,7 +126,12 @@ def run(engine: str, data: str, work: Path, mem_cap: float, time_cap: float, log
             break
         time.sleep(0.25)
     rec = json.loads((work / "worker.json").read_text()) if (work / "worker.json").exists() else {"engine": engine}
-    rec.update({"wall_sec": round(time.time() - t0, 1), "peak_rss_gb": round(peak, 2), "returncode": p.returncode})
+    if engine.startswith("fixest") and rec.get("status") == "ok":
+        f = rec.pop("fits")[FML]
+        rec["N"] = int(f["N"])
+        rec["coef"] = {t: {"b": float(f["coef"][t]), "se": float(f["se"][t])} for t in TS}
+    rec.update({"wall_sec": round(time.time() - t0, 1), "peak_rss_gb": round(peak, 2), "returncode": p.returncode,
+                "mem_cap_gb": mem_cap, "host": os.uname().nodename})
     if killed:
         rec["status"] = "killed"
         rec["killed"] = killed
@@ -134,7 +146,7 @@ def main() -> None:
     ap.add_argument("--out", type=Path, default=Path("build/openalex/pyfixest_probe"))
     ap.add_argument("--rungs", type=int, nargs="+", default=[1, 2, 4, 8, 16])
     ap.add_argument("--of", type=int, default=16, help="rung m keeps hash %% of < m (testing: large of)")
-    ap.add_argument("--engines", nargs="+", default=["dfeols", "pyfixest_lean", "pyfixest"])
+    ap.add_argument("--engines", nargs="+", default=["dfeols", "fixest_lean", "fixest", "pyfixest_lean", "pyfixest"])
     ap.add_argument("--mem-cap-gb", type=float, default=float(os.environ.get("MEM_CAP_GB", 96)))
     ap.add_argument("--time-cap-min", type=float, default=float(os.environ.get("TIME_CAP_MIN", 180)))
     a = ap.parse_args()
@@ -170,6 +182,7 @@ def main() -> None:
             d = ok[("dfeols", m, of)]["coef"]
             r["max_rel_b_vs_dfeols"] = max(abs(r["coef"][t]["b"] - d[t]["b"]) / max(abs(d[t]["b"]), 1e-12) for t in TS)
             r["max_rel_se_vs_dfeols"] = max(abs(r["coef"][t]["se"] - d[t]["se"]) / d[t]["se"] for t in TS)
+            r["N_minus_dfeols"] = r["N"] - ok[("dfeols", m, of)]["N"]
     resf.write_text(json.dumps(res, indent=1))
 
 
