@@ -78,3 +78,33 @@ def test_collinear_keep_drops_noise_columns_against_reference():
     assert collinear_keep(G, ref_diag=ref).tolist() == [True, False, True]
     assert absorbed(np.diag(G), ref).tolist() == [False, True, False]
     assert reference_ss(np.array([200.0]), np.array([200.0]), 200.0).tolist() == [0.0]  # a constant
+
+
+def test_collinear_keep_tightens_until_the_kept_gram_factors(monkeypatch, caplog):
+    """If the kept columns pass the pivot test but don't factor (rounding in an ill-conditioned
+    Gram, e.g. W&Z Table 4 isic 40's IRLS step with near-zero weights), the test is redone with
+    tol x10 until they do; the later of a near-dependent pair is dropped, with a warning."""
+    import logging
+
+    import dfeols.linalg as L
+
+    rng = np.random.default_rng(0)
+    X = rng.normal(size=(200, 4))
+    X[:, 3] = X[:, 2] + 1e-4 * rng.normal(size=200)  # nearly dependent on column 2
+    G = X.T @ X
+    real = L.cho_factor
+
+    def fussy(A, lower=True):  # stand-in for the rounding failure: fails while col 3 is in
+        if A.shape[0] == 4:
+            raise L.LinAlgError("not positive definite")
+        return real(A, lower=lower)
+
+    monkeypatch.setattr(L, "cho_factor", fussy)
+    with caplog.at_level(logging.WARNING, logger="dfeols.linalg"):
+        keep = L.collinear_keep(G, 1e-9)
+    assert keep.tolist() == [True, True, True, False]
+    assert "tightened" in caplog.text
+
+    monkeypatch.setattr(L, "cho_factor", lambda A, lower=True: (_ for _ in ()).throw(L.LinAlgError("x")))
+    with pytest.raises(L.LinAlgError, match="numerically singular"):
+        L.collinear_keep(G, 1e-9)

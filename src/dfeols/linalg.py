@@ -2,11 +2,53 @@
 # Copyright (C) 2026 Ted Matherly
 from __future__ import annotations
 
+import logging
+
 import numpy as np
-from scipy.linalg import cho_factor, cho_solve, solve_triangular
+from scipy.linalg import LinAlgError, cho_factor, cho_solve, solve_triangular
+
+log = logging.getLogger(__name__)
+MAX_COLLIN_TOL = 1e-4  # collinear_keep tightens up to this before giving up
 
 
 def collinear_keep(
+    ZtZ: np.ndarray, tol: float = 1e-9, block: int = 256, ref_diag: np.ndarray | None = None
+) -> np.ndarray:
+    """Columns to keep (see _collinear_keep), such that the kept Gram is positive definite.
+
+    The pivot test is relative to each column's own scale, so in an ill-conditioned Gram (a
+    weighted IRLS step with near-zero weights, dense crossing dummies) a nearly dependent set
+    can pass it and still not factor in floating point. Then the test is redone with tol x10,
+    up to MAX_COLLIN_TOL, dropping the later columns of the near-dependent set (callers order
+    crossing dummies before regressors, so dummies go first), with a warning; beyond that, a
+    LinAlgError that says so."""
+    t = tol
+    while True:
+        keep = _collinear_keep(ZtZ, t, block, ref_diag)
+        if not keep.any():
+            return keep
+        try:
+            cho_factor(np.asarray(ZtZ, np.float64)[np.ix_(keep, keep)], lower=True)
+        except (LinAlgError, ValueError):
+            if t * 10 > MAX_COLLIN_TOL * (1 + 1e-12):
+                raise LinAlgError(
+                    f"the cross-product matrix of the regressors and dummy-absorbed FEs is "
+                    f"numerically singular even with collinearity tolerance {t:g} "
+                    f"({int(keep.sum())} columns); the sample is too thin for these FEs"
+                ) from None
+            t *= 10
+            continue
+        if t != tol:
+            log.warning(
+                "collinearity: the kept columns were numerically singular at tol %g; tightened to "
+                "%g, dropping %d more (%d of %d kept)",
+                tol, t, int(_collinear_keep(ZtZ, tol, block, ref_diag).sum() - keep.sum()),
+                int(keep.sum()), len(keep),
+            )  # fmt: skip
+        return keep
+
+
+def _collinear_keep(
     ZtZ: np.ndarray, tol: float = 1e-9, block: int = 256, ref_diag: np.ndarray | None = None
 ) -> np.ndarray:
     """Detect collinear columns from the Gram matrix with an incremental
