@@ -17,7 +17,13 @@ Here (choices agreed with Ted 2026-11-22, docs/openalex.md):
   outcome      impact: sum over the year's articles in the 41 journals of IF(journal, decade) / coauthors
                (KMZ multiply by AER-equivalent pages too; OpenAlex lacks last pages for most articles in
                Econometrica, REStat, JASA, RAND, IER, ...), and articles: plain count (KMZ "article counts")
-Not available: rank, chaired, visiting, editor; zero-output CV years (only publishing years are seen).
+  --fill       years with no papers between two active years, as a stand-in for KMZ's zero-output CV
+               years (Ted 2026-11-22): none (default), or filled with impact = articles = 0 and the
+               institution carried forward; when the institution changes across the gap, the move is put
+               at the gap's midpoint (midpoint) or at a uniformly drawn year (random, --seed). Years before
+               the first or after the last active year are not filled. The sample (>= 2 top-25 years) is
+               always judged on active years, so the authors are the same under every --fill.
+Not available: rank, chaired, visiting, editor.
 
     cd /srv/dfeols && .venv/bin/python -I repo/replication/openalex/kmz.py --out build/openalex/kmz
 """
@@ -62,6 +68,28 @@ def main_inst(df: pl.DataFrame) -> pl.DataFrame:
             .agg(c("root").first().alias("inst"), (c("weight").first() / c("weight").sum()).alias("share")))
 
 
+def fill_gaps(s: pl.DataFrame, how: str, seed: int) -> pl.DataFrame:
+    """Add the years between consecutive active years (s: author_id, year, inst, move, filled)."""
+    import numpy as np
+
+    o = "author_id"
+    g = (s.sort(o, "year").with_columns(c("year").shift(-1).over(o).alias("ny"), c("inst").shift(-1).over(o).alias("ni"))
+         .filter(c("ny") > c("year") + 1))
+    if how == "midpoint":  # the move year T runs over year+1 .. ny; T = ny leaves the move where it was
+        g = g.with_columns((c("year") + 1 + (c("ny") - c("year") - 1) // 2).alias("T"))
+    else:
+        u = np.random.default_rng(seed).random(g.height)
+        g = g.with_columns((c("year") + 1 + (pl.Series(u) * (c("ny") - c("year")).cast(pl.Float64)).floor().cast(pl.Int16)).alias("T"))
+    chg = c("ni") != c("inst")
+    early = g.select(o, c("ny").alias("year"), (chg & (c("T") < c("ny"))).alias("early"))
+    gy = (g.with_columns(pl.int_ranges(c("year") + 1, c("ny"), dtype=pl.Int16).alias("gy")).explode("gy")
+          .select(o, c("gy").alias("year"), pl.when(chg & (c("gy") >= c("T"))).then(c("ni")).otherwise(c("inst")).alias("inst"),
+                  (chg & (c("gy") == c("T"))).alias("move"), pl.lit(True).alias("filled")))
+    s = (s.join(early, on=[o, "year"], how="left")
+         .with_columns((c("move") & ~c("early").fill_null(False)).alias("move")).drop("early"))
+    return pl.concat([s, gy.select(s.columns)]).sort(o, "year")
+
+
 def build(a) -> pl.DataFrame:
     stage, pan = a.openalex / "stage", a.openalex / "panel"
     inst = pl.read_parquet(stage / "institutions" / "*.parquet", columns=["institution_id", "lineage"])
@@ -93,15 +121,19 @@ def build(a) -> pl.DataFrame:
         m = m.with_columns(move.alias("move"), pl.when((c("k") == 0) | move).then(c("inst")).alias("anchor"))
         s = (yrs.join(m.select("author_id", "year", "anchor", "move"), on=["author_id", "year"], how="left")
              .sort("author_id", "year").with_columns(c("anchor").forward_fill().over(o).alias("inst"))
-             .filter(c("year").is_between(Y0, Y1) & c("inst").is_not_null())
+             .filter(c("inst").is_not_null())
+             .select("author_id", "year", "inst", c("move").fill_null(False), pl.lit(False).alias("filled")))
+        if a.fill != "none":
+            s = fill_gaps(s, a.fill, a.seed + b)
+        s = (s.filter(c("year").is_between(Y0, Y1))
              .join(start, on="author_id").join(fld, on="author_id")
-             .with_columns(c("move").fill_null(False),
+             .with_columns(
                            c("author_id").is_in(econ["author_id"].implode()).alias("in_econ"),
                            c("author_id").is_in(eb["author_id"].implode()).alias("in_econbus")))
         rows.append(s)
     s = pl.concat(rows)
     s = s.with_columns(c("inst").is_in(list(TOP25)).alias("top25"), DEC.alias("decade"))
-    s = s.join(s.group_by("author_id").agg(c("top25").sum().alias("top_years")), on="author_id").filter(c("top_years") >= 2)
+    s = s.join(s.group_by("author_id").agg((c("top25") & ~c("filled")).sum().alias("top_years")), on="author_id").filter(c("top_years") >= 2)
 
     # outcomes from the 41 journals
     ifd = pl.DataFrame([{"abbr": k, "decade": d, "if": v[i]} for k, v in IF.items() for i, d in enumerate((1970, 1980, 1990))])
@@ -120,7 +152,7 @@ def build(a) -> pl.DataFrame:
     cy = (c("year") - c("first_year")).cast(pl.Float64)
     s = s.with_columns(cy.alias("cy"), (cy**2 / 100).alias("cy2"), (cy**3 / 1000).alias("cy3"),
                        *[(c("top25") & (c("decade") == d)).cast(pl.Float64).alias(f"t{d % 100:02d}") for d in (1970, 1980, 1990)])
-    return s.drop("anchor")
+    return s
 
 
 def estimate(s: pl.DataFrame, work: Path, label: str) -> dict:
@@ -130,6 +162,7 @@ def estimate(s: pl.DataFrame, work: Path, label: str) -> dict:
 
     xs = "t70 + t80 + t90 + cy + cy2 + cy3"
     out = {"label": label, "N": s.height, "authors": s["author_id"].n_unique(), "moves": int(s["move"].sum()),
+           "filled_share": float(s["filled"].mean()),
            "means": {k: float(s[k].mean()) for k in ("impact", "articles")}}
     work.mkdir(parents=True, exist_ok=True)
     s.select("author_id", "decade", "impact", "articles", "t70", "t80", "t90", "cy", "cy2", "cy3").write_parquet(work / "data.parquet")
@@ -157,6 +190,8 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--openalex", type=Path, default=Path("build/openalex"))
     ap.add_argument("--out", type=Path, required=True)
+    ap.add_argument("--fill", choices=["none", "midpoint", "random"], default="none")
+    ap.add_argument("--seed", type=int, default=20261122)
     a = ap.parse_args()
     a.out.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
@@ -169,7 +204,7 @@ def main() -> None:
         "econbus_f20": s.filter(c("in_econbus") & (c("field_id") == 20)),
         "econbus_f14": s.filter(c("in_econbus") & (c("field_id") == 14)),
     }
-    res = {"kmz": KMZ, "kmz_b_over_mean": {k: [b / KMZ["impact_mean"] for b in v] for k, v in KMZ.items() if k in ("econ", "finance")},
+    res = {"fill": a.fill, "seed": a.seed if a.fill == "random" else None, "kmz": KMZ, "kmz_b_over_mean": {k: [b / KMZ["impact_mean"] for b in v] for k, v in KMZ.items() if k in ("econ", "finance")},
            "results": []}
     for k, d in samples.items():
         r = estimate(d, a.out / "work" / k, k)
