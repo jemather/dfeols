@@ -233,6 +233,8 @@ def main() -> None:
     ap.add_argument("--of", type=int, default=16, help="rung m keeps hash %% of < m (testing: large of)")
     ap.add_argument("--engines", nargs="+", default=["dfeols", "fixest_lean", "fixest", "pyfixest_lean", "pyfixest", "reghdfe"])
     threads = int(os.environ.get("THREADS") or os.environ.get("POLARS_MAX_THREADS") or os.cpu_count())
+    ap.add_argument("--force-engines", nargs="*", default=[],
+                    help="run these again even where they finished (repeat timings; every run is kept, numbered)")
     ap.add_argument("--dfeols-cores", type=int, default=4, help="cores per dfeols worker")
     ap.add_argument("--dfeols-workers", type=int, default=None, help="default: $THREADS // cores")
     ap.add_argument("--mem-cap-gb", type=float, default=float(os.environ.get("MEM_CAP_GB", 96)))
@@ -254,7 +256,7 @@ def main() -> None:
             rung = make_rung(a.package, a.out, m, a.of)
             print(f"{time.strftime('%H:%M:%S')} rung {rung}", flush=True)
             for e in a.engines:
-                if (e, m) in done or e in failed:
+                if ((e, m) in done and e not in a.force_engines) or e in failed:
                     continue
                 log.write(f"\n===== {time.strftime('%H:%M:%S')} {e} m={m} =====\n")
                 log.flush()
@@ -262,6 +264,7 @@ def main() -> None:
                 r = {**run(e, data, a.out / "work" / f"{e}_m{m:02d}_of{a.of}", a.mem_cap_gb, a.time_cap_min, log),
                      "m": m, "of": a.of, "rows": rung["rows"], "authors": rung["authors"]}
                 r.pop("traceback", None) if r["status"] == "ok" else None
+                r["repeat"] = sum(1 for x in res["runs"] if x["engine"] == e and x["m"] == m and x["of"] == a.of)
                 res["runs"].append(r)
                 if r["status"] != "ok":
                     failed.add(e)
