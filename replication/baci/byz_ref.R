@@ -11,7 +11,13 @@
 # the dfeols / pyfixest convention).
 suppressPackageStartupMessages({ library(fixest); library(jsonlite) })
 a <- commandArgs(trailingOnly = TRUE)
-d <- nanoparquet::read_parquet(a[1], col_select = c("t", "i", "j", "k", "pair", "v", "lv", "pos", "rta"))
+cols <- c("t", "i", "j", "k", "pair", "v", "lv", "pos", "rta")
+# nanoparquet where installed (OSCER), else arrow (valiant), as fixest_fit.R
+d <- if (requireNamespace("nanoparquet", quietly = TRUE)) {
+  nanoparquet::read_parquet(a[1], col_select = cols)
+} else {
+  as.data.frame(arrow::read_parquet(a[1], col_select = dplyr::all_of(cols)))
+}
 setFixest_notes(FALSE)
 fe <- "i^k^t + j^k^t + i^j^k"
 res <- list(rows = nrow(d), fixest = as.character(packageVersion("fixest")), R = R.version.string,
