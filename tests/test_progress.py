@@ -224,10 +224,14 @@ def test_live_line_is_wiped_by_the_next_record(monkeypatch):
     h.setFormatter(logging.Formatter("%(message)s"))
     monkeypatch.setattr(pm.log, "handlers", [h])
     assert pm._live_target() is s
-    pm._draw_live(s, "live status")
+    pm._draw_live(s, "live 1")
+    pm._draw_live(s, "live 2")
     pm.log.warning("a record")
     out = s.getvalue()
-    assert out.endswith("\r\033[Ka record\n") and "live status" in out
+    # each live line ends in a newline (a prompt after `tail` starts on its own line); the
+    # next one or the next record moves up onto it and erases it
+    assert out.endswith("live 1\n" + pm.LIVE_UP + out.split(pm.LIVE_UP)[1].split("live 2")[0]
+                        + "live 2\n" + pm.LIVE_UP + "a record\n")
     assert pm._live_stream is None
     f = io.StringIO()  # a file (Slurm's .out) gets the live line too, so tail -f shows it move
     h.stream = f
@@ -249,4 +253,4 @@ def test_a_warning_wipes_the_live_line(monkeypatch):
         monkeypatch.setattr(pm, "_showwarning", lambda *a, **k: s.write("WARN\n"))
         warnings.showwarning = pm._showwarning_clear
         warnings.warn("slow")
-    assert s.getvalue().endswith("live status\r\033[KWARN\n")
+    assert s.getvalue().endswith("live status\n" + pm.LIVE_UP + "WARN\n")

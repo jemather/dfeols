@@ -29,7 +29,6 @@ by the verbosity (set_verbosity, or DFEOLS_VERBOSITY in the environment):
 
 from __future__ import annotations
 
-import atexit
 import json
 import logging
 import os
@@ -66,11 +65,19 @@ def verbosity() -> int:
     return min(max(v, 0), 2)
 
 
-# The live line: verbosity 1 redraws the latest status in place (\r and erase-line, no
-# newline) between log lines. LiveAwareHandler, the package's default handler, wipes it
-# before it writes a record, so only the latest one is ever on screen. It goes to files too
-# (Slurm's .out), so `tail -f` shows the run moving; there each redraw stays in the file as
-# bytes (about 15 KB an hour), and `sed 's/.*\x1b\[K//' log` prints the file without them.
+# The live line: verbosity 1 shows the latest status between log lines, redrawn in place.
+# It ends in a newline, so a shell prompt after `cat` or `tail` starts on a line of its own;
+# the next redraw or record first moves the cursor up onto it and erases it (ESC[A, \r,
+# ESC[K), so only the latest one is on screen. LiveAwareHandler, the package's default
+# handler, does that before each record. It goes to files too (Slurm's .out), so `tail -f`
+# shows the run moving. In the file each redraw is a line of its own (about 15 KB an hour):
+# `tail -n` counts them, so ask for more lines than usual, and LIVE_FILTER prints the file
+# with the replaced ones dropped.
+LIVE_UP = "\033[A\r\033[K"
+LIVE_FILTER = (
+    "awk '{ if (n && substr($0, 1, 3) != \"\\033[A\") print p; "
+    "sub(/^\\033\\[A\\r\\033\\[K/, \"\"); p = $0; n = 1 } END { if (n) print p }'"
+)
 _live_stream = None
 
 
@@ -78,7 +85,7 @@ def _clear_live():
     global _live_stream
     if _live_stream is not None:
         try:
-            _live_stream.write("\r\033[K")
+            _live_stream.write(LIVE_UP)
             _live_stream.flush()
         except (OSError, ValueError):
             pass
@@ -103,14 +110,11 @@ def _live_target():
 def _draw_live(stream, text: str):
     global _live_stream
     try:
-        stream.write("\r\033[K" + time.strftime("%H:%M:%S ") + text)
+        stream.write((LIVE_UP if _live_stream is stream else "") + time.strftime("%H:%M:%S ") + text + "\n")
         stream.flush()
     except (OSError, ValueError):
         return
     _live_stream = stream
-
-
-atexit.register(_clear_live)
 
 # warnings (SlowConvergenceWarning, ...) go straight to stderr, not through the handler:
 # wipe the live line first so a warning does not land on the end of it

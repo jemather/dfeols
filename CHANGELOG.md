@@ -21,8 +21,10 @@ break the API).
   `DFEOLS_VERBOSITY=1`) the log gets a line when the stage, CG step or worker state changes,
   and otherwise once the stage has moved 5% or 10 minutes have passed, whichever comes first.
   Between those, a live line is redrawn in place every `log_every` seconds (30) and wiped by
-  the next log line, in a terminal and in a file, so `tail -f` shows the run moving.
-  `sed 's/.*\x1b\[K//' <log>` prints a log without the redraws. Verbosity 2 restores a line
+  the next log line, in a terminal and in a file, so `tail -f` shows the run moving. The live
+  line ends in a newline (a shell prompt after `cat` or `tail` gets its own line); each redraw
+  moves the cursor up and rewrites it, so in a file every redraw is a line `tail -n` counts.
+  `dfeols.progress.LIVE_FILTER` is an awk command that prints a log without the redraws. Verbosity 2 restores a line
   every `log_every` seconds; 0 prints no progress lines. `status.json` is still written every
   `log_every` seconds.
 - Workers report Dask's "Event loop was unresponsive" only for stalls over 30 s
