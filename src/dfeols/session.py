@@ -1896,6 +1896,9 @@ class Manager:
                 resp = {"id": rid, "ok": False, "error": f"{type(e).__name__}: {e}"}
             resp["sent"], resp["received"], resp["finished"] = req.get("sent"), received, _now()
             _write_json(self.dir / "responses" / f"{rid}.json", resp)
+            # idle counts from the end of a request: one that ran longer than idle_minutes
+            # (a 2 h add_variable, fpp_eng3 2026-11-22) closed the session as it answered
+            self.last_request = time.time()
             if self._stop.is_set():
                 break
         return bool(reqs)

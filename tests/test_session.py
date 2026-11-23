@@ -336,6 +336,20 @@ def test_idle_counts_from_ready_not_from_launch(ds, roots, tmp_path, monkeypatch
     assert time.time() - t0 >= 2.5  # it waited out the idle limit after ready
 
 
+def test_idle_counts_from_end_of_request(ds, roots, tmp_path, monkeypatch):
+    """A request that outlasts idle_minutes must not close the session as it answers."""
+    import time
+
+    r = {"root": tmp_path / "s", "demeaned": roots["demeaned"]}
+    m = Manager("long", Spec.make(ds.root, "spell", ["eng", "feat"]), idle_minutes=0.05, poll=0.05, **r)
+    m.start()
+    monkeypatch.setattr(m, "handle", lambda req: (time.sleep(4), {})[1])  # longer than 3 s idle
+    (m.dir / "requests" / "r1.json").write_text(json.dumps({"id": "r1", "type": "status"}))
+    m._poll_once()
+    assert time.time() - m.last_request < 1
+    assert json.loads((m.dir / "responses" / "r1.json").read_text())["ok"]
+
+
 @pytest.mark.parametrize("level_space_gb", [None, 0])
 def test_crossing_fe_iterate(ds, tmp_path, level_space_gb):
     """Crossing FEs above max_dummy_levels: plan C, one CG solve for every declared variable
