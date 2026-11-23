@@ -1952,7 +1952,7 @@ class Manager:
         if not _NAME.match(label):
             raise ValueError(f"label must match {_NAME.pattern}: {label!r}")
         wd = self.dir / "models" / f"{n:03d}-{label}"
-        factors, cat_levels = self._factors(req["formula"])
+        factors, cat_levels = self._factors(req["formula"], rid=req.get("id"))
         req = {**req, "factors": factors}
         est = self.estimate(req)
         if req.get("id"):
@@ -2144,7 +2144,7 @@ class Manager:
         self._save_state()
         return {"variables": [out[n] for n, _ in items]}
 
-    def _factors(self, formula: str) -> tuple[dict, dict]:
+    def _factors(self, formula: str, rid: str | None = None) -> tuple[dict, dict]:
         """A formula's i() terms as created indicator columns, made (in one batch) if this
         session has not made them: `i(year)` is year == level for each level but the first,
         `i(year, ref=2000)` each level but 2000, named `year::level` as fit names them;
@@ -2190,7 +2190,9 @@ class Manager:
                     lit = f'"{l}"' if isinstance(l, str) else repr(l)
                     want[nm] = f"({t.cat} == {lit})" + "".join(f" * {c}" for c in t.conts)
         if want:
-            self.add_variables({"variables": want}, internal=True)
+            # under the fit's request id, so the waiting client shows the creation's progress
+            # (it was silent until the fit was accepted: 74 columns, 30+ min, fpp_eng3)
+            self.add_variables({"id": rid, "variables": want}, internal=True)
         return factors, {t.cat: list(levels[t.cat]) for t in cats}
 
     def _var_entry(self, c: dict, **kw) -> dict:
@@ -2928,7 +2930,7 @@ class Session:
             a = _read_json(acc)
         except (OSError, json.JSONDecodeError):
             return
-        if self._once(f"est:{rid}"):
+        if self._once(f"est:{rid}:{a.get('model_dir')}"):  # creation first, then the fit
             rng = a.get("estimate_range")
             e = (
                 f"{_secs(rng[0])} to {_secs(rng[1])}"

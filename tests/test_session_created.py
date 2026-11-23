@@ -322,6 +322,17 @@ def test_export_table(ds, tmp_path, capsys):
     assert [c["header"] for c in cols] == ["m1", "m2", "two.eng", "two.fp"]
 
 
+def test_factor_creation_progress_shown(ds, tmp_path, capsys):
+    """A fit whose i() columns are new shows the creation's estimate, then the fit's."""
+    r = _roots(tmp_path)
+    with _start("facp", ds, r, progress=True) as s:
+        capsys.readouterr()
+        s.fit("eng ~ posts + i(tbin)", cluster="id_a")
+        err = capsys.readouterr().err
+    assert "creating tbin::" in err
+    assert err.index("creating tbin::") < err.index("estimated", err.index("creating tbin::") + 1)
+
+
 @pytest.mark.parametrize("spec", [{}, {"max_dummy_levels": 10, "iter_tol": 1e-12}], ids=["dense", "iterate"])
 def test_factor_terms(ds, tmp_path, spec):
     """i(tbin) and i(tbin, ref=...) in a session: indicator columns created in one batch,
