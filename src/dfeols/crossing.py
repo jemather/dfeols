@@ -1124,6 +1124,7 @@ class Checkpoint:
 
     def remove(self) -> None:
         self.path.unlink(missing_ok=True)
+        self.path.with_suffix(".hist.json").unlink(missing_ok=True)  # estimate._cg_hist_save
 
 
 # ---------------------------------------------------------------- CG steps' tree reduction

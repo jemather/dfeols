@@ -29,9 +29,12 @@ by the verbosity (set_verbosity, or DFEOLS_VERBOSITY in the environment):
 
 from __future__ import annotations
 
+import fcntl
+import io
 import json
 import logging
 import os
+import stat
 import time
 import warnings
 from dataclasses import dataclass, field
@@ -65,42 +68,96 @@ def verbosity() -> int:
     return min(max(v, 0), 2)
 
 
-# The live line: verbosity 1 shows the latest status between log lines, redrawn in place.
-# It ends in a newline, so a shell prompt after `cat` or `tail` starts on a line of its own;
-# the next redraw or record first moves the cursor up onto it and erases it (ESC[A, \r,
-# ESC[K), so only the latest one is on screen. LiveAwareHandler, the package's default
-# handler, does that before each record. It goes to files too (Slurm's .out), so `tail -f`
-# shows the run moving. In the file each redraw is a line of its own (about 15 KB an hour):
-# `tail -n` counts them, so ask for more lines than usual, and LIVE_FILTER prints the file
-# with the replaced ones dropped.
+# The live line: verbosity 1 shows the latest status between log lines, in place.
+#   * terminal: it ends in a newline (a prompt after it gets its own line); the next redraw
+#     or record moves the cursor up onto it and erases it (LIVE_UP).
+#   * regular file (Slurm's .out): it is the file's last line, overwritten in place with
+#     os.pwrite, padded with spaces so a shorter line covers a longer one, and a log record
+#     is written over it the same way. So `tail`, `cat`, `less` and `grep` see the milestone
+#     lines and one current live line, with no control codes. `tail -f` prints only what is
+#     appended, so it shows a live line once after each log line; `watch -n 30 tail <file>`
+#     or `dfeols status --watch` show it move. If anything else wrote to the file since
+#     (print, a warning), the old live line stays as it was and the next one is appended.
+#   * pipe, a file opened to append (>>), or anything else: no live line.
+# LiveAwareHandler, the package's default handler, does the replacing before each record.
 LIVE_UP = "\033[A\r\033[K"
-LIVE_FILTER = (
-    "awk '{ if (n && substr($0, 1, 3) != \"\\033[A\") print p; "
-    "sub(/^\\033\\[A\\r\\033\\[K/, \"\"); p = $0; n = 1 } END { if (n) print p }'"
-)
-_live_stream = None
+_live = None  # {"stream", "kind": "tty" | "file", and for a file "fd", "off", "len", "end"}
+
+
+def _stream_kind(stream) -> str | None:
+    try:
+        if stream.isatty():
+            return "tty"
+        fd = stream.fileno()
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        # opened to append (>>, Slurm's --open-mode=append): Linux's pwrite ignores the
+        # offset there and appends, so the live line would pile up; the log lines only
+        return None if fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_APPEND else "file"
+    except (AttributeError, OSError, ValueError, io.UnsupportedOperation):
+        return None
+
+
+def _file_slot_free(lv: dict) -> bool:
+    """The live line is still the file's end: nothing has been written after it."""
+    try:
+        lv["stream"].flush()
+        return os.fstat(lv["fd"]).st_size == lv["end"]
+    except (OSError, ValueError):
+        return False
+
+
+def _pwrite_slot(lv: dict, text: str) -> bool:
+    """Write `text` (newline-terminated) over the live line, padded to cover it; the file's
+    offset goes to its new end, where the next ordinary write lands."""
+    fd = lv["fd"]
+    body = text.rstrip("\n")
+    data = (body + " " * max(lv["len"] - 1 - len(body.encode()), 0) + "\n").encode()
+    try:
+        os.pwrite(fd, data, lv["off"])
+        end = max(lv["end"], lv["off"] + len(data))
+        os.lseek(fd, 0, os.SEEK_END)
+    except OSError:
+        return False
+    lv["len"], lv["end"] = max(lv["len"], len(data)), end
+    return True
 
 
 def _clear_live():
-    global _live_stream
-    if _live_stream is not None:
+    """Before a write that bypasses the handler (a warning): a terminal's live line is
+    erased; a file's stays as it is and the next one is appended after the warning."""
+    global _live
+    lv, _live = _live, None
+    if lv is not None and lv["kind"] == "tty":
         try:
-            _live_stream.write(LIVE_UP)
-            _live_stream.flush()
+            lv["stream"].write(LIVE_UP)
+            lv["stream"].flush()
         except (OSError, ValueError):
             pass
-        _live_stream = None
 
 
 class LiveAwareHandler(logging.StreamHandler):
     def emit(self, record):
-        _clear_live()
+        global _live
+        lv = _live
+        if lv is not None and lv["kind"] == "file" and lv["stream"] is self.stream:
+            _live = None
+            if _file_slot_free(lv):
+                try:
+                    msg = self.format(record)
+                except Exception:  # noqa: BLE001 (logging's own handleError reports it)
+                    self.handleError(record)
+                    return
+                if _pwrite_slot(lv, msg + "\n"):
+                    return
+        else:
+            _clear_live()
         super().emit(record)
 
 
 def _live_target():
-    """The stream the default handler writes to (terminal or file), or None when the user
-    configured their own handlers."""
+    """The stream the default handler writes to, or None when the user configured their
+    own handlers."""
     for h in log.handlers:
         if isinstance(h, LiveAwareHandler):
             return getattr(h, "stream", None)
@@ -108,16 +165,31 @@ def _live_target():
 
 
 def _draw_live(stream, text: str):
-    global _live_stream
+    global _live
+    line = time.strftime("%H:%M:%S ") + text + "\n"
+    lv = _live if _live is not None and _live["stream"] is stream else None
+    kind = lv["kind"] if lv else _stream_kind(stream)
     try:
-        stream.write((LIVE_UP if _live_stream is stream else "") + time.strftime("%H:%M:%S ") + text + "\n")
-        stream.flush()
+        if kind == "tty":
+            stream.write((LIVE_UP if lv else "") + line)
+            stream.flush()
+            _live = {"stream": stream, "kind": "tty"}
+        elif kind == "file":
+            if lv is not None and _file_slot_free(lv) and _pwrite_slot(lv, line):
+                return
+            stream.flush()
+            fd = stream.fileno()
+            off = os.fstat(fd).st_size
+            stream.write(line)
+            stream.flush()
+            end = os.fstat(fd).st_size
+            _live = {"stream": stream, "kind": "file", "fd": fd, "off": off, "len": end - off, "end": end}
     except (OSError, ValueError):
-        return
-    _live_stream = stream
+        _live = None
+
 
 # warnings (SlowConvergenceWarning, ...) go straight to stderr, not through the handler:
-# wipe the live line first so a warning does not land on the end of it
+# a terminal's live line is erased first so a warning does not land on it
 _showwarning = warnings.showwarning
 
 
@@ -221,6 +293,7 @@ class Progress:
         self.verbosity = verbosity()
         self._printed: dict | None = None  # what the last log line showed (verbosity 1)
         self.stage2_prior_frac: float | None = None  # round2 secs / round1 secs per row
+        self.round1_rate_prior: float | None = None  # round 1's rate from its checkpoint
         self.slots = 1
         self.max_slots: int | None = None
         self.running: dict[str, set[int]] = {}
@@ -291,6 +364,8 @@ class Progress:
         total_eta = 0.0
         total_known = True
         r1 = self.stages[self.order[0]].rate() if self.order else None
+        if r1 is None:  # round 1 came from a checkpoint: its rate as saved there
+            r1 = self.round1_rate_prior
         for name in self.order:
             st = self.stages[name]
             rate = st.rate()

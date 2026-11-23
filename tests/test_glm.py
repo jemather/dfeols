@@ -116,3 +116,44 @@ def test_singletons_and_separation_iterate_jointly(tmp_path):
     assert r.N == 400
     m = pf.fepois("y ~ x | a + b", data=df.filter(pl.col("a") > 0).to_pandas(), iwls_tol=1e-12, fixef_tol=1e-13)
     np.testing.assert_allclose(r.coef(), m.coef().to_numpy(), **TOL)
+
+
+def test_warm_start_and_step_halving(data, tmp_path, monkeypatch):
+    """The IRLS warm start (worker._warm_start) only moves the demeaning's starting point, so
+    the fit equals a cold one; and a step that raises the deviance is halved back (glm
+    shard_glm_halve) and the fit still converges to the same estimates."""
+    from dfeols import glm as G
+    from dfeols import worker as Wk
+
+    ds2 = dfeols.prep(
+        data, shard_dir=tmp_path / "sh", partition="id_a", fixed_effects=["spell", "week"],
+        clusters=["id_a"], target_rows=3000,
+    )  # fmt: skip
+    fml = "cnt ~ feat + posts | spell + week"
+    kw = dict(cluster="id_a", log_every=1e9, fe_method="iterate", fe_tol=1e-13, tol=1e-12)
+    warm = dfeols.fit_glm(ds2, fml, "poisson", workdir=tmp_path / "w", keep_sidecars=True, **kw)
+    assert list((tmp_path / "w" / "side1").glob("warm-*.npz")), "round 1 saved no warm start"
+    monkeypatch.setattr(G, "_WARM", False)
+    cold = dfeols.fit_glm(ds2, fml, "poisson", workdir=tmp_path / "c", **kw)
+    np.testing.assert_allclose(warm.coef(), cold.coef(), rtol=1e-9)
+    assert warm.options["glm"]["step_halvings"] == [0] * warm.options["glm"]["iterations"]
+    monkeypatch.setattr(G, "_WARM", True)
+
+    # a bad second step: eta overshoots by 4x the change, which raises the deviance
+    real, calls = Wk._write_glm_step, {"n": 0}
+
+    def overshoot(plan, shard_id, df, n0, eta):
+        calls["n"] += 1
+        if 13 <= calls["n"] <= 24:  # the shards' writes in iteration 2 (12 shards or fewer)
+            prev = pl.read_parquet(Wk.sidecar_path(plan.sidecar_dir, shard_id), columns=[G.ETA])[G.ETA]
+            p = prev.to_numpy()[df["__row"].to_numpy()]
+            eta = p + 5.0 * (eta - p)
+        return real(plan, shard_id, df, n0, eta)
+
+    monkeypatch.setattr(Wk, "_write_glm_step", overshoot)
+    nshards = len(ds2.shards)
+    calls["n"] = 12 - nshards  # so iteration 2's writes are calls 13 .. 12 + nshards
+    bad = dfeols.fit_glm(ds2, fml, "poisson", workdir=tmp_path / "b", **kw)
+    h = bad.options["glm"]["step_halvings"]
+    assert h[1] > 0 and bad.options["glm"]["converged"], h
+    np.testing.assert_allclose(bad.coef(), cold.coef(), rtol=1e-8)

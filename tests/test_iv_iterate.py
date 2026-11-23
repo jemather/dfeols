@@ -107,10 +107,16 @@ def test_cg_checkpoint_resumes_a_fit(ds, tmp_path, caplog):
     with pytest.raises(RuntimeError, match="did not converge in 3 steps"):
         _fit(ds, wd, iter_maxiter=3, **kw)
     assert (wd / "cg_checkpoint.npz").exists()
+    # the residuals by step are kept beside it, so a resume knows the steps left at once
+    from dfeols.estimate import _cg_hist_load
+
+    first, h = _cg_hist_load(wd / "cg_checkpoint.hist.json", 3)
+    assert first == 0 and len(h) == 4 and h[0] == 1.0
     with caplog.at_level(logging.INFO, logger="dfeols"):
         again = _fit(ds, wd, **kw)
     assert "resumes at step 3" in caplog.text
     assert not (wd / "cg_checkpoint.npz").exists()
+    assert not (wd / "cg_checkpoint.hist.json").exists()
     cg = again.options["crossing_cg"]
     assert cg["resumed_from"] == 3 and cg["passes"] == cg["steps"] - 3
     _same(clean, again, 1e-10)
@@ -144,3 +150,17 @@ def test_cg_checkpoint_kept_until_the_fit_is_done(ds, tmp_path, monkeypatch, cap
     assert cg["passes"] == 0 and cg["resumed_from"] == cg["steps"] > 0
     assert not (wd / "cg_checkpoint.npz").exists()
     _same(clean, again, 1e-10)
+
+
+def test_cg_history_load_trims_to_the_checkpoint(tmp_path):
+    from dfeols.estimate import _cg_hist_load, _cg_hist_save
+
+    p = tmp_path / "cg_checkpoint.hist.json"
+    assert _cg_hist_load(p, 5) == (6, [])  # none (a checkpoint from before 7a69832)
+    _cg_hist_save(p, 0, [1.0, 0.5, 0.2, 0.1, 0.05])
+    assert _cg_hist_load(p, 3) == (0, [1.0, 0.5, 0.2, 0.1])  # history ahead of the npz
+    assert _cg_hist_load(p, 9) == (10, [])  # behind it: not usable
+    _cg_hist_save(p, 6, [0.3, 0.2])  # a run that resumed at 5 without a history
+    assert _cg_hist_load(p, 7) == (6, [0.3, 0.2])
+    p.write_text("not json")
+    assert _cg_hist_load(p, 7) == (8, [])

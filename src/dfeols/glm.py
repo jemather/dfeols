@@ -29,6 +29,11 @@ factors; the iid VCE is the bread times (N - 1)/(N - K) (dispersion 1 for both f
 All three equal pyfixest's fepois.
 
 Convergence: |dev - dev_prev| / (0.1 + |dev|) < tol (fixest's rule), default 1e-8.
+
+Two safeguards, as fixest's feglm and ppmlhdfe have: each iteration's local demeaning starts
+from the previous iteration's solution (worker._warm_start; exact, it only moves the starting
+point), and a step that raises the deviance (or makes it non-finite) is halved toward the
+previous linear predictor until it doesn't, up to MAX_HALVINGS times (shard_glm_halve).
 """
 
 from __future__ import annotations
@@ -49,7 +54,9 @@ from .formula import parse
 
 log = logging.getLogger(__name__)
 
-Z, W = "_glm_z", "_glm_w"
+Z, W, ETA = "_glm_z", "_glm_w", "_glm_eta"
+MAX_HALVINGS = 20
+_WARM = True  # IRLS warm start of the local demeaning (tests switch it off to compare)
 
 
 @dataclass(frozen=True)
@@ -159,11 +166,46 @@ def shard_glm_init(sid: int, files: list[str], spec: dict) -> dict:
         from .worker import sidecar_path
 
         path = sidecar_path(spec["out"], sid)
-        side = pl.DataFrame({Z: z, W: w}).with_columns(pl.all().fill_nan(None))
+        side = pl.DataFrame({Z: z, W: w, ETA: eta}).with_columns(pl.all().fill_nan(None))
         side.write_parquet(path.with_suffix(".parquet.tmp"))
         path.with_suffix(".parquet.tmp").replace(path)
     out["timing"] = {"total": time.perf_counter() - t0}
     return out
+
+
+def shard_glm_halve(sid: int, files: list[str], spec: dict) -> dict:
+    """Step halving: eta = (eta_prev + eta_new) / 2 on the rows the new step covers, from the
+    sidecars in spec["prev"] (the step's input) and spec["cur"] (its output, rewritten here
+    with the halved z, w, eta and the shard's deviance at the halved mean)."""
+    from .worker import sidecar_path
+
+    t0 = time.perf_counter()
+    fam = FAMILIES[spec["family"]]
+    cur_p = sidecar_path(spec["cur"], sid)
+    cur = pl.read_parquet(cur_p)
+    prev = pl.read_parquet(sidecar_path(spec["prev"], sid), columns=[ETA])
+    y = pl.read_parquet(files, columns=[spec["y"]])[spec["y"]].cast(pl.Float64).to_numpy()
+    if not (cur.height == prev.height == len(y)):
+        raise RuntimeError(
+            f"shard {sid}: sidecars and shard differ in rows ({cur.height}, {prev.height}, {len(y)})"
+        )
+    en = cur[ETA].cast(pl.Float64).fill_null(np.nan).to_numpy()
+    ep = prev[ETA].cast(pl.Float64).fill_null(np.nan).to_numpy()
+    on = np.isfinite(en)
+    eta = np.full(len(y), np.nan)
+    eta[on] = np.where(np.isfinite(ep[on]), 0.5 * (ep[on] + en[on]), en[on])
+    eta[on] = np.clip(eta[on], *fam.eta_bounds)
+    mu = fam.linkinv(eta[on])
+    z, w = np.full(len(y), np.nan), np.full(len(y), np.nan)
+    z[on], w[on] = fam.working(y[on], eta[on], mu)
+    side = pl.DataFrame({Z: z, W: w, ETA: eta}).with_columns(pl.all().fill_nan(None))
+    side.write_parquet(cur_p.with_suffix(".parquet.tmp"))
+    cur_p.with_suffix(".parquet.tmp").replace(cur_p)
+    stats = {"deviance": float(fam.deviance(y[on], mu).sum()), "n": int(on.sum())}
+    stats["sum_y"] = float(y[on].sum())
+    stats["max_abs_eta"] = float(np.abs(eta[on]).max(initial=0.0))
+    (Path(spec["cur"]) / f"glm-{sid:05d}.json").write_text(json.dumps(stats))
+    return {"shard": sid, "n": stats["n"], "timing": {"total": time.perf_counter() - t0}}
 
 
 def _run(executor, fn, ds, args_of, wd, label):
@@ -315,21 +357,39 @@ def fit_glm(
     _run(executor, shard_glm_init, ds, lambda sid: wspec, wd, "glm_init")
 
     zf = f"{Z} ~{rhs}|{fe_part}" if fe_part else f"{Z} ~{rhs}"
-    dev_prev, it, converged, r, history = None, 0, False, None, []
+    dev_prev, it, converged, r, history, halvings = None, 0, False, None, [], []
     for it in range(1, maxiter + 1):
         read, write = sides[(it - 1) % 2], sides[it % 2]
         for old in write.glob("glm-*.json"):
             old.unlink()
+        for old in write.glob("warm-*.npz"):  # this step's round 1 writes its own
+            old.unlink()
         r = fit(
             ds, zf, weights=W, cluster=cluster, vcov=vcov, executor=executor, workdir=wd / "fit",
             record=False, predict=wd / "pred", predict_keep=[y],
-            _glm={"cols": (Z, W), "read": read, "write": write, "family": family, "y": y}, **fit_kw,
+            _glm={"cols": (Z, W), "read": read, "write": write, "family": family, "y": y, "warm": _WARM}, **fit_kw,
         )  # fmt: skip
-        stats = [json.loads(p.read_text()) for p in write.glob("glm-*.json")]
-        dev = sum(s["deviance"] for s in stats)
+        dev = _deviance(write)
+        # step halving (fixest, ppmlhdfe): a step that raises the deviance, or makes it
+        # non-finite, goes halfway back toward the previous linear predictor until it doesn't
+        nh = 0
+        while not np.isfinite(dev) or (dev_prev is not None and (dev - dev_prev) / (0.1 + abs(dev)) > tol):
+            if nh == MAX_HALVINGS:
+                raise RuntimeError(
+                    f"fit_glm {family}: iteration {it}: the deviance ({dev:.10g}, previous {dev_prev}) "
+                    f"did not fall after {MAX_HALVINGS} step halvings"
+                )
+            nh += 1
+            log.info("fit_glm %s: iteration %d, deviance %.10g rose; halving the step (%d)",
+                     family, it, dev, nh)  # fmt: skip
+            hspec = {"family": family, "y": y, "prev": str(read), "cur": str(write)}
+            _run(executor, shard_glm_halve, ds, lambda sid, h=hspec: h, wd, "glm_halve")
+            dev = _deviance(write)
+        halvings.append(nh)
         history.append(dev)
         log.info("fit_glm %s: iteration %d, deviance %.10g", family, it, dev)
-        if dev_prev is not None and abs(dev - dev_prev) / (0.1 + abs(dev)) < tol:
+        # not on a halved step: r is the fit before halving, so iterate once more from it
+        if nh == 0 and dev_prev is not None and abs(dev - dev_prev) / (0.1 + abs(dev)) < tol:
             converged = True
             break
         dev_prev = dev
@@ -355,12 +415,17 @@ def fit_glm(
         "converged": converged,
         "deviance": history[-1],
         "deviance_history": history,
+        "step_halvings": halvings,
         "tol": tol,
         "separated_rows": int(n0 - n_alive),
         "separation_passes": passes,
         "seconds": round(time.time() - t0, 2),
     }
     return r
+
+
+def _deviance(folder: Path) -> float:
+    return float(sum(json.loads(p.read_text())["deviance"] for p in folder.glob("glm-*.json")))
 
 
 def _iid_to_glm(out: dict, r) -> None:

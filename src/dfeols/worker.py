@@ -159,6 +159,10 @@ class Plan:
     sidecar_dir: str | None = None
     sidecar_cols: tuple[str, ...] = ()
     glm: dict | None = None
+    # IRLS warm start (dfeols.glm, as fixest and ppmlhdfe): (read dir, write dir). Round 1
+    # starts each shard's local demeaning from the previous iteration's solution and saves
+    # its own for the next (_warm_start / _warm_save)
+    glm_warm: tuple[str, str] | None = None
     # fit(subset=...): a row condition on raw columns (expr.condition), applied before
     # listwise deletion; its columns are read only for it
     subset: str | None = None
@@ -300,8 +304,8 @@ def _load(
         if sc.height != df.height:
             raise RuntimeError(f"shard {shard_id}: sidecar has {sc.height} rows, the shard {df.height}")
         df = df.hstack(sc)
-    if plan.glm:  # the raw row position, so round 2 can write the next sidecar aligned
-        df = df.with_row_index("__row")
+    if plan.glm or plan.glm_warm:  # the raw row position: round 2 writes the next sidecar
+        df = df.with_row_index("__row")  # aligned to it, round 1 the warm start
     # listwise deletion on the variables of this spec (a session's: its declared variables)
     num = [c for c in sorted(sample) if df.schema[c].is_float()]
     n_read = df.height
@@ -669,7 +673,54 @@ def _dummy_gram(plan: Plan, local_codes, w, Dm, gcodes, P: int, sparse_out: bool
     return DWD - (C.T @ sp.diags(1.0 / WA) @ C).toarray()
 
 
-def _round1_sparse(plan: Plan, shard_id: int, df, n0: int, local_codes, w, T, t0, raw: dict | None = None):
+def _warm_path(folder: str, shard_id: int) -> Path:
+    return Path(folder) / f"warm-{shard_id:05d}.npz"
+
+
+def _warm_start(plan: Plan, shard_id: int | None, df, M: np.ndarray) -> np.ndarray:
+    """IRLS warm start for the local demeaning: M minus the previous iteration's FE part of
+    each column (o = M_prev - M~_prev, saved by _warm_save), matched on raw row position.
+
+    o lies in the span of the local FEs (whatever the weights that produced it), and the
+    W-weighted residual maker annihilates that span for any W, so demeaning M - o gives M~
+    exactly (to fe_tol): only the alternating projections' starting point moves, close to
+    the answer once IRLS settles. fixest's fepois and ppmlhdfe do the same; without it a
+    Poisson fit with three high-dimensional FEs restarted every iteration from scratch and
+    hit fe_maxiter as the weights spread (D13 BYZ R0, 2026-11-23)."""
+    if not plan.glm_warm or shard_id is None or "__row" not in df.columns or not len(M):
+        return M
+    path = _warm_path(plan.glm_warm[0], shard_id)
+    if not path.exists():
+        return M
+    with np.load(path) as d:
+        rows, off = d["rows"], d["off"]
+    if off.ndim != 2 or off.shape[1] != M.shape[1] or not len(rows):
+        return M
+    cur = df["__row"].to_numpy().astype(np.int64)
+    i = np.minimum(np.searchsorted(rows, cur), len(rows) - 1)
+    ok = rows[i] == cur
+    out = np.array(M, dtype=np.float64, copy=True)
+    out[ok] -= off[i[ok]]
+    return out
+
+
+def _warm_save(plan: Plan, shard_id: int | None, df, M: np.ndarray, Mt: np.ndarray) -> None:
+    """Round 1 of an IRLS step: save this shard's FE part M - M~ for the next iteration."""
+    if not plan.glm_warm or shard_id is None or "__row" not in df.columns:
+        return
+    rows = df["__row"].to_numpy().astype(np.int64)
+    order = np.argsort(rows, kind="stable")
+    path = _warm_path(plan.glm_warm[1], shard_id)
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "wb") as fh:
+        np.savez(fh, rows=rows[order], off=(np.asarray(M, np.float64) - Mt)[order])
+    os.replace(tmp, path)
+
+
+def _round1_sparse(
+    plan: Plan, shard_id: int, df, n0: int, local_codes, w, T, t0, raw: dict | None = None,
+    warm_save: bool = True,
+):  # fmt: skip
     """Local FEs plus crossing FEs, without dense dummies.
 
     With Q the within-local-FEs residual maker (W-orthogonal), for the dummy
@@ -700,9 +751,12 @@ def _round1_sparse(plan: Plan, shard_id: int, df, n0: int, local_codes, w, T, t0
     m = Y.shape[1]
     converged = True
     if n:
+        YX0 = np.hstack([Y, X])
         YX, converged = demean(
-            np.hstack([Y, X]), local_codes, w, plan.fe_tol, plan.fe_maxiter, plan.fe_method
+            _warm_start(plan, shard_id, df, YX0), local_codes, w, plan.fe_tol, plan.fe_maxiter, plan.fe_method
         )
+        if warm_save:
+            _warm_save(plan, shard_id, df, YX0, YX)
     else:
         YX = np.zeros((0, m + X.shape[1]))
     Yt, Xt = YX[:, :m], YX[:, m:]
@@ -868,11 +922,13 @@ def _round1(plan: Plan, shard_id: int, files: list[str], write_cache: bool):
     raw: dict = {}
     if plan.sparse_global:
         Y, Yt, Zt, ZtZ, ZtY, extra, converged, aux = _round1_sparse(
-            plan, shard_id, df, n0, local_codes, w, T, t0, raw
+            plan, shard_id, df, n0, local_codes, w, T, t0, raw, warm_save=write_cache
         )
         t = time.perf_counter() - T.pop("crossprod")  # keep timing the cluster bookkeeping
     else:
-        Y, Yt, Zt, ZtZ, ZtY, converged, t = _round1_dense(plan, df, n, local_codes, w, T, raw)
+        Y, Yt, Zt, ZtZ, ZtY, converged, t = _round1_dense(
+            plan, df, n, local_codes, w, T, raw, shard_id=shard_id, warm_save=write_cache
+        )
         extra = aux = None
     out = {
         "shard": shard_id,
@@ -901,7 +957,10 @@ def _round1(plan: Plan, shard_id: int, files: list[str], write_cache: bool):
     return _round1_finish(plan, shard_id, df, local_codes, w, Yt, Zt, out, T, t, t0, write_cache, extra)
 
 
-def _round1_dense(plan: Plan, df, n, local_codes, w, T, raw: dict | None = None):
+def _round1_dense(
+    plan: Plan, df, n, local_codes, w, T, raw: dict | None = None, shard_id: int | None = None,
+    warm_save: bool = True,
+):  # fmt: skip
     f = plan.formula
     t = time.perf_counter()
     Y = _outcome_block(plan, df, n)
@@ -931,11 +990,11 @@ def _round1_dense(plan: Plan, df, n, local_codes, w, T, raw: dict | None = None)
         raw["s1"], raw["s2"] = w @ Z, w @ (Z * Z)
 
     t = time.perf_counter()
-    YZ = np.hstack([Y, Z])
+    YZ0 = YZ = np.hstack([Y, Z])
     converged = True
     if local_codes and n:
         YZ, converged = demean(
-            YZ,
+            _warm_start(plan, shard_id, df, YZ0),
             local_codes,
             w,
             plan.fe_tol,
@@ -944,6 +1003,8 @@ def _round1_dense(plan: Plan, df, n, local_codes, w, T, raw: dict | None = None)
             slopes=plan.local_slope_columns(df) if plan.slopes else None,
             intercept=plan.local_intercept,
         )
+        if warm_save:
+            _warm_save(plan, shard_id, df, YZ0, YZ)
     m = Y.shape[1]
     Yt, Zt = YZ[:, :m], YZ[:, m:]
     T["demean"] = time.perf_counter() - t
@@ -1282,8 +1343,11 @@ def _write_glm_step(plan: Plan, shard_id: int, df, n0: int, eta: np.ndarray) -> 
     zf = np.full(n0, np.nan)
     wf = np.full(n0, np.nan)
     zf[rows], wf[rows] = z, w
+    ef = np.full(n0, np.nan)
+    ef[rows] = eta
     zc, wc = plan.sidecar_cols
-    out = pl.DataFrame({zc: zf, wc: wf}).with_columns(pl.all().fill_nan(None))
+    # eta too: a step the deviance rejects is halved from the previous one (glm.shard_glm_halve)
+    out = pl.DataFrame({zc: zf, wc: wf, _glm.ETA: ef}).with_columns(pl.all().fill_nan(None))
     path = sidecar_path(g["out"], shard_id)
     tmp = path.with_suffix(".parquet.tmp")
     out.write_parquet(tmp)

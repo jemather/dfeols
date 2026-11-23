@@ -545,7 +545,10 @@ def _round1_load(plan: Plan, ds: Dataset, wd: Path, label: str):
     return rec
 
 
-def _round1_save(plan: Plan, ds: Dataset, wd: Path, acc: dict, peak: float, seconds: float, label: str) -> None:
+def _round1_save(plan: Plan, ds: Dataset, wd: Path, acc: dict, peak: float, seconds: float, label: str,
+                 rate: float | None = None, stage2_prior_frac: float | None = None) -> None:
+    """rate (worker-seconds a row) and stage2_prior_frac let a resumed fit project round 2's
+    time (Progress.snapshot) without rerunning round 1."""
     import pickle
 
     p = wd / ROUND1_CHECKPOINT
@@ -553,8 +556,8 @@ def _round1_save(plan: Plan, ds: Dataset, wd: Path, acc: dict, peak: float, seco
     t = time.time()
     try:
         with open(tmp, "wb") as fh:
-            pickle.dump({"digest": _round1_digest(plan, ds), "acc": acc, "peak": peak, "seconds": seconds},
-                        fh, protocol=5)
+            pickle.dump({"digest": _round1_digest(plan, ds), "acc": acc, "peak": peak, "seconds": seconds,
+                         "rate": rate, "stage2_prior_frac": stage2_prior_frac}, fh, protocol=5)
         tmp.replace(p)
     except Exception as e:  # noqa: BLE001 (the checkpoint is a convenience)
         log.warning("fit %s: could not save round 1's checkpoint (%r)", label, e)
@@ -876,6 +879,28 @@ def _cg_steps_left(hist: list[float], tol: float, window: int = 30) -> int | Non
     return max(int(np.ceil((h[-1] - np.log(tol)) / fall - 1e-9)), 0) if fall > 0 else None
 
 
+def _cg_hist_save(path: Path, first: int, hist: list[float]) -> None:
+    """The CG residuals by step (hist[0] is step `first`'s), written after each step."""
+    tmp = path.with_suffix(".tmp")
+    try:
+        tmp.write_text(json.dumps({"first": first, "hist": hist}))
+        os.replace(tmp, path)
+    except OSError:
+        pass  # only the ETA after a resume needs it
+
+
+def _cg_hist_load(path: Path | None, it: int) -> tuple[int, list[float]]:
+    """(first step, residuals through step `it`) from _cg_hist_save, or (it + 1, []) when
+    there is none: then the resumed steps build their own history."""
+    try:
+        d = json.loads(path.read_text())
+        first, h = int(d["first"]), [float(x) for x in d["hist"]]
+    except (AttributeError, OSError, ValueError, KeyError, TypeError):
+        return it + 1, []
+    h = h[: it - first + 1]  # the history file can be ahead of the checkpoint's last write
+    return (first, h) if h and first + len(h) - 1 == it else (it + 1, [])
+
+
 def _crossing_cg(
     plan: Plan,
     ds: Dataset,
@@ -1022,10 +1047,14 @@ def _crossing_cg(
         return Ap
 
     hist = [1.0]  # relative residuals, starting from the right-hand side
+    hist_from = [0]  # the step hist[0] belongs to
+    hist_path = None  # beside the checkpoint, so a resume knows how fast the residual fell
 
     def on_step(it, rel):
         step["it"] = it
         hist.append(float(rel.max()))
+        if hist_path is not None:
+            _cg_hist_save(hist_path, hist_from[0], hist)
         left = _cg_steps_left(hist, tol)
         dt = time.time() - step["t"]
         step["t"] = time.time()
@@ -1041,12 +1070,16 @@ def _crossing_cg(
     ck = state = None
     if not level and getattr(plan, "cg_checkpoint", None):
         ck = cx.Checkpoint(plan.cg_checkpoint, R, tol, method, every_s=CG_CHECKPOINT_EVERY_S)
+        hist_path = Path(ck.path).with_suffix(".hist.json")
         state = ck.load()
         if state is not None:
             log.info("fit %s: crossing-FE CG resumes at step %d (%s)", label, int(state["it"]), ck.path)
-            # the rate of fall is the resumed steps' own: the 1.0 at the start of hist is
-            # step 0's, so after a resume at step 808 it read as 808 steps' fall in a few
-            hist.clear()
+            # the history up to the resumed step, kept beside the checkpoint, so the steps
+            # left (and 'all left') are known at once. Without it, the rate of fall is the
+            # resumed steps' own: the 1.0 at the start of hist is step 0's, so after a resume
+            # at step 808 it read as 808 steps' fall in a few
+            hist_from[0], kept = _cg_hist_load(hist_path, int(state["it"]))
+            hist[:] = kept
     mv = cx.level_matvec(A) if level else matvec_pass
     trial = None
     if level and precond == "auto" and method != "jacobi" and A.nnz >= cx.PRECOND_TRIAL_MIN_NNZ:
@@ -1578,7 +1611,12 @@ def fit(
         subset=subset,
     )
     if _glm:  # one IRLS step of dfeols.glm: z and w come from sidecar files per shard
-        plan = dataclasses.replace(plan, sidecar_dir=str(_glm["read"]), sidecar_cols=tuple(_glm["cols"]))
+        plan = dataclasses.replace(
+            plan,
+            sidecar_dir=str(_glm["read"]),
+            sidecar_cols=tuple(_glm["cols"]),
+            glm_warm=(str(_glm["read"]), str(_glm["write"])) if _glm.get("warm", True) else None,
+        )
     if subset is not None:
         plan = dataclasses.replace(plan, subset=subset)
     if predict is not None:
@@ -1812,6 +1850,9 @@ def fit(
         r1 = _round1_load(plan, ds, wd, label) if _round1_checkpointed(plan) else None
         if r1 is not None:  # an earlier run of this fit got past round 1: its sums
             acc, peak["rss"] = r1["acc"], r1["peak"]
+            # its rate, for round 2's projection (checkpoints before 7a69832 have none)
+            prog.round1_rate_prior = r1.get("rate")
+            prog.stage2_prior_frac = r1.get("stage2_prior_frac")
             prog.start("round1")
             prog.finish("round1", log=False)
             log.info("fit %s: round 1 from the checkpoint of an earlier run (%s; it took %s)",
@@ -1903,7 +1944,8 @@ def fit(
             prog.finish("round1")
             if _round1_checkpointed(plan):
                 st = prog.stages["round1"]
-                _round1_save(plan, ds, wd, acc, peak["rss"], st.finished - st.started, label)
+                _round1_save(plan, ds, wd, acc, peak["rss"], st.finished - st.started, label,
+                             rate=st.rate(), stage2_prior_frac=prog.stage2_prior_frac)
         if not acc["converged"]:
             log.warning("fit %s: FE demeaning did not converge in some shards", label)
 

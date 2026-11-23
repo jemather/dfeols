@@ -20,11 +20,16 @@ break the API).
 - Progress output is quieter on long runs. By default (`dfeols.set_verbosity(1)`, or
   `DFEOLS_VERBOSITY=1`) the log gets a line when the stage, CG step or worker state changes,
   and otherwise once the stage has moved 5% or 10 minutes have passed, whichever comes first.
-  Between those, a live line is redrawn in place every `log_every` seconds (30) and wiped by
-  the next log line, in a terminal and in a file, so `tail -f` shows the run moving. The live
-  line ends in a newline (a shell prompt after `cat` or `tail` gets its own line); each redraw
-  moves the cursor up and rewrites it, so in a file every redraw is a line `tail -n` counts.
-  `dfeols.progress.LIVE_FILTER` is an awk command that prints a log without the redraws. Verbosity 2 restores a line
+  Between those, a live line shows the latest status, updated every `log_every` seconds (30)
+  and replaced by the next log line. In a terminal it is redrawn in place. In a log file
+  (Slurm's `.out`) it is the last line, overwritten in place, so `tail`, `cat`, `less` and
+  `grep` see the log lines plus one current live line, with no control codes; `tail -f` shows
+  only appended lines, so use `watch -n 30 tail <file>` or `dfeols status --watch` to see it
+  move. Pipes and files opened to append (`>>`) get no live line.
+- A fit resumed from its CG checkpoint knows the CG steps left at once (the residual history
+  is kept beside the checkpoint, `cg_checkpoint.hist.json`), and one resumed from round 1's
+  checkpoint projects round 2's time from round 1's saved rate, so "all left" and "done at"
+  show after a resume. Checkpoints written by earlier versions resume as before. Verbosity 2 restores a line
   every `log_every` seconds; 0 prints no progress lines. `status.json` is still written every
   `log_every` seconds.
 - Workers report Dask's "Event loop was unresponsive" only for stalls over 30 s

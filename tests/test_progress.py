@@ -209,34 +209,90 @@ def test_heartbeat_when_nothing_moves(tmp_path, caplog, monkeypatch):
     assert len(lines) == 3  # the first, then one each HEARTBEAT_S
 
 
-def test_live_line_is_wiped_by_the_next_record(monkeypatch):
-    import io
+def _live_handler(monkeypatch, stream):
     import logging
 
     from dfeols import progress as pm
+
+    h = pm.LiveAwareHandler(stream)
+    h.setFormatter(logging.Formatter("%(message)s"))
+    monkeypatch.setattr(pm.log, "handlers", [h])
+    monkeypatch.setattr(pm, "_live", None)
+    return pm
+
+
+def test_live_line_on_a_terminal_is_redrawn_in_place(monkeypatch):
+    import io
 
     class Tty(io.StringIO):
         def isatty(self):
             return True
 
     s = Tty()
-    h = pm.LiveAwareHandler(s)
-    h.setFormatter(logging.Formatter("%(message)s"))
-    monkeypatch.setattr(pm.log, "handlers", [h])
+    pm = _live_handler(monkeypatch, s)
     assert pm._live_target() is s
     pm._draw_live(s, "live 1")
     pm._draw_live(s, "live 2")
     pm.log.warning("a record")
     out = s.getvalue()
-    # each live line ends in a newline (a prompt after `tail` starts on its own line); the
-    # next one or the next record moves up onto it and erases it
-    assert out.endswith("live 1\n" + pm.LIVE_UP + out.split(pm.LIVE_UP)[1].split("live 2")[0]
-                        + "live 2\n" + pm.LIVE_UP + "a record\n")
-    assert pm._live_stream is None
-    f = io.StringIO()  # a file (Slurm's .out) gets the live line too, so tail -f shows it move
-    h.stream = f
-    assert pm._live_target() is f
-    monkeypatch.setattr(pm.log, "handlers", [logging.StreamHandler(f)])
+    # each ends in a newline (a prompt after it gets its own line); the next one or the next
+    # record moves up onto it and erases it
+    assert out.count(pm.LIVE_UP) == 2 and out.endswith("live 2\n" + pm.LIVE_UP + "a record\n")
+    assert out.split(pm.LIVE_UP)[0].endswith("live 1\n")
+    assert pm._live is None
+
+
+def test_live_line_in_a_file_is_overwritten_in_place(monkeypatch, tmp_path):
+    """Slurm's .out: the live line is the file's last line, overwritten (no control codes,
+    nothing piling up), and the next log record takes its place; `tail` shows the milestone
+    lines and one current live line."""
+    path = tmp_path / "job.out"
+    with open(path, "w") as f:
+        pm = _live_handler(monkeypatch, f)
+        pm.log.warning("milestone 1")
+        pm._draw_live(f, "live a much longer line than the others")
+        pm._draw_live(f, "live 2")
+        pm._draw_live(f, "live 3")
+        lines = path.read_text().splitlines()
+        assert len(lines) == 2 and lines[1].rstrip().endswith("live 3") and "longer" not in lines[1]
+        pm.log.warning("milestone 2")
+        pm._draw_live(f, "live 4")
+        f.write("printed by the user\n")  # something else wrote: the live line stays
+        f.flush()
+        pm._draw_live(f, "live 5")
+        f.write("partial")  # a print without a newline yet: appended after it
+        f.flush()
+        f.write(" done\n")
+        pm.log.warning("milestone 3")
+    text = path.read_text()
+    assert "\033" not in text and "\r" not in text
+    lines = [ln.rstrip() for ln in text.splitlines()]
+    assert lines[0] == "milestone 1" and lines[1] == "milestone 2"
+    assert lines[2].endswith("live 4") and lines[3] == "printed by the user"
+    assert lines[4].endswith("live 5") and lines[5] == "partial done" and lines[6] == "milestone 3"
+    assert len(lines) == 7
+
+
+def test_no_live_line_in_a_file_opened_to_append(monkeypatch, tmp_path):
+    path = tmp_path / "job.out"
+    with open(path, "a") as f:
+        pm = _live_handler(monkeypatch, f)
+        pm._draw_live(f, "live 1")
+        pm._draw_live(f, "live 2")
+        pm.log.warning("milestone")
+    assert path.read_text() == "milestone\n"
+
+
+def test_no_live_line_in_a_pipe(monkeypatch):
+    import io
+
+    s = io.StringIO()  # no isatty, no file: a pipe or a capture
+    pm = _live_handler(monkeypatch, s)
+    pm._draw_live(s, "live")
+    assert s.getvalue() == "" and pm._live is None
+    import logging
+
+    monkeypatch.setattr(pm.log, "handlers", [logging.StreamHandler(s)])
     assert pm._live_target() is None  # a handler the user set up: left alone
 
 
@@ -244,9 +300,12 @@ def test_a_warning_wipes_the_live_line(monkeypatch):
     import io
     import warnings
 
-    from dfeols import progress as pm
+    class Tty(io.StringIO):
+        def isatty(self):
+            return True
 
-    s = io.StringIO()
+    s = Tty()
+    pm = _live_handler(monkeypatch, s)
     pm._draw_live(s, "live status")
     with warnings.catch_warnings():
         warnings.simplefilter("always")
@@ -254,3 +313,16 @@ def test_a_warning_wipes_the_live_line(monkeypatch):
         warnings.showwarning = pm._showwarning_clear
         warnings.warn("slow")
     assert s.getvalue().endswith("live status\n" + pm.LIVE_UP + "WARN\n")
+
+
+def test_round2_projected_from_a_checkpointed_round1(tmp_path):
+    # round 1 read from its checkpoint has no tasks of its own: its saved rate projects round 2
+    prog = Progress(tmp_path, label="fit", every=1e9)
+    prog.add_stage("round1", {0: 1000})
+    prog.add_stage("round2", {0: 1000})
+    prog.start("round1")
+    prog.finish("round1", log=False)
+    assert prog.snapshot()["eta_total_seconds"] is None
+    prog.round1_rate_prior, prog.stage2_prior_frac = 0.01, 0.5
+    snap = prog.snapshot()
+    assert snap["stages"][1]["rate_projected"] and snap["eta_total_seconds"] is not None

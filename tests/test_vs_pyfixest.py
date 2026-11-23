@@ -955,6 +955,11 @@ def test_round1_checkpoint_resumes_a_failed_fit(ds_cw, tmp_path, monkeypatch):
     with pytest.raises(RuntimeError, match="killed in CG"):
         dfeols.fit(ds, f, **kw, workdir=str(wd))
     assert (wd / est.ROUND1_CHECKPOINT).exists()
+    import pickle
+
+    with open(wd / est.ROUND1_CHECKPOINT, "rb") as fh:
+        saved = pickle.load(fh)
+    assert saved["rate"] > 0 and saved["stage2_prior_frac"] > 0  # round 2's ETA on a resume
     assert (wd / "singletons" / est.SINGLETONS_DONE).exists()
     monkeypatch.setattr(est, "_crossing_cg", real)
     with pytest.warns(SlowConvergenceWarning):
