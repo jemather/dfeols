@@ -43,22 +43,24 @@ from __future__ import annotations
 import numpy as np
 from numba import njit
 
+# Kernels release the GIL (nogil): a long demean must not starve the Dask worker's
+# heartbeat thread, or the scheduler kills the worker (seen on BACI R0, 2026-11-23).
 ITER_WARMUP, ITER_PROJ_AFTER_ACC, ITER_GRAND_ACC = 15, 40, 4
 
 
-@njit(cache=True)
+@njit(cache=True, nogil=True)
 def _continue(a, b, tol):
     d = abs(a - b)
     return d > tol and d / (0.1 + abs(a)) > tol
 
 
-@njit(cache=True)
+@njit(cache=True, nogil=True)
 def _stop(a, b, tol):
     d = abs(a - b)
     return d < tol or d / (0.1 + abs(a)) < tol
 
 
-@njit(cache=True)
+@njit(cache=True, nogil=True)
 def _compute_fe(origin, dest, G, w, offs, isw, sum_in_out, Qa, other):
     """compute_fe_gnl: dest <- G(origin) over FEs 0..Qa-1, last first."""
     n = G.shape[1]
@@ -83,7 +85,7 @@ def _compute_fe(origin, dest, G, w, offs, isw, sum_in_out, Qa, other):
             dest[m] *= isw[m]
 
 
-@njit(cache=True)
+@njit(cache=True, nogil=True)
 def _irons_tuck(n_no_q, X, GX, GGX):
     """dm_update_X_IronsTuck: X <- GGX - (dGX . d2X)/(d2X . d2X) dGX on the first n_no_q
     coefficients. True when d2X is zero (numerically converged)."""
@@ -101,7 +103,7 @@ def _irons_tuck(n_no_q, X, GX, GGX):
     return False
 
 
-@njit(cache=True)
+@njit(cache=True, nogil=True)
 def _acc(x, out, G, w, offs, isw, Qa, tol, iter_max):
     """demean_acc_gnl on FEs 0..Qa-1 from zero coefficients, on what is left (x - out).
     Adds the fitted FEs to `out`. Returns (iterations, converged)."""
@@ -172,7 +174,7 @@ def _acc(x, out, G, w, offs, isw, Qa, tol, iter_max):
     return it, it != iter_max
 
 
-@njit(cache=True)
+@njit(cache=True, nogil=True)
 def _map2(a, b, ca, cb, cw, offs, isw, sum_in_out, a_out):
     """compute_fe_coef_2: b <- (in_out_b - sum W a) / SW_b, then a_out <- (in_out_a - sum W b) / SW_a,
     over the cells (ca, cb, cw): FE 0's and FE 1's codes of each distinct pair, its weight."""
@@ -192,7 +194,7 @@ def _map2(a, b, ca, cb, cw, offs, isw, sum_in_out, a_out):
         a_out[m] *= isw[m]
 
 
-@njit(cache=True)
+@njit(cache=True, nogil=True)
 def _acc2(x, out, G, w, offs, isw, ca, cb, cw, tol, iter_max):
     """demean_acc_gnl with two_fe (Q == 2, or the first two FEs of Q >= 3, the others held):
     the state is FE 0's coefficients. Adds the fitted FEs to `out`; returns (iterations,
@@ -262,7 +264,7 @@ def _acc2(x, out, G, w, offs, isw, ca, cb, cw, tol, iter_max):
     return it, it != iter_max
 
 
-@njit(cache=True)
+@njit(cache=True, nogil=True)
 def _column(x, G, w, offs, isw, Q, tol, iter_max, ca, cb, cw):
     """demean_single_gnl (and demean_single_1 for one FE)."""
     n = len(x)
