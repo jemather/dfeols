@@ -2055,9 +2055,12 @@ class Manager:
         d = self.data
         ds = Dataset.open(self.spec.data)
         raw = {c for c in ds.columns if not c.startswith("__")}
+        # a created variable can be used by name: its expression stands in for it
+        defs = {c["name"]: c["expression"] for c in d.created}
         todo, out = [], {}
         seen: dict[str, str] = {}
         for name, text in items:
+            text = _expr.expand(text, defs)
             if not isinstance(name, str) or (
                 not internal and (not re.match(r"^[A-Za-z_]\w*$", name) or name.startswith("__"))
             ):
@@ -2159,7 +2162,9 @@ class Manager:
         if not cats:
             return {}, {}
         ds = Dataset.open(self.spec.data)
-        missing = sorted(({t.cat for t in cats} | {c for t in cats for c in t.conts}) - set(ds.columns))
+        made = {c["name"] for c in self.data.created}  # x:i(c) takes a created x too
+        conts = {c for t in cats for c in t.conts}
+        missing = sorted(({t.cat for t in cats} - set(ds.columns)) | (conts - set(ds.columns) - made))
         if missing:
             raise KeyError(f"i(): not columns of the prepared data: {missing}")
         levels = category_levels(ds, sorted({t.cat for t in cats}), self.executor)

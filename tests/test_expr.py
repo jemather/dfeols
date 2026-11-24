@@ -110,3 +110,12 @@ def test_string_comparisons():
     assert ev('x > 1 & r == "east"') == [0.0, 1.0, None, 0.0]
     assert E.columns('(c == "u") * x') == ["c", "x"]
     assert E.digest("r == 'west'") == E.digest('r == "west"') != E.digest('r == "east"')
+
+
+def test_expand_created_names():
+    defs = {"lfd": "log1p(7 * t)", "x2": "x^2"}
+    assert E.expand("pct * lfd", defs) == "pct * (log1p(7 * t))"
+    assert E.expand("lfd2 + x2 - lfd", defs) == "lfd2 + (x^2) - (log1p(7 * t))"  # whole names only
+    assert E.expand('ifelse(g == "lfd", lfd, 0)', defs) == 'ifelse(g == "lfd", (log1p(7 * t)), 0)'
+    assert E.expand("log(y)", {"log": "z"}) == "log(y)"  # function names stay
+    assert E.columns(E.expand("pct * lfd", defs)) == ["pct", "t"]

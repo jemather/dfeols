@@ -174,6 +174,26 @@ def columns(text: str) -> list[str]:
     )
 
 
+def expand(text: str, defs: dict[str, str]) -> str:
+    """`text` with each name in `defs` (a session's created variables: name -> expression on
+    raw columns) replaced by its expression in parentheses, so `pct_i * lnfd` reads the raw
+    columns behind lnfd. String literals and function names are left alone; one pass, as the
+    expressions in `defs` are already on raw columns."""
+    if not defs or not isinstance(text, str):
+        return text
+    names = sorted((n for n in defs if re.fullmatch(r"[A-Za-z_]\w*", n)), key=len, reverse=True)
+    if not names:
+        return text
+    word = re.compile(r"(?<![\w.])(" + "|".join(map(re.escape, names)) + r")(?![\w.])(?!\s*\()")
+    out, pos = [], 0
+    for m in _STRING.finditer(text):
+        out.append(word.sub(lambda w: f"({defs[w.group(1)]})", text[pos : m.start()]))
+        out.append(m.group(0))
+        pos = m.end()
+    out.append(word.sub(lambda w: f"({defs[w.group(1)]})", text[pos:]))
+    return "".join(out)
+
+
 def canonical(text: str) -> str:
     """The expression's normal form: the same for `log(x)*y` and `log( x ) * y`."""
     return ast.unparse(parse(text))

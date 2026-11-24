@@ -113,6 +113,22 @@ def test_created_matches_fit(ds, ds_made, tmp_path, spec):
         assert all(("A_from" in b_["crossing"]) == saved for b_ in batches)
 
 
+def test_created_by_name_in_expressions_and_i(ds, ds_made, tmp_path):
+    """A created variable can be used by name: in another expression (its definition stands
+    in) and as the x of x:i(c)."""
+    r = _roots(tmp_path)
+    with _start("byname", ds, r) as s:
+        s.add_variable("lwt", "log(wt)").add_variable("fl", "feat * lwt")
+        assert s.variables()["created"]["fl"] == "feat * (log(wt))"
+        a = s.fit("eng ~ posts + fl", cluster="id_a")
+        b = _fit(ds_made, tmp_path / "f1", "eng ~ posts + feat:lwt | spell + week", cluster="id_a")
+        _same(a, b)
+        a = s.fit("eng ~ lwt:i(tbin)", cluster="id_a")
+        b = _fit(ds_made, tmp_path / "f2", "eng ~ lwt:i(tbin) | spell + week", cluster="id_a")
+        _same(a, b)
+        assert a.coefnames == b.coefnames
+
+
 def test_created_must_cover_the_sample(ds, tmp_path):
     r = _roots(tmp_path)
     with _start("m", ds, r) as s:
