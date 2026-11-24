@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 
 import numpy as np
-from scipy.linalg import LinAlgError, cho_factor, cho_solve, solve_triangular
+from scipy.linalg import LinAlgError, cho_factor, cho_solve, eigvalsh, solve_triangular
 
 log = logging.getLogger(__name__)
 MAX_COLLIN_TOL = 1e-4  # collinear_keep tightens up to this before giving up
@@ -28,7 +28,9 @@ def collinear_keep(
         if not keep.any():
             return keep
         try:
-            cho_factor(np.asarray(ZtZ, np.float64)[np.ix_(keep, keep)], lower=True)
+            K = np.asarray(ZtZ, np.float64)[np.ix_(keep, keep)]
+            cho_factor(K, lower=True)
+            _check_conditioned(K)
         except (LinAlgError, ValueError):
             if t * 10 > MAX_COLLIN_TOL * (1 + 1e-12):
                 raise LinAlgError(
@@ -46,6 +48,24 @@ def collinear_keep(
                 int(keep.sum()), len(keep),
             )  # fmt: skip
         return keep
+
+
+COND_EIG_MAX = 4000  # kept sets up to this size also get the eigenvalue test
+
+
+def _check_conditioned(K: np.ndarray) -> None:
+    """LinAlgError if K, scaled to unit diagonal, is numerically singular (smallest eigenvalue
+    at most 1000 n eps of the largest). A Cholesky factorization succeeding is not enough: it
+    depends on the column order, and a dependency spread over many columns (exporter-year and
+    importer-year dummies under Poisson weights spanning many orders of magnitude, W&Z isic 7)
+    can factor in the order tested and fail in the order solved."""
+    n = K.shape[0]
+    if n < 2 or n > COND_EIG_MAX:
+        return
+    s = 1.0 / np.sqrt(np.diag(K))
+    ev = eigvalsh(K * s[:, None] * s[None, :])
+    if not ev[0] > 1e3 * n * np.finfo(float).eps * ev[-1]:
+        raise LinAlgError(f"kept columns numerically singular (scaled eigenvalue ratio {ev[0] / ev[-1]:.1e})")
 
 
 def _collinear_keep(
