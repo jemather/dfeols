@@ -739,7 +739,15 @@ class Demeaned:
                 continue
             if doc.get("format") != CREATED_FORMAT:
                 continue
+            more = {}
+            if (vj.parent / "cross_more.json").exists():
+                try:
+                    more = _read_json(vj.parent / "cross_more.json")
+                except (OSError, ValueError):
+                    more = {}
             for v in doc.get("variables", []):
+                if more.get(v["digest"]):  # cross-products later sessions computed
+                    v = {**v, "cross": {**more[v["digest"]], **v.get("cross", {})}}
                 out.setdefault(v["digest"], (f"created/{vj.parent.name}", v))
         return out
 
@@ -2130,22 +2138,60 @@ class Manager:
                     _write_json(where / "variable.json", info)
                     built = {g for *_, g in build}
             index = d.created_index()
+        # Reused columns can lack cross-products with this session's columns (those made
+        # after them). All of them are added first and the missing ones computed in one pass
+        # (it was one pass over every shard per column: 74 passes for x:i(tbin), fpp_eng3),
+        # then kept beside their batch for later sessions.
+        need: list[tuple[str, str, str, list[str]]] = []  # (name, digest, batch, missing names)
         for name, text, digest in todo:
             dir_, info = index[digest]
             cross = d.known_cross(info)
             missing = [n for n, i in zip(d.names, d.ids) if i not in cross]
-            if missing:  # reused, and crossed with some of this session's columns nowhere on file
-                new = [(str(d.root / dir_), [(info["column"], name)])]
-                groups = d.groups(missing)
-                order = [nm for _, cols in groups for _, nm in cols]
-                x = cross_pass(d, groups, new, self.executor, self.dir / "progress" / f"cross-{digest}")[0]
-                cross.update(zip([d.ids[d.names.index(n)] for n in order], map(float, x)))
-            d.add_created(name, info, cross, text, dir_)
-            entry = self._var_entry(d.created[-1], reused=digest not in built, seconds=time.time() - t0)
+            d.add_created(name, info, {i: cross.get(i, np.nan) for i in d.ids}, text, dir_)
+            if missing:
+                need.append((name, digest, dir_, missing))
+        if need:
+            self._fill_cross(d, need)
+        for name, _, digest in todo:
+            c = next(c for c in d.created if c["name"] == name)
+            entry = self._var_entry(c, reused=digest not in built, seconds=time.time() - t0)
             self.event("variable_created", detail=entry)
             out[name] = entry
         self._save_state()
         return {"variables": [out[n] for n, _ in items]}
+
+    def _fill_cross(self, d: Demeaned, need) -> None:
+        """One pass for the cross-products of reused created columns with the session's
+        columns not on file (`need`: name, digest, batch, missing names), into d.gram, and
+        saved in each batch's cross_more.json for later sessions."""
+        new_names = [n for n, *_ in need]
+        want = sorted({m for *_, ms in need for m in ms}, key=d.names.index)
+        new, groups = d.groups(new_names), d.groups(want)
+        rows = [nm for _, cols in new for _, nm in cols]
+        cols = [nm for _, cs in groups for _, nm in cs]
+        where = self.dir / "progress" / f"cross-{need[0][1]}"
+        x = np.atleast_2d(cross_pass(d, groups, new, self.executor, where))
+        saved: dict[str, dict[str, dict[str, float]]] = {}
+        for name, digest, batch, missing in need:
+            i = d.names.index(name)
+            for m in missing:
+                j = d.names.index(m)
+                v = float(x[rows.index(name), cols.index(m)])
+                d.gram[i, j] = d.gram[j, i] = v
+                saved.setdefault(batch, {}).setdefault(digest, {})[d.ids[j]] = v
+        if not np.isfinite(d.gram).all():
+            raise RuntimeError("cross-products of reused created variables are incomplete")
+        for batch, by in saved.items():
+            where = d.root / batch
+            try:
+                with DirLock(where / "cross_more", what="created cross-products"):
+                    p = where / "cross_more.json"
+                    doc = _read_json(p) if p.exists() else {}
+                    for dg, vals in by.items():
+                        doc.setdefault(dg, {}).update(vals)
+                    _write_json(p, doc)
+            except OSError as e:  # a read-only store: they are recomputed next time
+                log.warning("session %s: could not keep cross-products in %s: %s", self.name, where, e)
 
     def _factors(self, formula: str, rid: str | None = None) -> tuple[dict, dict]:
         """A formula's i() terms as created indicator columns, made (in one batch) if this

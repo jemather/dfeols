@@ -443,3 +443,26 @@ def test_client_live_line_on_a_terminal(tmp_path, monkeypatch):
     plain = run(io.StringIO())
     assert P.LIVE_UP not in plain
     assert sum(" 1/100 " in l or " 10/100 " in l for l in plain.splitlines()) == 2  # first + final
+
+
+def test_reused_columns_cross_products_one_pass_and_kept(ds, ds_made, tmp_path, monkeypatch):
+    """Reused created columns lacking cross-products with a column this session made first
+    get them in one pass (not one per column), and a later session reads them from file."""
+    from dfeols import session as S
+
+    r = _roots(tmp_path)
+    with _start("a", ds, r) as s:
+        s.fit("eng ~ feat:i(tbin)", cluster="id_a")  # makes and keeps tbin::*:feat
+    calls = []
+    real = S.cross_pass
+    monkeypatch.setattr(S, "cross_pass", lambda *a, **k: calls.append(1) or real(*a, **k))
+    for name in ("b", "c"):
+        with _start(name, ds, r) as s:
+            s.add_variable("lwt", "log(wt)")  # new here: the reused columns lack it
+            a = s.fit("eng ~ lwt + feat:i(tbin)", cluster="id_a")
+            f = "eng ~ lwt + feat:i(tbin) | spell + week"
+            b = _fit(ds_made, tmp_path / f"f{name}", f, cluster="id_a")
+            _same(a, b)
+        if name == "b":
+            assert len(calls) == 1  # one pass for all the tbin::*:feat columns
+    assert len(calls) == 1  # session c read them from cross_more.json
