@@ -108,3 +108,29 @@ def test_collinear_keep_tightens_until_the_kept_gram_factors(monkeypatch, caplog
     monkeypatch.setattr(L, "cho_factor", lambda A, lower=True: (_ for _ in ()).throw(L.LinAlgError("x")))
     with pytest.raises(L.LinAlgError, match="numerically singular"):
         L.collinear_keep(G, 1e-9)
+
+
+def test_collinear_keep_spread_dependency_under_extreme_weights():
+    """Exporter and importer dummies (sum of one set = sum of the other) under weights spanning
+    ~1e10: the pivot test keeps every column, and the kept Gram still factors by Cholesky, but
+    it is singular; the eigenvalue check must catch it and drop one dummy (W&Z isic 7)."""
+    from scipy.linalg import eigvalsh
+
+    rng = np.random.default_rng(84)
+    n, a, b = 3000, 60, 60
+    i, j = rng.integers(0, a, n), rng.integers(0, b, n)
+    w = np.exp(rng.normal(0, 6, n))
+    D = np.zeros((n, a + b))
+    D[np.arange(n), i] = 1
+    D[np.arange(n), a + j] = 1
+    Z = np.column_stack([D, rng.normal(size=n)])
+    G = (Z * w[:, None]).T @ Z
+    from dfeols.linalg import _collinear_keep
+
+    assert _collinear_keep(G, 1e-9).sum() == a + b + 1  # the pivot test alone misses it
+    keep = collinear_keep(G, 1e-9)
+    assert keep.sum() == a + b and keep[-1]  # one dummy dropped, the regressor kept
+    K = G[np.ix_(keep, keep)]
+    s = 1 / np.sqrt(np.diag(K))
+    ev = eigvalsh(K * s[:, None] * s[None, :])
+    assert ev[0] / ev[-1] > 1e-12

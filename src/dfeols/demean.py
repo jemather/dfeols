@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 
 # pyfixest's compiled (Rust) alternating-projections demeaner. This is a private
@@ -276,9 +278,12 @@ def demean(
     """Demean the columns of x by the given FEs.
 
     One FE: exact one pass. Two FEs: exact Schur-complement solve (method
-    "auto"/"exact"), falling back to alternating projections if a connected
-    component is too large or numerically singular. Three or more, or
-    method="iterate": alternating projections (pyfixest's compiled core).
+    "auto"/"exact"), falling back to iteration if a connected component is too large or
+    numerically singular. Three or more, or method="iterate": fixest's algorithm in
+    coefficient space (demean_fx). The environment variable DFEOLS_DEMEAN=pyfixest uses
+    the earlier row-space alternating projections (pyfixest's compiled core, or the NumPy
+    fallback) instead, for comparison: on Poisson working weights they can stop at
+    maxiter far from the solution (D13 BYZ, 2026-11-23).
 
     `slopes` (one entry per FE: None, or an (n, s) array of its slope variables) and
     `intercept` (per FE; False for fe[[x]]) give FEs with varying slopes: demean_slopes.
@@ -301,6 +306,10 @@ def demean(
             import logging
 
             logging.getLogger("dfeols").debug("exact two-way demeaning fell back to iteration: %s", e)
+    if os.environ.get("DFEOLS_DEMEAN", "fixest") != "pyfixest":
+        from .demean_fx import demean_fx
+
+        return demean_fx(x, [d[0] for d in dense], w, tol, maxiter)
     flist = np.column_stack([d[0] for d in dense]).astype(np.uint64)
     if _pf_demean is not None:
         try:

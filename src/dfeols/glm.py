@@ -41,6 +41,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import shutil
 import time
 from collections.abc import Callable
@@ -82,14 +83,25 @@ def _xlogy(x, y):
 
 _EPS = 1e-15
 
+def _pois_inv(eta):
+    """exp(eta), floored at machine epsilon below eta = -36, as fixest (poisson_linkinv in
+    parallel_funs.cpp). The floor keeps working weights (w = mu) from vanishing on rows whose
+    fit runs off to minus infinity, which otherwise leaves their FE coefficients unconditioned."""
+    with np.errstate(over="ignore"):
+        return np.where(eta < -36.0, np.finfo(float).eps, np.exp(eta))
+
+
 POISSON = Family(
     "poisson",
-    linkinv=np.exp,
-    mu_eta=np.exp,
+    linkinv=_pois_inv,
+    mu_eta=_pois_inv,
     variance=lambda mu: mu,
     deviance=lambda y, mu: 2.0 * (_xlogy(y, mu) - (y - mu)),
-    start=lambda y, ybar: np.log((y + ybar) / 2.0),
-    eta_bounds=(-50.0, 50.0),
+    # R's poisson()$initialize, which fixest uses: each row starts near its own y. ppmlhdfe's
+    # (y + ybar) / 2 pulls every row toward the grand mean and, on sparse products (BACI R0),
+    # sent rows with small positive y to mu ~ e^-40, from which IRLS steps overshoot.
+    start=lambda y, ybar: np.log(y + 0.1),
+    eta_bounds=(-np.inf, np.inf),  # not clipped, as fixest: overflow gives a non-finite deviance, which step halving handles
     binary=False,
 )
 
@@ -198,6 +210,8 @@ def shard_glm_halve(sid: int, files: list[str], spec: dict) -> dict:
     mu = fam.linkinv(eta[on])
     z, w = np.full(len(y), np.nan), np.full(len(y), np.nan)
     z[on], w[on] = fam.working(y[on], eta[on], mu)
+    if spec.get("diag"):
+        _halve_diag(spec, sid, y, ep, en, fam)
     side = pl.DataFrame({Z: z, W: w, ETA: eta}).with_columns(pl.all().fill_nan(None))
     side.write_parquet(cur_p.with_suffix(".parquet.tmp"))
     cur_p.with_suffix(".parquet.tmp").replace(cur_p)
@@ -206,6 +220,38 @@ def shard_glm_halve(sid: int, files: list[str], spec: dict) -> dict:
     stats["max_abs_eta"] = float(np.abs(eta[on]).max(initial=0.0))
     (Path(spec["cur"]) / f"glm-{sid:05d}.json").write_text(json.dumps(stats))
     return {"shard": sid, "n": stats["n"], "timing": {"total": time.perf_counter() - t0}}
+
+
+def _halve_diag(spec, sid, y, ep, en, fam, top=200):
+    """Diagnostics (DFEOLS_GLM_DIAG=<dir>): the rows behind a rejected step, i.e. those whose
+    eta reached the upper bound and the `top` largest deviance increases, with their shard row
+    position (to join back to the shard for the FE ids), y, eta before and after the step, and
+    the prior working weight."""
+    from .worker import sidecar_path
+
+    both = np.isfinite(ep) & np.isfinite(en)
+    idx = np.flatnonzero(both)
+    dp = fam.deviance(y[idx], fam.linkinv(ep[idx]))
+    dn = fam.deviance(y[idx], fam.linkinv(np.clip(en[idx], *fam.eta_bounds)))
+    inc = dn - dp
+    pick = set(idx[(en[idx] >= fam.eta_bounds[1] - 1e-9) | (np.abs(en[idx] - ep[idx]) > 20)].tolist())
+    pick |= set(idx[np.argsort(-inc)[:top]].tolist())
+    rows = np.array(sorted(pick), dtype=np.int64)
+    pos = np.searchsorted(idx, rows)
+    w_prev = pl.read_parquet(sidecar_path(spec["prev"], sid), columns=[W])[W].cast(pl.Float64).to_numpy()
+    out = pl.DataFrame({"shard": np.full(len(rows), sid), "row": rows, "y": y[rows],
+                        "eta_prev": ep[rows], "eta_new": en[rows], "w_prev": w_prev[rows],
+                        "dev_prev": dp[pos], "dev_new": dn[pos]})  # fmt: skip
+    d = Path(spec["diag"])
+    d.mkdir(parents=True, exist_ok=True)
+    out.write_parquet(d / f"{spec['tag']}-{sid:05d}.parquet")
+    tot = {"shard": sid, "tag": spec["tag"], "n": int(both.sum()), "dev_prev": float(dp.sum()),
+           "dev_new": float(dn.sum()), "n_at_cap": int((en[idx] >= fam.eta_bounds[1] - 1e-9).sum()),
+           "n_step_gt20": int((np.abs(en[idx] - ep[idx]) > 20).sum()),
+           "max_eta_step": float(np.abs(en[idx] - ep[idx]).max(initial=0.0))}  # fmt: skip
+    (d / f"{spec['tag']}-{sid:05d}.json").write_text(json.dumps(tot))
+    if (tot["n_at_cap"] or tot["n_step_gt20"]) and spec["tag"].endswith("_h1"):  # the step's input, to redo its demeaning offline
+        shutil.copyfile(sidecar_path(spec["prev"], sid), d / f"{spec['tag']}-{sid:05d}-input.parquet")
 
 
 def _run(executor, fn, ds, args_of, wd, label):
@@ -382,7 +428,8 @@ def fit_glm(
             nh += 1
             log.info("fit_glm %s: iteration %d, deviance %.10g rose; halving the step (%d)",
                      family, it, dev, nh)  # fmt: skip
-            hspec = {"family": family, "y": y, "prev": str(read), "cur": str(write)}
+            hspec = {"family": family, "y": y, "prev": str(read), "cur": str(write),
+                     "diag": os.environ.get("DFEOLS_GLM_DIAG"), "tag": f"it{it:03d}_h{nh}"}  # fmt: skip
             _run(executor, shard_glm_halve, ds, lambda sid, h=hspec: h, wd, "glm_halve")
             dev = _deviance(write)
         halvings.append(nh)
