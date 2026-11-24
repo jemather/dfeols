@@ -83,14 +83,22 @@ def _xlogy(x, y):
 
 _EPS = 1e-15
 
+def _pois_inv(eta):
+    """exp(eta), floored at machine epsilon below eta = -36, as fixest (poisson_linkinv in
+    parallel_funs.cpp). The floor keeps working weights (w = mu) from vanishing on rows whose
+    fit runs off to minus infinity, which otherwise leaves their FE coefficients unconditioned."""
+    with np.errstate(over="ignore"):
+        return np.where(eta < -36.0, np.finfo(float).eps, np.exp(eta))
+
+
 POISSON = Family(
     "poisson",
-    linkinv=np.exp,
-    mu_eta=np.exp,
+    linkinv=_pois_inv,
+    mu_eta=_pois_inv,
     variance=lambda mu: mu,
     deviance=lambda y, mu: 2.0 * (_xlogy(y, mu) - (y - mu)),
     start=lambda y, ybar: np.log((y + ybar) / 2.0),
-    eta_bounds=(-50.0, 50.0),
+    eta_bounds=(-np.inf, np.inf),  # not clipped, as fixest: overflow gives a non-finite deviance, which step halving handles
     binary=False,
 )
 
@@ -223,7 +231,7 @@ def _halve_diag(spec, sid, y, ep, en, fam, top=200):
     dp = fam.deviance(y[idx], fam.linkinv(ep[idx]))
     dn = fam.deviance(y[idx], fam.linkinv(np.clip(en[idx], *fam.eta_bounds)))
     inc = dn - dp
-    pick = set(idx[en[idx] >= fam.eta_bounds[1] - 1e-9].tolist())
+    pick = set(idx[(en[idx] >= fam.eta_bounds[1] - 1e-9) | (np.abs(en[idx] - ep[idx]) > 20)].tolist())
     pick |= set(idx[np.argsort(-inc)[:top]].tolist())
     rows = np.array(sorted(pick), dtype=np.int64)
     pos = np.searchsorted(idx, rows)
@@ -236,9 +244,10 @@ def _halve_diag(spec, sid, y, ep, en, fam, top=200):
     out.write_parquet(d / f"{spec['tag']}-{sid:05d}.parquet")
     tot = {"shard": sid, "tag": spec["tag"], "n": int(both.sum()), "dev_prev": float(dp.sum()),
            "dev_new": float(dn.sum()), "n_at_cap": int((en[idx] >= fam.eta_bounds[1] - 1e-9).sum()),
+           "n_step_gt20": int((np.abs(en[idx] - ep[idx]) > 20).sum()),
            "max_eta_step": float(np.abs(en[idx] - ep[idx]).max(initial=0.0))}  # fmt: skip
     (d / f"{spec['tag']}-{sid:05d}.json").write_text(json.dumps(tot))
-    if tot["n_at_cap"] and spec["tag"].endswith("_h1"):  # the step's input, to redo its demeaning offline
+    if (tot["n_at_cap"] or tot["n_step_gt20"]) and spec["tag"].endswith("_h1"):  # the step's input, to redo its demeaning offline
         shutil.copyfile(sidecar_path(spec["prev"], sid), d / f"{spec['tag']}-{sid:05d}-input.parquet")
 
 
