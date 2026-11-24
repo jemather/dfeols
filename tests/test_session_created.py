@@ -404,3 +404,42 @@ def test_factor_terms_text_and_interacted(ds, tmp_path, spec):
         assert "grp::g 1" in names and "tbin::0:feat" in names and "grp::g 1:feat" in names
         with pytest.raises(SessionError, match="not a level"):
             s.fit("eng ~ i(grp, ref='g 9')")
+
+
+def test_client_live_line_on_a_terminal(tmp_path, monkeypatch):
+    """On a terminal the client prints milestones and redraws one live line between them
+    (in place, LIVE_UP), then prints the last status for good when the request is done; off
+    a terminal it prints the milestones only."""
+    import io
+
+    from dfeols import progress as P
+
+    class Tty(io.StringIO):
+        def isatty(self):
+            return True
+
+    def run(stream):
+        monkeypatch.setattr(sys, "stderr", stream)
+        P._live = None
+        s = Session("ui", root=tmp_path)
+        prog = P.Progress(tmp_path / "p", label="m1", every=1e9)
+        prog.add_stage("demean", {i: 1000 for i in range(100)})
+        prog.start("demean")
+        status = tmp_path / "p" / "status.json"
+        for i in range(10):  # 1% a step: one milestone line, then live redraws
+            prog.task_done("demean", i, 1.0, {"total": 1.0})
+            prog.tick(force=True)
+            snap = json.loads(status.read_text())
+            status.write_text(json.dumps({**snap, "updated": i}))
+            s._show_status(status)
+        s._settle()
+        return stream.getvalue()
+
+    out = run(Tty())
+    assert out.count(P.LIVE_UP) >= 7  # redrawn in place, not one line per update
+    last = out.rsplit(P.LIVE_UP, 1)[-1]
+    assert last.startswith("[session ui]") and " 10/100 " in last  # the live line erased, the final printed
+    assert P._live is None  # nothing left for the next output to erase
+    plain = run(io.StringIO())
+    assert P.LIVE_UP not in plain
+    assert sum(" 1/100 " in l or " 10/100 " in l for l in plain.splitlines()) == 2  # first + final

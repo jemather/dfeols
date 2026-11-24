@@ -2693,6 +2693,13 @@ def estimate_seconds(root: Path, rows: int, variables: int) -> tuple[float, floa
 # ---------------------------------------------------------------- the client
 
 
+def _isatty(stream) -> bool:
+    try:
+        return bool(stream.isatty())
+    except (AttributeError, ValueError, OSError):
+        return False
+
+
 class SessionError(RuntimeError):
     pass
 
@@ -2735,6 +2742,8 @@ class Session:
         self.progress = progress  # print estimates and progress lines to stderr while waiting
         self._shown: dict[str, Any] = {}
         self._headers: dict[str, Any] = {}  # status.json path -> HeaderEvery
+        self._printed: dict[str, dict] = {}  # status.json path -> milestone of its last printed line
+        self._live: dict[str, Any] = {}  # status.json path -> snapshot shown only on the live line
         self._manager = manager
         self._thread = thread
 
@@ -2868,6 +2877,7 @@ class Session:
         while True:
             st = self.state()
             if st and st["status"] == "ready":
+                self._settle()
                 if st.get("workers"):
                     self._say("workers: " + workers_text(st["workers"]))
                 break
@@ -2903,6 +2913,9 @@ class Session:
 
     def _say(self, msg: str) -> None:
         if self.progress:
+            from .progress import _clear_live
+
+            _clear_live()  # a live line is erased first, so the message takes its place
             print(f"[session {self.name}] {msg}", file=sys.stderr, flush=True)
 
     def _once(self, key: str) -> bool:
@@ -2911,21 +2924,46 @@ class Session:
         self._shown[key] = True
         return True
 
-    def _show_status(self, path: Path) -> None:
-        """Print a stage's status.json (Progress) when it has changed."""
-        from .progress import HeaderEvery, status_header, status_line
+    def _show_status(self, path: Path, final: bool = False) -> None:
+        """Show a stage's status.json (Progress) when it has changed: a printed line at a
+        milestone (new stage or state, LOG_PCT% more rows, the heartbeat), the same rule as the
+        job log, and in between, on a terminal, one live line redrawn in place. `final` prints
+        the latest status for good (the request is done)."""
+        from .progress import HeaderEvery, _draw_live, milestone, milestone_due, status_header, status_line
 
+        if not self.progress:
+            return
+        key = str(path)
         try:
             snap = _read_json(path)
         except (OSError, json.JSONDecodeError):
             return
-        if snap.get("stages") and self._shown.get(str(path)) != snap.get("updated"):
-            self._shown[str(path)] = snap.get("updated")
+        if not snap.get("stages"):
+            return
+        if self._shown.get(key) == snap.get("updated"):
+            if not (final and key in self._live):
+                return
+        self._shown[key] = snap.get("updated")
+        now = time.time()
+        m = milestone(snap, now)
+        if final or milestone_due(m, self._printed.get(key), now):
             hdr = status_header(snap)
-            every = self._headers.setdefault(str(path), HeaderEvery())
+            every = self._headers.setdefault(key, HeaderEvery())
             if every(hdr):
                 self._say(hdr)
             self._say(status_line(snap))
+            self._printed[key] = m
+            self._live.pop(key, None)
+        else:  # on a terminal, the live line; elsewhere (a pipe, a file) milestones only
+            if _isatty(sys.stderr):
+                _draw_live(sys.stderr, f"[session {self.name}] {status_line(snap)}")
+            self._live[key] = snap  # not printed yet: _settle prints it when the request ends
+
+    def _settle(self) -> None:
+        """A request is done: what is only on the live line is printed for good."""
+        for key in list(self._live):
+            self._show_status(Path(key), final=True)
+        self._live.clear()
 
     def _watch_fit(self, rid: str) -> None:
         acc = self.dir / "responses" / f"{rid}.accepted.json"
@@ -2970,6 +3008,7 @@ class Session:
             time.sleep(0.1)
         if watch:  # a quick request may finish before the first look
             watch(rid)
+            self._settle()
         resp = _read_json(resp_path)
         self.last_trip = {k: resp.get(k) for k in ("sent", "received", "finished")} | {"seen": _now()}
         if not resp.get("ok"):
@@ -3564,6 +3603,7 @@ def cmd_start(args) -> None:
         while True:
             st = s.state()
             if st and st.get("status") == "ready":
+                s._settle()
                 print(f"ready after {fmt_td(time.time() - t0)}; session {st['id']}")
                 if st.get("workers"):
                     print("workers: " + workers_text(st["workers"]))

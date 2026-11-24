@@ -456,24 +456,7 @@ class Progress:
             os.replace(tmp, p)
 
     def _milestone(self, snap: dict, now: float) -> dict:
-        """What decides whether verbosity 1 logs a line: the current stage, its state (waiting
-        for workers, calibrating, running), the share of its rows done and the note."""
-        stages = snap["stages"]
-        cur = next((s for s in stages if not s["finished"]), stages[-1])
-        eta = cur["eta_seconds"]
-        if snap["workers"] == 0 and not cur["finished"]:
-            state = "waiting"
-        elif eta is None or not np.isfinite(eta):
-            state = "calibrating"
-        else:
-            state = "running"
-        return {
-            "stage": cur["stage"],
-            "state": state,
-            "pct": float(cur["pct_rows"]),
-            "note": snap.get("note") or "",
-            "t": now,
-        }
+        return milestone(snap, now)
 
     def _report(self, snap: dict, now: float, force: bool):
         if self.verbosity <= 0:
@@ -482,14 +465,7 @@ class Progress:
             self._log_line(snap)
             return
         m, last = self._milestone(snap, now), self._printed
-        due = (
-            force
-            or last is None
-            or any(m[k] != last[k] for k in ("stage", "state", "note"))
-            or m["pct"] - last["pct"] >= LOG_PCT  # both count from the last line printed:
-            or now - last["t"] >= HEARTBEAT_S  # a line at whichever comes first
-        )
-        if due:
+        if force or milestone_due(m, last, now):
             shown = snap
             if last is not None and m["note"] == last["note"] and m["stage"] == last["stage"]:
                 shown = {**snap, "note": ""}  # the note is on the line above; don't repeat it
@@ -505,6 +481,39 @@ class Progress:
         if self._header(hdr):
             log.info(hdr)
         log.info(self.line(snap))
+
+
+def milestone(snap: dict, now: float) -> dict:
+    """What decides whether verbosity 1 logs a line: the current stage, its state (waiting
+    for workers, calibrating, running), the share of its rows done and the note. Also used by
+    the session client to choose between a printed line and the live line."""
+    stages = snap["stages"]
+    cur = next((s for s in stages if not s["finished"]), stages[-1])
+    eta = cur["eta_seconds"]
+    if snap["workers"] == 0 and not cur["finished"]:
+        state = "waiting"
+    elif eta is None or not np.isfinite(eta):
+        state = "calibrating"
+    else:
+        state = "running"
+    return {
+        "stage": cur["stage"],
+        "state": state,
+        "pct": float(cur["pct_rows"]),
+        "note": snap.get("note") or "",
+        "t": now,
+    }
+
+
+def milestone_due(m: dict, last: dict | None, now: float) -> bool:
+    """A printed line is due: the first, a new stage, state or note, LOG_PCT% more of the
+    stage's rows since the last line, or HEARTBEAT_S seconds since it."""
+    return (
+        last is None
+        or any(m[k] != last[k] for k in ("stage", "state", "note"))
+        or m["pct"] - last["pct"] >= LOG_PCT  # both count from the last line printed:
+        or now - last["t"] >= HEARTBEAT_S  # a line at whichever comes first
+    )
 
 
 # (time.time(), seconds of known work left) from the latest status line of any run in this
