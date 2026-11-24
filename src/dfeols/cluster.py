@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import ipaddress
 import logging
+import math
 import os
 import shlex
 import socket
@@ -482,13 +483,19 @@ def _replace_lost_jobs(cl, max_workers: int, every: float = 60.0, live_jobs=_slu
     cl.dfeols_lost_jobs_check = check
 
 
-def queue_lead(waits: list[float], prior: float, life: float) -> float:
-    """Seconds before a worker's retirement to ask for its replacement: 1.25 x the longest of the
-    last 20 queue waits (submit to connect; `prior` until one is seen) plus 5 min, at most half a
-    worker's lifetime. The longest, since waits vary a lot (OSCER: 5-16 min for the first pool,
-    30-50 min for replacements) and asking early only costs some overlap."""
-    q = max(waits[-20:]) if waits else prior
-    return min(1.25 * q + 300.0, life / 2)
+def queue_wait(waits: list[float], prior: float, pending: float = 0.0) -> float:
+    """The queue wait to plan for: the longest of the last 20 (submit to connect; `prior` until
+    one is seen), or the age of the oldest worker still waiting if longer. A wait in progress
+    counts: H L1 (OSCER 36391325, 2026-11-23) kept planning for the 14 min it had seen while its
+    replacements waited 16 min to 3 h, and the pool fell to 6 of 40 for an hour."""
+    return max(max(waits[-20:]) if waits else prior, pending)
+
+
+def queue_lead(waits: list[float], prior: float, life: float, pending: float = 0.0) -> float:
+    """Seconds before a worker's retirement to ask for its replacement: 1.25 x `queue_wait` plus
+    5 min, at most half a worker's lifetime. The longest, since waits vary a lot (OSCER: 5-16 min
+    for the first pool, 30-50 min for replacements) and asking early only costs some overlap."""
+    return min(1.25 * queue_wait(waits, prior, pending) + 300.0, life / 2)
 
 
 def retiring(connected: dict, now: float, life: float, stagger: float, lead: float,
@@ -508,20 +515,30 @@ def retiring(connected: dict, now: float, life: float, stagger: float, lead: flo
     return out
 
 
-def spares_cap(max_workers: int, n: int | None = None) -> int:
-    """Most replacements asked for ahead at once: `n` if given, else 10% of max_workers, at
-    least 1. Dask draws each worker's lifetime at random within the window, so every worker of
-    a pool that started together comes due at once: uncapped, H L2 (OSCER 36358879, 2026-11-21)
-    asked for 40 at 21:44 and ran 79 workers for 2 h, slower than 40 (/scratch-bound)."""
+SPARES_WAIT_S = 900.0  # queue waits up to this keep the cap at 10%; longer ones scale it
+
+
+def spares_cap(max_workers: int, n: int | None = None, wait: float = 0.0) -> int:
+    """Most replacements asked for ahead at once: `n` if given, else 10% of max_workers (at
+    least 1), scaled by `wait` / 15 min once the queue wait is longer, up to half of
+    max_workers. Dask draws each worker's lifetime at random within the window, so every worker
+    of a pool that started together comes due at once: uncapped, H L2 (OSCER 36358879,
+    2026-11-21) asked for 40 at 21:44 and ran 79 workers for 2 h, slower than 40
+    (/scratch-bound). But a spare that starts early costs its overlap, linear in time, while a
+    worker short for a long wait costs more the longer the wait (Ted, 2026-11-23): so long
+    waits get more spares, which mostly wait in the queue rather than run."""
     if n is not None:
         return max(int(n), 0)
-    return max(int(round(0.1 * max_workers)), 1)
+    base = max(int(round(0.1 * max_workers)), 1)
+    scaled = int(math.ceil(base * max(1.0, wait / SPARES_WAIT_S)))
+    return min(scaled, max(max_workers // 2, base))
 
 
-def braked(waits: list[float], quick: float, k: int = 2) -> bool:
-    """The last k queue waits were all within `quick` s: workers start at once, so none are
-    asked for ahead (a retiring worker is replaced after it leaves)."""
-    return len(waits) >= k and max(waits[-k:]) <= quick
+def braked(waits: list[float], quick: float, k: int = 2, pending: float = 0.0) -> bool:
+    """The last k queue waits were all within `quick` s, and no worker has been waiting longer:
+    workers start at once, so none are asked for ahead (a retiring worker is replaced after it
+    leaves)."""
+    return len(waits) >= k and max(waits[-k:]) <= quick and pending <= quick
 
 
 def _replace_ahead(cl, max_workers: int, prior_wait: float, clock=time.time,
@@ -529,7 +546,8 @@ def _replace_ahead(cl, max_workers: int, prior_wait: float, clock=time.time,
     """Add, to adaptive scaling's target, one worker for each worker about to retire at its
     lifetime while the work outlasts it, so the replacement waits in the queue while the old
     worker still runs; at most `spares_cap` at once, and none while the last two queue waits
-    were within `quick_wait` s (`braked`). It is computed on each adapt tick, so the extra drops
+    were within `quick_wait` s (`braked`). A worker still waiting counts as a wait in progress,
+    so a slow queue lengthens the lead and raises the cap while it lasts. It is computed on each adapt tick, so the extra drops
     the moment the old worker leaves. Queue waits are measured per job (first in the plan to
     first connected)."""
     ad = getattr(cl, "_adaptive", None)
@@ -538,8 +556,7 @@ def _replace_ahead(cl, max_workers: int, prior_wait: float, clock=time.time,
         log.warning("cluster: cannot ask for replacements ahead of retirement (no adaptive scaling)")
         return
     orig = ad.safe_target
-    cap = spares_cap(max_workers, max_spares)
-    st = {"planned": {}, "seen": {}, "waits": [], "extra": 0, "braked": False}
+    st = {"planned": {}, "seen": {}, "waits": [], "extra": 0, "braked": False, "cap": 0}
 
     async def safe_target():
         n = await orig()
@@ -560,19 +577,27 @@ def _replace_ahead(cl, max_workers: int, prior_wait: float, clock=time.time,
                     del st[d][x]
             wl = progress.WORK_LEFT
             work_left = wl[1] - (now - wl[0]) if wl and now - wl[0] < 600 else None
-            lead = queue_lead(st["waits"], prior_wait, life)
+            waiting = [now - st["planned"][x] for x in plan - seen if x in st["planned"]]
+            pending = max(waiting, default=0.0)  # the oldest worker still in the queue
+            lead = queue_lead(st["waits"], prior_wait, life, pending)
+            cap = spares_cap(max_workers, max_spares, queue_wait(st["waits"], prior_wait, pending))
             due = retiring({x: st["seen"][x] for x in seen if x in st["seen"]}, now, life, stagger, lead, work_left)
-            brake = braked(st["waits"], quick_wait)
+            brake = braked(st["waits"], quick_wait, pending=pending)
             if brake != st["braked"]:
                 log.info("cluster: the last 2 queue waits were %s %.0f min: %s", "within" if brake else "not all within",
                          quick_wait / 60, "replacements only after workers leave" if brake
                          else f"asking for replacements ahead again (at most {cap} at once)")
                 st["braked"] = brake
+            if cap > st["cap"] and st["cap"]:
+                log.info("cluster: a worker has waited %.0f min in the queue: asking for replacements %.0f min "
+                         "ahead, at most %d at once", pending / 60, lead / 60, cap)
+            st["cap"] = cap
             extra = 0 if brake else min(len(due), cap, max_workers)
             if extra > st["extra"]:
                 log.info("cluster: %d worker(s) retire within %.0f min; asking for %d replacement(s) now, "
-                         "%d ahead in all (at most %d; queue waits so far up to %.0f min)", len(due), lead / 60,
-                         extra - st["extra"], extra, cap, max(st["waits"], default=prior_wait) / 60)
+                         "%d ahead in all (at most %d; queue waits so far up to %.0f min, oldest waiting %.0f min)",
+                         len(due), lead / 60, extra - st["extra"], extra, cap,
+                         max(st["waits"], default=prior_wait) / 60, pending / 60)
             st["extra"] = extra
             return n + extra
         except Exception as e:  # noqa: BLE001 (never take adaptive scaling down)

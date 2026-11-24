@@ -197,3 +197,42 @@ def test_quick_waits_brake_asking_ahead(monkeypatch):
     ad.observed = {"w1", "w2"}
     assert tgt() == 3  # the brake is off: w1 gets its replacement ahead
     assert not cl.dfeols_replace_ahead["braked"]
+
+
+def test_a_wait_in_progress_counts():
+    """H L1 (36391325): replacements waited 16 min to 3 h while the lead still planned for the
+    14 min seen; a worker still in the queue now counts, for the lead, the cap and the brake."""
+    assert queue_lead([600.0], prior=1800, life=LIFE, pending=3600.0) == 1.25 * 3600 + 300
+    assert queue_lead([600.0], prior=1800, life=LIFE, pending=60.0) == 1.25 * 600 + 300
+    assert spares_cap(40, wait=600.0) == 4  # up to 15 min: 10%
+    assert spares_cap(40, wait=1800.0) == 8  # 30 min: twice
+    assert spares_cap(40, wait=4 * 3600.0) == 20  # at most half
+    assert spares_cap(40, 3, wait=4 * 3600.0) == 3  # a fixed cap stays fixed
+    assert spares_cap(5, wait=4 * 3600.0) == 2
+    assert not braked([60.0, 90.0], 180, pending=1200.0)  # quick so far, but one is waiting
+
+
+def test_a_slow_queue_asks_earlier_and_for_more(monkeypatch):
+    monkeypatch.setattr(progress, "WORK_LEFT", None)
+    now = [0.0]
+    ad = FakeAdaptive(target=40)
+    life = 11 * 3600.0
+    cl = SimpleNamespace(_adaptive=ad, dfeols_lifetime=(life, 3960.0))
+    cmod._replace_ahead(cl, max_workers=40, prior_wait=1800, clock=lambda: now[0])
+    tgt = lambda: asyncio.run(ad.safe_target())  # noqa: E731
+    old = _pool(40, 0)
+    ad.plan = set(old)
+    tgt()
+    now[0] = 480.0
+    ad.observed = set(old)
+    tgt()
+    # the pool comes due (8 min waits seen): 4 asked for ahead
+    now[0] = 480.0 + life - 3960.0 - 600
+    assert tgt() == 44
+    new = {f"r{i}" for i in range(4)}
+    ad.plan = old | new
+    tgt()
+    # an hour on, none of the 4 has started: the cap is now 16, so 12 more are asked for
+    now[0] += 3600.0
+    assert tgt() == 40 + 16
+    assert cl.dfeols_replace_ahead["cap"] == 16
