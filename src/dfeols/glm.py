@@ -97,7 +97,10 @@ POISSON = Family(
     mu_eta=_pois_inv,
     variance=lambda mu: mu,
     deviance=lambda y, mu: 2.0 * (_xlogy(y, mu) - (y - mu)),
-    start=lambda y, ybar: np.log((y + ybar) / 2.0),
+    # R's poisson()$initialize, which fixest uses: each row starts near its own y. ppmlhdfe's
+    # (y + ybar) / 2 pulls every row toward the grand mean and, on sparse products (BACI R0),
+    # sent rows with small positive y to mu ~ e^-40, from which IRLS steps overshoot.
+    start=lambda y, ybar: np.log(y + 0.1),
     eta_bounds=(-np.inf, np.inf),  # not clipped, as fixest: overflow gives a non-finite deviance, which step halving handles
     binary=False,
 )
