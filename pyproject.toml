@@ -42,6 +42,8 @@ dependencies = [
   "pandas>=2.0",
   "pyarrow>=14",
   "pyfixest>=0.50.1,<1",
+  # demean_fx (fixest's demeaning for 3+ FEs) is numba-compiled; pyfixest lists numba only as an extra
+  "numba>=0.58",
   "psutil>=5.9",
   # estimation records (reader, writer, validator, schemas). Capped below the next minor
   # version: estrec is pre-1.0, so a minor release may change the format.
