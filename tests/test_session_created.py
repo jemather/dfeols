@@ -114,6 +114,30 @@ def test_created_matches_fit(ds, ds_made, tmp_path, spec):
         assert all(("A_from" in b_["crossing"]) == saved for b_ in batches)
 
 
+def test_partial_out_can_run_a_shard_twice(ds, tmp_path):
+    """fpp_eng3 (OSCER 36407756): a worker went mid partial_out and Dask ran shard 27 again,
+    which found its stage file gone (FileNotFoundError). A task run twice gives the same."""
+    from dfeols.executors import SerialExecutor
+
+    class Twice(SerialExecutor):
+        def run(self, fn, tasks, on_result, progress, stage, **kw):
+            if stage == "partial_out":
+                inner = fn
+
+                def fn(*a):
+                    inner(*a)
+                    return inner(*a)
+
+            return super().run(fn, tasks, on_result, progress, stage, **kw)
+
+    r = _roots(tmp_path)
+    with _start("t", ds, r, executor=Twice()) as s:
+        s.add_variable("fp", "feat * posts")
+        a = s.fit("eng ~ posts + fp", cluster="id_a")
+    b = _fit(ds, tmp_path / "f", "eng ~ posts + feat:posts | spell + week", cluster="id_a")
+    _same(a, b)
+
+
 def test_created_by_name_in_expressions_and_i(ds, ds_made, tmp_path):
     """A created variable can be used by name: in another expression (its definition stands
     in) and as the x of x:i(c)."""

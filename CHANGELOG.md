@@ -266,6 +266,10 @@ The first release on PyPI. Late-task copies in round 1 and CG steps, row conditi
 
 ### Fixed
 
+- A session's `add_variable` (and its first build) failed with `FileNotFoundError` in
+  `partial_out` when a worker was lost mid-stage: each shard's task deleted its stage file, so
+  the run Dask gives the task again on another worker found nothing to read (fpp_eng3, OSCER
+  36407756, shard 27). The stage files now stay until the stage ends.
 - A resumed CG solve (`cg_checkpoint.npz`) estimated the steps left from a fall
   measured against step 0's residual of 1, so for its first 30 steps it said "about 10 more
   steps" when hundreds were left (D11 L3 resumed at step 808). The estimate now uses only the

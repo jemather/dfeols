@@ -527,8 +527,10 @@ def demean_round2(
         from .worker import iter_cache_drop
 
         iter_cache_drop(plan.iter_token, sid)
+    # the stage file stays until the stage ends (add_variables removes the folder): Dask runs
+    # a task again when its worker is lost, even after it finished (fpp_eng3, OSCER 36407756:
+    # shard 27 failed in partial_out with FileNotFoundError after a worker went, 37 to 36)
     _write_part(out_dir, sid, names, V, None if bare else w, cls)
-    p.unlink()
     r = {
         "shard": sid,
         "gram": (V * w[:, None]).T @ V,
