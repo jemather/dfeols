@@ -84,6 +84,12 @@ CROSSING_A = Path("crossing") / "A.npz"  # plan C's level-space A, kept for crea
 CREATED_COL = "__created_"  # + i: a created column in its batch's files (each session names it)
 COLLECTION_NAME = "session.estrec-collection.json"
 WEIGHT_COL = "__w"
+# a model's pass costs by the columns it reads, and a column read recently is much cheaper:
+# fpp_eng3 (OSCER 36407756, 2026-11-24) passes cost ~1.3 s a column when every column had
+# been read 1-4 min before, 6-12 s when not read for 38 min (as on a first read); m6 and m8
+# repeated m2 and m5 after that gap at the cold cost. WARM_S is a guess between the two.
+WARM_S = 900.0
+COLD_RATIO = 6.0  # cold / warm cost a column, until this session's passes tell them apart
 TASK_OVERHEAD = 0.005  # seconds a shard task costs beyond its reading (scheduling, results)
 VCOVS = ("iid", "hetero", "CRV1")
 # export suffix -> estrec table format (.doc: an HTML document styled for Word, which opens it)
@@ -1348,6 +1354,7 @@ def fit_model(
         src_rows = {sh["id"]: sh["rows"] for sh in Dataset.open(m["dataset"]["root"]).shards}
         rows = {sid: src_rows.get(sid, 1) for sid in d.shards}
         prog = Progress(wd, label=label or "model", every=log_every)
+        prog.settle_frac = 0.10  # one short pass: its first rows/s are the quick shards'
         prog.add_stage("meat", rows)
         prog.start("meat")
         maps = [(gp, A_, H_) for gp, A_, H_ in groups]
@@ -1627,11 +1634,10 @@ class Manager:
         self.data: Demeaned | None = None
         self._stop = threading.Event()
         self.state_extra: dict[str, Any] = {}  # kept in session.json (estimates, progress file)
-        # row-columns per second of a model's pass, measured in this session: the first pass
-        # reads files no node has cached yet (OSCER 35828091: 17 s for m1, 6 s for m2 with more
-        # columns), so it is kept apart from the later passes
-        self.pass_rate: float | None = None
-        self.first_pass_rate: float | None = None
+        # this session's passes as (columns cold, columns warm, seconds), and when each column
+        # was last read (WARM_S): estimate() fits a cost a cold and a warm column from them
+        self.passes: list[tuple[int, int, float]] = []
+        self.col_read: dict[str, float] = {}
         self.calibration: tuple[float, int] | None = None  # (row-columns/s read, shards read)
         self.progress_every = 0.5  # status.json, so a client's live line moves as tasks finish
 
@@ -1989,7 +1995,7 @@ class Manager:
             cat_levels=cat_levels,
         )
         if res.timing.get("meat_seconds"):
-            self._log_pass(est["columns"], res.timing["meat_seconds"])
+            self._log_pass(est, res.timing["meat_seconds"])
         recs = {}
         for y in res.outcomes:
             rec = session_record(res, y)
@@ -2152,6 +2158,8 @@ class Manager:
                 need.append((name, digest, dir_, missing))
         if need:
             self._fill_cross(d, need)
+            self._mark_read({n for n, *_ in need} | {m for *_, ms in need for m in ms})
+        self._mark_read(n for n, _, g in todo if g in built)  # just written
         for name, _, digest in todo:
             c = next(c for c in d.created if c["name"] == name)
             entry = self._var_entry(c, reused=digest not in built, seconds=time.time() - t0)
@@ -2314,40 +2322,57 @@ class Manager:
         )
 
     def estimate(self, req: dict) -> dict:
-        """A model's cost before it runs: rows x the columns its pass reads, at a rate from
-        (in order) this session's later passes, its first pass, the first passes of earlier
-        sessions on these demeaned data's file system, or a read of a few shard files. The
-        last three give a range; `estimate_seconds` is its upper end."""
+        """A model's cost before it runs, from the columns its pass reads. Once this session
+        has run a pass: a cost a cold column (not read in the last WARM_S) and a warm one,
+        fitted to its passes (_column_costs), with the range those passes' errors give. Before
+        that: rows x columns at the first-pass rate of earlier sessions on these demeaned
+        data's file system, or of a read of a few shard files. `estimate_seconds` is the upper
+        end of a range."""
         _, ys, xs, endog, insts = _model_terms(req["formula"], self.spec.fe, req.get("factors"))
         xs, ys = [*xs, *insts], [*ys, *endog]  # IV's pass reads the instruments and endogenous
         vcov = req.get("vcov") or (["CRV1"] if req.get("cluster") else ["iid"])
         vcov = [vcov] if isinstance(vcov, str) else list(vcov)
         passes = int(any(v in ("hetero", "CRV1") for v in vcov) and bool(xs))
         # the columns model_meat reads: regressors, responses, the weight, the cluster codes
-        cols = len(xs) + len(ys) + 1 + len(_cluster_names(req.get("cluster")))
+        names = [*xs, *ys, WEIGHT_COL, *(_cl_col(c) for c in _cluster_names(req.get("cluster")))]
+        cols = len(names)
+        now = time.time()
+        cold = [n for n in names if now - self.col_read.get(n, -np.inf) > WARM_S]
         work = self.data.manifest["rows"] * cols
-        out = {"passes": passes, "columns": cols, "estimate_seconds": 0.0, "estimate_range": None}
+        out = {
+            "passes": passes,
+            "columns": cols,
+            "cold": len(cold),
+            "column_names": names,
+            "estimate_seconds": 0.0,
+            "estimate_range": None,
+        }
         if not passes:
             return {**out, "basis": "no pass"}
-        if self.pass_rate:
-            return {**out, "estimate_seconds": work / self.pass_rate, "basis": "measured in this session"}
+        if self.passes:
+            c_s, w_s, spread = self._column_costs()
+            sec = len(cold) * c_s + (cols - len(cold)) * w_s
+            mins = f"{WARM_S / 60:g} min"
+            basis = (
+                f"measured in this session; {len(cold)} of {cols} columns not read in the last {mins}"
+                if cold
+                else f"measured in this session; every column read in the last {mins}"
+            )
+            rng = [sec * spread[0], sec * spread[1]] if spread else None
+            return {**out, "estimate_seconds": rng[1] if rng else sec, "estimate_range": rng, "basis": basis}
         lo = self._parallel_read_seconds(work)
-        if self.first_pass_rate:
-            hi = work / self.first_pass_rate
-            basis = "this session's first pass; later passes are usually faster"
+        hist = pass_history(self.demeaned_dir)
+        if hist:
+            lo, hi = work / max(hist), work / min(hist)
+            basis = f"first pass of {len(hist)} earlier session{'s' if len(hist) > 1 else ''}"
         else:
-            hist = pass_history(self.demeaned_dir)
-            if hist:
-                lo, hi = work / max(hist), work / min(hist)
-                basis = f"first pass of {len(hist)} earlier session{'s' if len(hist) > 1 else ''}"
-            else:
-                rate, k = self.calibration or self._calibrate()
-                hi = work / rate + TASK_OVERHEAD * len(self.data.shards)  # one reader, no overlap
-                slots = self._workers()
-                basis = (
-                    f"read rate of {k} shard{'s' if k > 1 else ''}, 1 to {slots} "
-                    f"worker{'s' if slots > 1 else ''}; first pass, no earlier sessions"
-                )
+            rate, k = self.calibration or self._calibrate()
+            hi = work / rate + TASK_OVERHEAD * len(self.data.shards)  # one reader, no overlap
+            slots = self._workers()
+            basis = (
+                f"read rate of {k} shard{'s' if k > 1 else ''}, 1 to {slots} "
+                f"worker{'s' if slots > 1 else ''}; first pass, no earlier sessions"
+            )
         lo = min(lo, hi)
         return {**out, "estimate_seconds": hi, "estimate_range": [lo, hi], "basis": basis}
 
@@ -2373,20 +2398,43 @@ class Manager:
         slots = self._workers()
         return work / (rate * slots) + TASK_OVERHEAD * len(self.data.shards) / slots
 
-    def _log_pass(self, columns: int, seconds: float) -> None:
-        rate = self.data.manifest["rows"] * columns / max(seconds, 1e-6)
-        first = self.first_pass_rate is None and self.pass_rate is None
-        if first:
-            self.first_pass_rate = rate
-        else:
-            self.pass_rate = rate
+    def _column_costs(self) -> tuple[float, float, tuple[float, float] | None]:
+        """Seconds a pass spends on a cold and on a warm column, fitted to this session's
+        passes (least squares; COLD_RATIO between them while the passes can't separate the
+        two), and the range of measured / fitted over those passes (None for one pass)."""
+        A = np.array([(c, w) for c, w, _ in self.passes], float)
+        s = np.array([x for *_, x in self.passes], float)
+        cost = None
+        if len(s) >= 2 and np.linalg.matrix_rank(A) == 2:
+            x, *_ = np.linalg.lstsq(A, s, rcond=None)
+            if x[0] >= x[1] > 0:
+                cost = x
+        if cost is None:
+            u = s.sum() / max(float((A @ [COLD_RATIO, 1.0]).sum()), 1e-9)
+            cost = np.array([COLD_RATIO * u, u])
+        if len(s) < 2:
+            return float(cost[0]), float(cost[1]), None
+        r = s / np.maximum(A @ cost, 1e-9)
+        return float(cost[0]), float(cost[1]), (float(r.min()), float(r.max()))
+
+    def _mark_read(self, names) -> None:
+        now = time.time()
+        for n in names:
+            self.col_read[n] = now
+
+    def _log_pass(self, est: dict, seconds: float) -> None:
+        names, cold = est["column_names"], est["cold"]
+        first = not self.passes
+        self.passes.append((cold, len(names) - cold, float(seconds)))
+        self._mark_read(names)
         try:
             _append_jsonl(
                 self.demeaned_dir / "passes.jsonl",
                 {
                     "when": _now(),
                     "rows": self.data.manifest["rows"],
-                    "columns": columns,
+                    "columns": len(names),
+                    "cold": cold,
                     "seconds": seconds,
                     "workers": self._workers(),
                     "first": first,
@@ -2552,6 +2600,7 @@ def cross_pass(d: Demeaned, name_groups, new_groups, executor, progress_dir: Pat
         acc["x"] = r["x"] if acc["x"] is None else acc["x"] + r["x"]
 
     prog = Progress(progress_dir, label="cross-products", every=30.0)
+    prog.settle_frac = 0.10
     prog.add_stage("cross", {sid: 1 for sid in d.shards})
     prog.start("cross")
     tasks = [(sid, 1, (sid, str(d.root), new_groups, name_groups)) for sid in d.shards]

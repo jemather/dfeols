@@ -202,6 +202,30 @@ def test_a_short_stage_does_not_scroll():
     assert milestone_due({**m, "stage": "bread", "t": 5.0}, last, 5.0)  # a new stage still shows
 
 
+def test_settle_frac_holds_the_first_times_back(tmp_path):
+    """With settle_frac the first tenth of a stage shows "calibrating" (the quick shards
+    come back first: fpp_eng3 m6 showed 316M rows/s at 0.4%, 7M from 15%)."""
+    from dfeols.progress import Progress, status_line
+
+    prog = Progress(tmp_path, label="m6", every=1e9)
+    prog.settle_frac = 0.10
+    prog.add_stage("meat", {i: 1000 for i in range(100)})
+    prog.start("meat")
+    prog.set_slots(4, 8)
+    for i in range(5):
+        prog.task_done("meat", i, 0.01)
+    line = status_line(prog.snapshot())
+    assert "calibrating" in line and "at 8 workers" not in line
+    for i in range(5, 12):
+        prog.task_done("meat", i, 0.01)
+    assert "calibrating" not in status_line(prog.snapshot())
+    off = Progress(tmp_path / "b", label="x", every=1e9)  # the default: off
+    off.add_stage("meat", {i: 1000 for i in range(100)})
+    off.start("meat")
+    off.task_done("meat", 0, 0.01)
+    assert "calibrating" not in status_line(off.snapshot())
+
+
 def test_heartbeat_when_nothing_moves(tmp_path, caplog, monkeypatch):
     import logging
 

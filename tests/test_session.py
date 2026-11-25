@@ -462,9 +462,10 @@ def test_estimates_and_progress(ds, tmp_path, capsys):
         s.fit("eng ~ feat + posts", cluster="id_a", label="b")
         err = capsys.readouterr().err
         assert "estimated" in err and "read rate of" in err and "b: done in" in err
-        # the first pass reads cold files (OSCER 35828091: m1 17 s, m2 6 s): kept apart
+        # after a pass: cold and warm columns, fitted to this session's passes
         s.fit("eng ~ posts", vcov="hetero", label="c")
-        assert "this session's first pass" in capsys.readouterr().err
+        err = capsys.readouterr().err
+        assert "measured in this session; every column read in the last 15 min" in err
         s.fit("eng ~ feat", vcov="hetero", label="d")
         assert "measured in this session" in capsys.readouterr().err
         idx = [json.loads(l) for l in (r["root"] / "p2" / "results" / "index.jsonl").read_text().splitlines()]
@@ -473,8 +474,11 @@ def test_estimates_and_progress(ds, tmp_path, capsys):
             (json.loads(p.read_text()) for p in (r["root"] / "p2" / "responses").glob("*.accepted.json")),
             key=lambda a: a["accepted"],
         )
-        assert [a["estimate_range"] is None for a in acc] == [True, False, False, True]
-        assert all(a["estimate_range"][0] <= a["estimate_range"][1] for a in acc[1:3])
+        # b: a range from earlier runs; c: one pass of this session, no range yet; d: a
+        # range from two passes' errors
+        assert [a["estimate_range"] is None for a in acc] == [True, False, True, False]
+        assert all(a["estimate_range"][0] <= a["estimate_range"][1] for a in (acc[1], acc[3]))
+        assert acc[2]["cold"] == 0 and acc[2]["columns"] == 3  # eng, posts, the weight: read by b a moment before
         passes = [json.loads(l) for l in (r["demeaned"] / "passes.jsonl").read_text().splitlines()]
         assert [p["first"] for p in passes] == [True, False, False]
         # the pass's progress counts rows, not shards (OSCER 35828091 showed 0.00M rows/s)
@@ -549,3 +553,17 @@ def test_worker_counts_shown(ds, tmp_path, capsys):
         assert "; on 25 of 40 running (15 queued or starting)" in capsys.readouterr().err
         a.fit("eng ~ feat", vcov="iid", label="m3")  # no pass: nothing about workers
         assert "workers" not in capsys.readouterr().err
+
+
+def test_estimate_counts_cold_and_warm_columns():
+    """fpp_eng3 (OSCER 36407756): a column read in the last minutes cost ~1.3 s a pass, one
+    not read for 38 min 6-12 s; the next model's estimate follows its cold columns."""
+    from dfeols import session as S
+
+    m = S.Manager.__new__(S.Manager)
+    m.passes = [(6, 0, 87.0), (1, 5, 14.0), (37, 3, 268.0), (0, 40, 54.0)]  # m2-m5
+    cold, warm, spread = m._column_costs()
+    assert 5 < cold < 9 and 0.5 < warm < 2 and spread[0] < 1 < spread[1]
+    m.passes = [(6, 0, 87.0)]  # one pass: COLD_RATIO between them, no range
+    cold, warm, spread = m._column_costs()
+    assert spread is None and abs(cold / warm - S.COLD_RATIO) < 1e-9 and abs(6 * cold - 87) < 1e-9

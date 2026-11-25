@@ -85,8 +85,12 @@ fixed sample).
   record of earlier runs (`<scratch>/dfeols/timings.jsonl`), shown as a range, plus the size of
   persisted output. With no history: a short calibration on a few shards at startup, and a wide
   range until then.
-- **Per model, at submission:** passes x columns x the throughput measured in this session;
-  accurate once the session has run one model.
+- **Per model, at submission:** by the columns the pass reads, each cold (not read in the
+  last 15 minutes, `WARM_S`) or warm, at a cost of each fitted to this session's passes, with
+  the range their errors give. A recently read column is several times cheaper: fpp_eng3
+  (OSCER 36407756, 2026-11-24) paid ~1.3 s a column a pass warm and 6-12 s cold, and two
+  models repeated after a 38-minute gap ran at the cold cost. Before the session's first
+  pass, rows x columns at earlier sessions' first-pass rate or a calibration read.
 - **Progress:** the existing per-stage progress (shards, rows/s, ETA) streamed to the client.
 
 ## Persisted demeaned data

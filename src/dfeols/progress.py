@@ -47,6 +47,7 @@ log = logging.getLogger("dfeols")
 
 LOG_PCT = 5.0  # verbosity 1: a line once a stage has moved this % of its rows since the last
 HEARTBEAT_S = 600.0  # ... or this many seconds have passed, whichever comes first
+SETTLE_MAX_S = 300.0  # Progress.settle_frac holds a stage's times back at most this long
 MIN_GAP_S = 60.0  # a LOG_PCT line waits until this long after the last: a short stage
 # (5% every few seconds) gets its first and last lines and the live line, not a scroll
 _VERBOSITY: int | None = None
@@ -310,6 +311,11 @@ class Progress:
         # GB a task of `rows` rows asks (DaskExecutor's MEMORY), when tasks differ: else task_gb
         self.task_gb_of = None
         self.extra_eta: float | None = None  # seconds of work no stage holds yet (CG steps to come)
+        # show a stage's times as "calibrating" until this share of its tasks is done (or
+        # SETTLE_MAX_S has passed): the first tasks back are the quick ones, so the early
+        # rate runs high (fpp_eng3 m6: 316M rows/s at 0.4%, 7M from 15%). Off (0) by
+        # default: a fit's CG steps are stages too, and each would lose its ETA for a while.
+        self.settle_frac = 0.0
 
     # --- bookkeeping -----------------------------------------------------
     def add_stage(self, name: str, rows: dict[int, int], before: str | None = None):
@@ -411,6 +417,11 @@ class Progress:
                     "eta_seconds_at_max_workers": eta_max,
                     "elapsed_seconds": (now - st.started) if st.started else 0,
                     "finished": bool(st.finished),
+                    "settling": bool(
+                        not st.finished
+                        and len(st.done) < self.settle_frac * len(st.rows)
+                        and (now - (st.started or now)) < SETTLE_MAX_S
+                    ),
                 }
             )
         if self.extra_eta is not None:
@@ -547,21 +558,21 @@ def _columns(snap: dict) -> list[tuple[str, str, str]]:
     eta = cur["eta_seconds"]
     if snap["workers"] == 0 and not cur["finished"]:
         stage_left = "waiting for workers"
-    elif eta is None or not np.isfinite(eta):
+    elif eta is None or not np.isfinite(eta) or cur.get("settling"):
         stage_left = "calibrating"
     else:
         stage_left = fmt_td(eta)
-    total = snap["eta_total_seconds"]
+    total = None if cur.get("settling") else snap["eta_total_seconds"]
     return [
         ("run", snap["label"], "<"),
         ("stage", f"{i + 1:>{len(str(n))}}/{n} {cur['stage']:<{wname}}", "<"),
         ("shards", f"{cur['tasks_done']:>{wn}}/{cur['tasks']:<{wn}}", ">"),
         ("rows", f"{float(cur['pct_rows']):.1f}%", ">"),
         ("workers", f"{snap['workers']:>{ww}}/{mx}" if mx else f"{snap['workers']}", ">"),
-        ("rows/s", _rows_per_sec(cur, snap["workers"]), ">"),
+        ("rows/s", "-" if cur.get("settling") else _rows_per_sec(cur, snap["workers"]), ">"),
         ("stage left", stage_left, ">"),
         ("all left", fmt_td(total) if total is not None else "-", ">"),
-        ("done at", snap.get("finish_time") or "-", ">"),
+        ("done at", (None if cur.get("settling") else snap.get("finish_time")) or "-", ">"),
     ]
 
 
@@ -586,8 +597,8 @@ def _render(snap: dict, header: bool) -> str:
         out.append(f"{(h if header else v):{al}{w}}")
     line = "  ".join(out)
     if not header:
-        at_max = next((s for s in snap["stages"] if not s["finished"]), snap["stages"][-1]).get(
-            "eta_seconds_at_max_workers")
+        cur = next((s for s in snap["stages"] if not s["finished"]), snap["stages"][-1])
+        at_max = None if cur.get("settling") else cur.get("eta_seconds_at_max_workers")
         mx = snap.get("max_workers")
         if at_max is not None and mx and snap["workers"] < mx:
             line += f"  ({fmt_td(at_max)} at {mx} workers)"
