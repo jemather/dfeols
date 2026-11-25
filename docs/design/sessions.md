@@ -281,7 +281,7 @@ within 5e-15.
 - **Estimates and progress** (2026-11-02). Before demeaning, `session start` and the manager
   estimate it from `timings.jsonl` (rows x variables over earlier runs' throughput, as a
   range) and put it in `session.json` with the path of the live progress file
-  (`progress/demean/status.json`, the usual `Progress` snapshot, refreshed every 2 s);
+  (`progress/demean/status.json`, the usual `Progress` snapshot, refreshed every 0.5 s);
   `Session.attach` and `session start --wait` print both while waiting. Per model, before it
   runs, the manager writes `responses/<id>.accepted.json` with passes, columns and an
   estimate: none needed when the Gram matrix answers it (b, iid), else rows x the columns the

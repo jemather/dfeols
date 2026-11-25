@@ -190,6 +190,18 @@ def test_verbosity_2_logs_every_tick_and_0_none(tmp_path, caplog, monkeypatch):
     assert _replay(tmp_path / "b", 0, caplog, monkeypatch) == []
 
 
+def test_a_short_stage_does_not_scroll():
+    """A 1-minute stage moves 5% every few seconds: LOG_PCT alone would print a line each
+    time; MIN_GAP_S holds those back, so it gets its first line and the live line."""
+    from dfeols.progress import LOG_PCT, MIN_GAP_S, milestone_due
+
+    last = {"stage": "meat", "state": "running", "pct": 20.0, "note": "", "t": 0.0}
+    m = {**last, "pct": 20.0 + 3 * LOG_PCT}
+    assert not milestone_due({**m, "t": 5.0}, last, 5.0)
+    assert milestone_due({**m, "t": MIN_GAP_S}, last, MIN_GAP_S)
+    assert milestone_due({**m, "stage": "bread", "t": 5.0}, last, 5.0)  # a new stage still shows
+
+
 def test_heartbeat_when_nothing_moves(tmp_path, caplog, monkeypatch):
     import logging
 

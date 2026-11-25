@@ -22,7 +22,8 @@ by the verbosity (set_verbosity, or DFEOLS_VERBOSITY in the environment):
 
   0  no progress lines (warnings and the fit's own notes still show)
   1  (default) a line when the stage, CG step or worker state changes, and otherwise once
-     the stage has moved LOG_PCT% or HEARTBEAT_S seconds have passed since the last line;
+     the stage has moved LOG_PCT% (and MIN_GAP_S seconds have passed) or HEARTBEAT_S
+     seconds have passed since the last line;
      between those, a live line redrawn every `every` seconds and wiped by the next line
   2  a line every `every` seconds
 """
@@ -46,6 +47,8 @@ log = logging.getLogger("dfeols")
 
 LOG_PCT = 5.0  # verbosity 1: a line once a stage has moved this % of its rows since the last
 HEARTBEAT_S = 600.0  # ... or this many seconds have passed, whichever comes first
+MIN_GAP_S = 60.0  # a LOG_PCT line waits until this long after the last: a short stage
+# (5% every few seconds) gets its first and last lines and the live line, not a scroll
 _VERBOSITY: int | None = None
 
 
@@ -164,9 +167,11 @@ def _live_target():
     return None
 
 
-def _draw_live(stream, text: str):
+def _draw_live(stream, text: str, stamp: bool = True):
+    """`stamp`: lead with the time, as the default handler's records do; off where the
+    printed lines around it carry none (the session client), so the two look the same."""
     global _live
-    line = time.strftime("%H:%M:%S ") + text + "\n"
+    line = (time.strftime("%H:%M:%S ") if stamp else "") + text + "\n"
     lv = _live if _live is not None and _live["stream"] is stream else None
     kind = lv["kind"] if lv else _stream_kind(stream)
     try:
@@ -507,12 +512,14 @@ def milestone(snap: dict, now: float) -> dict:
 
 def milestone_due(m: dict, last: dict | None, now: float) -> bool:
     """A printed line is due: the first, a new stage, state or note, LOG_PCT% more of the
-    stage's rows since the last line, or HEARTBEAT_S seconds since it."""
+    stage's rows since the last line (once MIN_GAP_S has passed), or HEARTBEAT_S seconds
+    since it."""
+    since = now - last["t"] if last is not None else 0.0
     return (
         last is None
         or any(m[k] != last[k] for k in ("stage", "state", "note"))
-        or m["pct"] - last["pct"] >= LOG_PCT  # both count from the last line printed:
-        or now - last["t"] >= HEARTBEAT_S  # a line at whichever comes first
+        or (m["pct"] - last["pct"] >= LOG_PCT and since >= MIN_GAP_S)  # all count from the
+        or since >= HEARTBEAT_S  # last line printed: a line at whichever comes first
     )
 
 

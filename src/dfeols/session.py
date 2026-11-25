@@ -1633,7 +1633,7 @@ class Manager:
         self.pass_rate: float | None = None
         self.first_pass_rate: float | None = None
         self.calibration: tuple[float, int] | None = None  # (row-columns/s read, shards read)
-        self.progress_every = 2.0
+        self.progress_every = 0.5  # status.json, so a client's live line moves as tasks finish
 
     # ---- state on disk
     def _state(self, **extra) -> dict:
@@ -2962,7 +2962,7 @@ class Session:
             from .progress import _clear_live
 
             _clear_live()  # a live line is erased first, so the message takes its place
-            print(f"[session {self.name}] {msg}", file=sys.stderr, flush=True)
+            print(msg, file=sys.stderr, flush=True)  # no "[session name]": the user knows
 
     def _once(self, key: str) -> bool:
         if key in self._shown:
@@ -2972,9 +2972,9 @@ class Session:
 
     def _show_status(self, path: Path, final: bool = False) -> None:
         """Show a stage's status.json (Progress) when it has changed: a printed line at a
-        milestone (new stage or state, LOG_PCT% more rows, the heartbeat), the same rule as the
-        job log, and in between, on a terminal, one live line redrawn in place. `final` prints
-        the latest status for good (the request is done)."""
+        milestone (new stage or state, LOG_PCT% more rows after MIN_GAP_S, the heartbeat),
+        the same rule as the job log, and in between, on a terminal, one live line redrawn in
+        place. `final` prints the latest status for good (the request is done)."""
         from .progress import HeaderEvery, _draw_live, milestone, milestone_due, status_header, status_line
 
         if not self.progress:
@@ -3002,7 +3002,7 @@ class Session:
             self._live.pop(key, None)
         else:  # on a terminal, the live line; elsewhere (a pipe, a file) milestones only
             if _isatty(sys.stderr):
-                _draw_live(sys.stderr, f"[session {self.name}] {status_line(snap)}")
+                _draw_live(sys.stderr, status_line(snap), stamp=False)
             self._live[key] = snap  # not printed yet: _settle prints it when the request ends
 
     def _settle(self) -> None:

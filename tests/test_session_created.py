@@ -438,8 +438,11 @@ def test_client_live_line_on_a_terminal(tmp_path, monkeypatch):
     out = run(Tty())
     assert out.count(P.LIVE_UP) >= 7  # redrawn in place, not one line per update
     last = out.rsplit(P.LIVE_UP, 1)[-1]
-    assert last.startswith("[session ui]") and " 10/100 " in last  # the live line erased, the final printed
+    assert last.startswith("m1 ") and " 10/100 " in last  # the live line erased, the final printed
     assert P._live is None  # nothing left for the next output to erase
+    # the live line looks like the printed lines: no time or session name in front of it
+    assert all(seg.startswith("m1 ") for seg in out.split(P.LIVE_UP)[1:])
+    assert "[session" not in out
     plain = run(io.StringIO())
     assert P.LIVE_UP not in plain
     assert sum(" 1/100 " in l or " 10/100 " in l for l in plain.splitlines()) == 2  # first + final

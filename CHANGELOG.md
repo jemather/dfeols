@@ -26,6 +26,12 @@ break the API).
   `grep` see the log lines plus one current live line, with no control codes; `tail -f` shows
   only appended lines, so use `watch -n 30 tail <file>` or `dfeols status --watch` to see it
   move. Pipes and files opened to append (`>>`) get no live line.
+- A short stage no longer scrolls: a line for 5% more rows also waits until a minute has
+  passed since the last one, so a stage of a minute or two gets its first line and the live
+  line rather than one row every few seconds. In a session client (`Session.fit`,
+  `add_variable`, `attach`) the live line now looks exactly like the printed rows (no time in
+  front), the `[session <name>]` prefix is gone from its messages, and the server refreshes
+  the status every 0.5 s (was 2 s), so the live line moves as tasks finish.
 - A fit resumed from its CG checkpoint knows the CG steps left at once (the residual history
   is kept beside the checkpoint, `cg_checkpoint.hist.json`), and one resumed from round 1's
   checkpoint projects round 2's time from round 1's saved rate, so "all left" and "done at"
