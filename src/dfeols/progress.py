@@ -134,7 +134,7 @@ def _clear_live():
     lv, _live = _live, None
     if lv is not None and lv["kind"] == "tty":
         try:
-            lv["stream"].write(LIVE_UP)
+            lv["stream"].write(LIVE_UP * lv.get("n", 1))
             lv["stream"].flush()
         except (OSError, ValueError):
             pass
@@ -170,16 +170,18 @@ def _live_target():
 
 def _draw_live(stream, text: str, stamp: bool = True):
     """`stamp`: lead with the time, as the default handler's records do; off where the
-    printed lines around it carry none (the session client), so the two look the same."""
+    printed lines around it carry none (the session client), so the two look the same.
+    On a terminal `text` may be several lines (the client's header and status row), all
+    redrawn and erased together."""
     global _live
     line = (time.strftime("%H:%M:%S ") if stamp else "") + text + "\n"
     lv = _live if _live is not None and _live["stream"] is stream else None
     kind = lv["kind"] if lv else _stream_kind(stream)
     try:
         if kind == "tty":
-            stream.write((LIVE_UP if lv else "") + line)
+            stream.write((LIVE_UP * lv.get("n", 1) if lv else "") + line)
             stream.flush()
-            _live = {"stream": stream, "kind": "tty"}
+            _live = {"stream": stream, "kind": "tty", "n": line.count("\n")}
         elif kind == "file":
             if lv is not None and _file_slot_free(lv) and _pwrite_slot(lv, line):
                 return

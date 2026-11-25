@@ -43,6 +43,10 @@ break the API).
   to 9x. Replayed over fpp_eng3's seven passes, they now fall within or near their range.
   Its passes also show "calibrating" for their first 10% of shards (at most 5 minutes),
   where the first, quickest shards made the rate run high.
+- A session client prints less: on a terminal the column header and the latest row are
+  redrawn in place, a row is printed for good only at a milestone after the first status (a
+  new stage, waiting for workers, 5% more after a minute, the heartbeat), and the live rows
+  are erased when the request ends. A short fit leaves only its estimate and `done in`.
 - A fit resumed from its CG checkpoint knows the CG steps left at once (the residual history
   is kept beside the checkpoint, `cg_checkpoint.hist.json`), and one resumed from round 1's
   checkpoint projects round 2's time from round 1's saved rate, so "all left" and "done at"

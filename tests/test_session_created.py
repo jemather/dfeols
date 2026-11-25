@@ -5,6 +5,7 @@ session on the same demeaned data; refit equals a fresh fit with the new vcov.""
 
 import json
 import sys
+import time
 import warnings
 from pathlib import Path
 
@@ -406,10 +407,24 @@ def test_factor_terms_text_and_interacted(ds, tmp_path, spec):
             s.fit("eng ~ i(grp, ref='g 9')")
 
 
+def _screen(out: str) -> list[str]:
+    """What a terminal shows after `out`: each LIVE_UP takes back the line above."""
+    from dfeols import progress as P
+
+    lines: list[str] = []
+    for i, part in enumerate(out.split(P.LIVE_UP)):
+        if i and lines:
+            lines.pop()
+        lines += part.splitlines()
+    return lines
+
+
 def test_client_live_line_on_a_terminal(tmp_path, monkeypatch):
-    """On a terminal the client prints milestones and redraws one live line between them
-    (in place, LIVE_UP), then prints the last status for good when the request is done; off
-    a terminal it prints the milestones only."""
+    """On a terminal the client redraws the header and the latest row in place and prints a
+    row for good only at a milestone after the first status; when the request is done the
+    live block is erased, so a short pass leaves nothing (Ted 2026-11-24: fpp_eng3 m9-m12
+    printed the first row, the calibrating-to-running row and a stale last row). Off a
+    terminal, the milestone rows only."""
     import io
 
     from dfeols import progress as P
@@ -418,16 +433,21 @@ def test_client_live_line_on_a_terminal(tmp_path, monkeypatch):
         def isatty(self):
             return True
 
-    def run(stream):
+    clock = [1e6]
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+
+    def run(stream, steps, dt):
         monkeypatch.setattr(sys, "stderr", stream)
         P._live = None
         s = Session("ui", root=tmp_path)
-        prog = P.Progress(tmp_path / "p", label="m1", every=1e9)
-        prog.add_stage("demean", {i: 1000 for i in range(100)})
-        prog.start("demean")
-        status = tmp_path / "p" / "status.json"
-        for i in range(10):  # 1% a step: one milestone line, then live redraws
-            prog.task_done("demean", i, 1.0, {"total": 1.0})
+        prog = P.Progress(tmp_path / f"p{dt}", label="m1", every=1e9)
+        prog.add_stage("meat", {i: 1000 for i in range(100)})
+        prog.start("meat")
+        status = tmp_path / f"p{dt}" / "status.json"
+        for i in range(steps):
+            clock[0] += dt
+            if i:
+                prog.task_done("meat", i - 1, 1.0, {"total": 1.0})
             prog.tick(force=True)
             snap = json.loads(status.read_text())
             status.write_text(json.dumps({**snap, "updated": i}))
@@ -435,17 +455,18 @@ def test_client_live_line_on_a_terminal(tmp_path, monkeypatch):
         s._settle()
         return stream.getvalue()
 
-    out = run(Tty())
-    assert out.count(P.LIVE_UP) >= 7  # redrawn in place, not one line per update
-    last = out.rsplit(P.LIVE_UP, 1)[-1]
-    assert last.startswith("m1 ") and " 10/100 " in last  # the live line erased, the final printed
-    assert P._live is None  # nothing left for the next output to erase
-    # the live line looks like the printed lines: no time or session name in front of it
-    assert all(seg.startswith("m1 ") for seg in out.split(P.LIVE_UP)[1:])
+    out = run(Tty(), 30, 1.0)  # 29% in 30 s: no milestone
+    assert out.count(P.LIVE_UP) >= 25 and out.startswith("run ")  # header + row, redrawn
+    assert _screen(out) == [] and P._live is None  # erased at the end, nothing left over
     assert "[session" not in out
-    plain = run(io.StringIO())
-    assert P.LIVE_UP not in plain
-    assert sum(" 1/100 " in l or " 10/100 " in l for l in plain.splitlines()) == 2  # first + final
+    assert run(io.StringIO(), 30, 1.0) == ""
+    out = run(Tty(), 30, 30.0)  # 1% every 30 s: a row each 5% (2.5 min)
+    shown = _screen(out)
+    assert shown[0].startswith("run ") and len(shown) == 6, shown  # header + rows at 5,10,...
+    assert all(l.startswith("m1 ") for l in shown[1:]) and not any(" 0/100 " in l for l in shown)
+    plain = run(io.StringIO(), 30, 30.0)
+    assert P.LIVE_UP not in plain  # the same rows (the clock ran on: "done at" differs)
+    assert [l[:40] for l in plain.splitlines()[1:]] == [l[:40] for l in shown[1:]]
 
 
 def test_reused_columns_cross_products_one_pass_and_kept(ds, ds_made, tmp_path, monkeypatch):
@@ -480,7 +501,11 @@ def test_client_lists_the_folder_before_reading_a_new_status(tmp_path, monkeypat
     from dfeols import progress as P
     from dfeols import session as S
 
-    monkeypatch.setattr(sys, "stderr", io.StringIO())
+    class Tty(io.StringIO):
+        def isatty(self):
+            return True
+
+    monkeypatch.setattr(sys, "stderr", Tty())
     P._live = None
     s = Session("ui", root=tmp_path)
     prog = P.Progress(tmp_path / "p", label="m1", every=1e9)

@@ -3019,11 +3019,14 @@ class Session:
         self._shown[key] = True
         return True
 
-    def _show_status(self, path: Path, final: bool = False) -> None:
-        """Show a stage's status.json (Progress) when it has changed: a printed line at a
-        milestone (new stage or state, LOG_PCT% more rows after MIN_GAP_S, the heartbeat),
-        the same rule as the job log, and in between, on a terminal, one live line redrawn in
-        place. `final` prints the latest status for good (the request is done)."""
+    def _show_status(self, path: Path) -> None:
+        """Show a stage's status.json (Progress) when it has changed. On a terminal, the
+        column header and the latest row are redrawn in place below the estimate; a row is
+        printed for good only at a milestone after the first status (a new stage, waiting
+        for workers or no longer, LOG_PCT% more rows after MIN_GAP_S, the heartbeat), so a
+        short pass leaves only its estimate and "done in" (Ted 2026-11-24, fpp_eng3 m9-m12:
+        the first row, calibrating to running, and the last row said nothing new). Off a
+        terminal (a pipe, a file), the milestone rows only."""
         from .progress import HeaderEvery, _draw_live, milestone, milestone_due, status_header, status_line
 
         if not self.progress:
@@ -3041,28 +3044,37 @@ class Session:
         if not snap.get("stages"):
             return
         if self._shown.get(key) == snap.get("updated"):
-            if not (final and key in self._live):
-                return
+            return
         self._shown[key] = snap.get("updated")
         now = time.time()
         m = milestone(snap, now)
-        if final or milestone_due(m, self._printed.get(key), now):
-            hdr = status_header(snap)
+        if m["state"] == "calibrating":  # its first rows/s, not news: only waiting counts
+            m = {**m, "state": "running"}
+        last = self._printed.get(key)
+        if last is None:
+            self._printed[key] = m  # the first status: the start, shown live, not printed
+        elif milestone_due(m, last, now):
             every = self._headers.setdefault(key, HeaderEvery())
+            hdr = status_header(snap)
             if every(hdr):
                 self._say(hdr)
             self._say(status_line(snap))
             self._printed[key] = m
             self._live.pop(key, None)
-        else:  # on a terminal, the live line; elsewhere (a pipe, a file) milestones only
-            if _isatty(sys.stderr):
-                _draw_live(sys.stderr, status_line(snap), stamp=False)
-            self._live[key] = snap  # not printed yet: _settle prints it when the request ends
+            return
+        if _isatty(sys.stderr):
+            text = status_line(snap)
+            if key not in self._headers:  # no header printed yet: it goes in the live block
+                text = status_header(snap) + "\n" + text
+            _draw_live(sys.stderr, text, stamp=False)
+            self._live[key] = True
 
     def _settle(self) -> None:
-        """A request is done: what is only on the live line is printed for good."""
-        for key in list(self._live):
-            self._show_status(Path(key), final=True)
+        """A request is done: its live block is erased ("done in" says the rest)."""
+        from .progress import _clear_live
+
+        if self._live:
+            _clear_live()
         self._live.clear()
 
     def _watch_fit(self, rid: str) -> None:
