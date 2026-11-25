@@ -2980,6 +2980,11 @@ class Session:
         if not self.progress:
             return
         key = str(path)
+        # a new model's status.json, written on the manager's node: opened by name, /scratch
+        # can answer "no such file" for ~30 s (fpp_eng3 m6: the first row at 82/268, m7's
+        # 25 s pass none at all); listing its folders first revalidates them (_appeared)
+        if key not in self._shown and not (_appeared(path.parent) and _appeared(path)):
+            return
         try:
             snap = _read_json(path)
         except (OSError, json.JSONDecodeError):

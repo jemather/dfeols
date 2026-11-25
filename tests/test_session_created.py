@@ -469,3 +469,29 @@ def test_reused_columns_cross_products_one_pass_and_kept(ds, ds_made, tmp_path, 
         if name == "b":
             assert len(calls) == 1  # one pass for all the tbin::*:feat columns
     assert len(calls) == 1  # session c read them from cross_more.json
+
+
+def test_client_lists_the_folder_before_reading_a_new_status(tmp_path, monkeypatch):
+    """A new model's status.json is looked for by listing its folders (_appeared), not
+    opened by name: on OSCER's /scratch the name can read as missing for ~30 s (fpp_eng3 m7:
+    a 25 s pass showed nothing)."""
+    import io
+
+    from dfeols import progress as P
+    from dfeols import session as S
+
+    monkeypatch.setattr(sys, "stderr", io.StringIO())
+    P._live = None
+    s = Session("ui", root=tmp_path)
+    prog = P.Progress(tmp_path / "p", label="m1", every=1e9)
+    prog.add_stage("meat", {i: 1000 for i in range(10)})
+    prog.start("meat")
+    prog.tick(force=True)
+    status = tmp_path / "p" / "status.json"
+    looked = []
+    monkeypatch.setattr(S, "_appeared", lambda p: looked.append(p) or p == status.parent)
+    s._show_status(status)
+    assert status in looked and "m1 " not in sys.stderr.getvalue()  # not listed yet: wait
+    monkeypatch.setattr(S, "_appeared", lambda p: True)
+    s._show_status(status)
+    assert "m1 " in sys.stderr.getvalue()

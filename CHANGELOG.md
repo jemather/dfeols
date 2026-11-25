@@ -32,6 +32,10 @@ break the API).
   `add_variable`, `attach`) the live line now looks exactly like the printed rows (no time in
   front), the `[session <name>]` prefix is gone from its messages, and the server refreshes
   the status every 0.5 s (was 2 s), so the live line moves as tasks finish.
+- A session client on another node shows a model's progress from its first shard. It
+  opened the new `status.json` by name, which OSCER's `/scratch` can report missing for
+  about 30 s, so a short fit showed its first row late or not at all. It now lists the
+  folder first, as it already did for responses.
 - A fit resumed from its CG checkpoint knows the CG steps left at once (the residual history
   is kept beside the checkpoint, `cg_checkpoint.hist.json`), and one resumed from round 1's
   checkpoint projects round 2's time from round 1's saved rate, so "all left" and "done at"
