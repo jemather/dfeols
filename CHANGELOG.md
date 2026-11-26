@@ -266,6 +266,10 @@ The first release on PyPI. Late-task copies in round 1 and CG steps, row conditi
 
 ### Fixed
 
+- A CG step's note (step, residual, tolerance, steps left) is on every printed line again,
+  not only the first line of the step: a step runs for hours and `tail` shows the last lines
+  (cellxgene H:L3). Between two steps, the line keeps naming the step just done instead of
+  round 2 at 0% (which said "14/14 round2 0/27011 ... 0:30:12" for a minute each step).
 - During the singleton passes, the status line showed "7/7 singletons7" and an 'all left' and
   'done at' for that pass alone: the passes, and the stages after them, are added only as they
   start (cellxgene H:L3). The stage now reads "singletons pass 7", with "-" for 'all left' and

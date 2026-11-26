@@ -80,6 +80,9 @@ def test_cg_steps_show_in_the_line(tmp_path):
     line = prog.line(prog.snapshot())
     assert line.startswith("fit  2/3 cg1 ") and line.endswith("CG step 1, residual 3.1e-01 (tol 1e-10)")
     assert prog.snapshot()["eta_total_seconds"] >= 600
+    prog.finish("cg1")  # between steps (cg2 not added yet): still cg1, not round 2 at 0%
+    line = prog.line(prog.snapshot())
+    assert line.startswith("fit  2/3 cg1 ") and "CG step 1" in line, line
     assert _cg_steps_left([1.0, 0.5, 0.2], 1e-10) is None  # too few steps
     assert _cg_steps_left([1e-1, 1e-2, 1e-3, 1e-4], 1e-10) == 6  # a decade a step
     assert _cg_steps_left([1e-4, 2e-4, 1e-4, 1e-4], 1e-10) is None  # stalled
@@ -180,7 +183,7 @@ def test_verbosity_1_logs_milestones_and_a_heartbeat(tmp_path, caplog, monkeypat
     # 5% of this stage is 12 minutes, so the 10-minute heartbeat sets the pace: ~24 lines
     # in 4 hours, not 480
     assert 22 <= len(lines) <= 26, len(lines)
-    assert sum("CG step 12" in m for m in lines) == 1  # the note shows once, not on every line
+    assert all("CG step 12" in m for m in lines)  # on every line: `tail` shows the residual (H:L3)
     assert len((tmp_path / "history.jsonl").read_text().splitlines()) == 480  # status every tick
 
 

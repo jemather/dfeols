@@ -429,6 +429,7 @@ class Progress:
                     "eta_seconds_at_max_workers": eta_max,
                     "elapsed_seconds": (now - st.started) if st.started else 0,
                     "finished": bool(st.finished),
+                    "started": st.started is not None,
                     "title": st.title,
                     "settling": bool(
                         not st.finished
@@ -505,10 +506,9 @@ class Progress:
             return
         m, last = self._milestone(snap, now), self._printed
         if force or milestone_due(m, last, now):
-            shown = snap
-            if last is not None and m["note"] == last["note"] and m["stage"] == last["stage"]:
-                shown = {**snap, "note": ""}  # the note is on the line above; don't repeat it
-            self._log_line(shown)
+            # the note (CG step, residual, tolerance) on every line, not once a stage: a CG step
+            # runs for hours, and `tail` shows only the last lines (cellxgene H:L3, Ted)
+            self._log_line(snap)
             self._printed = m
             return
         out = _live_target()
@@ -522,12 +522,23 @@ class Progress:
         log.info(self.line(snap))
 
 
+def _current(stages: list[dict]) -> int:
+    """The stage a line describes: the first unfinished one, unless it has not started and
+    one before it has finished, which is then still the latest news. Between two CG steps the
+    next step is not added yet and round 2 is next (H:L3 showed "14/14 round2 0/27011 ...
+    0:30:12" for the minute the coordinator took between steps)."""
+    i = next((k for k, s in enumerate(stages) if not s["finished"]), len(stages) - 1)
+    if i > 0 and not stages[i]["finished"] and not stages[i].get("started", True):
+        return i - 1
+    return i
+
+
 def milestone(snap: dict, now: float) -> dict:
     """What decides whether verbosity 1 logs a line: the current stage, its state (waiting
     for workers, calibrating, running), the share of its rows done and the note. Also used by
     the session client to choose between a printed line and the live line."""
     stages = snap["stages"]
-    cur = next((s for s in stages if not s["finished"]), stages[-1])
+    cur = stages[_current(stages)]
     eta = cur["eta_seconds"]
     if snap["workers"] == 0 and not cur["finished"]:
         state = "waiting"
@@ -570,7 +581,7 @@ def _columns(snap: dict) -> list[tuple[str, str, str]]:
     """(header, value, align) per column of a status line. Widths depend only on what is fixed
     for a run (label, stage names, shard counts, max workers), so successive lines line up."""
     stages = snap["stages"]
-    i = next((k for k, s in enumerate(stages) if not s["finished"]), len(stages) - 1)
+    i = _current(stages)
     cur = stages[i]
     n = len(stages)
     more = snap.get("more_stages")
@@ -627,7 +638,7 @@ def _render(snap: dict, header: bool) -> str:
         out.append(f"{(h if header else v):{al}{w}}")
     line = "  ".join(out)
     if not header:
-        cur = next((s for s in snap["stages"] if not s["finished"]), snap["stages"][-1])
+        cur = snap["stages"][_current(snap["stages"])]
         at_max = None if cur.get("settling") else cur.get("eta_seconds_at_max_workers")
         mx = snap.get("max_workers")
         if at_max is not None and mx and snap["workers"] < mx:
