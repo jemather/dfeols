@@ -242,6 +242,8 @@ class StageProgress:
     started: float | None = None
     finished: float | None = None
     done_at: dict[int, float] = field(default_factory=dict)  # task id -> when its result came in
+    title: str | None = None  # shown in the stage column instead of the name
+    settle: bool = True  # Progress.settle_frac applies (not to a CG step: each would lose its ETA)
 
     def throughput(self, now: float, window: float = THROUGHPUT_WINDOW_S) -> float | None:
         """Rows a second whose results reached the coordinator over the last `window` seconds
@@ -316,12 +318,19 @@ class Progress:
         # show a stage's times as "calibrating" until this share of its tasks is done (or
         # SETTLE_MAX_S has passed): the first tasks back are the quick ones, so the early
         # rate runs high (fpp_eng3 m6: 316M rows/s at 0.4%, 7M from 15%). Off (0) by
-        # default: a fit's CG steps are stages too, and each would lose its ETA for a while.
+        # default; a fit's CG steps are stages too, added with settle=False so they keep it.
         self.settle_frac = 0.0
+        # stages not added yet follow, whose times are unknown (the singleton passes until one
+        # drops nothing, then the rounds): no total is shown, nor a stage count (cellxgene H:L3
+        # singletons7 said "7/7" and 'all left' 2:28 for that pass alone)
+        self.more = False
 
     # --- bookkeeping -----------------------------------------------------
-    def add_stage(self, name: str, rows: dict[int, int], before: str | None = None):
-        self.stages[name] = StageProgress(name, dict(rows))
+    def add_stage(
+        self, name: str, rows: dict[int, int], before: str | None = None, title: str | None = None,
+        settle: bool = True,
+    ):
+        self.stages[name] = StageProgress(name, dict(rows), title=title, settle=settle)
         self.order.insert(self.order.index(before) if before in self.order else len(self.order), name)
         self.running[name] = set()
 
@@ -376,7 +385,8 @@ class Progress:
         stages = []
         total_eta = 0.0
         total_known = True
-        r1 = self.stages[self.order[0]].rate() if self.order else None
+        # round 2's prior is a share of round 1's rate (not the first stage's: singletons1)
+        r1 = self.stages["round1"].rate() if "round1" in self.stages else None
         if r1 is None:  # round 1 came from a checkpoint: its rate as saved there
             r1 = self.round1_rate_prior
         for name in self.order:
@@ -419,8 +429,10 @@ class Progress:
                     "eta_seconds_at_max_workers": eta_max,
                     "elapsed_seconds": (now - st.started) if st.started else 0,
                     "finished": bool(st.finished),
+                    "title": st.title,
                     "settling": bool(
                         not st.finished
+                        and st.settle
                         and len(st.done) < self.settle_frac * len(st.rows)
                         and (now - (st.started or now)) < SETTLE_MAX_S
                     ),
@@ -428,6 +440,8 @@ class Progress:
             )
         if self.extra_eta is not None:
             total_eta += self.extra_eta
+        if self.more:
+            total_known = False
         return {
             "label": self.label,
             "updated": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -437,6 +451,7 @@ class Progress:
             "stages": stages,
             "eta_total_seconds": total_eta if total_known else None,
             "finish_time": _clock(now + total_eta) if total_known else None,
+            "more_stages": bool(self.more),
             "note": self.note,
         }
 
@@ -450,8 +465,14 @@ class Progress:
         self._last = now
         snap = self.snapshot()
         global WORK_LEFT
-        if snap["eta_total_seconds"] is not None:
-            WORK_LEFT = (now, float(snap["eta_total_seconds"]))
+        # stages still to be added: None, which the cluster counts as work to come (the last
+        # known total, one singleton pass's, let workers go). A stage with no rate yet (a few
+        # seconds at its start) keeps the last total, so replacements do not flicker
+        tot = snap["eta_total_seconds"]
+        if tot is not None:
+            WORK_LEFT = (now, float(tot))
+        elif snap["more_stages"]:
+            WORK_LEFT = (now, None)
         self._report(snap, now, force)
         rows_all = sum(st.total_rows for st in self.stages.values())
         done_all = sum(st.done_rows for st in self.stages.values())
@@ -539,7 +560,7 @@ def milestone_due(m: dict, last: dict | None, now: float) -> bool:
 # (time.time(), seconds of known work left) from the latest status line of any run in this
 # process: the coordinator's cluster reads it to decide whether a retiring worker needs a
 # replacement (cluster._replace_ahead)
-WORK_LEFT: tuple[float, float] | None = None
+WORK_LEFT: tuple[float, float | None] | None = None
 
 
 HEADER_EVERY = 10  # the column header repeats every this many status lines
@@ -552,7 +573,8 @@ def _columns(snap: dict) -> list[tuple[str, str, str]]:
     i = next((k for k, s in enumerate(stages) if not s["finished"]), len(stages) - 1)
     cur = stages[i]
     n = len(stages)
-    wname = max(len(s["stage"]) for s in stages)
+    more = snap.get("more_stages")
+    wname = max(len(s.get("title") or s["stage"]) for s in stages)
     wn = len(str(max(s["tasks"] for s in stages)))
     mx = snap.get("max_workers")
     ww = len(str(mx or snap["workers"]))
@@ -567,7 +589,13 @@ def _columns(snap: dict) -> list[tuple[str, str, str]]:
     total = None if cur.get("settling") else snap["eta_total_seconds"]
     return [
         ("run", snap["label"], "<"),
-        ("stage", f"{i + 1:>{len(str(n))}}/{n} {cur['stage']:<{wname}}", "<"),
+        (
+            "stage",
+            f"{cur.get('title') or cur['stage']:<{wname}}"
+            if more
+            else f"{i + 1:>{len(str(n))}}/{n} {cur.get('title') or cur['stage']:<{wname}}",
+            "<",
+        ),
         ("shards", f"{cur['tasks_done']:>{wn}}/{cur['tasks']:<{wn}}", ">"),
         ("rows", f"{float(cur['pct_rows']):.1f}%", ">"),
         ("workers", f"{snap['workers']:>{ww}}/{mx}" if mx else f"{snap['workers']}", ">"),

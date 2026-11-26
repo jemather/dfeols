@@ -81,6 +81,11 @@ def test_no_replacements_when_the_run_ends_first(monkeypatch):
     # a stale report (no status line for 10 min) counts as unknown: work to come
     monkeypatch.setattr(progress, "WORK_LEFT", (now[0] - 700, 120.0))
     assert asyncio.run(ad.safe_target()) == 2
+    monkeypatch.setattr(progress, "WORK_LEFT", (now[0], 120.0))
+    assert asyncio.run(ad.safe_target()) == 1
+    # stages still to come (H:L3's singleton passes): the total is unknown, so work to come
+    monkeypatch.setattr(progress, "WORK_LEFT", (now[0], None))
+    assert asyncio.run(ad.safe_target()) == 2
 
 
 def test_executor_installs_it_on_a_jobqueue_cluster(monkeypatch, tmp_path):

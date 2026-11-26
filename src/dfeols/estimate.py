@@ -631,6 +631,8 @@ def _drop_singletons(plan: Plan, ds: Dataset, executor, prog: Progress, rows: di
     done.unlink(missing_ok=True)  # a run that stops in the passes leaves no record
     t0 = time.time()
     gcount, p, total = None, 0, 0
+    more = prog.more
+    prog.more = True  # passes until one drops nothing, then the caller's stages: no total yet
     # each shard's kept rows after the last pass: a pass's drops are counted from them, not from
     # the task's own "dropped", which is 0 when the task ran twice (a worker lost after the mask
     # was written: H L2 36294727 undercounted by 5,078 rows, and a pass so undercounted to 0
@@ -655,7 +657,7 @@ def _drop_singletons(plan: Plan, ds: Dataset, executor, prog: Progress, rows: di
         tasks = [
             (s["id"], rows[s["id"]], (plan, s["id"], ds.shard_paths(s), gcount, p == 1)) for s in ds.shards
         ]
-        prog.add_stage(name, rows)
+        prog.add_stage(name, rows, title=f"singletons pass {p}")
         prog.start(name)
         executor.run(shard_singletons, tasks, on, prog, name)
         prog.finish(name)
@@ -663,6 +665,7 @@ def _drop_singletons(plan: Plan, ds: Dataset, executor, prog: Progress, rows: di
         if p > 1 and acc["dropped"] == 0:
             break
         gcount = acc["g"]
+    prog.more = more
     log.info(
         "fit %s: dropped %s singleton rows over all FEs in %d passes (%s)",
         label,
@@ -1026,7 +1029,7 @@ def _crossing_cg(
 
         name = f"cg{step['it'] + 1}"
         tasks = [(s["id"], rows[s["id"]], (plan, s["id"], ds.shard_paths(s), p)) for s in ds.shards]
-        prog.add_stage(name, rows, before="round2")
+        prog.add_stage(name, rows, before="round2", settle=False)  # each step keeps its ETA
         prog.start(name)
         prog.task_gb, prog.task_gb_of = gb_step, gb_step_of
         if "reduce" in inspect.signature(executor.run).parameters:
@@ -1711,6 +1714,7 @@ def fit(
         )
 
     prog = Progress(wd, label=label, every=log_every, round2_recomputes=not cache)
+    prog.settle_frac = 0.10  # one pass a stage: its first rows/s are the quick shards' (H:L3)
     prog.task_gb = need_gb  # workers run as many shards at once as this fits
     rows = {s["id"]: max(s["rows"], 1) for s in ds.shards}
     sing = {"passes": 0, "seconds": 0.0}

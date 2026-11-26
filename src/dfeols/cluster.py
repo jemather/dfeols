@@ -576,7 +576,9 @@ def _replace_ahead(cl, max_workers: int, prior_wait: float, clock=time.time,
                 for x in [x for x in st[d] if x not in plan and x not in seen]:
                     del st[d][x]
             wl = progress.WORK_LEFT
-            work_left = wl[1] - (now - wl[0]) if wl and now - wl[0] < 600 else None
+            # None (no run reporting, or its total not known yet, e.g. in the singleton passes)
+            # counts as work to come
+            work_left = wl[1] - (now - wl[0]) if wl and wl[1] is not None and now - wl[0] < 600 else None
             waiting = [now - st["planned"][x] for x in plan - seen if x in st["planned"]]
             pending = max(waiting, default=0.0)  # the oldest worker still in the queue
             lead = queue_lead(st["waits"], prior_wait, life, pending)

@@ -828,6 +828,7 @@ def demean_once(
         clusters = []
         others = base.groups()
     prog = Progress(progress_dir or out, label=label, every=log_every)
+    prog.settle_frac = 0.10  # one pass a stage: its first rows/s are the quick shards'
     rows = {s["id"]: max(s["rows"], 1) for s in ds.shards}
     sing = {"passes": 0, "seconds": 0.0}
     if plan.keep_dir and create is None:
@@ -938,6 +939,7 @@ def demean_once(
         for s in ds.shards
     ]
     prog.add_stage("demean", rows)
+    prog.more = bool(plan.global_fes)  # partial_out follows (and plan C's CG steps): no total yet
     prog.start("demean")
     if reduce is not None and "reduce" in inspect.signature(executor.run).parameters:
         prog.task_gb = None  # a shard's part of A is not in any estimate: a whole worker
@@ -1022,6 +1024,7 @@ def demean_once(
             for s in ds.shards
         ]
         prog.add_stage("partial_out", rows)
+        prog.more = False
         prog.start("partial_out")
         executor.run(demean_round2, tasks2, on2, prog, "partial_out")
         prog.finish("partial_out")

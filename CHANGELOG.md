@@ -266,6 +266,18 @@ The first release on PyPI. Late-task copies in round 1 and CG steps, row conditi
 
 ### Fixed
 
+- During the singleton passes, the status line showed "7/7 singletons7" and an 'all left' and
+  'done at' for that pass alone: the passes, and the stages after them, are added only as they
+  start (cellxgene H:L3). The stage now reads "singletons pass 7", with "-" for 'all left' and
+  'done at' until the rest of the run is known; a session's demean pass, which partial_out
+  follows, shows no total either. The cluster counts that unknown total as work to come when
+  deciding whether a retiring worker needs a replacement (it used the last pass's total).
+- A fit's passes (singletons, round 1, round 2) and a session's demean and partial_out show
+  "calibrating" for their first 10% of shards (at most 5 min), as session models already did;
+  their first rows/s are the quick shards' (H:L3 pass 7: 7.3M rows/s and 4:47 left at 0.4%,
+  28M by 5%). CG steps keep their ETA.
+- Round 2's rate before its first shards came from the first stage of the run, which after
+  singleton passes is singletons1, not round 1.
 - A session's `add_variable` (and its first build) failed with `FileNotFoundError` in
   `partial_out` when a worker was lost mid-stage: each shard's task deleted its stage file, so
   the run Dask gives the task again on another worker found nothing to read (fpp_eng3, OSCER

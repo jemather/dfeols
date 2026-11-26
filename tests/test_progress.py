@@ -226,6 +226,72 @@ def test_settle_frac_holds_the_first_times_back(tmp_path):
     assert "calibrating" not in status_line(off.snapshot())
 
 
+def test_a_cg_step_keeps_its_eta_under_settle_frac(tmp_path):
+    from dfeols.progress import Progress, status_line
+
+    prog = Progress(tmp_path, label="f", every=1e9)
+    prog.settle_frac = 0.10
+    prog.add_stage("cg1", {i: 1000 for i in range(100)}, settle=False)
+    prog.start("cg1")
+    prog.task_done("cg1", 0, 0.01)
+    assert "calibrating" not in status_line(prog.snapshot())
+
+
+def test_singleton_passes_show_no_total(tmp_path):
+    """cellxgene H:L3: singletons7 read "7/7" and its 'all left' and 'done at' were that
+    pass's alone, as the passes and the rounds after them are added as they start (Ted
+    2026-11-25: "pass 7", no total). The cluster then counts the work left as unknown."""
+    from dfeols import progress as pm
+    from dfeols.progress import Progress, status_line
+
+    prog = Progress(tmp_path, label="H:L3", every=1e9)
+    prog.set_slots(15, 40)
+    prog.more = True
+    for p in (1, 2):
+        prog.add_stage(f"singletons{p}", {i: 1000 for i in range(50)}, title=f"singletons pass {p}")
+        prog.start(f"singletons{p}")
+        for i in range(30 if p == 2 else 50):
+            prog.task_done(f"singletons{p}", i, 0.5)
+        if p == 1:
+            prog.finish("singletons1", log=False)
+    snap = prog.snapshot()
+    line = status_line(snap)
+    assert "singletons pass 2" in line and "2/2" not in line, line
+    assert snap["eta_total_seconds"] is None and snap["finish_time"] is None
+    vals = line.split("(")[0].split()  # without the "(... at 40 workers)" note
+    assert vals[-2:] == ["-", "-"] and vals[-3] != "-", line  # stage left shown; all left, done at not
+    prog.tick(force=True)
+    assert pm.WORK_LEFT[1] is None
+    prog.more = False  # the rounds are added: a count and a total again
+    prog.finish("singletons2", log=False)
+    prog.add_stage("round1", {i: 1000 for i in range(50)})
+    prog.add_stage("round2", {i: 1000 for i in range(50)})
+    prog.start("round1")
+    for i in range(10):
+        prog.task_done("round1", i, 0.5)
+    line = status_line(prog.snapshot())
+    assert "3/4 round1" in line, line
+
+
+def test_round2_prior_follows_round1_not_the_first_stage(tmp_path):
+    from dfeols.progress import Progress
+
+    prog = Progress(tmp_path, label="f", every=1e9)
+    prog.add_stage("singletons1", {i: 1000 for i in range(10)})
+    prog.add_stage("round1", {i: 1000 for i in range(10)})
+    prog.add_stage("round2", {i: 1000 for i in range(10)})
+    prog.start("singletons1")
+    for i in range(10):
+        prog.task_done("singletons1", i, 0.01)  # quick
+    prog.finish("singletons1", log=False)
+    prog.start("round1")
+    for i in range(10):
+        prog.task_done("round1", i, 1.0, {"total": 1.0, "write": 0.5, "crossprod": 0.2})
+    prog.finish("round1", log=False)
+    r2 = prog.snapshot()["stages"][2]
+    assert r2["rate_projected"] and abs(r2["rows_per_sec_per_worker"] - 1000 / 0.8) < 1, r2
+
+
 def test_heartbeat_when_nothing_moves(tmp_path, caplog, monkeypatch):
     import logging
 
