@@ -194,6 +194,16 @@ def _nbytes(a) -> int:
     return 0
 
 
+# scheduler states of a key computed again after its worker was lost (DaskExecutor._fetch)
+_RECOMPUTING = ("released", "waiting", "queued", "processing", "no-worker")
+
+
+def _task_state(key, dask_scheduler=None):
+    """On the scheduler: the state of a key, None if it is unknown (DaskExecutor._key_state)."""
+    ts = dask_scheduler.tasks.get(key)
+    return None if ts is None else ts.state
+
+
 def _unbox(box):
     """A shared argument's task: returns the one object it was submitted with (see
     DaskExecutor._scatter_shared)."""
@@ -510,11 +520,29 @@ class DaskExecutor:
         except Exception:
             return set()
 
-    def _fetch(self, f, what: str):
-        """f.result(), or a clear error when the result cannot be fetched in GATHER_TIMEOUT_S."""
+    def _key_state(self, key) -> str | None:
+        """The scheduler's state of a key ("memory", "waiting", "processing", ...), None if
+        it cannot be asked."""
         try:
-            return f.result(timeout=self.GATHER_TIMEOUT_S)
-        except TimeoutError:
+            return self.client.run_on_scheduler(_task_state, key)
+        except Exception:
+            return None
+
+    def _fetch(self, f, what: str):
+        """f.result(), or a clear error when the result cannot be fetched in GATHER_TIMEOUT_S.
+        The limit is for a result that sits finished on a worker and never arrives; one lost
+        with its worker and being computed again (state waiting, queued, processing or
+        no-worker) is waited for as long as that takes: H L3 36407900 stopped in cg13 when a
+        node's 2 workers went and one rest, behind 2,276 lost shards run again, took over 900 s."""
+        while True:
+            try:
+                return f.result(timeout=self.GATHER_TIMEOUT_S)
+            except TimeoutError:
+                state = self._key_state(f.key)
+                if state in _RECOMPUTING:
+                    log.info("%s: its result was lost with its worker; still waiting while it is "
+                             "computed again (%s)", what, state)
+                    continue
             try:
                 where = sorted(self.client.who_has([f]).get(f.key, ()))
             except Exception:
@@ -719,6 +747,14 @@ class DaskExecutor:
                 f = self.client.submit(reduce.strip, m, key=f"{key}-rest", **hi)
                 for part in parts:
                     part_of[part] = f
+                # the coordinator needs only the part(s) and the rest: held, every shard's whole
+                # result stayed on its worker beside its part for the rest of the pass (H L3
+                # 36407900, cg13: 1,117 results and 1,079 parts on one worker, all moved at each
+                # retirement). Dask keeps its recipe while the part and rest depend on it. The
+                # parts stay held (_Pool): a lost combine is then summed again from them, not
+                # from its whole subtree of shards read again
+                m.release()
+                m = None
             f.add_done_callback(doneq.put)
             attempt[f] = (m, parts)
             futs[f] = tid
@@ -736,7 +772,8 @@ class DaskExecutor:
 
         def drop(f):  # an attempt that lost, or a copy that failed: cancelled and forgotten
             tid = futs[f]
-            m, parts = attempt[f]
+            m, parts = attempt[f]  # m: None with reduce (released at submit; Dask drops it with
+            # its part and rest, and cancelling a key no client holds asserts in the scheduler)
             pending.discard(f)
             for part in parts:
                 pool.discard(part)

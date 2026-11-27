@@ -619,3 +619,98 @@ def test_reduce_trees_sum_each_slice_once(n, dask):
     assert len(sums) == k
     for j, s in enumerate(sums):
         assert sorted(s or []) == [i for i in range(n) if i % k == j]
+
+
+def _slow_again(d):
+    """0.0 s the first time, 2 s after (the marker file is there): a recompute that outlasts
+    a short fetch limit."""
+    import os
+    import time
+
+    p = os.path.join(d, "ran")
+    if os.path.exists(p):
+        time.sleep(2)
+    else:
+        open(p, "w").close()
+    return 42
+
+
+def test_fetch_waits_for_a_lost_result_computed_again(tmp_path):
+    """A finished result whose worker dies is computed again by Dask; the fetch limit is for a
+    result stuck on a live worker, so the fetch waits past it (H L3 36407900, cg13: a node's
+    workers went and a rest's recompute took over 900 s, which stopped the fit)."""
+    import os
+
+    distributed = pytest.importorskip("distributed")
+    with (
+        distributed.LocalCluster(n_workers=2, threads_per_worker=1, dashboard_address=None) as lc,
+        distributed.Client(lc) as c,
+    ):
+        w0 = sorted(c.scheduler_info()["workers"])[0]
+        f = c.submit(_slow_again, str(tmp_path), key="lost-then-again", workers=[w0],
+                     allow_other_workers=True, pure=False)
+        distributed.wait(f)
+        try:
+            c.run(lambda: os._exit(1), workers=[w0])
+        except Exception:
+            pass
+        ex = DaskExecutor(c, max_workers=2)
+        ex.GATHER_TIMEOUT_S = 0.5
+        assert ex._fetch(f, "shard 0 in s") == 42
+
+
+def test_fetch_gives_up_on_a_result_stuck_in_memory():
+    """A result the scheduler holds in memory that never arrives (a worker that cannot read
+    what it spilled: 35937527) still stops the fetch after the limit."""
+
+    class _F:
+        key = "k"
+
+        def result(self, timeout=None):
+            raise TimeoutError
+
+    class _C:
+        def run_on_scheduler(self, fn, key):
+            return "memory"
+
+        def who_has(self, fs):
+            return {"k": ("tcp://w:1",)}
+
+    ex = DaskExecutor(_C(), max_workers=1)
+    ex.GATHER_TIMEOUT_S = 0.01
+    with pytest.raises(RuntimeError, match="could not be fetched from tcp://w:1"):
+        ex._fetch(_F(), "shard 0 in s")
+
+
+def test_reduce_keeps_no_whole_results_on_the_workers():
+    """With a Reduce, only parts and rests stay wanted: each task's whole result is released
+    once its part and rest are submitted, so a lost worker does not take finished shards that
+    must run again for nothing (H L3 36407900: 1,117 of them on one worker)."""
+    distributed = pytest.importorskip("distributed")
+    n, got, held = 12, {}, []
+    red = Reduce(
+        get=lambda r: r["part"],
+        strip=lambda r: {k: v for k, v in r.items() if k != "part"},
+        combine=_combine,
+        done=lambda p: got.setdefault("sum", p),
+    )
+    prog = Progress(None, label="t", every=1e9)
+    prog.add_stage("s", {i: 1 for i in range(n)})
+    prog.start("s")
+    with (
+        distributed.LocalCluster(n_workers=2, threads_per_worker=1, dashboard_address=None) as lc,
+        distributed.Client(lc) as c,
+    ):
+        seen = []
+
+        def on_result(tid, r):  # at the last rest: whole results whose part is done
+            seen.append(tid)
+            if len(seen) == n:
+                mem = {k for k, ws in c.who_has().items() if ws}
+                held.extend(k for k in mem if f"{k}-part" in mem)  # every rest is done by now
+
+        DaskExecutor(c, max_workers=2, tick=0.05).run(
+            _task, [(i, 1, (i,)) for i in range(n)], on_result, prog, "s", reduce=red, affinity="fit"
+        )
+    assert sorted(got["sum"]) == list(range(n))
+    assert held == []
