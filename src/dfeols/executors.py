@@ -210,6 +210,39 @@ def _unbox(box):
     return box[0]
 
 
+def _life_left(dask_worker=None):
+    """(seconds until Dask's lifetime closes this worker, the lifetime), or None without one.
+    Counted from the worker process's start: Dask starts the timer in Worker.__init__, a little
+    later, so the time left is at most a few seconds short."""
+    life = getattr(dask_worker, "lifetime", None)
+    if not life:
+        return None
+    import psutil
+
+    return float(life) - (time.time() - psutil.Process().create_time()), float(life)
+
+
+def due_to_retire(lives: dict, expect: float | None, margin: float = 120.0,
+                  max_fraction: float = 0.25) -> list:
+    """Workers to retire before a pass starts: those whose lifetime would end during it.
+
+    lives: {worker: (seconds left, lifetime)}; expect: the pass's expected length (the last
+    pass of its type), None if none ran yet. A worker is due when its lifetime ends within the
+    margin, or within 1.25 x expect + margin, unless that is more than max_fraction of its
+    lifetime (a pass so long that retiring before it would throw away much of a worker: then
+    it retires during the pass, as without this). If every worker is due, the one with the
+    most time left stays, so the pass can start."""
+    due = []
+    for w, (left, life) in lives.items():
+        if left <= margin:
+            due.append(w)
+        elif expect is not None and 1.25 * expect <= max_fraction * life and left <= 1.25 * expect + margin:
+            due.append(w)
+    if due and len(due) == len(lives):
+        due.remove(max(due, key=lambda w: lives[w][0]))
+    return sorted(due)
+
+
 def _same(x):
     """A copy of a shared argument on one worker (DaskExecutor._spread): the object itself,
     which the worker fetched from the copy above it in the tree."""
@@ -464,6 +497,14 @@ class DaskExecutor:
         Times Dask reruns a task that fails, for example because its worker died.
     worker_memory : int, optional
         Bytes of memory each worker declares as the Dask resource MEMORY.
+    retire_at_pass : bool, default False
+        Before each pass (a `run`), retire the workers whose Dask lifetime would end during
+        it (`due_to_retire`), so workers leave between passes, when they hold almost nothing,
+        rather than in the middle of one. A worker that retires mid-pass hands its results to
+        the others, and those transfers stalled the receivers until the scheduler dropped
+        them with their results (2026-11-27: of 30 OSCER runs, every lost result followed a
+        dropped worker, most within 30 min of a lifetime retirement). `dfeols.executor` turns
+        it on for batch-system workers (the profile's `retire_at_pass`).
     """
 
     MARGIN = 1.25  # on the worker-memory estimate
@@ -479,10 +520,15 @@ class DaskExecutor:
         tick: float = 5.0,
         retries: int = 3,
         worker_memory: int | None = None,
+        retire_at_pass: bool = False,
     ):
         self.client = client
         self.max_workers = max_workers
         self.worker_memory = worker_memory
+        self.retire_at_pass = retire_at_pass
+        self._pass_s: dict = {}  # pass type (progress.stage_kind) -> seconds its last run took
+        # a worker retires before a pass only if the pass takes at most this share of its life
+        self.retire_max_fraction = float(os.environ.get("DFEOLS_RETIRE_MAX_FRACTION", "0.25"))
         self.tick_s = tick
         self.retries = retries
         self.scatter_min_bytes = 1 << 20  # arrays this large shared by every task are scattered
@@ -553,6 +599,45 @@ class DaskExecutor:
                 "worker may have run out of local disk for spilled data, or died; see its log "
                 "and the scheduler log); DFEOLS_GATHER_TIMEOUT_S sets the limit"
             ) from None
+
+    def _retire_due(self, stage: str) -> list[str]:
+        """Retire, before a pass of `stage` starts, the workers whose lifetime would end during
+        it (retire_at_pass; due_to_retire). Returns their addresses."""
+        if not self.retire_at_pass:
+            return []
+        from .progress import stage_kind
+
+        expect = self._pass_s.get(stage_kind(stage))
+        try:
+            lives = {w: v for w, v in self.client.run(_life_left).items() if v is not None}
+        except Exception as e:  # noqa: BLE001 (housekeeping: the pass runs regardless)
+            log.debug("%s: cannot ask the workers for their lifetimes: %r", stage, e)
+            return []
+        due = due_to_retire(lives, expect, max_fraction=self.retire_max_fraction)
+        if not due:
+            return []
+        log.info(
+            "%s: retiring %d of %d workers before the pass, not during it (their lifetime ends "
+            "within %.0f min%s)",
+            stage, len(due), len(lives), max(max(lives[w][0] for w in due), 0) / 60,
+            f"; the last such pass took {expect / 60:.0f} min" if expect else "",
+        )
+        try:
+            self.client.retire_workers(workers=due, close_workers=True)
+        except Exception as e:  # noqa: BLE001 (they then retire at their lifetime, as before)
+            log.warning("%s: retiring workers before the pass failed: %r", stage, e)
+            return []
+        return due
+
+    def _pass_done(self, stage: str, seconds: float) -> None:
+        """Remember how long a pass of this type took, for the next one's retirements and for
+        replace-ahead (cluster.dfeols_pass_seconds: retirements come up to one pass early)."""
+        from .progress import stage_kind
+
+        self._pass_s[stage_kind(stage)] = seconds
+        cl = getattr(self, "cluster", None)
+        if cl is not None and self.retire_at_pass:
+            cl.dfeols_pass_seconds = seconds
 
     def _workers(self) -> list[str]:
         return sorted(self._threads())
@@ -664,6 +749,8 @@ class DaskExecutor:
 
         if reduce and local_help:
             raise ValueError("reduce and local_help together are not supported")
+        self._retire_due(stage)
+        t_pass = time.monotonic()
         ordered = _order(tasks)
         futs, fargs = {}, {}
         n = len(ordered)
@@ -976,6 +1063,7 @@ class DaskExecutor:
                 pool.combines,
                 time.perf_counter() - (last_task or time.perf_counter()),
             )
+        self._pass_done(stage, time.monotonic() - t_pass)
 
     def _pool(self, reduce: Reduce, stage: str, run_id: str, priority: int, on_done=None) -> _Pools:
         """Combine tasks, each summing fan_in parts as soon as they exist, ahead of the shards

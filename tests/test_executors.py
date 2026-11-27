@@ -714,3 +714,77 @@ def test_reduce_keeps_no_whole_results_on_the_workers():
         )
     assert sorted(got["sum"]) == list(range(n))
     assert held == []
+
+
+def test_due_to_retire_rules():
+    """A worker retires before a pass its lifetime would end in; not for a pass so long that
+    retiring before it would waste much of the worker; never the whole pool at once."""
+    from dfeols.executors import due_to_retire
+
+    life = 12 * 3600.0
+    lives = {"a": (30 * 60.0, life), "b": (5 * 3600.0, life), "c": (60.0, life)}
+    # no pass of this type yet: only one about to go anyway
+    assert due_to_retire(lives, None) == ["c"]
+    # a 25-min pass: a (30 min left, under 1.25 x 25 + 2) and c; b has hours
+    assert due_to_retire(lives, 25 * 60.0) == ["a", "c"]
+    # a 20-min pass: 1.25 x 20 + 2 = 27 min, so a (30 min) lasts through it
+    assert due_to_retire(lives, 20 * 60.0) == ["c"]
+    # a 4-h pass is over a quarter of a 12-h life: a stays for it (retires mid-pass, as before)
+    assert due_to_retire(lives, 4 * 3600.0) == ["c"]
+    # all due: the one with the most time left stays, so the pass can start
+    assert due_to_retire({"a": (100.0, life), "b": (50.0, life)}, None) == ["b"]
+    assert due_to_retire({"a": (100.0, life)}, None) == []
+
+
+def test_life_left_reads_the_workers_lifetime():
+    distributed = pytest.importorskip("distributed")
+    from dfeols.executors import _life_left
+
+    with (
+        distributed.LocalCluster(n_workers=1, threads_per_worker=1, dashboard_address=None,
+                                 lifetime="600s", lifetime_stagger="0s") as lc,
+        distributed.Client(lc) as c,
+    ):
+        (left, life), = c.run(_life_left).values()
+    assert life == 600.0 and 500.0 < left <= 600.0
+    assert _life_left(None) is None
+
+
+def test_run_retires_due_workers_before_the_pass_not_during_it():
+    """Two workers whose lifetime would end during a CG step: one retires before the step
+    starts (the other stays so it can run), the step still completes on the one left, and
+    the step's length is remembered for the next."""
+    distributed = pytest.importorskip("distributed")
+    n, seen = 6, []
+    prog = Progress(None, label="t", every=1e9)
+    prog.add_stage("cg3", {i: 1 for i in range(n)})
+    prog.start("cg3")
+    with (
+        distributed.LocalCluster(n_workers=2, threads_per_worker=1, dashboard_address=None,
+                                 lifetime="600s", lifetime_stagger="0s") as lc,
+        distributed.Client(lc) as c,
+    ):
+        ex = DaskExecutor(c, max_workers=2, tick=0.05, retire_at_pass=True)
+        ex.retire_max_fraction = 2.0  # a test-sized lifetime: let a long pass count
+        ex._pass_s["cg"] = 500.0  # the last CG step took 500 s: both lifetimes end in the next
+        ex.run(_task, [(i, 1, (i,)) for i in range(n)], lambda t, r: seen.append(t), prog, "cg3")
+        left = len(c.scheduler_info()["workers"])
+    assert sorted(seen) == list(range(n))
+    assert left == 1
+    assert ex._pass_s["cg"] < 500.0  # this step's own length
+
+
+def test_run_retires_nothing_without_retire_at_pass():
+    distributed = pytest.importorskip("distributed")
+    prog = Progress(None, label="t", every=1e9)
+    prog.add_stage("cg1", {0: 1})
+    prog.start("cg1")
+    with (
+        distributed.LocalCluster(n_workers=2, threads_per_worker=1, dashboard_address=None,
+                                 lifetime="600s", lifetime_stagger="0s") as lc,
+        distributed.Client(lc) as c,
+    ):
+        ex = DaskExecutor(c, max_workers=2, tick=0.05)
+        ex._pass_s["cg"] = 500.0
+        ex.run(_task, [(0, 1, (0,))], lambda t, r: None, prog, "cg1")
+        assert len(c.scheduler_info()["workers"]) == 2

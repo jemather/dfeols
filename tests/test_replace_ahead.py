@@ -241,3 +241,14 @@ def test_a_slow_queue_asks_earlier_and_for_more(monkeypatch):
     now[0] += 3600.0
     assert tgt() == 40 + 16
     assert cl.dfeols_replace_ahead["cap"] == 16
+
+
+def test_retiring_counts_workers_retired_up_to_a_pass_early():
+    """retire_at_pass retires a worker before a pass its lifetime would end in, so replace-ahead
+    counts it that much sooner."""
+    t0, lead, early_by = 0.0, 1800.0, 3600.0
+    w = {"a": t0}
+    early = t0 + LIFE - STAG
+    assert retiring(w, early - lead - early_by - 1, LIFE, STAG, lead, None, early_by=early_by) == set()
+    assert retiring(w, early - lead - early_by + 1, LIFE, STAG, lead, None, early_by=early_by) == {"a"}
+    assert retiring(w, early - lead - early_by + 1, LIFE, STAG, lead, None) == set()

@@ -87,6 +87,11 @@ DEFAULTS = {
         # workers retire over lifetime minus up to 2 x this (None: 10% of the lifetime, at
         # least 5 min), so a pool that started together doesn't retire together
         "retire_spread_minutes": None,
+        # before each pass, retire the workers whose lifetime would end during it, so they leave
+        # between passes holding almost nothing; one leaving mid-pass hands its results to the
+        # others, and those transfers got receivers dropped with their results (2026-11-27: every
+        # lost result in 30 OSCER runs followed such a drop, most soon after a lifetime retirement)
+        "retire_at_pass": True,
         # times a task may be on a worker that leaves before Dask fails it (KilledWorker) on the
         # next; None: half of max_workers, at least Dask's 3, which counted planned retirements
         # and slow connections and failed H L2 (OSCER, 2026-11-20)
@@ -171,6 +176,7 @@ queue_wait_minutes = 30        # the queue wait assumed until one is seen
 # replace_ahead_max = 4        # most replacements asked for ahead at once (default 10% of max_workers, at least 1)
 quick_wait_minutes = 3         # none asked for ahead while the last 2 queue waits were within this
 # retire_spread_minutes = 60    # workers retire over this x 2 before their lifetime (default 10% of it)
+retire_at_pass = true          # retire workers between passes, before a pass their lifetime would end in
 # allowed_failures = 20        # a task fails on the next worker leaving under it (default max_workers / 2, at least 3)
 io_ceiling = true              # stop replacing retiring workers once a bigger pool stopped adding rows/s
 # io_ceiling_larger = 0.20      # ... a pool this much bigger

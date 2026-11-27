@@ -394,7 +394,8 @@ def executor(
 
         attach_scheduler_log(getattr(cl, "dfeols_log_directory", None) or log_directory)
     ex = DaskExecutor(
-        client, max_workers=w["max_workers"], tick=tick, worker_memory=_memory_bytes(w["memory"])
+        client, max_workers=w["max_workers"], tick=tick, worker_memory=_memory_bytes(w["memory"]),
+        retire_at_pass=p.scheduler != "local" and bool(w.get("retire_at_pass", True)),
     )
     ex.cluster = cl
     if p.scheduler != "local":
@@ -501,17 +502,18 @@ def queue_lead(waits: list[float], prior: float, life: float, pending: float = 0
 
 
 def retiring(connected: dict, now: float, life: float, stagger: float, lead: float,
-             work_left: float | None, grace: float = 600.0) -> set:
+             work_left: float | None, grace: float = 600.0, early_by: float = 0.0) -> set:
     """Names of connected workers (name -> time first seen) that retire at their lifetime within
     `lead` s and that the work outlasts: replacements to ask for now.
 
     A worker retires between lifetime - stagger and lifetime + stagger after it started; it
     counts from `lead` before the earliest until `grace` after the latest (then it is late, and
     adaptive scaling treats any extra as surplus). `work_left` None (no run reporting) counts as
-    work to come."""
+    work to come. `early_by`: workers may retire up to this much sooner (the executor's
+    retire_at_pass retires them before a pass of about this length, not during it)."""
     out = set()
     for n, t0 in connected.items():
-        early, late = t0 + life - stagger, t0 + life + stagger + grace
+        early, late = t0 + life - stagger - early_by, t0 + life + stagger + grace
         if early - lead <= now <= late and (work_left is None or work_left > max(early - now, 0) + 300):
             out.add(n)
     return out
@@ -585,7 +587,11 @@ def _replace_ahead(cl, max_workers: int, prior_wait: float, clock=time.time,
             pending = max(waiting, default=0.0)  # the oldest worker still in the queue
             lead = queue_lead(st["waits"], prior_wait, life, pending)
             cap = spares_cap(max_workers, max_spares, queue_wait(st["waits"], prior_wait, pending))
-            due = retiring({x: st["seen"][x] for x in seen if x in st["seen"]}, now, life, stagger, lead, work_left)
+            # retire_at_pass retires a worker before a pass its lifetime would end in: up to a
+            # pass sooner, and never for a pass over a quarter of its life (DaskExecutor)
+            early_by = min(1.25 * float(getattr(cl, "dfeols_pass_seconds", 0.0) or 0.0), 0.25 * life)
+            due = retiring({x: st["seen"][x] for x in seen if x in st["seen"]}, now, life, stagger, lead,
+                           work_left, early_by=early_by)
             brake = braked(st["waits"], quick_wait, pending=pending)
             if brake != st["braked"]:
                 log.info("cluster: the last 2 queue waits were %s %.0f min: %s", "within" if brake else "not all within",
