@@ -14,6 +14,19 @@ break the API).
   user guide, an API reference generated from the docstrings, benchmarks, validation and the
   design notes. `pip install -e ".[docs]"` and `zensical serve` build it locally. It was first
   built with MkDocs Material, which is now in maintenance mode.
+- An IO ceiling on the worker pool (`io_ceiling`, on by default; settings
+  `io_ceiling_larger`, `io_ceiling_gain`, `io_ceiling_window_minutes`, `io_ceiling_lift`,
+  `io_ceiling_pair_minutes`). On a shared filesystem a bigger pool can be slower: D11 H on
+  OSCER ran 28-30M rows/s with 23-24 workers, 26-27M with 40 and ~22M with 74-79. Every 10
+  minutes in which the pool held steady and tasks were waiting gives a (workers, rows/s)
+  reading for the current pass type (CG steps count as one type). When a pool at least 20%
+  larger gained under 5% rows/s over a reading within 2 h, the smaller size becomes a soft
+  ceiling for the rest of the fit: workers retiring above it aren't replaced, nothing is
+  cancelled, and replace-ahead asks only for the replacements that keep the pool at the
+  ceiling. The ceiling comes off when a reading at or below it beats the saturated rate by
+  25% (other jobs on the filesystem ended), or when a new fit starts. Sessions (`hold`) keep
+  their pool and are unaffected. On for testing, to see how often it sets and how close the
+  ceiling is.
 
 ### Changed
 

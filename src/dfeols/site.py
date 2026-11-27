@@ -92,6 +92,17 @@ DEFAULTS = {
         # and slow connections and failed H L2 (OSCER, 2026-11-20)
         "allowed_failures": None,
         "queue_wait_minutes": 30,  # the queue wait assumed until a worker job's own wait is seen
+        # a soft ceiling on the pool once more workers stop adding rows/s (cluster.PoolCeiling):
+        # when a pool at least io_ceiling_larger bigger gained under io_ceiling_gain rows/s in the
+        # same pass type, workers retiring above the smaller pool aren't replaced. D11 H on OSCER:
+        # 23-24 workers 28-30M rows/s, 40 26-27M, 74-79 ~22M (/scratch-bound). On for testing
+        # (Ted, 2026-11-26)
+        "io_ceiling": True,
+        "io_ceiling_larger": 0.20,
+        "io_ceiling_gain": 0.05,
+        "io_ceiling_window_minutes": 10,  # one (workers, rows/s) sample per this long
+        "io_ceiling_lift": 0.25,  # off when rows/s at or below it beats the saturated rate by this
+        "io_ceiling_pair_minutes": 120,  # two samples compared only this close in time
         "local_directory": None,
     },
     # queue: the coordinator's own partition (None: the profile's queue, as the workers);
@@ -161,6 +172,12 @@ queue_wait_minutes = 30        # the queue wait assumed until one is seen
 quick_wait_minutes = 3         # none asked for ahead while the last 2 queue waits were within this
 # retire_spread_minutes = 60    # workers retire over this x 2 before their lifetime (default 10% of it)
 # allowed_failures = 20        # a task fails on the next worker leaving under it (default max_workers / 2, at least 3)
+io_ceiling = true              # stop replacing retiring workers once a bigger pool stopped adding rows/s
+# io_ceiling_larger = 0.20      # ... a pool this much bigger
+# io_ceiling_gain = 0.05        # ... gained under this much more rows/s, in the same pass type
+# io_ceiling_window_minutes = 10  # one (workers, rows/s) reading per this long
+# io_ceiling_lift = 0.25        # the ceiling comes off when rows/s under it beats the saturated rate by this
+# io_ceiling_pair_minutes = 120 # readings compared only this close in time
 
 [profiles.cluster.coordinator]
 cores = 4

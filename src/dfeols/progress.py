@@ -32,9 +32,11 @@ from __future__ import annotations
 
 import fcntl
 import io
+import itertools
 import json
 import logging
 import os
+import re
 import stat
 import time
 import warnings
@@ -324,6 +326,7 @@ class Progress:
         # drops nothing, then the rounds): no total is shown, nor a stage count (cellxgene H:L3
         # singletons7 said "7/7" and 'all left' 2:28 for that pass alone)
         self.more = False
+        self.run_id = next(_RUN_IDS)  # tells one fit from the next in PASSES
 
     # --- bookkeeping -----------------------------------------------------
     def add_stage(
@@ -474,6 +477,7 @@ class Progress:
             WORK_LEFT = (now, float(tot))
         elif snap["more_stages"]:
             WORK_LEFT = (now, None)
+        self._publish_passes(snap, now)
         self._report(snap, now, force)
         rows_all = sum(st.total_rows for st in self.stages.values())
         done_all = sum(st.done_rows for st in self.stages.values())
@@ -494,6 +498,24 @@ class Progress:
             tmp = p.with_suffix(".tmp")
             tmp.write_text(json.dumps(snap, indent=1, default=float))
             os.replace(tmp, p)
+
+    def _publish_passes(self, snap: dict, now: float):
+        """Rows and tasks done so far by pass type, the current pass type and its tasks not yet
+        running, for the cluster's IO ceiling (cluster.PoolCeiling)."""
+        global PASSES
+        kinds: dict[str, tuple[int, int]] = {}
+        for st in self.stages.values():
+            r, t = kinds.get(stage_kind(st.name), (0, 0))
+            kinds[stage_kind(st.name)] = (r + st.done_rows, t + len(st.done))
+        cur = None
+        queued = 0
+        if snap["stages"]:
+            name = snap["stages"][_current(snap["stages"])]["stage"]
+            st = self.stages[name]
+            cur = stage_kind(name)
+            if st.started is not None and not st.finished:
+                queued = len(st.rows) - len(st.done) - len(self.running.get(name, set()) - set(st.done))
+        PASSES = {"t": now, "run": self.run_id, "kinds": kinds, "stage": cur, "queued": max(queued, 0)}
 
     def _milestone(self, snap: dict, now: float) -> dict:
         return milestone(snap, now)
@@ -572,6 +594,20 @@ def milestone_due(m: dict, last: dict | None, now: float) -> bool:
 # process: the coordinator's cluster reads it to decide whether a retiring worker needs a
 # replacement (cluster._replace_ahead)
 WORK_LEFT: tuple[float, float | None] | None = None
+
+# from the latest status tick of any run in this process (Progress._publish_passes): "t"
+# (time.time()), "run" (Progress.run_id), "kinds" ({pass type: (rows done, tasks done)}),
+# "stage" (the current pass type) and "queued" (its tasks not yet running). The cluster's IO
+# ceiling turns it into rows/s by pass type (cluster.PoolCeiling)
+PASSES: dict | None = None
+_RUN_IDS = itertools.count(1)
+
+
+def stage_kind(name: str) -> str:
+    """A stage's pass type: CG steps (cg1, cg2, ...) and singleton passes share one each, as
+    their rows cost the same; every other stage is its own."""
+    m = re.fullmatch(r"(cg|singletons)\d+", name)
+    return m.group(1) if m else name
 
 
 HEADER_EVERY = 10  # the column header repeats every this many status lines

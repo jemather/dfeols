@@ -23,7 +23,13 @@ Edit the profile in that file:
 
 Smaller, shorter worker jobs start sooner on a busy queue. Workers are released only after
 `idle_minutes` (default 15) with nothing to do, so a pause between fits doesn't hand back
-workers that waited in the queue. `examples/profiles/oscer.toml`
+workers that waited in the queue. A pool on a shared filesystem can outgrow it: past some
+size, more workers wait on reads and add no rows/s. With `io_ceiling` (default on), dfeols
+compares the rows/s of pools of different sizes within the same pass type as the pool drifts.
+When a pool at least 20% larger (`io_ceiling_larger`) gained under 5% (`io_ceiling_gain`), it
+stops replacing retiring workers above the smaller size for the rest of the fit. It cancels
+nothing, and it logs a line when it sets or lifts the ceiling. Sessions keep their pool and
+aren't affected. `examples/profiles/oscer.toml`
 is a tested Slurm profile; `examples/profiles/templates.toml` covers PBS, SGE, LSF and local.
 
 Set `default = "<name>"` at the top of the file so commands use your profile without

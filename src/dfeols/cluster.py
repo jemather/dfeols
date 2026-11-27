@@ -384,6 +384,8 @@ def executor(
             _replace_ahead(cl, w["max_workers"], 60 * float(w.get("queue_wait_minutes", 30)),
                            max_spares=w.get("replace_ahead_max"),
                            quick_wait=60 * float(w.get("quick_wait_minutes", 3)))
+        if w.get("io_ceiling", True):
+            _pool_ceiling(cl, w)
     client = Client(cl)
     if p.scheduler == "slurm":
         _replace_lost_jobs(cl, w["max_workers"])
@@ -595,19 +597,183 @@ def _replace_ahead(cl, max_workers: int, prior_wait: float, clock=time.time,
                          "ahead, at most %d at once", pending / 60, lead / 60, cap)
             st["cap"] = cap
             extra = 0 if brake else min(len(due), cap, max_workers)
+            target = n + extra
+            ceil = getattr(cl, "dfeols_pool_ceiling", None)
+            if ceil is not None:  # replacements only for workers that would take it below the ceiling
+                ceil.observe(now, len(seen))
+                target, extra = ceil.clip(n, extra, len(plan), len(due))
             if extra > st["extra"]:
                 log.info("cluster: %d worker(s) retire within %.0f min; asking for %d replacement(s) now, "
                          "%d ahead in all (at most %d; queue waits so far up to %.0f min, oldest waiting %.0f min)",
                          len(due), lead / 60, extra - st["extra"], extra, cap,
                          max(st["waits"], default=prior_wait) / 60, pending / 60)
             st["extra"] = extra
-            return n + extra
+            return target
         except Exception as e:  # noqa: BLE001 (never take adaptive scaling down)
             log.warning("cluster: replacing retiring workers ahead failed: %r", e)
             return n
 
     ad.safe_target = safe_target
     cl.dfeols_replace_ahead = st
+
+
+def _progress_passes() -> dict | None:
+    from . import progress
+
+    return progress.PASSES
+
+
+class PoolCeiling:
+    """A soft ceiling on the pool once more workers stop adding rows/s (the shared filesystem
+    saturates).
+
+    D11 H on OSCER (/scratch-bound) ran at 26-27M rows/s with 40 workers, ~22M with 74-79 and
+    28-30M with 23-24: past ~25-30 workers, more of them wait on reads and add contention.
+
+    Each adapt tick `observe` notes the connected workers and the latest progress counters
+    (progress.PASSES). Within one pass type (CG steps share one), a window of `window_s`
+    becomes a sample (mean workers, rows/s) when the pool held steady (within 10%, or 1
+    worker), at least MIN_TASKS tasks finished in it and tasks were waiting to run for 80% of
+    it (not a stage's tail). The pool drifts on its own as workers retire and replacements
+    arrive, so nothing is probed. When a sample with at least `larger` more workers than
+    another of the same pass type, within `pair_s` of it, gained under `gain` rows/s, the
+    smaller pool (at least `min_workers`) becomes the ceiling for the rest of the fit: workers
+    retiring above it aren't replaced, and nothing is cancelled (`clip`). It comes off when a
+    sample at or below it beats the saturated rate by `lift` (the filesystem got faster: other
+    jobs on it ended), or a new fit starts."""
+
+    MIN_TASKS = 20
+    STEADY = 0.10
+    BUSY = 0.8
+    STALE_S = 180.0  # progress counters older than this: no run reporting
+
+    def __init__(self, min_workers: int = 1, larger: float = 0.20, gain: float = 0.05,
+                 window_s: float = 600.0, lift: float = 0.25, pair_s: float = 7200.0, passes=None):
+        self.min_workers = max(int(min_workers), 1)
+        self.larger, self.gain, self.window_s, self.lift, self.pair_s = larger, gain, window_s, lift, pair_s
+        self._passes = passes or _progress_passes
+        self.ceiling: int | None = None
+        self.saturated: tuple[str, float] | None = None  # (pass type, rows/s) when it was set
+        self.samples: list[dict] = []
+        self.window: dict | None = None
+        self.run = None
+
+    # --- samples -----------------------------------------------------------
+    def observe(self, now: float, workers: int) -> None:
+        ps = self._passes()
+        if not ps or now - ps["t"] > self.STALE_S or ps.get("stage") is None:
+            self.window = None
+            return
+        if ps["run"] != self.run:  # a new fit: what the last one measured no longer applies
+            if self.ceiling is not None:
+                log.info("cluster: IO ceiling of %d workers lifted: a new fit started", self.ceiling)
+            self.run, self.ceiling, self.saturated, self.samples, self.window = ps["run"], None, None, [], None
+        kind = ps["stage"]
+        rows, tasks = ps["kinds"].get(kind, (0, 0))
+        w = self.window
+        if w is None or w["kind"] != kind or rows < w["rows0"]:
+            self.window = {"kind": kind, "t0": ps["t"], "rows0": rows, "tasks0": tasks, "t": ps["t"],
+                           "rows": rows, "tasks": tasks, "obs": [], "busy": 0}
+            w = self.window
+        w["obs"].append(int(workers))
+        w["busy"] += ps.get("queued", 0) > 0
+        w["t"], w["rows"], w["tasks"] = ps["t"], rows, tasks
+        if w["t"] - w["t0"] < self.window_s:
+            return
+        self.window = {"kind": kind, "t0": w["t"], "rows0": rows, "tasks0": tasks, "t": w["t"],
+                       "rows": rows, "tasks": tasks, "obs": [], "busy": 0}
+        s = self._sample(w, now)
+        if s is not None:
+            self.add(s)
+
+    def _sample(self, w: dict, now: float) -> dict | None:
+        obs = w["obs"]
+        mean = sum(obs) / len(obs)
+        if (mean < 1 or max(obs) - min(obs) > max(1.0, self.STEADY * mean)
+                or w["tasks"] - w["tasks0"] < self.MIN_TASKS or w["busy"] < self.BUSY * len(obs)):
+            return None
+        return {"t": now, "kind": w["kind"], "workers": mean, "rate": (w["rows"] - w["rows0"]) / (w["t"] - w["t0"])}
+
+    def add(self, s: dict) -> None:
+        """Take one sample (also for tests): lift the ceiling, or set or lower it."""
+        self.samples = [x for x in self.samples if s["t"] - x["t"] <= self.pair_s] + [s]
+        if self.ceiling is not None and self.saturated and s["kind"] == self.saturated[0] \
+                and s["workers"] <= self.ceiling + 0.5 and s["rate"] > (1 + self.lift) * self.saturated[1]:
+            log.info("cluster: IO ceiling of %d workers lifted: %.0f workers now give %.1fM rows/s in %s, "
+                     "over %.0f%% above the %.1fM it saturated at", self.ceiling, s["workers"], s["rate"] / 1e6,
+                     s["kind"], 100 * self.lift, self.saturated[1] / 1e6)
+            self.ceiling, self.saturated, self.samples = None, None, [s]
+            return
+        best = None
+        same = [x for x in self.samples if x["kind"] == s["kind"]]
+        for a in same:
+            for b in same:
+                if b["workers"] >= (1 + self.larger) * a["workers"] and b["rate"] < (1 + self.gain) * a["rate"]:
+                    c = max(int(round(a["workers"])), self.min_workers)
+                    if best is None or c < best[0]:
+                        best = (c, a, b)
+        if best is None or (self.ceiling is not None and best[0] >= self.ceiling):
+            return
+        c, a, b = best
+        log.info("cluster: IO ceiling %d workers: in %s, %.0f workers gave %.1fM rows/s and %.0f gave %.1fM "
+                 "(%.0f%%+ more workers, under %.0f%% more rows/s); workers retiring above %d aren't replaced",
+                 c, s["kind"], a["workers"], a["rate"] / 1e6, b["workers"], b["rate"] / 1e6,
+                 100 * self.larger, 100 * self.gain, c)
+        self.ceiling, self.saturated = c, (s["kind"], max(a["rate"], b["rate"]))
+
+    # --- the target ----------------------------------------------------------
+    def clip(self, n: int, extra: int, planned: int, due: int) -> tuple[int, int]:
+        """Adaptive scaling's target under the ceiling: (target, replacements ahead kept).
+
+        `n` is adapt's own target, `extra` the replacements replace-ahead asks for ahead,
+        `planned` the workers asked for (running or queued), `due` those about to retire.
+        Never below `planned` because of the ceiling (nothing is cancelled; the pool shrinks as
+        workers retire), and replacements ahead only for the ones that would take it below. The
+        second value is the replacements ahead the target holds (0 while the pool is still above
+        the ceiling plus them), for replace-ahead's log. A target of adapt's at or below the
+        ceiling (scaling down while idle) is left alone."""
+        lim = max(self.ceiling or 0, self.min_workers)
+        if self.ceiling is None or n <= lim:
+            return n + extra, extra
+        keep = min(extra, max(0, lim - (planned - due)))
+        target = max(lim + keep, min(planned, n + extra))
+        return target, (keep if lim + keep >= planned else 0)
+
+
+def _pool_ceiling(cl, p_worker: dict, clock=time.time, passes=None) -> PoolCeiling | None:
+    """Install a PoolCeiling on an adaptive cluster from the profile's worker settings. With
+    replace-ahead installed it consults the ceiling on its own tick; otherwise this wraps
+    adaptive scaling's target itself."""
+    ad = getattr(cl, "_adaptive", None)
+    if ad is None or not hasattr(ad, "safe_target"):
+        log.warning("cluster: cannot set an IO ceiling on the pool (no adaptive scaling)")
+        return None
+    w = p_worker
+    ceil = PoolCeiling(
+        min_workers=w.get("min_workers", 1),
+        larger=float(w.get("io_ceiling_larger", 0.20)),
+        gain=float(w.get("io_ceiling_gain", 0.05)),
+        window_s=60 * float(w.get("io_ceiling_window_minutes", 10)),
+        lift=float(w.get("io_ceiling_lift", 0.25)),
+        pair_s=60 * float(w.get("io_ceiling_pair_minutes", 120)),
+        passes=passes,
+    )
+    cl.dfeols_pool_ceiling = ceil
+    if hasattr(cl, "dfeols_replace_ahead"):
+        return ceil
+    orig = ad.safe_target
+
+    async def safe_target():
+        n = await orig()
+        try:
+            ceil.observe(clock(), len(set(ad.observed)))
+            return ceil.clip(n, 0, len(set(ad.plan)), 0)[0]
+        except Exception as e:  # noqa: BLE001 (never take adaptive scaling down)
+            log.warning("cluster: IO ceiling failed: %r", e)
+            return n
+
+    ad.safe_target = safe_target
+    return ceil
 
 
 def _close_on_exit(cl) -> None:
