@@ -244,6 +244,36 @@ def _order(tasks):
 MISS_COST = 4.0
 
 
+# Worker parking, for the IO saturation test (docs/test_worker_parking.md in the data-builds
+# project; off unless DFEOLS_PARK_SCHEDULE is set). "48,48,36,24,..." gives the active workers
+# for CG step 1, 2, ... (the last value repeats). In a CG step (stage cg<N>) with the feeder,
+# only the first k connected workers by join order get tasks and a copy of the step's shared
+# block; the rest of a held pool stays idle. Dask's work stealing must be off
+# (DASK_DISTRIBUTED__SCHEDULER__WORK_STEALING=False, set before the cluster starts), or it moves
+# queued tasks onto the idle parked workers. Each such step logs a "probe:" line and appends a
+# record to probe.jsonl in the fit's progress folder.
+def park_schedule(text: str | None) -> list[int] | None:
+    """The parking schedule from DFEOLS_PARK_SCHEDULE: positive ints, comma separated; None
+    if unset or empty."""
+    if not text or not text.strip():
+        return None
+    out = [int(x) for x in text.replace(" ", "").split(",") if x]
+    if not out or min(out) < 1:
+        raise ValueError(f"DFEOLS_PARK_SCHEDULE needs positive worker counts, got {text!r}")
+    return out
+
+
+def park_active(stage: str, schedule: list[int] | None) -> int | None:
+    """Active workers for this stage: the schedule's entry for CG step N (stage cg<N>), the
+    last entry past its end; None for any other stage or no schedule."""
+    import re
+
+    m = re.fullmatch(r"cg(\d+)", stage)
+    if not schedule or m is None:
+        return None
+    return schedule[min(int(m.group(1)), len(schedule)) - 1]
+
+
 class _Feeder:
     """Hands out a run's tasks (with affinity) to workers as they free up, instead of placing
     them all at the start. Dask keeps a loose restriction (workers=[w],
@@ -504,6 +534,29 @@ class DaskExecutor:
         # first of the two to finish counts (_Feeder.stragglers). 0 turns copies off
         self.copy_after_s = float(os.environ.get("DFEOLS_COPY_AFTER_S", "30"))
         self.copy_factor = float(os.environ.get("DFEOLS_COPY_FACTOR", "4"))
+        self.park = park_schedule(os.environ.get("DFEOLS_PARK_SCHEDULE"))  # the saturation test
+        self._joined: dict = {}  # worker address -> join order, for parking
+        self._steal_warned = False
+
+    def _active(self, threads: dict, k: int | None) -> dict:
+        """The first k of the connected workers by join order (all with k None): the workers
+        a parked CG step uses."""
+        for a in sorted(threads):
+            self._joined.setdefault(a, len(self._joined))
+        if k is None:
+            return threads
+        return {a: threads[a] for a in sorted(threads, key=self._joined.__getitem__)[:k]}
+
+    def _check_stealing(self) -> None:
+        if self._steal_warned:
+            return
+        self._steal_warned = True
+        import dask
+
+        if dask.config.get("distributed.scheduler.work-stealing", True):
+            log.warning("parking workers (DFEOLS_PARK_SCHEDULE) with Dask's work stealing on: queued "
+                        "tasks can move to parked workers; set DASK_DISTRIBUTED__SCHEDULER__WORK_STEALING="
+                        "False before the cluster starts")
 
     def slots(self):
         try:
@@ -673,6 +726,15 @@ class DaskExecutor:
         # block): a task left to Dask took the single root copy, so each miss fetched the
         # block from one worker again (36097628: ~2.5 min at the start of each pass)
         threads = self._threads() if affinity else {}
+        k_park = park_active(stage, self.park) if threads else None
+        pool_n = len(threads)
+        threads = self._active(threads, k_park)
+        probe = None
+        if k_park is not None:
+            self._check_stealing()
+            probe = {"stage": stage, "label": progress.label, "active": len(threads), "asked": k_park,
+                     "pool": pool_n, "t0": time.perf_counter(), "tasks": 0, "rows": 0, "read_s": 0.0,
+                     "task_s": 0.0, "hits": 0, "on_parked": 0, "workers_used": set()}
         feeder = _Feeder(ordered, where, threads, self.queue_depth, self._rates) if threads else None
         shared = self._scatter_shared(ordered, run_id, spread=feeder is not None, workers=sorted(threads))
         # finished futures arrive here from their done callbacks (run off the event loop), once
@@ -902,6 +964,16 @@ class DaskExecutor:
                         raise err
                     if f not in pending:
                         continue
+                    if probe is not None:
+                        tm = res.get("timing") or {} if isinstance(res, dict) else {}
+                        probe["tasks"] += 1
+                        probe["rows"] += int(trows.get(tid) or 0)
+                        probe["read_s"] += float(tm.get("read") or 0.0)
+                        probe["task_s"] += float(tm.get("total") or 0.0)
+                        probe["hits"] += bool(tm.get("cache_hit"))
+                        if isinstance(res, dict) and "_worker" in res:
+                            probe["workers_used"].add(res["_worker"])
+                            probe["on_parked"] += res["_worker"] not in feeder.own
                     if affinity and isinstance(res, dict) and "_worker" in res:
                         res = dict(res)
                         w = res.pop("_worker")
@@ -929,7 +1001,9 @@ class DaskExecutor:
                     t_status = time.monotonic()
                     if feeder is not None:  # workers that joined or left
                         live = self._threads()
-                        feeder.workers(live)
+                        # parked: the first k by join order, so a retired worker's place goes to
+                        # a parked one and the step keeps k active
+                        feeder.workers(self._active(live, k_park))
                         for tid, w in feeder.fill():
                             submit(tid, w)
                         if self.copy_after_s > 0 and not len(feeder) and len(per_row) >= 3:
@@ -976,6 +1050,39 @@ class DaskExecutor:
                 pool.combines,
                 time.perf_counter() - (last_task or time.perf_counter()),
             )
+        if probe is not None:
+            self._probe_record(probe, last_task, progress)
+
+    def _probe_record(self, probe: dict, last_task: float | None, progress) -> None:
+        """The parked step's log line and probe.jsonl record (docs/test_worker_parking.md)."""
+        import json
+
+        now = time.perf_counter()
+        t0 = probe.pop("t0")
+        used = probe.pop("workers_used")
+        rec = {
+            **probe,
+            "time": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "step_s": round(now - t0, 3),  # handing out the first task to the step's sums in
+            "tasks_s": round((last_task or now) - t0, 3),  # ... to the last task's result in
+            "workers_used": len(used),
+            "read_s": round(probe["read_s"], 3),
+            "task_s": round(probe["task_s"], 3),
+        }
+        rec["rows_per_s"] = rec["rows"] / rec["step_s"] if rec["step_s"] > 0 else None
+        log.info("probe: %s %s: %d of %d workers active, %.1f s, %.1fM rows/s, read %.0f%% of task time, "
+                 "cache hits %d/%d%s", rec["stage"], rec["label"], rec["active"], rec["pool"], rec["step_s"],
+                 (rec["rows_per_s"] or 0) / 1e6, 100 * rec["read_s"] / max(rec["task_s"], 1e-9),
+                 rec["hits"], rec["tasks"],
+                 f", {rec['on_parked']} tasks ran on parked workers" if rec["on_parked"] else "")
+        wd = getattr(progress, "workdir", None)
+        if wd:
+            try:
+                os.makedirs(wd, exist_ok=True)
+                with open(os.path.join(str(wd), "probe.jsonl"), "a") as fh:
+                    fh.write(json.dumps(rec) + "\n")
+            except OSError as e:
+                log.warning("probe: could not write probe.jsonl in %s: %r", wd, e)
 
     def _pool(self, reduce: Reduce, stage: str, run_id: str, priority: int, on_done=None) -> _Pools:
         """Combine tasks, each summing fan_in parts as soon as they exist, ahead of the shards
