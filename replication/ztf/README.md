@@ -33,14 +33,17 @@ acknowledgement guidelines and [registry.opendata.aws/ztf](https://registry.open
 
 ## Running it
 
-    python -I repo/replication/ztf/stage.py --out build/ztf/stage --npix 3/385     # download + flatten
+    python -I repo/replication/ztf/stage.py --raw raw/ztf/dr24 --out build/ztf/stage --npix 3/385   # flatten
     python -I repo/replication/ztf/build.py --stage build/ztf/stage --out build/ztf/analysis.parquet
     python -I repo/replication/ztf/fit.py --data build/ztf/analysis.parquet --root build/ztf
     python -I repo/replication/ztf/fit.py ... --partition objectid                   # sharding check
     python -I repo/replication/ztf/pyfixest_check.py --data build/ztf/analysis.parquet --root build/ztf/check
 
-`fit.py --profile <site>` runs on a cluster; `--only S1,S8` picks specs. `stage.py --first N` or
-`--all --workers K` takes more partitions. See the docstrings for the steps and the checks each prints.
+`stage.py` downloads nothing: the partitions must already be in `raw/ztf/dr24/` at the bucket's
+`Norder=/Dir=/Npix=` layout (URLs and copy commands in `docs/sources/ztf.md` of the data-build
+project). `--all --workers K` stages every partition found there. `fit.py --profile <site>` runs on a
+cluster; `--only S1,S8` picks specs. `jobs/ztf_dial_in.sh` runs the fits and checks below. See the
+docstrings for the steps and the checks each prints.
 
 ## Dial-in results (partition Norder=3 Npix=385; RA ~186, Dec ~-28)
 
@@ -63,13 +66,20 @@ sample: 24,362,418 rows, 421,388 objects, 9,393 exposures, 754 visits.
 S5 rules out noise in g - r as the cause of the OLS attenuation (bright stars are no closer to -1);
 the instrument for clrcoeff's own noise moves it to -1.
 
-All on one core, serial, 4 shards (`--partition fieldid`); 0.4-0.9M rows/s.
+All on one core, serial, 4 shards (`--partition fieldid`); 0.4-0.9M rows/s. First run in a cloud
+session; reproduced on valiant 2026-11-27 (repo d25ef42, polars 2.0, pyfixest 0.60): every build count
+and every estimate above to the printed digits (log `logs/ztf_dial_in_20261127_1529.log`).
 
-Checks:
+Checks (valiant, 2026-11-27):
 
-- **pyfixest**, field 222 (3.7M rows), S1-S3: coefficients agree to <= 4e-13 relative, SEs to <= 6e-10.
-- **Sharding**, `--partition objectid` (13 shards; the exposure FE crosses shards and is solved
-  by CG, converging in one step): S1-S5 identical to `--partition fieldid` to every printed digit.
+- **pyfixest**, field 222 (3,705,235 rows, 3,697,734 after singletons), S1-S3 and IV S7-S8:
+  coefficients agree to <= 7e-15 relative, SEs to <= 1.1e-13. Two settings matter: pyfixest 0.60
+  demeans to 1e-6 by default (tightened to 1e-13), and it keeps Float32 weights in lower precision
+  (the weighted specs were ~1e-8 off until the columns were cast to float64).
+- **Sharding**, `--partition objectid` (13 shards; the exposure FE's 9,393 levels cross shards and are
+  solved exactly in level space, CG converging in one step): S1-S9 equal `--partition fieldid` to
+  <= 1.9e-14 relative, coefficients and SEs. (The cloud session's objectid log was from an earlier
+  build, 24,700,431 rows, so it was not this comparison.)
 
 ## Known issues / next steps
 

@@ -19,11 +19,14 @@ from pathlib import Path
 
 import polars as pl
 import pyfixest as pf
+from pyfixest.demeaners import MapDemeaner
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from fit import SPECS
 
 CHECK = ["S1", "S2", "S3", "S7", "S8"]
+# pyfixest 0.60 demeans to 1e-6 by default; tighten it so differences are dfeols's, not convergence
+DEMEANER = MapDemeaner(fixef_tol=1e-13, fixef_maxiter=100_000)
 
 
 def main() -> None:
@@ -44,12 +47,14 @@ def main() -> None:
     cmd = [sys.executable, "-I", fit, "--data", str(sub), "--root", str(root)]
     subprocess.run([*cmd, "--only", ",".join(CHECK), "--out", str(res)], check=True)
     got = json.loads(res.read_text())
-    pdf = d.to_pandas()
+    # Float32 columns (mag, w, cc_gr): pyfixest keeps float32 weights in lower precision (~1e-8 off on
+    # the weighted specs), dfeols promotes to float64. Give pyfixest float64 so both see the same numbers.
+    pdf = d.with_columns(pl.selectors.float().cast(pl.Float64)).to_pandas()
     ref = {}
     for sid in CHECK:
         _, f, kw = SPECS[sid]
         vc = {"CRV1": kw["cluster"]}
-        m = pf.feols(f, data=pdf, vcov=vc, weights=kw.get("weights"))
+        m = pf.feols(f, data=pdf, vcov=vc, weights=kw.get("weights"), demeaner=DEMEANER)
         ref[sid] = {"coef": m.coef().to_dict(), "se": m.se().to_dict(), "nobs": int(m._N)}
         for v, b in m.coef().items():
             db = abs(got[sid]["coef"][v] / b - 1)
