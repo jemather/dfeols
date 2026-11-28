@@ -92,6 +92,12 @@ DEFAULTS = {
         # others, and those transfers got receivers dropped with their results (2026-11-27: every
         # lost result in 30 OSCER runs followed such a drop, most soon after a lifetime retirement)
         "retire_at_pass": True,
+        # cancel a worker job after this many restarts of its Dask process within
+        # restart_window_minutes and, on Slurm, keep the fit's new workers off its node; 0: off.
+        # OSCER doesn't enforce memory requests, so another job overrunning its request can run a
+        # node out of memory: on H L3 (2026-11-27) the workers on one node were killed 316 times
+        "restart_limit": 3,
+        "restart_window_minutes": 30,
         # times a task may be on a worker that leaves before Dask fails it (KilledWorker) on the
         # next; None: half of max_workers, at least Dask's 3, which counted planned retirements
         # and slow connections and failed H L2 (OSCER, 2026-11-20)
@@ -177,6 +183,8 @@ queue_wait_minutes = 30        # the queue wait assumed until one is seen
 quick_wait_minutes = 3         # none asked for ahead while the last 2 queue waits were within this
 # retire_spread_minutes = 60    # workers retire over this x 2 before their lifetime (default 10% of it)
 retire_at_pass = true          # retire workers between passes, before a pass their lifetime would end in
+restart_limit = 3              # cancel a worker job restarted this often in restart_window_minutes, avoid its node (0: off)
+restart_window_minutes = 30
 # allowed_failures = 20        # a task fails on the next worker leaving under it (default max_workers / 2, at least 3)
 io_ceiling = true              # stop replacing retiring workers once a bigger pool stopped adding rows/s
 # io_ceiling_larger = 0.20      # ... a pool this much bigger

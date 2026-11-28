@@ -389,6 +389,10 @@ def executor(
     client = Client(cl)
     if p.scheduler == "slurm":
         _replace_lost_jobs(cl, w["max_workers"])
+    if p.scheduler != "local":
+        _restart_guard(cl, int(w.get("restart_limit", 3)), 60 * float(w.get("restart_window_minutes", 30)),
+                       node_of=_slurm_node if p.scheduler == "slurm" else None,
+                       max_excluded=max(3, w["max_workers"] // 4))
     if p.scheduler != "local" or log_directory:
         from .diag import attach_scheduler_log
 
@@ -484,6 +488,133 @@ def _replace_lost_jobs(cl, max_workers: int, every: float = 60.0, live_jobs=_slu
     cl.loop.add_callback(pc.start)
     cl.dfeols_lost_jobs = st
     cl.dfeols_lost_jobs_check = check
+
+
+def _slurm_node(job_id: str) -> str | None:
+    """The node a Slurm job runs (or ran) on; None if neither squeue nor sacct says."""
+    for cmd in (["squeue", "-h", "-j", str(job_id), "-o", "%N"],
+                ["sacct", "-n", "-X", "-P", "-j", str(job_id), "-o", "NodeList"]):
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        except Exception:  # noqa: BLE001
+            continue
+        node = r.stdout.strip().splitlines()[0].strip() if not r.returncode and r.stdout.strip() else ""
+        if node and node not in ("(null)", "None assigned"):
+            return node
+    return None
+
+
+def exclude_directives(directives: list[str], nodes) -> list[str]:
+    """Slurm job directives with `nodes` added to the node exclusion: an existing `--exclude`
+    (or `-x`) directive is widened, else one is added. Other directives are kept as they are."""
+    import re
+
+    pat = re.compile(r"^\s*(?:--exclude[= ]|-x\s*=?\s*)\s*(\S+)\s*$")
+    out, have = [], []
+    for d in directives:
+        m = pat.match(d)
+        if m:
+            have += [n for n in m.group(1).split(",") if n]
+        else:
+            out.append(d)
+    allx = list(dict.fromkeys(have + [n for n in nodes if n]))
+    return out + ([f"--exclude={','.join(allx)}"] if allx else [])
+
+
+def exclude_nodes(cl, nodes) -> None:
+    """Keep a dask-jobqueue cluster's later worker jobs off `nodes` (Slurm `--exclude`): the
+    cluster's job options are shared by its spec for new workers, so this reaches every job
+    submitted after it, and none already submitted."""
+    opts = [getattr(cl, "new_spec", {}).get("options")]
+    opts += [s.get("options") for s in getattr(cl, "worker_spec", {}).values()]
+    for o in {id(o): o for o in opts if isinstance(o, dict)}.values():
+        if "job_extra_directives" in o:
+            o["job_extra_directives"] = exclude_directives(o["job_extra_directives"] or [], nodes)
+
+
+def restarts_due(times: list[float], now: float, limit: int, window: float) -> bool:
+    """Whether a worker job registered at `times` (its first start, then each restart of its
+    Dask process) has restarted `limit` or more times within the last `window` s."""
+    return limit > 0 and sum(1 for t in times[1:] if now - t <= window) >= limit
+
+
+def _restart_guard(cl, limit: int = 3, window: float = 1800.0, node_of=_slurm_node,
+                   max_excluded: int | None = None, clock=time.time) -> None:
+    """Cancel a worker job whose Dask process keeps getting killed and restarted by its nanny, and,
+    on Slurm, keep this fit's later worker jobs off its node.
+
+    OSCER H L3 (36464754, 2026-11-27): the four worker jobs on node c880 were each SIGKILLed
+    within a minute of every start, 3, 2, 23 and 288 times over 4.5 h, losing 316 workers' finished
+    results. Slurm marked none OUT_OF_MEMORY and no Dask memory warning was logged: OSCER does not
+    enforce jobs' memory requests, so another job on the node that used more than it asked for ran
+    it out of memory. A worker job counts each registration with the scheduler after its first as
+    a restart; at `limit` within `window` s it is cancelled and a new one submitted. At most
+    `max_excluded` nodes are excluded (default 3; `executor` passes a quarter of max_workers, at
+    least 3), so a problem of the fit's own doesn't exclude the whole cluster."""
+    import asyncio
+
+    from distributed.diagnostics.plugin import SchedulerPlugin
+
+    st = {"starts": {}, "excluded": [], "cancelled": 0, "tasks": set()}
+    cap = 3 if max_excluded is None else max_excluded
+
+    async def act(name, jid, n):
+        try:
+            node = None
+            if jid and node_of is not None:
+                node = await asyncio.get_running_loop().run_in_executor(None, node_of, jid)
+            if node and node not in st["excluded"] and len(st["excluded"]) < cap:
+                st["excluded"].append(node)
+                exclude_nodes(cl, [node])
+                where = f"keeping this fit's new workers off node {node}"
+            elif node in st["excluded"]:
+                where = f"node {node} is already excluded"
+            else:
+                where = (f"not excluding node {node}: {len(st['excluded'])} are already" if node
+                         else "its node is unknown")
+            log.warning("cluster: worker %s (job %s) restarted %d times in %.0f min, its process killed each "
+                        "time (on a shared node, usually another job using more memory than it asked for); "
+                        "cancelling it and asking for a new one, %s", name, jid or "-", n, window / 60, where)
+            job = cl.workers.pop(name, None)
+            if job is not None:
+                await job.close()
+            st["cancelled"] += 1
+            await cl._correct_state()
+        except Exception as e:  # noqa: BLE001 (a watcher must not take the cluster down)
+            log.warning("cluster: cancelling crash-looping worker %s failed: %r", name, e)
+
+    class Guard(SchedulerPlugin):
+        name = "dfeols-restart-guard"
+
+        def add_worker(self, scheduler=None, worker=None, **kw):
+            ws = scheduler.workers.get(worker) if scheduler is not None else None
+            if ws is None:
+                return
+            name = ws.name
+            job = cl.workers.get(name)
+            ident = None if job is None else (getattr(job, "job_id", None) or id(job))
+            rec = st["starts"].get(name)
+            # a new job under the same name (a replacement) starts a new count; a first
+            # registration may come before the cluster records its job (LocalCluster's nanny)
+            if rec is None or (ident is not None and rec["job"] is not None and rec["job"] != ident):
+                rec = st["starts"][name] = {"job": ident, "times": [], "done": False}
+            rec["job"] = rec["job"] if ident is None else ident
+            if rec["done"]:
+                return
+            now = clock()
+            times = rec["times"]
+            times.append(now)
+            if restarts_due(times, now, limit, window):
+                rec["done"] = True
+                n = sum(1 for t in times[1:] if now - t <= window)
+                t = asyncio.ensure_future(act(name, getattr(job, "job_id", None), n))
+                st["tasks"].add(t)
+                t.add_done_callback(st["tasks"].discard)
+
+    if limit <= 0:
+        return
+    cl.scheduler.add_plugin(Guard())
+    cl.dfeols_restart_guard = st
 
 
 def queue_wait(waits: list[float], prior: float, pending: float = 0.0) -> float:
