@@ -118,6 +118,34 @@ def test_singletons_and_separation_iterate_jointly(tmp_path):
     np.testing.assert_allclose(r.coef(), m.coef().to_numpy(), **TOL)
 
 
+def test_separation_with_hash_ids(tmp_path):
+    """Distributed prep gives FEs with many levels 64-bit hash ids (UInt64). The separation scan
+    must match them against the dropped levels exactly: comparing uint64 with int64 went through
+    float64, ids >= 2**63 were never removed and the loop ran forever (OSCER job 36480215).
+
+    40 all-zero groups of a (y = 0) and a singleton a^b in every group are separated; of the
+    ~180 hashed ids dropped, about half are >= 2**63."""
+    rng = np.random.default_rng(5)
+    na, nz = 140, 40
+    a = np.repeat(np.arange(na), 5)
+    b = np.tile([0, 0, 1, 1, 9], na)  # b = 9 is a singleton in every group
+    x = rng.normal(size=len(a))
+    y = np.where(a < nz, 0.0, 1.0 + rng.poisson(np.exp(0.3 * x)))
+    df = pl.DataFrame({"a": a, "b": b, "x": x, "y": y})
+    (tmp_path / "raw").mkdir()
+    df.write_parquet(tmp_path / "raw" / "p.parquet")
+    src = str(tmp_path / "raw" / "*.parquet")
+    kw = dict(partition="a", fixed_effects=["a", "a^b"], target_rows=200)
+    dense = dfeols.prep(src, shard_dir=tmp_path / "dense", **kw)
+    hashed = dfeols.prep(src, shard_dir=tmp_path / "hash", executor=dfeols.SerialExecutor(), hash_levels=0, **kw)
+    assert any(m.get("id") == "hash" for m in hashed.fes.values())
+    ra = dfeols.fit_glm(dense, "y ~ x | a + a^b", "poisson", workdir=tmp_path / "wa", log_every=1e9)
+    rb = dfeols.fit_glm(hashed, "y ~ x | a + a^b", "poisson", workdir=tmp_path / "wb", log_every=1e9)
+    assert ra.N == rb.N == 4 * (na - nz)
+    assert rb.options["glm"]["separation_passes"] == ra.options["glm"]["separation_passes"]
+    np.testing.assert_allclose(rb.coef(), ra.coef(), rtol=1e-9)
+
+
 def test_warm_start_and_step_halving(data, tmp_path, monkeypatch):
     """The IRLS warm start (worker._warm_start) only moves the demeaning's starting point, so
     the fit equals a cold one; and a step that raises the deviance is halved back (glm

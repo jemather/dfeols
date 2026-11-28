@@ -157,15 +157,19 @@ def shard_glm_init(sid: int, files: list[str], spec: dict) -> dict:
             f"({int(bad.sum())} rows in shard {sid} are not)"
         )
     alive = valid.copy()
+    # FE ids as int64 everywhere: hash ids are UInt64, and np.isin(uint64, int64) compares as
+    # float64, so an id >= 2**63 never matched its own (wrapped) entry in the dead list and the
+    # separation loop never ended (baci_byz_v1 p1, OSCER job 36480215: 800+ passes, needs 14)
+    ids = {c: df[c].to_numpy().astype(np.int64, copy=False) for c in spec["fes"]}
     for c in spec["fes"]:
         dead = spec["dead"].get(c)
         if dead is not None and len(dead):
-            alive &= ~np.isin(df[c].to_numpy(), dead)
+            alive &= ~np.isin(ids[c], dead)
     out = {"shard": sid, "n": int(alive.sum()), "sum_y": float(y[alive].sum())}
     if spec["mode"] == "scan":
         out["levels"] = {}
         for c in spec["fes"]:
-            codes = df[c].to_numpy()[alive].astype(np.int64)
+            codes = ids[c][alive]
             lv, inv = np.unique(codes, return_inverse=True)
             out["levels"][c] = (lv, np.bincount(inv, weights=y[alive]), np.bincount(inv))
     else:
@@ -369,7 +373,7 @@ def fit_glm(
     # singleton groups, until none changes; each can create the other, so they share one loop
     drop_singletons = fit_kw.get("drop_singletons", True)
     dead: dict[str, np.ndarray] = {c: np.zeros(0, np.int64) for c in fes}
-    passes, n0 = 0, None
+    passes, n0, n_prev = 0, None, None
     spec = {"family": family, "y": y, "vars": xvars, "fes": fes, "dead": dead, "mode": "scan", "subset": subset}
     while True:
         passes += 1
@@ -377,6 +381,14 @@ def fit_glm(
         n_alive = sum(r["n"] for r in res.values())
         if n0 is None:
             n0 = n_alive
+        elif n_alive >= n_prev:  # the last pass dropped groups, so rows must have gone
+            raise RuntimeError(
+                f"fit_glm: separation pass {passes} removed no rows ({n_alive:,} alive) after groups "
+                "were dropped; the shards' FE ids don't match the dropped levels"
+            )
+        n_prev = n_alive
+        if passes > 1:
+            log.info("fit_glm %s: separation pass %d, %s rows left", family, passes, f"{n_alive:,}")
         changed = False
         if not separation:
             break
