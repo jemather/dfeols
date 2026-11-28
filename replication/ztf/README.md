@@ -34,10 +34,10 @@ acknowledgement guidelines and [registry.opendata.aws/ztf](https://registry.open
 ## Running it
 
     python -I repo/replication/ztf/stage.py --raw raw/ztf/dr24 --out build/ztf/stage --npix 3/385   # flatten
-    python -I repo/replication/ztf/build.py --stage build/ztf/stage --out build/ztf/analysis.parquet
-    python -I repo/replication/ztf/fit.py --data build/ztf/analysis.parquet --root build/ztf
+    python -I repo/replication/ztf/build.py --stage build/ztf/stage --out build/ztf/analysis --workers 4
+    python -I repo/replication/ztf/fit.py --data 'build/ztf/analysis/data/*.parquet' --root build/ztf
     python -I repo/replication/ztf/fit.py ... --partition objectid                   # sharding check
-    python -I repo/replication/ztf/pyfixest_check.py --data build/ztf/analysis.parquet --root build/ztf/check
+    python -I repo/replication/ztf/pyfixest_check.py --data 'build/ztf/analysis/data/*.parquet' --root build/ztf/check
 
 `stage.py` downloads nothing: the partitions must already be in `raw/ztf/dr24/` at the bucket's
 `Norder=/Dir=/Npix=` layout (URLs and copy commands in `docs/sources/ztf.md` of the data-build
@@ -85,11 +85,13 @@ Checks (valiant, 2026-11-27):
 
 - This patch is far south (airmass >= 1.89), so `airmass:gr` is barely identified. Add a field
   near Dec +30 (e.g. a Norder=3 pixel there) to the dial-in set.
-- Large between-field heterogeneity: field 222 alone gives OLS -0.27. Fit IV per field.
-- 7 (visit, rcid) pairs hold two exposures: VISIT_GAP (3 min) merges a few close visits. Only
-  affects the instrument; tighten or split on time order.
+- Large between-field heterogeneity: field 222 alone gives OLS -0.27. 7 (visit, rcid) pairs hold
+  two exposures (VISIT_GAP merges a few close visits; only affects the instrument). Both are left
+  alone: this is a validation dataset for dfeols, not a calibration study (decision 2026-11-27).
 - g/r matching is within one partition, so objects at partition edges lose their partner.
-- `build.py` runs in memory. For the full release: build the distinct-time table per quadrant
-  group across all partitions (~1e9 rows), then the rest lazily per partition; then `dfeols prep`
-  on the cluster with `--partition objectid` (the CG path) or `fieldid`.
-- Middle step before the full release: one band over one or two seasons (~1e10 rows).
+- `build.py` runs out of core: the distinct (quadrant, hmjd) table with counts across all
+  partitions (88k rows per 34M detections), then one partition at a time. On the dial-in partition
+  it reproduces the in-memory build exactly except `cc_loo`/`z_gr`, now summed in float64 (they
+  moved by <= 2.6e-7 relative; S8 unchanged to the printed digits).
+- Middle step (decision 2026-11-27): HEALPix base pixel 6, 660 partitions, ~1e10 detections
+  (RA ~135-225, Dec -42..+42; includes the dial-in pixel and northern fields), fitted on OSCER.
