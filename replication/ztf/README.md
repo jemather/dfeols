@@ -51,6 +51,10 @@ Build: 33.9M detections; 12,603 quadrant-exposures (no object twice in one; hmjd
 exposure at most 10.4 s; 3 ambiguous time gaps); 27.3M good detections; 213k g/r pairs. Analysis
 sample: 24,362,418 rows, 421,388 objects, 9,393 exposures, 754 visits.
 
+The results below use the first exposure and visit definitions (hmjd gaps of 22 s and 3 min). The
+observation-time definitions adopted 2026-11-28 (see below) give the same exposures and rows here,
+but 757 visits (1,168 before the sample cuts, was 1,164), which changes `z_gr` on 9,828 rows (0.04%).
+
 | Spec | Formula (`FE = objectid + expid`) | `cc_gr` (SE) | `airmass:gr` (SE) | s |
 |---|---|---|---|---|
 | S1 OLS | `mag ~ cc_gr \| FE`, CRV objectid | -0.5677 (0.0074) | | 67 |
@@ -85,13 +89,22 @@ Checks (valiant, 2026-11-27):
 
 - This patch is far south (airmass >= 1.89), so `airmass:gr` is barely identified. Add a field
   near Dec +30 (e.g. a Norder=3 pixel there) to the dial-in set.
-- Large between-field heterogeneity: field 222 alone gives OLS -0.27. 7 (visit, rcid) pairs hold
-  two exposures (VISIT_GAP merges a few close visits; only affects the instrument). Both are left
-  alone: this is a validation dataset for dfeols, not a calibration study (decision 2026-11-27).
+- Large between-field heterogeneity: field 222 alone gives OLS -0.27. Left alone: this is a
+  validation dataset for dfeols, not a calibration study (decision 2026-11-27).
+- Exposures and visits from observation time (decision 2026-11-28). On base pixel 6 the hmjd
+  definitions broke: fields 525 and 526 take exposures 10-20 s apart, so the 22 s gap merged 4,457
+  pairs of quadrant-exposures (mixed clrcoeff, 0.7% of detections), and the light-time correction
+  varies across the focal plane by more than the gap between back-to-back exposures, so the 3 min
+  visits chained up to ~220 telescope exposures (59% of detections in visits holding two exposures
+  of one quadrant). `build.py` now removes that correction first (`obs_mjd`) and uses 5 s gaps for
+  both. On base pixel 6: 4,502,947 quadrant-exposures, spread at most 0.9 s, no 2-10 s gaps,
+  clrcoeff constant in every one; 105,852 visits, at most 64 quadrants (one focal plane), spread at
+  most 1.1 s, never two exposures of one quadrant. The build stops if either check fails.
 - g/r matching is within one partition, so objects at partition edges lose their partner.
 - `build.py` runs out of core: the distinct (quadrant, hmjd) table with counts across all
   partitions (88k rows per 34M detections), then one partition at a time. On the dial-in partition
   it reproduces the in-memory build exactly except `cc_loo`/`z_gr`, now summed in float64 (they
   moved by <= 2.6e-7 relative; S8 unchanged to the printed digits).
-- Middle step (decision 2026-11-27): HEALPix base pixel 6, 660 partitions, ~1e10 detections
-  (RA ~135-225, Dec -42..+42; includes the dial-in pixel and northern fields), fitted on OSCER.
+- Middle step (decision 2026-11-27): HEALPix base pixel 6, 660 partitions, 2.77e9 detections
+  (the 1e10 estimate assumed the dial-in's 40.6 per light curve; RA ~135-225, Dec -42..+42;
+  includes the dial-in pixel and northern fields), fitted on OSCER.

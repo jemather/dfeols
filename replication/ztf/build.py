@@ -3,22 +3,27 @@
 
     python -I repo/replication/ztf/build.py --stage build/ztf/stage --out build/ztf/analysis [--workers 4]
 
-Writes ``<out>/times/`` (small per-partition tables, step 1), ``<out>/exposures.parquet`` and
-``<out>/data/<partition>.parquet``, one analysis file per staged partition. Read them back as the
-glob ``<out>/data/*.parquet``.
+Writes ``<out>/times/`` (small per-partition tables, step 1), ``<out>/exposures.parquet``,
+``<out>/data/<partition>.parquet`` (one analysis file per staged partition; read them back as the
+glob ``<out>/data/*.parquet``), ``<out>/stats/`` (per-partition counts and distinct ids) and
+``<out>/summary.json`` (the totals).
 
 Steps (all checks print; see README.md for the values on the dial-in partition):
 
 1. Exposure IDs. The light curves carry no exposure ID, only hmjd (heliocentric MJD at the
-   object's position). Within one CCD quadrant (fieldid, rcid, filterid) the heliocentric
-   correction varies by < ~10 s, and exposures are >= ~45 s apart, so sorted distinct hmjd values
-   separated by more than EXP_GAP start a new exposure: ``expid``. A quadrant's exposure spans
-   partitions, so each partition contributes its distinct (quadrant, hmjd) values with counts
-   (about 88k for 34M detections), and the clustering runs on their union. Checked: no object
-   twice in one exposure; the largest hmjd spread within an exposure.
-2. Visits. Quadrant-exposures of the same field and filter whose median times are within
-   VISIT_GAP are one telescope exposure across the focal plane: ``visit``. The median is exact,
-   taken from the counts of step 1 (the mean of the two middle values when the count is even).
+   object's position). The heliocentric light-time correction differs by up to ~10 s within a
+   CCD quadrant and ~1 min across the focal plane, more than the 10-20 s between back-to-back
+   exposures in some fields (525 and 526). So each detection's observation time ``mjd`` (at
+   Earth) is recovered first: hmjd minus that correction (``obs_mjd``). Within one quadrant
+   (fieldid, rcid, filterid), sorted observation times more than EXP_GAP (5 s) apart start a new
+   exposure: ``expid``. A quadrant's exposure spans partitions, so each partition contributes
+   its distinct (quadrant, hmjd) values with counts (about 88k for 34M detections), and the
+   clustering runs on their union. Checked: no object twice in one exposure; no time gaps of
+   2-10 s; clrcoeff constant within every quadrant-exposure (the build stops otherwise).
+2. Visits. Quadrant-exposures of the same field and filter whose median observation times are
+   within VISIT_GAP (5 s) are one telescope exposure across the focal plane: ``visit``. The median
+   is exact, taken from the counts of step 1 (the mean of the two middle values when the count
+   is even). The build stops if a visit holds two exposures of one quadrant.
 3. Quality cuts: catflags == 0 (no flagged epochs, which includes clouds/moon, bit 15), and
    0 < magerr < MAX_MAGERR.
 4. Colour. ``mag`` is calibrated for a source with g - r = 0; the colour correction is
@@ -45,7 +50,9 @@ cc_gr cc_loo z_gr airmass mobj. ``w = 1/magerr^2``; ``season`` = whole years sin
 from __future__ import annotations
 
 import argparse
+import json
 import os
+import sys
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from multiprocessing import get_context
@@ -56,8 +63,9 @@ import numpy as np
 import polars as pl
 from scipy.spatial import cKDTree
 
-EXP_GAP = 2.5e-4  # days (~22 s)
-VISIT_GAP = 2e-3  # days (~3 min)
+EXP_GAP = 5 / 86400  # days: gap in observation time that starts a new quadrant-exposure
+VISIT_GAP = 5 / 86400  # days: gap between quadrant-exposure times that starts a new visit
+AU_DAYS = 499.004784 / 86400  # light travel time over 1 au
 MAX_MAGERR = 0.2
 MATCH_ARCSEC = 1.5
 GR_RANGE = (-0.5, 2.5)
@@ -71,13 +79,42 @@ COLS = [
 ]  # fmt: skip
 
 
+def obs_mjd() -> pl.Expr:
+    """Observation time (MJD at Earth): hmjd minus the heliocentric light-time correction toward
+    the object, with Earth's heliocentric position from the low-precision solar formula of the
+    Astronomical Almanac (~0.01 deg, so ~0.1 s here). The correction varies by up to ~1 min across
+    the focal plane, so it must come off before quadrants are grouped into one telescope exposure."""
+    n = pl.col("hmjd") - 51544.5
+    g = ((357.528 + 0.9856003 * n) % 360).radians()
+    lam = (
+        ((280.460 + 0.9856474 * n) % 360).radians()
+        + np.radians(1.915) * g.sin()
+        + np.radians(0.020) * (2 * g).sin()
+    )
+    r = 1.00014 - 0.01671 * g.cos() - 0.00014 * (2 * g).cos()
+    eps = (23.439 - 4e-7 * n).radians()
+    ra, de = pl.col("objra").radians(), pl.col("objdec").radians()
+    # Earth = -(Sun seen from Earth); dot product with the unit vector to the object
+    dot = -r * (
+        lam.cos() * de.cos() * ra.cos()
+        + eps.cos() * lam.sin() * de.cos() * ra.sin()
+        + eps.sin() * lam.sin() * de.sin()
+    )
+    return (pl.col("hmjd") - dot * AU_DAYS).alias("mjd")
+
+
 def times_one(src: str, dst: str) -> str:
-    """Step 1, one partition: distinct (quadrant, hmjd) with counts and clrcoeff range."""
+    """Step 1, one partition: distinct (quadrant, hmjd) with counts, summed observation time and
+    clrcoeff range."""
     (
         pl.scan_parquet(src)
+        .with_columns(obs_mjd())
         .group_by(*QUAD, "hmjd")
         .agg(
             pl.len().alias("n"),
+            pl.col("mjd").sum().alias("msum"),
+            pl.col("mjd").min().alias("mmin"),
+            pl.col("mjd").max().alias("mmax"),
             pl.col("clrcoeff").min().alias("cmin"),
             pl.col("clrcoeff").max().alias("cmax"),
         )
@@ -88,16 +125,25 @@ def times_one(src: str, dst: str) -> str:
 
 def exposures(times: list[str]) -> pl.DataFrame:
     """Steps 1-2 on the union of the partitions' times: one row per (quadrant, hmjd) with expid,
-    visit and cc_loo."""
+    visit and cc_loo. Stops if a quadrant-exposure has two clrcoeff values or a visit holds two
+    exposures of one quadrant."""
     t = (
         pl.scan_parquet(times)
         .group_by(*QUAD, "hmjd")
-        .agg(pl.col("n").sum(), pl.col("cmin").min(), pl.col("cmax").max())
-        .sort(*QUAD, "hmjd")
+        .agg(
+            pl.col("n").sum(),
+            pl.col("msum").sum(),
+            pl.col("mmin").min(),
+            pl.col("mmax").max(),
+            pl.col("cmin").min(),
+            pl.col("cmax").max(),
+        )  # fmt: skip
+        .with_columns(mjd=pl.col("msum") / pl.col("n"))
+        .sort(*QUAD, "mjd")
         .collect()
-        .with_columns(gap=pl.col("hmjd").diff().over(QUAD).fill_null(1.0))
+        .with_columns(gap=pl.col("mjd").diff().over(QUAD).fill_null(1.0))
     )
-    amb = t.filter(pl.col("gap").is_between(5e-5, 1e-3)).height
+    amb = t.filter(pl.col("gap").is_between(2 / 86400, 10 / 86400)).height
     t = t.with_columns(expid=(pl.col("gap") > EXP_GAP).cum_sum().cast(pl.Int64))
     q = (
         t.with_columns(
@@ -108,25 +154,39 @@ def exposures(times: list[str]) -> pl.DataFrame:
         .group_by(*QUAD, "expid")
         .agg(
             t=(
-                pl.col("hmjd").filter(pl.col("cum") > pl.col("k1")).first()
-                + pl.col("hmjd").filter(pl.col("cum") > pl.col("k2")).first()
+                pl.col("mjd").filter(pl.col("cum") > pl.col("k1")).first()
+                + pl.col("mjd").filter(pl.col("cum") > pl.col("k2")).first()
             )
             / 2,
             clrcoeff=pl.col("cmin").min(),  # Float32 as stored; summed in float64 below
             same=(pl.col("cmin").min() == pl.col("cmax").max()),
-            span=pl.col("hmjd").max() - pl.col("hmjd").min(),
+            span=pl.col("mmax").max() - pl.col("mmin").min(),
+            hspan=pl.col("hmjd").max() - pl.col("hmjd").min(),
         )
         .sort("fieldid", "filterid", "t")
         .with_columns(gap=pl.col("t").diff().over("fieldid", "filterid").fill_null(1.0))
-        .with_columns(visit=(pl.col("gap") > VISIT_GAP).cum_sum().cast(pl.Int64))
     )
+    vamb = q.filter(pl.col("gap").is_between(1 / 86400, 10 / 86400)).height
+    q = q.with_columns(visit=(pl.col("gap") > VISIT_GAP).cum_sum().cast(pl.Int64))
     print(
-        f"exposures {q.height:,}; ambiguous gaps (5e-5..1e-3 d) {amb}; "
-        f"max hmjd spread in an exposure {q['span'].max() * 86400:.1f}s"
+        f"exposures {q.height:,}; quadrant time gaps of 2-10 s {amb}; largest spread in an exposure: "
+        f"observation time {q['span'].max() * 86400:.1f}s, hmjd {q['hspan'].max() * 86400:.1f}s",
+        flush=True,
     )
-    print(f"clrcoeff constant within every quadrant-exposure: {bool(q['same'].all())}")
-    multi = q.group_by("visit", "rcid").len().filter(pl.col("len") > 1).height
-    print(f"visits {q['visit'].n_unique():,}; (visit, rcid) with more than one exposure: {multi}")
+    same = bool(q["same"].all())
+    print(f"clrcoeff constant within every quadrant-exposure: {same}", flush=True)
+    vq = q.group_by("visit").agg(
+        k=pl.len(), r=pl.col("rcid").n_unique(), s=pl.col("t").max() - pl.col("t").min()
+    )
+    multi = vq.filter(pl.col("k") > pl.col("r")).height
+    print(
+        f"visits {vq.height:,}; quadrant-exposure time gaps of 1-10 s {vamb}; visits with two exposures "
+        f"of one quadrant: {multi}; quadrants in a visit at most {vq['k'].max()}; largest time spread "
+        f"in a visit {vq['s'].max() * 86400:.1f}s",
+        flush=True,
+    )
+    if not same or multi:
+        raise SystemExit("exposure or visit definition failed (see the lines above)")
     # float64 sum: a Float32 sum over the visit rounds at ~1e-7 and depends on row order
     q = q.with_columns(
         s=pl.col("clrcoeff").cast(pl.Float64).sum().over("visit"), n=pl.len().over("visit")
@@ -139,7 +199,8 @@ def exposures(times: list[str]) -> pl.DataFrame:
     )
     print(
         f"within-quadrant sd of clrcoeff {w['a'].std():.4f}; "
-        f"corr(own, other quadrants') {w.select(pl.corr('a', 'b')).item():.3f}"
+        f"corr(own, other quadrants') {w.select(pl.corr('a', 'b')).item():.3f}",
+        flush=True,
     )
     return t.select(*QUAD, "hmjd", "expid").join(q.select("expid", "visit", "cc_loo"), on="expid")
 
@@ -187,6 +248,12 @@ def airmass(d: pl.DataFrame) -> pl.Series:
     return pl.Series("airmass", 1 / (np.sin(lat) * np.sin(de) + np.cos(lat) * np.cos(de) * np.cos(ha)))
 
 
+def stats_path(dst: str) -> Path:
+    """Per-partition counts (json) beside the distinct expid/visit ids (npz), in <out>/stats/."""
+    d = Path(dst)
+    return d.parent.parent / "stats" / (d.stem + ".json")
+
+
 def analysis_one(src: str, exp: str, dst: str, threads: int) -> dict:
     """Steps 3-6, one partition."""
     os.environ["POLARS_MAX_THREADS"] = str(threads)
@@ -210,12 +277,20 @@ def analysis_one(src: str, exp: str, dst: str, threads: int) -> dict:
         .filter(pl.col("z_gr").is_not_null())
         .with_columns(mobj=pl.col("mag").median().over("objectid"))
     )
+    st = dict(
+        det=n_det, dup=dup, good=n_good, pairs=n_pairs, rows=d.height, objects=d["objectid"].n_unique(),
+        amin=d["airmass"].min(), amax=d["airmass"].max(),
+    )  # fmt: skip
     tmp = Path(dst).with_suffix(".part")
     d.select(COLS).write_parquet(tmp)
     tmp.rename(dst)
-    return dict(
-        det=n_det, dup=dup, good=n_good, pairs=n_pairs, rows=d.height, objects=d["objectid"].n_unique()
-    )
+    ids = {k: d[k].unique().to_numpy() for k in ("expid", "visit")}
+    npz = stats_path(dst).with_suffix(".npz")
+    with open(npz.with_suffix(".part"), "wb") as fh:  # a file object: savez would append .npz to a path
+        np.savez(fh, **ids)
+    npz.with_suffix(".part").rename(npz)
+    stats_path(dst).write_text(json.dumps(st))
+    return st
 
 
 def run(pool: ProcessPoolExecutor, fn, jobs: list[tuple], label: str) -> list:
@@ -238,28 +313,45 @@ def main() -> None:
 
     files = sorted(Path(a.stage).glob("Norder=*_Npix=*.parquet"))
     out = Path(a.out)
-    for sub in ("times", "data"):
+    for sub in ("times", "data", "stats"):
         (out / sub).mkdir(parents=True, exist_ok=True)
     print(f"{len(files)} partition(s)", flush=True)
     with ProcessPoolExecutor(a.workers, mp_context=get_context("spawn")) as pool:
         times = run(pool, times_one, [(str(f), str(out / "times" / f.name)) for f in files], "times")
-        exp = exposures(sorted(times))
-        exp.write_parquet(out / "exposures.parquet")
-        del exp
+        # in a worker, so the parent stays small while the analysis step runs
+        pool.submit(write_exposures, sorted(times), str(out / "exposures.parquet")).result()
         jobs = [
             (str(f), str(out / "exposures.parquet"), str(out / "data" / f.name), a.threads) for f in files
         ]
-        res = run(pool, analysis_one, jobs, "analysis")
-    tot = {k: sum(r[k] for r in res) for k in res[0]}
-    print(f"detections {tot['det']:,}; object twice in an exposure {tot['dup']}")
-    print(f"good detections {tot['good']:,}; g/r matched pairs {tot['pairs']:,}")
-    s = pl.scan_parquet(out / "data" / "*.parquet").select(
-        pl.col("expid").n_unique(), pl.col("visit").n_unique(), pl.col("airmass").min().alias("amin"),
-        pl.col("airmass").max().alias("amax"),
-    ).collect(engine="streaming")  # fmt: skip
+        run(pool, analysis_one, jobs, "analysis")
+    summary(out, [out / "data" / f.name for f in files])
+
+
+def write_exposures(times: list[str], dst: str) -> None:
+    exposures(times).write_parquet(dst)
+    sys.stdout.flush()  # python -I ignores PYTHONUNBUFFERED
+
+
+def summary(out: Path, data: list[Path]) -> None:
+    """Totals from the per-partition stats; distinct expid/visit merged from small id arrays (a
+    scan of every analysis file with n_unique was killed at 115 GB on base pixel 6)."""
+    st = [json.loads(stats_path(str(f)).read_text()) for f in data]
+    tot = {k: sum(r[k] for r in st) for k in ("det", "dup", "good", "pairs", "rows", "objects")}
+    ids = {"expid": np.array([], np.int64), "visit": np.array([], np.int64)}
+    for f in data:
+        with np.load(stats_path(str(f)).with_suffix(".npz")) as z:
+            for k in ids:
+                ids[k] = np.union1d(ids[k], z[k])
+    print(f"detections {tot['det']:,}; object twice in an exposure {tot['dup']}", flush=True)
+    print(f"good detections {tot['good']:,}; g/r matched pairs {tot['pairs']:,}", flush=True)
     print(
-        f"analysis rows {tot['rows']:,}; objects {tot['objects']:,}; exposures {s['expid'].item():,}; "
-        f"visits {s['visit'].item():,}; airmass {s['amin'].item():.2f}..{s['amax'].item():.2f}"
+        f"analysis rows {tot['rows']:,}; objects {tot['objects']:,}; exposures {ids['expid'].size:,}; "
+        f"visits {ids['visit'].size:,}; airmass {min(r['amin'] for r in st):.2f}.."
+        f"{max(r['amax'] for r in st):.2f}",
+        flush=True,
+    )
+    (out / "summary.json").write_text(
+        json.dumps({**tot, "exposures": int(ids["expid"].size), "visits": int(ids["visit"].size)}, indent=1)
     )
 
 
