@@ -9,6 +9,17 @@ break the API).
 
 ### Added
 
+- A fit lists its stages in the log before the first one starts ("fit <label>: plan" and a
+  bullet per stage: drop singletons, demean + X'X, FE solve, residuals + SEs), with what is
+  known ahead of time: the crossing FEs, their levels and the CG tolerance, an earlier run's
+  singleton masks or round 1 checkpoint in the workdir, and, from the timings record, the
+  singleton passes, CG steps and time of the latest fit of the same FEs on the same data.
+- Progress lines name stages in words: `demean + X'X` (was `round1`), `FE solve step N`
+  (`cgN`), `residuals + SEs` (`round2`), and in sessions `partial out <column>`,
+  `SEs (cluster sums)` and `cross-products`; the CG note reads
+  `solve step N: residual R, stops at T`. status.json keeps the short names. While CG steps
+  are to come and not yet estimated (round 1, and a fit's first CG steps), the line shows no
+  stage count or total, as in the singleton passes (was `5/6` in round 1, then `36/36`).
 - Documentation site at https://jemather.github.io/dfeols/ (built with Zensical from
   `mkdocs.yml`, deployed to GitHub Pages by `.github/workflows/docs.yml`): getting started, a
   user guide, an API reference generated from the docstrings, benchmarks, validation and the

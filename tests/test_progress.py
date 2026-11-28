@@ -1,6 +1,7 @@
 """ETA and status reporting edge cases."""
 
 import json
+import logging
 import math
 
 from dfeols.progress import Progress
@@ -431,3 +432,51 @@ def test_round2_projected_from_a_checkpointed_round1(tmp_path):
     prog.round1_rate_prior, prog.stage2_prior_frac = 0.01, 0.5
     snap = prog.snapshot()
     assert snap["stages"][1]["rate_projected"] and snap["eta_total_seconds"] is not None
+
+
+def test_a_fit_lists_its_plan_and_titles_its_stages(tmp_path, caplog):
+    """The log lists the stages before the first starts, and the progress lines use the
+    same words (Ted 2026-11-27: 'round 1' and 'cg' said nothing); status.json keeps the
+    short names. A second fit of the same FEs quotes the first's singleton passes, CG steps
+    and time (timings record)."""
+    import sys
+    from pathlib import Path
+
+    import polars as pl
+
+    sys.path.insert(0, str(Path(__file__).parent))
+    import dfeols
+    from simdata import sim_panel
+
+    d = sim_panel().with_columns(cw=(pl.col("id_f") % 100) * 100 + pl.col("week"))
+    ds = dfeols.prep(
+        d, shard_dir=tmp_path / "s", partition="id_a", fixed_effects=["spell", "cw"], target_rows=3000
+    )
+    kw = dict(crossing_fe="iterate", level_space_gb=0, iter_tol=1e-10, log_every=1e9)
+    import os
+
+    os.environ["DFEOLS_TIMINGS"] = str(tmp_path / "t")
+    try:
+        with caplog.at_level(logging.INFO, logger="dfeols"):
+            dfeols.fit(ds, "eng ~ feat + posts | spell + cw", workdir=tmp_path / "a", **kw)
+        plan = next(r.getMessage() for r in caplog.records if ": plan\n" in r.getMessage())
+        items = plan.split("\n")[1:]
+        assert [i.split(":")[0] for i in items] == [
+            "  - drop singletons", "  - demean + X'X", "  - FE solve", "  - residuals + SEs"
+        ], plan
+        assert "cw" in items[2] and "1e-10" in items[2]
+        st = json.loads((tmp_path / "a" / "status.json").read_text())
+        titles = {s["stage"]: s.get("title") for s in st["stages"]}
+        assert titles["round1"] == "demean + X'X" and titles["round2"] == "residuals + SEs"
+        assert any(k.startswith("cg") and v.startswith("FE solve step ") for k, v in titles.items()), titles
+        rows = [r.getMessage() for r in caplog.records if r.getMessage().startswith(st["label"] + "  ")]
+        assert any(r.split()[1:3] == ["demean", "+"] for r in rows), rows  # no '5/6': CG steps to come
+        last = rows[-1].split()  # round 2: steps done, the total and stage count are back
+        assert last[1].endswith(f"/{last[1].split('/')[0]}") and last[2:5] == ["residuals", "+", "SEs"], rows
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger="dfeols"):
+            dfeols.fit(ds, "eng ~ feat | spell + cw", workdir=tmp_path / "b", **kw)
+        plan = next(r.getMessage() for r in caplog.records if ": plan\n" in r.getMessage())
+        assert "the last fit of these FEs took" in plan and "steps)" in plan and "passes)" in plan, plan
+    finally:
+        del os.environ["DFEOLS_TIMINGS"]

@@ -1023,7 +1023,8 @@ def demean_once(
             )
             for s in ds.shards
         ]
-        prog.add_stage("partial_out", rows)
+        what = names[0] if len(names) == 1 else f"{len(names)} columns"
+        prog.add_stage("partial_out", rows, title=f"partial out {what}")
         prog.more = False
         prog.start("partial_out")
         executor.run(demean_round2, tasks2, on2, prog, "partial_out")
@@ -1360,7 +1361,7 @@ def fit_model(
         rows = {sid: src_rows.get(sid, 1) for sid in d.shards}
         prog = Progress(wd, label=label or "model", every=log_every)
         prog.settle_frac = 0.10  # one short pass: its first rows/s are the quick shards'
-        prog.add_stage("meat", rows)
+        prog.add_stage("meat", rows, title="SEs (cluster sums)")
         prog.start("meat")
         maps = [(gp, A_, H_) for gp, A_, H_ in groups]
         tasks = [(sid, 1, (d.files(sid, T), T, maps, vcov, cl)) for sid in d.shards]
@@ -2606,7 +2607,7 @@ def cross_pass(d: Demeaned, name_groups, new_groups, executor, progress_dir: Pat
 
     prog = Progress(progress_dir, label="cross-products", every=30.0)
     prog.settle_frac = 0.10
-    prog.add_stage("cross", {sid: 1 for sid in d.shards})
+    prog.add_stage("cross", {sid: 1 for sid in d.shards}, title="cross-products")
     prog.start("cross")
     tasks = [(sid, 1, (sid, str(d.root), new_groups, name_groups)) for sid in d.shards]
     executor.run(_cross_task, tasks, on, prog, "cross")

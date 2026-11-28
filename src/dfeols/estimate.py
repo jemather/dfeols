@@ -1029,7 +1029,9 @@ def _crossing_cg(
 
         name = f"cg{step['it'] + 1}"
         tasks = [(s["id"], rows[s["id"]], (plan, s["id"], ds.shard_paths(s), p)) for s in ds.shards]
-        prog.add_stage(name, rows, before="round2", settle=False)  # each step keeps its ETA
+        # each step keeps its ETA (settle=False)
+        title = f"FE solve step {step['it'] + 1}"
+        prog.add_stage(name, rows, before="round2", title=title, settle=False)
         prog.start(name)
         prog.task_gb, prog.task_gb_of = gb_step, gb_step_of
         if "reduce" in inspect.signature(executor.run).parameters:
@@ -1049,6 +1051,8 @@ def _crossing_cg(
         prog.finish(name, log=False)
         return Ap
 
+    more = prog.more  # stages of the caller's to come (a session's partial_out)
+    prog.more = True  # steps to come, unknown until _cg_steps_left has an estimate
     hist = [1.0]  # relative residuals, starting from the right-hand side
     hist_from = [0]  # the step hist[0] belongs to
     hist_path = None  # beside the checkpoint, so a resume knows how fast the residual fell
@@ -1062,7 +1066,8 @@ def _crossing_cg(
         dt = time.time() - step["t"]
         step["t"] = time.time()
         prog.extra_eta = None if left is None else left * dt
-        prog.note = f"CG step {it}, residual {rel.max():.1e} (tol {tol:g})" + (
+        prog.more = more or left is None
+        prog.note = f"solve step {it}: residual {rel.max():.1e}, stops at {tol:g}" + (
             f", about {left} more steps" if left is not None else ""
         )
         if it == 1 or it % (100 if level else 10) == 0:
@@ -1134,7 +1139,7 @@ def _crossing_cg(
             ck.flush()  # the latest state, converged or not, is on disk
             if rel <= tol:
                 acc["cg_checkpoint"] = ck
-    prog.note, prog.extra_eta = "", None
+    prog.note, prog.extra_eta, prog.more = "", None, more
     if rel > tol and it < maxiter:
         raise RuntimeError(
             f"fit {label}: crossing-FE CG stalled at step {it}: its largest relative residual "
@@ -1345,6 +1350,74 @@ def check_sample(n: int, rows_in: int, load: dict) -> None:
     raise ValueError(f"no rows left in the estimation sample ({load.get('rows', 0):,} rows read{why})")
 
 
+def _fe_key(plan: Plan, ds: Dataset) -> str:
+    """These data, FEs and weights: earlier fits with the same key absorbed the same FEs."""
+    meta_sha = hashlib.sha256((ds.root / "dfeols_meta.json").read_bytes()).hexdigest()
+    return hashlib.sha256(
+        json.dumps([meta_sha, sorted(plan.fe_labels), plan.weights], sort_keys=True).encode()
+    ).hexdigest()[:16]
+
+
+# the stages' names in the progress lines (status.json keeps the short names)
+TITLES = {"round1": "demean + X'X", "round2": "residuals + SEs"}
+
+
+def _plan_text(
+    plan: Plan, ds: Dataset, wd: Path, label: str, tol: float, runs: list[dict] | None = None
+) -> str:
+    """The fit's stages as a list, before the first one starts, so each progress line's stage
+    names something already said (Ted 2026-11-27: 'round 1' and 'cg' said nothing), with what
+    earlier runs say of each: the latest fit of these FEs on these data (timings record)."""
+    from . import timings
+
+    try:
+        key = _fe_key(plan, ds)
+        same = [e for e in (timings.history() if runs is None else runs) if e.get("fe_key") == key]
+    except Exception:  # the record is a hint; never fails the fit
+        same = []
+    last = same[-1] if same else None
+    sing_last = next((e["singleton_passes"] for e in reversed(same) if e.get("singleton_passes")), None)
+    cg_last = next((e["cg_steps"] for e in reversed(same) if e.get("cg_steps")), None)
+    n_sh = f"{len(ds.shards):,} shards"
+    out = []
+    if plan.drop_singletons and any(plan.fe_intercept(n) for n, *_ in plan.global_fes):
+        t = "drop singletons: passes over the shards until one drops nothing"
+        if plan.keep_dir and (Path(plan.keep_dir) / SINGLETONS_DONE).exists():
+            t += "; an earlier run's masks are in the workdir (reused if they match)"
+        elif sing_last:
+            t += f" (the last fit of these FEs took {sing_last} passes)"
+        out.append(t)
+    r1 = f"{TITLES['round1']}: one pass over the {n_sh}, demeaning within the local FEs"
+    if plan.global_fes and not plan.crossing_iterate:
+        r1 += f" (crossing FEs as {plan.n_dummy:,} dummy columns)"
+    r1 += " and summing the cross-products"
+    if _round1_checkpointed(plan) and (wd / ROUND1_CHECKPOINT).exists():
+        r1 += "; an earlier run's checkpoint is in the workdir (used if it matches)"
+    out.append(r1)
+    if plan.crossing_iterate:
+        names = ", ".join(str(n) for n, *_ in plan.global_fes)
+        levels = sum(L for *_, L in plan.global_fes)
+        t = (
+            f"FE solve: conjugate gradient for the crossing FEs ({names}; {levels:,} levels) to a "
+            f"residual of {tol:g}; on the coordinator if their matrix fits, else a pass over the "
+            "shards per step"
+        )
+        t += (
+            f" (the last fit of these FEs took {cg_last} steps)"
+            if cg_last
+            else "; steps left are estimated from step 3"
+        )
+        out.append(t)
+    out.append(f"{TITLES['round2']}: one pass, each shard's residuals and its share of the standard errors")
+    if last:
+        w = int(last.get("workers") or 1)
+        out.append(
+            f"the last fit of these FEs ({last.get('when', '?')}) took {fmt_td(last['seconds'])} "
+            f"at {w} worker{'s' if w > 1 else ''}"
+        )
+    return f"fit {label}: plan\n" + "\n".join(f"  - {t}" for t in out)
+
+
 def _record_timing(res, plan, ds, executor, acc, sing, cells, f) -> None:
     """Append this run to the local record (timings.py) for the planner's estimates, and
     point to a session when the same FEs, data and weights were just absorbed for another
@@ -1368,10 +1441,7 @@ def _record_timing(res, plan, ds, executor, acc, sing, cells, f) -> None:
         solve = ("level" if cg.get("mode") == "level" else "fallback") if plan.crossing_iterate else None
         passes = 1 if cells else 2 + int(sing.get("passes", 0)) + int(cg.get("passes") or 0)
         running, most = executor.slots()
-        meta_sha = hashlib.sha256((ds.root / "dfeols_meta.json").read_bytes()).hexdigest()
-        fe_key = hashlib.sha256(
-            json.dumps([meta_sha, sorted(res.fe), plan.weights], sort_keys=True).encode()
-        ).hexdigest()[:16]
+        fe_key = _fe_key(plan, ds)
         entry = {
             "path": path,
             "solve": solve,
@@ -1744,9 +1814,11 @@ def fit(
     else:
         if plan.drop_singletons and any(plan.fe_intercept(n) for n, *_ in plan.global_fes):
             plan.keep_dir = str(wd / "singletons")
+        log.info("%s", _plan_text(plan, ds, wd, label, iter_tol))
+        if plan.drop_singletons and any(plan.fe_intercept(n) for n, *_ in plan.global_fes):
             sing = _drop_singletons(plan, ds, executor, prog, rows, label)
-        prog.add_stage("round1", rows)
-        prog.add_stage("round2", rows)
+        prog.add_stage("round1", rows, title=TITLES["round1"])
+        prog.add_stage("round2", rows, title=TITLES["round2"])
 
         # ---------------- round 1 ----------------
         acc = {
@@ -1851,6 +1923,9 @@ def fit(
                 for i, mm in enumerate(rc["global_minmax"]):
                     merge_minmax(c2["glo"][i], c2["ghi"][i], mm)
 
+        # CG's steps follow round 1, their count unknown: no total, no stage count (as in the
+        # singleton passes) until the steps left are estimated (_crossing_cg)
+        prog.more = bool(plan.crossing_iterate)
         r1 = _round1_load(plan, ds, wd, label) if _round1_checkpointed(plan) else None
         if r1 is not None:  # an earlier run of this fit got past round 1: its sums
             acc, peak["rss"] = r1["acc"], r1["peak"]
@@ -1959,6 +2034,7 @@ def fit(
         if plan.crossing_iterate:
             plan.cg_checkpoint = str(wd / "cg_checkpoint.npz")
             _zero_absorbed(plan, acc, collin_tol)
+            prog.more = False  # round 2 follows the steps (round 1 set it for them)
             acc["Gamma"] = _crossing_cg(
                 plan,
                 ds,
